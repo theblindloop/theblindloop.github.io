@@ -44,3 +44,6 @@ side-by-side forward/image/inverse comparison on phones.
 Shared navigation is maintained by scripts/sync_navigation.py; reading.css
 loads last and provides common reading styles across all seven pages.
 Run tests/site_consistency.py after cross-page changes.
+
+Results subsection headings state the paper’s six takeaways, not just experiment
+names. Keep short experiment names in navigation and eyebrow labels.
