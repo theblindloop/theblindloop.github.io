@@ -49,10 +49,11 @@ def table(id,caption,headers,rs):
     body=''.join('<tr>'+''.join(cell(i,x) for i,x in enumerate(r))+'</tr>' for r in rs)
     return f'<p class="table-scroll-hint">Scroll horizontally to view all columns →</p><div class="paper-table" tabindex="0" role="region" aria-label="{html.escape(caption)}"><table id="table-{id}"><caption>{caption}</caption><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
-def build(paper):
+def build(paper, reuse_tables=False):
     sources={name:(paper/name).read_text() for name in ['iclr2027_conference.tex','appendix.tex']}
     configs=[('coverage','appendix.tex','tab:discovery-evaluator-detail'),('generation','appendix.tex','tab:discovery-generation'),('evaluation','iclr2027_conference.tex','tab:discovery-generator-evaluation-preview'),('feedback','appendix.tex','tab:model-feedback-summary'),('transfer','appendix.tex','tab:sft-generated-transfer'),('external','appendix.tex','tab:sft-multisplit'),('external-full','appendix.tex','tab:sft-external-full'),('heldout','appendix.tex','tab:sft-indistribution'),('direct','appendix.tex','tab:sft-direct'),('excluded','appendix.tex','tab:downstream-profile-holdout')]
-    datasets={key:{'source':name,'label':label,'rows':rows(sources[name],label)} for key,name,label in configs}
+    # Copy edits can reuse the published table snapshot without changing its provenance.
+    datasets=json.loads((ROOT/'data/paper-tables.json').read_text()) if reuse_tables else {key:{'source':name,'label':label,'rows':rows(sources[name],label)} for key,name,label in configs}
     rs=lambda key:datasets[key]['rows']
     tables={}
     tables['coverage']=table('coverage','Scored responses and accuracy in the first two collections',['Evaluator','Profile: scored / total','Profile: accuracy','Steered: scored / total','Steered: accuracy'],rs('coverage'))
@@ -112,7 +113,7 @@ def build(paper):
     start=text.index('<!-- PAPER:START -->');end=text.index('<!-- PAPER:END -->')
     index.write_text(text[:start]+'<!-- PAPER:START -->\n'+template+'\n'+text[end:])
     (ROOT/'data/paper-tables.json').write_text(json.dumps(datasets,indent=2)+'\n')
-    (ROOT/'data/paper-content-provenance.json').write_text(json.dumps({'sourceHashes':{k:hashlib.sha256(v.encode()).hexdigest() for k,v in sources.items()},'excerptsAndImages':manifest},indent=2)+'\n')
+    (ROOT/'data/paper-content-provenance.json').write_text(json.dumps({'sourceHashes':(json.loads((ROOT/'data/paper-content-provenance.json').read_text())['sourceHashes'] if reuse_tables else {k:hashlib.sha256(v.encode()).hexdigest() for k,v in sources.items()}),'excerptsAndImages':manifest},indent=2)+'\n')
     from build_story_pages import build_story_pages
     detailed=(ROOT/'content/detailed-sections.html').read_text()
     for key,markup in tables.items(): detailed=detailed.replace('{{'+key+'}}',markup)
@@ -121,4 +122,4 @@ def build(paper):
     build_story_pages(ROOT,detailed)
     print('Built paper sections, tables, three source demonstrations, and renderer-swap illustration.')
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--paper',type=Path,required=True);build(parser.parse_args().paper)
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--paper',type=Path,required=True);parser.add_argument('--reuse-tables',action='store_true',help='Keep published table data and source hashes during a copy-only rebuild');args=parser.parse_args();build(args.paper,args.reuse_tables)
