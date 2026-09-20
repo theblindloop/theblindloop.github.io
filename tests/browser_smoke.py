@@ -164,7 +164,7 @@ def main(home):
         preview.locator('.gallery-invitation a').click()
         expect(preview).to_have_url(home + '/questions.html')
         expect(preview.locator('.world-card')).to_have_count(48)
-        preview.locator('.site-nav a[href="index.html#method"]').click()
+        preview.locator('.site-nav .nav-links a[href="index.html"]').click()
         expect(preview.locator('#method')).to_be_visible()
         expect(preview.locator('.world-card')).to_have_count(6)
         preview.goto(home)

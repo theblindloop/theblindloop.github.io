@@ -41,6 +41,8 @@ def build(paper):
     (ROOT/'data/steering-examples.json').write_text(json.dumps({'source':str(source.relative_to(paper)),'sourceSha256':hashlib.sha256(source.read_bytes()).hexdigest(),'requestJoinSource':str((source.parent/'support_replay_join.csv').relative_to(paper)),'requestJoinSha256':hashlib.sha256((source.parent/'support_replay_join.csv').read_bytes()).hexdigest(),'examples':manifest},indent=2)+'\n')
     from build_steering_gallery import build_gallery
     build_gallery(ROOT,gallery_records)
+    from sync_navigation import sync
+    sync(ROOT)
     print('Built steering explainer: 9 measured categories, 18 worlds, original recorded images/questions.')
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--paper',type=Path,required=True);build(p.parse_args().paper)

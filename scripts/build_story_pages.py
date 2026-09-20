@@ -22,3 +22,6 @@ def build_story_pages(root, detailed):
     program=program.replace('href="inverse-programs.html"','href="#inverse-walkthroughs"')
     program+='<section class="section" id="inverse-walkthroughs"><div class="container site-width inverse-wrap"><h2>Five inverse programs, step by step</h2>'+inverse+'</div></section>'
     write('programs.html','Programs behind the questions','Inspect the two answer programs, test the role of pixels, and follow five inverse computations from image to decision.',program,'<link rel="stylesheet" href="static/css/inverse.css">')
+
+    from sync_navigation import sync
+    sync(root)
