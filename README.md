@@ -133,3 +133,11 @@ the anonymous project account.
 
 Website-template adaptations use CC BY-SA 4.0. Research asset licensing remains
 separate; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Page organization
+
+The homepage follows the paper's six results in order. Detailed examples live
+on `programs.html`; complete tables and additional studies live on `results.html`.
+The question gallery and image-steering explainer remain separate pages.
+See [site structure and checkpoint](docs/SITE_STRUCTURE.md) for the content map,
+build sources, and preserved pre-restructure tag.

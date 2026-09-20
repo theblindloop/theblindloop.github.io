@@ -45,12 +45,14 @@ def main(base,paper):
         page.locator('.verification-map').screenshot(path=str(ROOT/'artifacts/redesign-method-desktop.png'))
         page.locator('#training').screenshot(path=str(ROOT/'artifacts/redesign-training-desktop.png'))
         assert page.locator('#table-transfer td.delta-positive').count()==4
+        page.goto(base+'/results.html#external',wait_until='networkidle')
         assert page.locator('#table-external td.delta-negative').count()>0
         page.locator('#external').screenshot(path=str(ROOT/'artifacts/redesign-external-desktop.png'))
         for width in [320,390,768,1024,1440]:
             page.set_viewport_size({'width':width,'height':844})
             assert not page.evaluate('document.documentElement.scrollWidth>innerWidth'),width
         page.set_viewport_size({'width':390,'height':844})
+        page.goto(base+'/#method',wait_until='networkidle')
         page.locator('.verification-map').screenshot(path=str(ROOT/'artifacts/redesign-method-mobile.png'))
         page.goto(base+'/steering.html',wait_until='networkidle')
         expect(page.locator('.category-cell')).to_have_count(9)

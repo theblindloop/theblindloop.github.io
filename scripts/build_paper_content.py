@@ -86,14 +86,29 @@ def build(paper):
     for name in ['stovetop_original','stovetop_same_answer','stovetop_answer_changed']:
         src=paper/'figures/results/inverse-arm'/f'{name}.png'; dest=ROOT/'static/images/method'/f'{name}.png';dest.write_bytes(src.read_bytes())
         manifest.append({'paperImage':str(src.relative_to(paper)),'path':str(dest.relative_to(ROOT)),'sha256':hashlib.sha256(dest.read_bytes()).hexdigest()})
+    overall=rs('evaluation')[5]
+    bars=[]
+    for i,(label,value) in enumerate(zip(headers[2:],overall[2:])):
+        group='Frontier' if i<3 else 'Open-weight'
+        bars.append(f'<div class="accuracy-row" data-value="{value}"><span>{html.escape(label)}<small>{group}</small></span><div class="accuracy-track" aria-hidden="true"><i style="width:{float(value)}%"></i></div><strong>{value}%</strong></div>')
+    tables['evaluation-summary']='<figure class="accuracy-summary"><figcaption>Overall accuracy · profile-conditioned collection · scored responses</figcaption>'+''.join(bars)+'</figure>'
     template=(ROOT/'content/paper-sections.html').read_text()
     for key,markup in tables.items():template=template.replace('{{'+key+'}}',markup)
     template=template.replace('{{programs}}','\n'.join(programs))
+    preview_world=json.loads((ROOT/'data/worlds/profile-guitar-string-count.json').read_text())
+    preview=''.join(f'<figure><a href="#world={preview_world["id"]}&amp;sample={i+1}"><img loading="lazy" src="{sample["image"]}" alt="Recorded guitar instance {i+1}"></a><figcaption>Recorded answer: {html.escape(sample["answer"])}</figcaption></figure>' for i,sample in enumerate(preview_world['samples']))
+    template=template.replace('{{program-preview}}','<div class="instance-strip">'+preview+'</div>')
     assert '{{' not in template
     index=ROOT/'index.html';text=index.read_text();start=text.index('<!-- PAPER:START -->');end=text.index('<!-- PAPER:END -->')
     index.write_text(text[:start]+'<!-- PAPER:START -->\n'+template+'\n'+text[end:])
     (ROOT/'data/paper-tables.json').write_text(json.dumps(datasets,indent=2)+'\n')
     (ROOT/'data/paper-content-provenance.json').write_text(json.dumps({'sourceHashes':{k:hashlib.sha256(v.encode()).hexdigest() for k,v in sources.items()},'excerptsAndImages':manifest},indent=2)+'\n')
+    from build_story_pages import build_story_pages
+    detailed=(ROOT/'content/detailed-sections.html').read_text()
+    for key,markup in tables.items(): detailed=detailed.replace('{{'+key+'}}',markup)
+    detailed=detailed.replace('{{programs}}','\n'.join(programs))
+    assert '{{' not in detailed
+    build_story_pages(ROOT,detailed)
     print('Built paper sections, tables, three source demonstrations, and renderer-swap illustration.')
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--paper',type=Path,required=True);build(parser.parse_args().paper)

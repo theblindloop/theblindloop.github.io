@@ -1,4 +1,5 @@
 (() => {
+  if (document.querySelector(".lab-workbench")) {
   let methodInstances = null;
   let methodIndex = 0;
   function connectMethod() {
@@ -119,8 +120,10 @@
         renderMethod(Number(button.dataset.methodSample)),
       ),
     );
+  }
   let programLink = null;
   document.querySelectorAll(".instance-strip a").forEach((link) => {
+    if (new URL(link.href).pathname !== location.pathname) return;
     link.addEventListener("click", (event) => {
       event.preventDefault();
       programLink = link;
@@ -128,7 +131,7 @@
       window.dispatchEvent(new HashChangeEvent("hashchange"));
     });
   });
-  document.getElementById("question-dialog").addEventListener("close", () => {
+  document.getElementById("question-dialog")?.addEventListener("close", () => {
     if (!programLink) return;
     const link = programLink;
     programLink = null;

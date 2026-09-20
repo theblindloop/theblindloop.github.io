@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""Validate source excerpts, table bindings, navigation and responsive paper sections."""
-import argparse
-import hashlib
-import json
+"""Check source-bound results, program navigation, and paper-ordered site structure."""
+import argparse, hashlib, json
 from pathlib import Path
 from playwright.sync_api import sync_playwright, expect
 ROOT=Path(__file__).resolve().parents[1]
@@ -17,14 +15,22 @@ def main(base):
         browser=p.chromium.launch()
         page=browser.new_page(viewport={'width':1440,'height':1000},reduced_motion='reduce')
         errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
-        page.goto(base+'/#method',wait_until='networkidle')
-        expect(page.locator('#method')).to_be_visible()
+        page.goto(base+'/',wait_until='networkidle')
         assert page.locator('.world-card').count()==6
-        page.locator('#method').screenshot(path=str(ROOT/'artifacts/paper-method-desktop.png'))
+        assert page.locator('#results > .container > article').evaluate_all('(els)=>els.map(e=>e.id)')==['generation','steering','evaluation','feedback','human-review','training']
+        assert page.locator('#training #external').count()==1
+        assert page.locator('.accuracy-row').evaluate_all('(els)=>els.map(e=>e.dataset.value)')==tables['evaluation']['rows'][5][2:]
+        assert page.locator('main > .paper-section').evaluate_all('(els)=>els.map(e=>e.id)')==['method','programs','results','limitations']
+        for i in range(3):
+            page.locator(f'[data-method-sample="{i}"]').click()
+            assert page.locator('[data-method-count]').all_text_contents()==[str(6+i)]*3
+            assert page.locator('[data-comparison-count]').all_text_contents()==[str(6+i)]*2
+        page.goto(base+'/results.html',wait_until='networkidle')
         for key in ['transfer','heldout','direct','external','excluded','coverage']:
             actual=page.locator('#table-'+key+' tbody tr').evaluate_all('(rows)=>rows.map(r=>[...r.children].map(c=>c.textContent))')
             assert actual==tables[key]['rows'],key
         assert page.locator('#table-external tbody tr').count()==17
+        page.goto(base+'/programs.html',wait_until='networkidle')
         for i in range(3):
             page.locator(f'#program-tab-{i}').click()
             expect(page.locator(f'#program-example-{i}')).to_be_visible()
@@ -39,32 +45,27 @@ def main(base):
                 if item.get('world')==id: assert item['text'] in code
         page.locator('#program-tab-2').focus();page.keyboard.press('ArrowRight')
         expect(page.locator('#program-tab-0')).to_be_focused()
-        expect(page.locator('#program-example-0')).to_be_visible()
-        page.locator('#programs').screenshot(path=str(ROOT/'artifacts/paper-programs-desktop.png'))
         page.locator('#program-example-0 .instance-strip a').first.click()
+        page.wait_for_url('**/questions.html#world=*')
         expect(page.locator('#question-dialog')).to_be_visible()
-        expect(page.locator('#question-viewer')).to_be_visible()
-        page.locator('#close-question').click()
-        expect(page.locator('#program-example-0 .instance-strip a').first).to_be_focused()
-        page.wait_for_url('**/#programs')
-        page.locator('#verification').screenshot(path=str(ROOT/'artifacts/paper-verification-desktop.png'))
-        page.locator('#training').screenshot(path=str(ROOT/'artifacts/paper-training-desktop.png'))
-        page.locator('#external').screenshot(path=str(ROOT/'artifacts/paper-external-desktop.png'))
-        for width in [320,390,768,1024,1440]:
-            page.set_viewport_size({'width':width,'height':844})
-            page.evaluate('document.querySelectorAll(".paper-details").forEach(d=>d.open=true)')
-            assert not page.evaluate('document.documentElement.scrollWidth>innerWidth'),width
-            for i in range(3):
-                page.locator(f'#program-tab-{i}').click()
-                assert not page.evaluate('document.documentElement.scrollWidth>innerWidth'),(width,i)
-            page.evaluate('document.querySelectorAll(".paper-details").forEach(d=>d.open=false)')
-        page.set_viewport_size({'width':390,'height':844})
-        page.locator('#method').screenshot(path=str(ROOT/'artifacts/paper-method-mobile.png'))
-        page.locator('#programs').screenshot(path=str(ROOT/'artifacts/paper-programs-mobile.png'))
-        page.locator('#training').screenshot(path=str(ROOT/'artifacts/paper-training-mobile.png'))
-        page.locator('#external').screenshot(path=str(ROOT/'artifacts/paper-external-mobile.png'))
+        page.goto(base+'/programs.html')
+        assert page.locator('.inverse-example').count()==5
+        for route in ['/', '/programs.html', '/results.html']:
+            page.goto(base+route,wait_until='networkidle')
+            for width in [320,390,768,1024,1440]:
+                page.set_viewport_size({'width':width,'height':844})
+                page.evaluate('document.querySelectorAll(".paper-details").forEach(d=>d.open=true)')
+                assert not page.evaluate('document.documentElement.scrollWidth>innerWidth'),(route,width)
+                if route=='/programs.html':
+                    for i in range(3):
+                        page.locator(f'#program-tab-{i}').click()
+                        assert not page.evaluate('document.documentElement.scrollWidth>innerWidth'),(route,width,i)
+                page.evaluate('document.querySelectorAll(".paper-details").forEach(d=>d.open=false)')
+            for width in [1440,390]:
+                page.set_viewport_size({'width':width,'height':1000})
+                page.screenshot(path=str(ROOT/f'artifacts/story-{route.strip("/").replace(".html", "") or "home"}-{width}.png'),full_page=True)
         assert not errors,errors
         browser.close()
-    print('PASS: exact code excerpts and hashes; table bindings; three accessible program tabs; quiz links; paper navigation; all expandable tables and code panels fit 320–1440px.')
+    print('PASS: paper order; live method instances; exact source/table bindings; all program tabs and gallery links; five inverse walkthroughs; 320–1440px layouts; no JS errors.')
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--url',default='http://127.0.0.1:8767');main(parser.parse_args().url.rstrip('/'))

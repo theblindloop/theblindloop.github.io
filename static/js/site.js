@@ -1,6 +1,15 @@
 /* Publication metadata is intentionally separate from the paper's prose. */
 (() => {
   "use strict";
+  // Preserve links to sections moved off the homepage.
+  if (document.body.classList.contains("homepage")) {
+    const moved = new Set(["#verification", "#source-analysis"]);
+    const routeMovedSection = () => {
+      if (moved.has(location.hash)) location.replace("programs.html" + location.hash);
+    };
+    routeMovedSection();
+    window.addEventListener("hashchange", routeMovedSection);
+  }
   function publicURL(value) {
     try {
       const url = new URL(value);
