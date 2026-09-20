@@ -9,7 +9,7 @@ def build(paper):
     joins={r['replay_record_id']:r for r in csv.DictReader((source.parent/'support_replay_join.csv').open())}
     worlds=[json.loads(p.read_text()) for p in (ROOT/'data/worlds').glob('*.json')]
     by_record={w['recordId']:w for w in worlds}
-    cells=[];panels=[];manifest=[]
+    cells=[];panels=[];manifest=[];gallery_records=[]
     scales=['focal','regional','distributed'];shapes=['compact','pathlike','multipart']
     for y,scale in enumerate(scales):
       for x,shape in enumerate(shapes):
@@ -22,11 +22,13 @@ def build(paper):
         icon=f'<svg viewBox="0 0 100 100" aria-hidden="true"><rect class="glyph-field" x="2" y="2" width="96" height="96" rx="9"/><g transform="translate({50*(1-size)} {50*(1-size)}) scale({size})" fill="currentColor">{shape_svg}</g></svg>'
         cells.append(f'<button type="button" class="category-cell scale-{scale}" data-category="{key}" aria-pressed="{str(x==0 and y==0).lower()}" aria-controls="category-{key}">{icon}<span>{label}</span></button>')
         cards=[]
-        for r in chosen:
+        for sample_index,r in enumerate(eligible[:12]):
             w=by_record[r['record_id']];s=w['samples'][0]
-            manifest.append({'category':key,'world':w['id'],'recordId':w['recordId'],'measuredScale':scale,'measuredShape':shape,'stability':float(r['descriptor_stability_fraction']),'measurementScenes':int(r['attestation_scene_count']),'requestedCategory':joins[r['record_id']]['qd_target_cell'],'image':s['image'],'imageSha256':s['sha256'],'question':s['question'],'answer':s['answer']})
+            record={'category':key,'world':w['id'],'recordId':w['recordId'],'measuredScale':scale,'measuredShape':shape,'stability':float(r['descriptor_stability_fraction']),'measurementScenes':int(r['attestation_scene_count']),'requestedCategory':joins[r['record_id']]['qd_target_cell'],'image':s['image'],'imageSha256':s['sha256'],'question':s['question'],'answer':s['answer']}
+            gallery_records.append(record)
+            if sample_index < 2: manifest.append(record)
             cards.append(f'<article class="steering-sample"><a href="questions.html#world={w["id"]}&amp;sample=1"><img src="{s["image"]}" alt="{html.escape(w["title"])}" loading="lazy"></a><div><span class="sample-category">Measured {label}</span><h3>{html.escape(w["title"])}</h3><p class="sample-question">{html.escape(s["question"])}</p><details><summary>Recorded answer</summary><p>{html.escape(s["answer"])}</p></details><a href="questions.html#world={w["id"]}&amp;sample=1">Try all three instances ↗</a><p class="small-note">The world matched its requested category. {float(r["descriptor_stability_fraction"])*100:g}% category agreement across {r["attestation_scene_count"]} measured scenes.</p></div></article>')
-        panels.append(f'<section id="category-{key}" class="category-panel" {"hidden" if x or y else ""}><h2>{label}</h2><div class="steering-samples">'+''.join(cards)+'</div></section>')
+        panels.append(f'<section id="category-{key}" class="category-panel" {"hidden" if x or y else ""}><h2>{label}</h2><div class="steering-samples">'+''.join(cards[:2])+'</div><a class="text-link" href="steering-gallery.html#'+key+'">More questions in this category →</a></section>')
     template=(ROOT/'content/steering-page.html').read_text().replace('{{cells}}',''.join(cells)).replace('{{panels}}',''.join(panels))
     index=(ROOT/'index.html').read_text();head=index[:index.index('<body')];head=head.replace('<title>BlindLoop — Executable Visual Questions</title>','<title>Image-support steering — BlindLoop</title>')
     import re
@@ -37,6 +39,8 @@ def build(paper):
     footer=index[index.index('    <footer'):index.index('    <dialog')]
     (ROOT/'steering.html').write_text(head+'<body class="steering-page"><a class="skip-link" href="#main">Skip to content</a>'+nav+'<main id="main">'+template+'</main>'+footer+'</body></html>\n')
     (ROOT/'data/steering-examples.json').write_text(json.dumps({'source':str(source.relative_to(paper)),'sourceSha256':hashlib.sha256(source.read_bytes()).hexdigest(),'requestJoinSource':str((source.parent/'support_replay_join.csv').relative_to(paper)),'requestJoinSha256':hashlib.sha256((source.parent/'support_replay_join.csv').read_bytes()).hexdigest(),'examples':manifest},indent=2)+'\n')
+    from build_steering_gallery import build_gallery
+    build_gallery(ROOT,gallery_records)
     print('Built steering explainer: 9 measured categories, 18 worlds, original recorded images/questions.')
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--paper',type=Path,required=True);build(p.parse_args().paper)

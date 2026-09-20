@@ -13,10 +13,11 @@ anonymous project identity.
 ## Homepage
 
 - Opening mosaic, introduction, six playable questions, and abstract.
-- 01 Method: interactive guitar, component definitions, generation loop.
-- 02 Programs: a short explanation and three recorded guitar instances;
+- 01 Motivation: why scene-derived answers alone do not establish pixel recoverability.
+- 02 Method: interactive guitar, component definitions, generation loop.
+- 03 Programs: a short explanation and three recorded guitar instances;
   link to the full program demonstrations.
-- 03 Experiments and results, in manuscript order:
+- 04 Experiments and results, in manuscript order:
   1. Profile-conditioned collection growth.
   2. Image-support-steered discovery.
   3. Model evaluation.
@@ -32,6 +33,7 @@ anonymous project identity.
   test, 225-world source review, and five inverse-program walkthroughs. The
   separate 250-world audit is explicitly distinguished from the paper review.
 - `steering.html`: 3×3 category explanation, masking demonstration, and 18 samples.
+- `steering-gallery.html`: 108 measured-category worlds, 12 per category, linking to 324 original instances.
 - `results.html`: all original tables, denominators, recipes, and additional
   studies in paper order. No detailed results were discarded.
 - `inverse-programs.html`: retained for existing public links; its walkthroughs

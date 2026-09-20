@@ -1,8 +1,7 @@
 # Content provenance and publication notes
 
 This version uses the supplied September 19, 2026 manuscript for the narrative. The manuscript
-and export are read-only inputs. The page abstract is a website summary, not a
-verbatim copy of the manuscript abstract.
+and export are read-only inputs. The page abstract is extracted verbatim from the manuscript, with LaTeX macros and punctuation rendered for HTML. `data/paper-abstract.json` records its source hash and exact text.
 
 | Website content | Manuscript source |
 | --- | --- |
@@ -126,3 +125,7 @@ These display checks are not new campaign-level verification outcomes.
 ## Inverse-program walkthroughs
 
 `inverse-programs.html` explains five selected original programs and reuses their shipped images and source files. Pseudocode is explanatory, not executable source. `data/inverse-examples.json` records image, program, and archived analysis hashes. The 250-world Sol (max) audit is separate from the paper’s 225-world review. Taxonomy counts group heuristic primary labels; they are not estimates for the entire collection. No candidate programs were executed.
+
+## Method teaser and category gallery
+
+`data/method-examples.json` binds three additional teaser worlds to original images, answers, source hashes, and AST-extracted forward functions. The browser switches saved records; it does not execute research programs. `data/steering-gallery.json` records 108 worlds, twelve per measured category, using the same completeness, stability, and request-match criteria as the steering explainer. Thumbnails are original question images, not measured support maps.

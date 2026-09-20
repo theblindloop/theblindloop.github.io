@@ -20,7 +20,7 @@ def main(base):
         assert page.locator('#results > .container > article').evaluate_all('(els)=>els.map(e=>e.id)')==['generation','steering','evaluation','feedback','human-review','training']
         assert page.locator('#training #external').count()==1
         assert page.locator('.accuracy-row').evaluate_all('(els)=>els.map(e=>e.dataset.value)')==tables['evaluation']['rows'][5][2:]
-        assert page.locator('main > .paper-section').evaluate_all('(els)=>els.map(e=>e.id)')==['method','programs','results','limitations']
+        assert page.locator('main > .paper-section').evaluate_all('(els)=>els.map(e=>e.id)')==['motivation','method','programs','results','limitations']
         for i in range(3):
             page.locator(f'[data-method-sample="{i}"]').click()
             assert page.locator('[data-method-count]').all_text_contents()==[str(6+i)]*3

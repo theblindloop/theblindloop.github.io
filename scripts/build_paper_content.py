@@ -92,6 +92,11 @@ def build(paper):
         group='Frontier' if i<3 else 'Open-weight'
         bars.append(f'<div class="accuracy-row" data-value="{value}"><span>{html.escape(label)}<small>{group}</small></span><div class="accuracy-track" aria-hidden="true"><i style="width:{float(value)}%"></i></div><strong>{value}%</strong></div>')
     tables['evaluation-summary']='<figure class="accuracy-summary"><figcaption>Overall accuracy · profile-conditioned collection · scored responses</figcaption>'+''.join(bars)+'</figure>'
+    from build_method_extras import build_extras, abstract_content, steering_overview
+    teaser_tabs,teaser_panels=build_extras(ROOT)
+    tables['teaser-tabs']=teaser_tabs
+    tables['teaser-panels']=teaser_panels
+    tables['steering-atlas']=steering_overview(ROOT)
     template=(ROOT/'content/paper-sections.html').read_text()
     for key,markup in tables.items():template=template.replace('{{'+key+'}}',markup)
     template=template.replace('{{programs}}','\n'.join(programs))
@@ -99,7 +104,12 @@ def build(paper):
     preview=''.join(f'<figure><a href="#world={preview_world["id"]}&amp;sample={i+1}"><img loading="lazy" src="{sample["image"]}" alt="Recorded guitar instance {i+1}"></a><figcaption>Recorded answer: {html.escape(sample["answer"])}</figcaption></figure>' for i,sample in enumerate(preview_world['samples']))
     template=template.replace('{{program-preview}}','<div class="instance-strip">'+preview+'</div>')
     assert '{{' not in template
-    index=ROOT/'index.html';text=index.read_text();start=text.index('<!-- PAPER:START -->');end=text.index('<!-- PAPER:END -->')
+    index=ROOT/'index.html';text=index.read_text()
+    abstract=abstract_content(sources['iclr2027_conference.tex'])
+    abstract_html='<section class="section abstract-section" id="abstract"><div class="container reading-width"><h2 class="title is-3 has-text-centered">Abstract</h2><p class="paper-abstract">'+html.escape(abstract)+'</p></div></section>'
+    text=re.sub(r'<section[^>]*id="abstract".*?</section>',abstract_html,text,flags=re.S)
+    (ROOT/'data/paper-abstract.json').write_text(json.dumps({'source':'iclr2027_conference.tex','sourceSha256':hashlib.sha256(sources['iclr2027_conference.tex'].encode()).hexdigest(),'text':abstract},indent=2)+'\n')
+    start=text.index('<!-- PAPER:START -->');end=text.index('<!-- PAPER:END -->')
     index.write_text(text[:start]+'<!-- PAPER:START -->\n'+template+'\n'+text[end:])
     (ROOT/'data/paper-tables.json').write_text(json.dumps(datasets,indent=2)+'\n')
     (ROOT/'data/paper-content-provenance.json').write_text(json.dumps({'sourceHashes':{k:hashlib.sha256(v.encode()).hexdigest() for k,v in sources.items()},'excerptsAndImages':manifest},indent=2)+'\n')

@@ -169,3 +169,29 @@
     });
   });
 })();
+
+// Additional recorded worlds share the forward/image/inverse reading order.
+(() => {
+  const tabs = [...document.querySelectorAll('[data-teaser]')];
+  function select(index, focus=false) {
+    tabs.forEach((t,i) => { t.setAttribute('aria-selected', String(i===index)); t.tabIndex=i===index?0:-1; document.getElementById(`teaser-panel-${i}`).hidden=i!==index; });
+    if (focus) tabs[index].focus();
+    window.dispatchEvent(new Event('resize'));
+  }
+  tabs.forEach((t,i) => {
+    t.addEventListener('click',()=>select(i));
+    t.addEventListener('keydown',e=>{
+      const next={ArrowRight:(i+1)%tabs.length,ArrowLeft:(i+tabs.length-1)%tabs.length,Home:0,End:tabs.length-1}[e.key];
+      if(next!==undefined){e.preventDefault();select(next,true);}
+    });
+  });
+  document.querySelectorAll('.method-alt').forEach(panel=>{
+    const answers=JSON.parse(panel.dataset.answers);
+    panel.querySelectorAll('[data-teaser-sample]').forEach(b=>b.addEventListener('click',()=>{
+      const index=Number(b.dataset.teaserSample);
+      panel.querySelectorAll('[data-teaser-sample]').forEach(t=>t.setAttribute('aria-pressed',String(t===b)));
+      panel.querySelectorAll('[data-teaser-slide]').forEach(s=>s.hidden=Number(s.dataset.teaserSlide)!==index);
+      panel.querySelectorAll('[data-alt-answer]').forEach(a=>a.textContent=answers[index]);
+    }));
+  });
+})();
