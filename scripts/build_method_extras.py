@@ -1,9 +1,11 @@
-"""Build the exact abstract and source-linked method examples without executing code."""
+"""Build the paper abstract (without its project-page sentence) and source-linked method examples without executing code."""
 import ast,hashlib,html,json,re
 from build_inverse_measurements import build_measurements
 
 def abstract_content(source):
     text=re.search(r'\\begin\{abstract\}(.*?)\\end\{abstract\}',source,re.S).group(1)
+    # Omit only the paper's self-referential project-page sentence on the website.
+    text=re.sub(r'Project page:\s*\\url\{https://theblindloop\.github\.io/\}\s*$', '', text)
     text=text.replace(r'\method{}','BlindLoop').replace('--','–')
     text=re.sub(r'\\url\{([^}]+)\}',r'\1',text)
     assert '\\' not in text, 'New abstract TeX needs explicit rendering'

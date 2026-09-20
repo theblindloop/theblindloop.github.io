@@ -8,6 +8,8 @@ from build_method_extras import abstract_content
 if len(sys.argv)!=2: raise SystemExit('Usage: python3 tests/method_and_support.py /path/to/manuscript')
 paper=Path(sys.argv[1])
 abstract=abstract_content((paper/'iclr2027_conference.tex').read_text())
+assert 'Project page:' not in abstract
+assert 'https://theblindloop.github.io/' not in abstract
 records=json.loads((ROOT/'data/method-examples.json').read_text())
 for r in records:
  for kind in ['forward','inverse']:
@@ -64,4 +66,4 @@ with sync_playwright() as p:
   page.set_viewport_size({'width':width,'height':1000});assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
  page.set_viewport_size({'width':1440,'height':1000});page.locator('.support-panel:visible').screenshot(path=str(ROOT/'artifacts/support-gallery-desktop.png'))
  assert not errors,errors;b.close()
-print(f'PASS: verbatim abstract; three added source-bound worlds; nine recorded instances; four teaser tabs; {len(gallery)} gallery worlds; nine category filters; keyboard and mobile layouts.')
+print(f'PASS: paper abstract without project-page sentence; three added source-bound worlds; nine recorded instances; four teaser tabs; {len(gallery)} gallery worlds; nine category filters; keyboard and mobile layouts.')
