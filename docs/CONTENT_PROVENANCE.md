@@ -122,3 +122,7 @@ The curve plots the mean of the three color channels along the central row;
 the dashed threshold is 105, as in the source code. Contiguous dark runs are
 counted on each of the three selected rows and match the recorded answers.
 These display checks are not new campaign-level verification outcomes.
+
+## Inverse-program walkthroughs
+
+`inverse-programs.html` explains five selected original programs and reuses their shipped images and source files. Pseudocode is explanatory, not executable source. `data/inverse-examples.json` records image, program, and archived analysis hashes. The 250-world Sol (max) audit is separate from the paper’s 225-world review. Taxonomy counts group heuristic primary labels; they are not estimates for the entire collection. No candidate programs were executed.
