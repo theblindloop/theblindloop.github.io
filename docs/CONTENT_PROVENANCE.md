@@ -129,3 +129,14 @@ These display checks are not new campaign-level verification outcomes.
 ## Method teaser and category gallery
 
 `data/method-examples.json` binds three additional teaser worlds to original images, answers, source hashes, and AST-extracted forward functions. The browser switches saved records; it does not execute research programs. `data/steering-gallery.json` records 108 worlds, twelve per measured category, using the same completeness, stability, and request-match criteria as the steering explainer. Thumbnails are original question images, not measured support maps.
+
+## Pixel measurements in the method teaser
+
+`build_inverse_measurements.py` reads original PNG pixels and explicitly computes
+source-informed display measurements: frame/color segmentation and four-connected
+components for rings, band/marker row measurements at six checkpoint columns, and
+least-squares circle fitting with marker centroids. It never imports or executes
+candidate programs. All nine computed decisions are asserted against recorded
+answers. `data/method-examples.json` stores measurements with image hashes. These
+illustrations are not a new held-out verification result. Original images remain
+unchanged; SVG masks and overlays visualize the extracted evidence.

@@ -13,6 +13,17 @@ for r in records:
  for kind in ['forward','inverse']:
   p=ROOT/r[kind]['path'];assert hashlib.sha256(p.read_bytes()).hexdigest()==r[kind]['sha256']
  lines=(ROOT/r['forward']['path']).read_text().splitlines();e=r['forwardExcerpt'];assert '\n'.join(lines[e['startLine']-1:e['endLine']])==e['text']
+ for measurement,sample in zip(r['displayMeasurements'],r['samples']):
+  assert measurement['answer']==sample['answer']
+  assert measurement['imageSha256']==sample['sha256']
+  if 'panels' in measurement:
+   winners=[p['panel'] for p in measurement['panels'] if p['counts']==[1,1] and p['touching']]
+   assert winners==[int(sample['answer'].split('-')[-1])]
+  elif 'checkpoints' in measurement:
+   assert str(sum(p['upperY']+4 < p['markerY'] < p['lowerY']-4 for p in measurement['checkpoints']))==sample['answer']
+  else:
+   assert min(measurement['markers'],key=lambda m:m['distance'])['name']==sample['answer']
+   assert measurement['rms']<5
  for s in r['samples']:assert hashlib.sha256((ROOT/s['image']).read_bytes()).hexdigest()==s['sha256']
 gallery=json.loads((ROOT/'data/steering-gallery.json').read_text())['examples']
 assert len({r['category'] for r in gallery})==9
@@ -29,7 +40,7 @@ with sync_playwright() as p:
  for i,r in enumerate(records,1):
   page.locator(f'[data-teaser="{i}"]').click();panel=page.locator(f'#teaser-panel-{i}');expect(panel).to_be_visible()
   for j,s in enumerate(r['samples']):
-   panel.locator(f'[data-teaser-sample="{j}"]').click();assert panel.locator('[data-alt-answer]').all_text_contents()==[s['answer']]*2
+   panel.locator(f'[data-teaser-sample="{j}"]').click();expect(panel.locator(f'[data-inverse-measurement="{j}"]')).to_be_visible();assert panel.locator('[data-alt-answer]').all_text_contents()==[s['answer']]*2
    img=panel.locator('[data-teaser-slide]:visible img');assert img.get_attribute('src')==s['image'];assert img.evaluate('(i)=>i.decode().then(()=>i.naturalWidth>0)')
   for width in [320,390,768,1440]:
    page.set_viewport_size({'width':width,'height':1000});panel.locator('details').first.evaluate('(e)=>e.open=true');assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'),(i,width)
