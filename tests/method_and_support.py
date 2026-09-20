@@ -37,10 +37,18 @@ with sync_playwright() as p:
  assert page.locator('#abstract p').inner_text()==abstract
  assert page.locator('#method .section-intro .eyebrow').evaluate('(e)=>getComputedStyle(e,"::before").content')=='counter(chapter, decimal-leading-zero)' # CSS numbering remains driven by section order
  assert page.locator('[data-teaser]').count()==4
+ styles=[]
+ for i in range(4):
+  page.locator(f'[data-teaser="{i}"]').click();panel=page.locator(f'#teaser-panel-{i}')
+  assert panel.locator('.render-title').inner_text().startswith('Rendered image\nThe renderer draws the scene')
+  expect(panel.locator('.pixel-boundary')).to_be_visible()
+  styles.append(panel.locator('.answer-panel').evaluate_all('(els)=>els.map(e=>{const s=getComputedStyle(e);const t=getComputedStyle(e.querySelector(".arm-title>span"));return [s.backgroundColor,s.borderTopColor,s.borderRadius,t.color,t.fontSize,t.fontWeight]})'))
+ assert all(style==styles[0] for style in styles),styles
  for i,r in enumerate(records,1):
   page.locator(f'[data-teaser="{i}"]').click();panel=page.locator(f'#teaser-panel-{i}');expect(panel).to_be_visible()
   for j,s in enumerate(r['samples']):
    panel.locator(f'[data-teaser-sample="{j}"]').click();expect(panel.locator(f'[data-inverse-measurement="{j}"]')).to_be_visible();assert panel.locator('[data-alt-answer]').all_text_contents()==[s['answer']]*2
+   assert panel.locator('[data-alt-comparison]').all_text_contents()==[s['answer']]*2
    img=panel.locator('[data-teaser-slide]:visible img');assert img.get_attribute('src')==s['image'];assert img.evaluate('(i)=>i.decode().then(()=>i.naturalWidth>0)')
   for width in [320,390,768,1440]:
    page.set_viewport_size({'width':width,'height':1000});panel.locator('details').first.evaluate('(e)=>e.open=true');assert page.evaluate('document.documentElement.scrollWidth<=innerWidth'),(i,width)

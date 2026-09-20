@@ -191,7 +191,7 @@
       const index=Number(b.dataset.teaserSample);
       panel.querySelectorAll('[data-teaser-sample]').forEach(t=>t.setAttribute('aria-pressed',String(t===b)));
       panel.querySelectorAll('[data-teaser-slide]').forEach(s=>s.hidden=Number(s.dataset.teaserSlide)!==index);
-      panel.querySelectorAll('[data-alt-answer]').forEach(a=>a.textContent=answers[index]);
+      panel.querySelectorAll('[data-alt-answer], [data-alt-comparison]').forEach(a=>a.textContent=answers[index]);
       panel.querySelectorAll('[data-inverse-measurement]').forEach(m=>m.hidden=Number(m.dataset.inverseMeasurement)!==index);
     }));
   });
