@@ -19,8 +19,11 @@ def main(base):
         assert page.locator('.world-card').count()==6
         assert page.locator('#results > .container > article').evaluate_all('(els)=>els.map(e=>e.id)')==['generation','steering','evaluation','feedback','human-review','training']
         assert page.locator('#training #external').count()==1
-        assert page.locator('.accuracy-row').evaluate_all('(els)=>els.map(e=>e.dataset.value)')==tables['evaluation']['rows'][5][2:]
-        assert page.locator('main > .paper-section').evaluate_all('(els)=>els.map(e=>e.id)')==['motivation','method','programs','results','limitations']
+        assert page.locator('#generation #programs').count()==1
+        assert page.locator('.accuracy-track').count()==0
+        assert page.locator('#table-evaluation-summary tbody tr td:nth-child(3)').all_text_contents()==tables['evaluation']['rows'][5][2:]
+        assert page.locator('#table-evaluation-summary tbody tr td:nth-child(4)').all_text_contents()==tables['evaluation']['rows'][11][2:]
+        assert page.locator('main > .paper-section').evaluate_all('(els)=>els.map(e=>e.id)')==['motivation','method','results','limitations']
         for i in range(3):
             page.locator(f'[data-method-sample="{i}"]').click()
             assert page.locator('[data-method-count]').all_text_contents()==[str(6+i)]*3

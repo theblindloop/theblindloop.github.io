@@ -87,12 +87,10 @@ def build(paper, reuse_tables=False):
     for name in ['stovetop_original','stovetop_same_answer','stovetop_answer_changed']:
         src=paper/'figures/results/inverse-arm'/f'{name}.png'; dest=ROOT/'static/images/method'/f'{name}.png';dest.write_bytes(src.read_bytes())
         manifest.append({'paperImage':str(src.relative_to(paper)),'path':str(dest.relative_to(ROOT)),'sha256':hashlib.sha256(dest.read_bytes()).hexdigest()})
-    overall=rs('evaluation')[5]
-    bars=[]
-    for i,(label,value) in enumerate(zip(headers[2:],overall[2:])):
-        group='Frontier' if i<3 else 'Open-weight'
-        bars.append(f'<div class="accuracy-row" data-value="{value}"><span>{html.escape(label)}<small>{group}</small></span><div class="accuracy-track" aria-hidden="true"><i style="width:{float(value)}%"></i></div><strong>{value}%</strong></div>')
-    tables['evaluation-summary']='<figure class="accuracy-summary"><figcaption>Overall accuracy · profile-conditioned collection · scored responses</figcaption>'+''.join(bars)+'</figure>'
+    profile_overall=rs('evaluation')[5]
+    steered_overall=rs('evaluation')[11]
+    summary_rows=[[label, 'Frontier' if i<3 else 'Open-weight', profile_overall[i+2], steered_overall[i+2]] for i,label in enumerate(headers[2:])]
+    tables['evaluation-summary']=table('evaluation-summary','Model accuracy (%) over scored responses',['Model','Model group','Profile-conditioned','Image-support-steered'],summary_rows)
     from build_method_extras import build_extras, abstract_content, steering_overview
     teaser_tabs,teaser_panels=build_extras(ROOT)
     tables['teaser-tabs']=teaser_tabs
