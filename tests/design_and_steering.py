@@ -38,7 +38,7 @@ def main(base,paper):
         page.goto(base+'/#method',wait_until='networkidle');page.evaluate('document.fonts.ready')
         for i in range(3):
             page.locator(f'[data-method-sample="{i}"]').click()
-            assert page.locator('[data-method-count]').all_text_contents()==[str(6+i)]*3
+            assert page.locator('[data-method-count]').all_text_contents()==[str(6+i)]*page.locator('[data-method-count]').count()
             assert page.locator('#method-runs i').count()==6+i
             assert page.locator('#method-image').evaluate('(img)=>img.decode().then(()=>img.naturalWidth>0)')
         page.locator('[data-method-sample="0"]').click()

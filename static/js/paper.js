@@ -64,6 +64,11 @@
       box.setAttribute(key, item.crop[i]),
     );
     const [x, y, w, h] = item.crop;
+    const scan = document.getElementById("method-scan-row");
+    scan.setAttribute("x1", item.rowOrigin[0]);
+    scan.setAttribute("x2", item.rowOrigin[0] + 85);
+    scan.setAttribute("y1", item.rowOrigin[1] + 1);
+    scan.setAttribute("y2", item.rowOrigin[1] + 1);
     document
       .getElementById("method-bridge-leader")
       .setAttribute("d", `M${x + w} ${y + h / 2}H505`);
