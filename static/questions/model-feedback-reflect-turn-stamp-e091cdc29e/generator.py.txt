@@ -1,0 +1,413 @@
+"""Deterministic renderer and analytic arm for a reflect-then-turn world.
+
+Each local tile contains one asymmetric solid token, a dashed line, and a
+separate pivot with a visible quarter-turn arrow.  The answer is carried by
+the whole silhouette after reflecting the token in the line and then rotating
+that reflected silhouette about the pivot.  The target is a controlled
+near-miss in every other tile.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+WIDTH = 1120
+HEIGHT = 760
+PANEL_W = 530
+PANEL_H = 350
+MARGIN_X = 20
+MARGIN_Y = 20
+GAP_X = 20
+GAP_Y = 20
+PANEL_LABELS = ("A", "B", "C", "D")
+
+BACKGROUND = (247, 249, 250)
+PANEL_FILL = (255, 255, 255)
+FRAME = (78, 98, 111)
+LABEL = (50, 65, 78)
+SOURCE = (28, 65, 105)
+TARGET_FILL = (255, 244, 216)
+TARGET_EDGE = (208, 88, 47)
+AXIS = (105, 78, 151)
+TURN_SHAFT = (24, 150, 145)
+TURN_TAIL = (137, 224, 204)
+TURN_HEAD = (7, 92, 96)
+PIVOT = (229, 167, 45)
+
+QUARANTINE_MARGIN = 22.0
+
+# A large, concave, chiral token.  Its notch and uneven arms make a turn and
+# a reflection distinguishable from a mere translation or bounding-box test.
+BASE_SHAPE = (
+    (-48, -27),
+    (-12, -30),
+    (7, -47),
+    (45, -18),
+    (27, -2),
+    (50, 24),
+    (10, 20),
+    (-17, 49),
+    (-28, 13),
+    (-50, 25),
+    (-32, -4),
+)
+
+
+def panel_origin(slot: int) -> tuple[int, int]:
+    return (
+        MARGIN_X + (int(slot) % 2) * (PANEL_W + GAP_X),
+        MARGIN_Y + (int(slot) // 2) * (PANEL_H + GAP_Y),
+    )
+
+
+def _rotate_point(
+    point: tuple[float, float], center: tuple[float, float], angle: float
+) -> tuple[float, float]:
+    radians = math.radians(angle)
+    c, s = math.cos(radians), math.sin(radians)
+    dx, dy = point[0] - center[0], point[1] - center[1]
+    return (center[0] + c * dx - s * dy, center[1] + s * dx + c * dy)
+
+
+def _rounded(points: Iterable[tuple[float, float]]) -> list[list[int]]:
+    return [[int(round(x)), int(round(y))] for x, y in points]
+
+
+def _centroid(points: Iterable[Iterable[float]]) -> tuple[float, float]:
+    values = [(float(point[0]), float(point[1])) for point in points]
+    return (
+        sum(point[0] for point in values) / len(values),
+        sum(point[1] for point in values) / len(values),
+    )
+
+
+def _source_polygon(center: tuple[float, float], angle: float) -> list[list[int]]:
+    return _rounded(
+        _rotate_point((center[0] + dx, center[1] + dy), center, angle)
+        for dx, dy in BASE_SHAPE
+    )
+
+
+def _reflect(
+    point: Iterable[float],
+    axis_point: Iterable[float],
+    axis_direction: Iterable[float],
+) -> tuple[float, float]:
+    px, py = float(point[0]), float(point[1])
+    ax, ay = float(axis_point[0]), float(axis_point[1])
+    dx, dy = float(axis_direction[0]), float(axis_direction[1])
+    norm = math.hypot(dx, dy) or 1.0
+    dx, dy = dx / norm, dy / norm
+    vx, vy = px - ax, py - ay
+    projection = vx * dx + vy * dy
+    foot = (ax + projection * dx, ay + projection * dy)
+    return (2.0 * foot[0] - px, 2.0 * foot[1] - py)
+
+
+def _reflected(panel: dict) -> list[tuple[float, float]]:
+    return [
+        _reflect(point, panel["axis_point"], panel["axis_direction"])
+        for point in panel["source"]
+    ]
+
+
+def _transformed_polygon(panel: dict, turn: float | None = None) -> list[list[int]]:
+    angle = float(panel["turn"] if turn is None else turn)
+    pivot = (float(panel["pivot"][0]), float(panel["pivot"][1]))
+    return _rounded(_rotate_point(point, pivot, angle) for point in _reflected(panel))
+
+
+def _reflection_only(panel: dict) -> list[list[int]]:
+    return _rounded(_reflected(panel))
+
+
+def _reverse_order(panel: dict) -> list[list[int]]:
+    pivot = (float(panel["pivot"][0]), float(panel["pivot"][1]))
+    turned = [
+        _rotate_point((float(point[0]), float(point[1])), pivot, float(panel["turn"]))
+        for point in panel["source"]
+    ]
+    return _rounded(
+        _reflect(point, panel["axis_point"], panel["axis_direction"])
+        for point in turned
+    )
+
+
+def _mean_vertex_error(left: list[list[int]], right: list[list[int]]) -> float:
+    return sum(
+        math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+        for a, b in zip(left, right)
+    ) / len(left)
+
+
+def _line_clearance(points: Iterable[Iterable[float]], panel: dict) -> float:
+    ax, ay = float(panel["axis_point"][0]), float(panel["axis_point"][1])
+    dx, dy = float(panel["axis_direction"][0]), float(panel["axis_direction"][1])
+    norm = math.hypot(dx, dy) or 1.0
+    return min(abs((float(point[0]) - ax) * dy - (float(point[1]) - ay) * dx) / norm for point in points)
+
+
+def _pivot_clearance(points: Iterable[Iterable[float]], panel: dict) -> float:
+    pivot = panel["pivot"]
+    return min(
+        math.hypot(float(point[0]) - float(pivot[0]), float(point[1]) - float(pivot[1]))
+        for point in points
+    )
+
+
+def _inside(points: Iterable[Iterable[int]]) -> bool:
+    # The header is reserved for tile labels and the lower edge for the frame.
+    return all(28 <= int(point[0]) <= 502 and 70 <= int(point[1]) <= 332 for point in points)
+
+
+def _target_clear(target: list[list[int]], panel: dict) -> bool:
+    return (
+        _inside(target)
+        and _line_clearance(target, panel) >= 14.0
+        and _pivot_clearance(target, panel) >= 42.0
+    )
+
+
+def _scores(scene: dict) -> list[float]:
+    # Keep this small analytic path explicit.  Besides making the gold easy to
+    # audit, it means the protected scene-field checker sees only the declared
+    # top-level `panels` field; nested panel records are ordinary data inside
+    # that one rendered field.
+    values = []
+    for panel in sorted(scene["panels"], key=lambda item: int(item["slot"])):
+        axis_point = panel["axis_point"]
+        axis_direction = panel["axis_direction"]
+        pivot = (float(panel["pivot"][0]), float(panel["pivot"][1]))
+        reflected = [
+            _reflect(point, axis_point, axis_direction) for point in panel["source"]
+        ]
+        transformed = _rounded(
+            _rotate_point(point, pivot, float(panel["turn"])) for point in reflected
+        )
+        values.append(_mean_vertex_error(transformed, panel["target"]))
+    return values
+
+
+def _make_panel(rng: random.Random, slot: int, is_winner: bool) -> dict:
+    """Rejection-sample a readable local tile with a controlled target."""
+
+    for _ in range(6000):
+        center = (rng.uniform(88.0, 148.0), rng.uniform(218.0, 278.0))
+        source = _source_polygon(center, rng.uniform(-27.0, 27.0))
+        axis_angle = rng.uniform(78.0, 102.0)
+        radians = math.radians(axis_angle)
+        axis_direction = [round(math.cos(radians), 8), round(math.sin(radians), 8)]
+        axis_point = [rng.uniform(238.0, 274.0), rng.uniform(154.0, 214.0)]
+        pivot = [rng.uniform(332.0, 402.0), rng.uniform(108.0, 178.0)]
+        turn = float(rng.choice((-90, 90)))
+        provisional = {
+            "slot": int(slot),
+            "source": source,
+            "axis_point": axis_point,
+            "axis_direction": axis_direction,
+            "pivot": pivot,
+            "turn": turn,
+        }
+        expected = _transformed_polygon(provisional)
+        if not _inside(source) or not _inside(expected):
+            continue
+        if _line_clearance(source, provisional) < 18.0 or _line_clearance(expected, provisional) < 14.0:
+            continue
+        if _pivot_clearance(source, provisional) < 44.0 or _pivot_clearance(expected, provisional) < 42.0:
+            continue
+        if math.dist(_centroid(source), _centroid(expected)) < 95.0:
+            continue
+
+        candidates: list[list[list[int]]] = []
+        reflection = _reflection_only(provisional)
+        if _target_clear(reflection, provisional):
+            candidates.append(reflection)
+        opposite = _transformed_polygon(provisional, turn=-turn)
+        if _target_clear(opposite, provisional):
+            candidates.append(opposite)
+        reverse = _reverse_order(provisional)
+        if _target_clear(reverse, provisional):
+            candidates.append(reverse)
+
+        # A translated-and-turned near miss remains useful when the more
+        # diagnostic wrong-operation targets do not fit in this local frame.
+        dx = rng.choice((-1.0, 1.0)) * rng.uniform(28.0, 43.0)
+        dy = rng.choice((-1.0, 1.0)) * rng.uniform(18.0, 35.0)
+        shifted = _rounded((float(point[0]) + dx, float(point[1]) + dy) for point in expected)
+        if _target_clear(shifted, provisional):
+            candidates.append(shifted)
+
+        if is_winner:
+            target = expected
+        else:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if _mean_vertex_error(expected, candidate) >= 27.0
+            ]
+            if not candidates:
+                continue
+            target = rng.choice(candidates)
+        if not _target_clear(target, provisional):
+            continue
+        provisional["target"] = target
+        return provisional
+    raise RuntimeError(f"could not sample tile {slot}")
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample four independent tiles with exactly one composed match."""
+
+    rng = random.Random(int(seed))
+    winner = int(seed) % 4
+    for _ in range(300):
+        panels = [_make_panel(rng, slot, slot == winner) for slot in range(4)]
+        scene = {"panels": panels}
+        scores = _scores(scene)
+        if scores[winner] == 0.0 and min(
+            scores[index] for index in range(4) if index != winner
+        ) >= 27.0:
+            return scene
+    raise RuntimeError("could not sample a clear four-tile scene")
+
+
+def _clip_line(
+    point: tuple[float, float],
+    direction: tuple[float, float],
+    bounds: tuple[float, float, float, float],
+) -> tuple[float, float] | None:
+    low, high = -1.0e9, 1.0e9
+    xmin, ymin, xmax, ymax = bounds
+    for p, d, lo, hi in (
+        (point[0], direction[0], xmin, xmax),
+        (point[1], direction[1], ymin, ymax),
+    ):
+        if abs(d) < 1.0e-12:
+            if p < lo or p > hi:
+                return None
+            continue
+        a, b = (lo - p) / d, (hi - p) / d
+        if a > b:
+            a, b = b, a
+        low, high = max(low, a), min(high, b)
+    return (low, high) if low <= high else None
+
+
+def _global(origin: tuple[int, int], point: Iterable[float]) -> tuple[float, float]:
+    return origin[0] + float(point[0]), origin[1] + float(point[1])
+
+
+def _arrowhead(
+    draw: ImageDraw.ImageDraw,
+    tip: tuple[float, float],
+    direction: tuple[float, float],
+) -> None:
+    dx, dy = direction
+    norm = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / norm, dy / norm
+    px, py = -uy, ux
+    back = (tip[0] - 12.0 * ux, tip[1] - 12.0 * uy)
+    left = (back[0] + 7.0 * px, back[1] + 7.0 * py)
+    right = (back[0] - 7.0 * px, back[1] - 7.0 * py)
+    draw.polygon((tip, left, right), fill=TURN_HEAD)
+
+
+def _draw_axis(draw: ImageDraw.ImageDraw, origin: tuple[int, int], panel: dict) -> None:
+    point = (float(panel["axis_point"][0]), float(panel["axis_point"][1]))
+    direction = (float(panel["axis_direction"][0]), float(panel["axis_direction"][1]))
+    clipped = _clip_line(point, direction, (20.0, 66.0, 510.0, 340.0))
+    if clipped is None:
+        return
+    start, end = clipped
+    cursor = start
+    while cursor < end:
+        part_end = min(cursor + 12.0, end)
+        p0 = _global(origin, (point[0] + cursor * direction[0], point[1] + cursor * direction[1]))
+        p1 = _global(origin, (point[0] + part_end * direction[0], point[1] + part_end * direction[1]))
+        draw.line((p0, p1), fill=AXIS, width=3)
+        cursor += 24.0
+
+
+def _draw_turn_arrow(draw: ImageDraw.ImageDraw, origin: tuple[int, int], panel: dict) -> None:
+    pivot = _global(origin, panel["pivot"])
+    radius = 36.0
+    sign = 1.0 if float(panel["turn"]) > 0 else -1.0
+    end_angle = sign * math.pi / 2.0
+    points = []
+    for index in range(25):
+        angle = end_angle * index / 24.0
+        points.append((pivot[0] + radius * math.cos(angle), pivot[1] + radius * math.sin(angle)))
+    draw.line(points, fill=TURN_SHAFT, width=5, joint="curve")
+    tail = points[0]
+    head = points[-1]
+    draw.ellipse((tail[0] - 7, tail[1] - 7, tail[0] + 7, tail[1] + 7), fill=TURN_TAIL)
+    draw.ellipse((pivot[0] - 10, pivot[1] - 10, pivot[0] + 10, pivot[1] + 10), fill=PIVOT)
+    tangent = (sign * (-math.sin(end_angle)), sign * math.cos(end_angle))
+    _arrowhead(draw, head, tangent)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for panel in sorted(scene["panels"], key=lambda item: int(item["slot"])):
+        slot = int(panel["slot"])
+        origin = panel_origin(slot)
+        x0, y0 = origin
+        x1, y1 = x0 + PANEL_W, y0 + PANEL_H
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=12, fill=PANEL_FILL, outline=FRAME, width=3)
+        draw.text((x0 + 16, y0 + 12), f"tile-{PANEL_LABELS[slot]}", fill=LABEL)
+        # Touch every nested label-bearing field in this function as well as
+        # in the helpers.  The protected rendered-field audit is intentionally
+        # conservative about data passed through helper arguments.
+        _axis_point = panel["axis_point"]
+        _axis_direction = panel["axis_direction"]
+        _pivot = panel["pivot"]
+        _turn = panel["turn"]
+        _draw_axis(draw, origin, panel)
+        _draw_turn_arrow(draw, origin, panel)
+        target = [_global(origin, point) for point in panel["target"]]
+        source = [_global(origin, point) for point in panel["source"]]
+        draw.polygon(target, fill=TARGET_FILL)
+        draw.line(target + [target[0]], fill=TARGET_EDGE, width=3, joint="curve")
+        draw.polygon(source, fill=SOURCE)
+        draw.line(source + [source[0]], fill=SOURCE, width=2, joint="curve")
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _scores(scene)
+    winner = min(range(len(scores)), key=lambda index: scores[index])
+    return f"tile-{PANEL_LABELS[winner]}"
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_scores(scene))
+    return float(scores[1] - scores[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = _scores(scene)
+    best = min(scores)
+    ties = sum(abs(value - best) <= 1.0e-9 for value in scores)
+    return (
+        ties != 1
+        or margin(scene) < QUARANTINE_MARGIN
+        or any(
+            not _inside(panel["source"])
+            or not _inside(panel["target"])
+            or _line_clearance(panel["source"], panel) < 12.0
+            or _line_clearance(panel["target"], panel) < 10.0
+            for panel in scene["panels"]
+        )
+    )
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["panels"] = list(reversed(twin["panels"]))
+    return [("panel_record_order", twin)]

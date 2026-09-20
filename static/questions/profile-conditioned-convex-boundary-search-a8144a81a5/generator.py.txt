@@ -1,0 +1,291 @@
+"""Deterministic renderer and analytic arm for convex-boundary dot search.
+
+The analytic arm derives its label from point geometry.  The independent oracle
+receives only the final raster and shares no code with this module.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH, HEIGHT = 760, 560
+LABELS = ("A", "B", "C", "D")
+POINTS_PER_PANEL = 12
+
+_OUTER = (
+    (-105.0, -24.0),
+    (-66.0, -69.0),
+    (14.0, -78.0),
+    (83.0, -55.0),
+    (106.0, 8.0),
+    (59.0, 69.0),
+    (-27.0, 78.0),
+    (-96.0, 47.0),
+)
+_EXTRA_EDGES = (0, 2, 4, 6)
+_PALETTES = (
+    {
+        "background": [246, 248, 244],
+        "panel": [255, 255, 252],
+        "outer": [139, 148, 155],
+        "frame": [35, 137, 151],
+        "dot": [24, 48, 82],
+        "accent": [225, 112, 54],
+        "label_text": [255, 255, 255],
+    },
+    {
+        "background": [250, 247, 242],
+        "panel": [255, 254, 250],
+        "outer": [151, 143, 137],
+        "frame": [35, 137, 151],
+        "dot": [24, 48, 82],
+        "accent": [205, 94, 65],
+        "label_text": [255, 255, 255],
+    },
+)
+
+
+def _signed_area(points: list[tuple[float, float]]) -> float:
+    return 0.5 * sum(
+        points[i][0] * points[(i + 1) % len(points)][1]
+        - points[(i + 1) % len(points)][0] * points[i][1]
+        for i in range(len(points))
+    )
+
+
+def _convex_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Monotone-chain hull; collinear edge points are deliberately omitted."""
+    ordered = sorted(set(points))
+    if len(ordered) < 3:
+        return ordered
+
+    def cross(o: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for point in ordered:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 1e-9:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[float, float]] = []
+    for point in reversed(ordered):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 1e-9:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _point_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    vx, vy = end[0] - start[0], end[1] - start[1]
+    wx, wy = point[0] - start[0], point[1] - start[1]
+    denom = vx * vx + vy * vy
+    if denom <= 0:
+        return math.hypot(wx, wy)
+    t = max(0.0, min(1.0, (wx * vx + wy * vy) / denom))
+    return math.hypot(point[0] - (start[0] + t * vx), point[1] - (start[1] + t * vy))
+
+
+def _inward_score(points: list[tuple[float, float]]) -> float:
+    hull = _convex_hull(points)
+    if len(hull) < 3 or abs(_signed_area(hull)) < 1.0:
+        return float("inf")
+    distances = []
+    for point in points:
+        distances.append(
+            min(
+                _point_segment_distance(point, hull[i], hull[(i + 1) % len(hull)])
+                for i in range(len(hull))
+            )
+        )
+    return max(distances)
+
+
+def _edge_point(edge: int, t: float) -> tuple[float, float]:
+    start = _OUTER[edge]
+    end = _OUTER[(edge + 1) % len(_OUTER)]
+    return (start[0] * (1.0 - t) + end[0] * t, start[1] * (1.0 - t) + end[1] * t)
+
+
+def _move_inward(point: tuple[float, float], edge: int, depth: float) -> tuple[float, float]:
+    start = _OUTER[edge]
+    end = _OUTER[(edge + 1) % len(_OUTER)]
+    vx, vy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(vx, vy)
+    nx, ny = -vy / length, vx / length
+    centroid = (
+        sum(item[0] for item in _OUTER) / len(_OUTER),
+        sum(item[1] for item in _OUTER) / len(_OUTER),
+    )
+    if (centroid[0] - point[0]) * nx + (centroid[1] - point[1]) * ny < 0:
+        nx, ny = -nx, -ny
+    return (point[0] + nx * depth, point[1] + ny * depth)
+
+
+def _transform(point: tuple[float, float], signs: tuple[int, int]) -> list[float]:
+    return [point[0] * signs[0], point[1] * signs[1]]
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample four equal-count panels with exactly one all-boundary point set."""
+    rng = random.Random(int(seed))
+    target_index = int(seed) % 4
+    edge_fractions = [rng.uniform(0.43, 0.57) for _ in _EXTRA_EDGES]
+    extras = [_edge_point(edge, fraction) for edge, fraction in zip(_EXTRA_EDGES, edge_fractions, strict=True)]
+    depths = [18.0, 27.0, 36.0]
+    rng.shuffle(depths)
+    moved_slots = list(range(len(_EXTRA_EDGES)))
+    rng.shuffle(moved_slots)
+    transforms = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
+    rng.shuffle(transforms)
+
+    panels: list[dict[str, Any]] = []
+    distractor_cursor = 0
+    for index, label in enumerate(LABELS):
+        points = list(_OUTER) + list(extras)
+        if index != target_index:
+            slot = moved_slots[distractor_cursor]
+            points[len(_OUTER) + slot] = _move_inward(
+                points[len(_OUTER) + slot], _EXTRA_EDGES[slot], depths[distractor_cursor]
+            )
+            distractor_cursor += 1
+        signs = transforms[index]
+        transformed = [_transform(point, signs) for point in points]
+        rng.shuffle(transformed)
+        panels.append({"label": label, "points": transformed})
+
+    return {
+        "panels": panels,
+        "palette": copy.deepcopy(rng.choice(_PALETTES)),
+        "origin": [rng.randint(-6, 6), rng.randint(-5, 5)],
+    }
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSans-Bold.ttf", size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _box(box: tuple[float, float, float, float], scale: int) -> tuple[float, float, float, float]:
+    return tuple(value * scale for value in box)  # type: ignore[return-value]
+
+
+def _draw_centered(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[float, float],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+) -> None:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text((xy[0] - width / 2, xy[1] - height / 2 - bbox[1]), text, font=font, fill=fill)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render a clean four-panel search image with equal-size point markers."""
+    scale = 3
+    palette = {key: tuple(value) for key, value in scene["palette"].items()}
+    ox, oy = (int(value) for value in scene["origin"])
+    image = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), palette["background"])
+    draw = ImageDraw.Draw(image)
+    label_font = _font(25 * scale)
+    panel_origins = ((42, 38), (398, 38), (42, 300), (398, 300))
+
+    for panel, (base_x, base_y) in zip(scene["panels"], panel_origins, strict=True):
+        x, y = base_x + ox, base_y + oy
+        draw.rounded_rectangle(
+            _box((x, y, x + 320, y + 222), scale),
+            radius=16 * scale,
+            fill=palette["panel"],
+            outline=palette["outer"],
+            width=3 * scale,
+        )
+        draw.rectangle(
+            _box((x + 56, y + 37, x + 308, y + 214), scale),
+            outline=palette["frame"],
+            width=3 * scale,
+        )
+        draw.ellipse(_box((x + 13, y + 13, x + 51, y + 51), scale), fill=palette["accent"])
+        _draw_centered(
+            draw,
+            ((x + 32) * scale, (y + 32) * scale),
+            str(panel["label"]),
+            label_font,
+            palette["label_text"],
+        )
+        center_x, center_y = x + 182, y + 128
+        for px, py in panel["points"]:
+            cx, cy = center_x + float(px), center_y + float(py)
+            radius = 8.0
+            draw.ellipse(
+                _box((cx - radius, cy - radius, cx + radius, cy + radius), scale),
+                fill=palette["dot"],
+            )
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def _scores(scene: dict) -> list[float]:
+    return [
+        _inward_score([(float(x), float(y)) for x, y in panel["points"]])
+        for panel in scene["panels"]
+    ]
+
+
+def analytic_gold(scene: dict) -> str:
+    """Select the only panel whose maximum inward clearance is essentially zero."""
+    scores = _scores(scene)
+    winners = [index for index, score in enumerate(scores) if score <= 1e-6]
+    if len(winners) != 1:
+        raise ValueError(f"expected one all-boundary panel, found {len(winners)}")
+    return str(scene["panels"][winners[0]]["label"])
+
+
+def margin(scene: dict) -> float:
+    """Runner-up gap between the two smallest maximum inward clearances, in pixels."""
+    ordered = sorted(_scores(scene))
+    return float(ordered[1] - ordered[0]) if len(ordered) >= 2 else 0.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        panels = scene["panels"]
+        if len(panels) != 4 or [panel.get("label") for panel in panels] != list(LABELS):
+            return True
+        for panel in panels:
+            points = panel["points"]
+            if len(points) != POINTS_PER_PANEL:
+                return True
+            normalized = [(float(x), float(y)) for x, y in points]
+            if len(set(normalized)) != POINTS_PER_PANEL:
+                return True
+            if any(abs(x) > 120 or abs(y) > 95 for x, y in normalized):
+                return True
+            if min(
+                math.hypot(normalized[i][0] - normalized[j][0], normalized[i][1] - normalized[j][1])
+                for i in range(len(normalized))
+                for j in range(i + 1, len(normalized))
+            ) < 18.0:
+                return True
+        scores = sorted(_scores(scene))
+        return not (scores[0] <= 1e-6 and scores[1] >= 14.0 and margin(scene) >= 14.0)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Reverse latent point lists; separated equal-color dots render identically."""
+    twin = copy.deepcopy(scene)
+    for panel in twin["panels"]:
+        panel["points"] = list(reversed(panel["points"]))
+    return [("reverse_all_point_lists", twin)]

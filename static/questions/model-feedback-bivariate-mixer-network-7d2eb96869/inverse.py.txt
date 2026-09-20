@@ -1,0 +1,178 @@
+"""Independent PNG-only inverse for the bivariate mixer board."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 1200
+HEIGHT = 800
+MACHINES = ("blue", "orange")
+CHANNELS = ("teal", "violet")
+SIDES = ("left", "right")
+MACHINE_COLORS = {
+    "blue": np.array((43, 104, 189), dtype=np.int16),
+    "orange": np.array((218, 124, 48), dtype=np.int16),
+}
+CHANNEL_COLORS = {
+    "teal": np.array((20, 150, 145), dtype=np.int16),
+    "violet": np.array((132, 82, 190), dtype=np.int16),
+}
+DISPLAY_BG = np.array((34, 43, 53), dtype=np.int16)
+SEGMENT_ON = np.array((250, 239, 184), dtype=np.int16)
+QUERY_COLOR = np.array((39, 137, 124), dtype=np.int16)
+CAL_Y = (220, 330)
+CAL_POSITIONS = {
+    "blue": (100, 205, 515, 350),
+    "orange": (690, 795, 1105, 940),
+}
+QUERY_Y = (550, 680)
+BUILD_NUMBER_X = (120, 225)
+BUILD_MACHINE_X = 370
+BUILD_CHANNEL_X = 520
+FINAL_TOKEN_X = (720, 795)
+FINAL_MACHINE_X = 955
+
+SEGMENT_CENTERS = {
+    "a": (0, -18), "g": (0, 0), "d": (0, 18),
+    "f": (-12, -9), "b": (12, -9), "e": (-12, 9), "c": (12, 9),
+}
+DIGIT_SEGMENTS = {
+    0: frozenset("abcedf"), 1: frozenset("bc"), 2: frozenset("abged"),
+    3: frozenset("abgcd"), 4: frozenset("fgbc"), 5: frozenset("afgcd"),
+    6: frozenset("afgecd"), 7: frozenset("abc"), 8: frozenset("abcdefg"),
+    9: frozenset("abfgcd"),
+}
+SEGMENTS_TO_DIGIT = {segments: digit for digit, segments in DIGIT_SEGMENTS.items()}
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _near(patch: np.ndarray, color: np.ndarray, tolerance: int = 22) -> np.ndarray:
+    delta = patch.astype(np.int32) - color.astype(np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _fraction(array: np.ndarray, box: tuple[int, int, int, int], color: np.ndarray, tolerance: int = 22) -> float:
+    x0, y0, x1, y1 = box
+    patch = array[y0:y1, x0:x1]
+    return 0.0 if patch.size == 0 else float(np.mean(_near(patch, color, tolerance)))
+
+
+def _read_digit(array: np.ndarray, cx: int, cy: int, label: str) -> int:
+    active = set()
+    for name, (dx, dy) in SEGMENT_CENTERS.items():
+        patch = array[cy + dy - 2:cy + dy + 3, cx + dx - 2:cx + dx + 3]
+        fraction = float(np.mean(_near(patch, SEGMENT_ON, 18)))
+        if fraction >= 0.78:
+            active.add(name)
+        elif fraction > 0.18:
+            raise OracleError(f"{label}: ambiguous segment {name}")
+    key = frozenset(active)
+    if key not in SEGMENTS_TO_DIGIT:
+        raise OracleError(f"{label}: invalid segment pattern")
+    return SEGMENTS_TO_DIGIT[key]
+
+
+def _read_number(array: np.ndarray, cx: int, cy: int, label: str) -> int:
+    if _fraction(array, (cx - 35, cy - 27, cx + 36, cy + 28), DISPLAY_BG, 20) < 0.56:
+        raise OracleError(f"{label}: display body is missing or damaged")
+    return 10 * _read_digit(array, cx - 18, cy, f"{label} tens") + _read_digit(array, cx + 18, cy, f"{label} ones")
+
+
+def _infer_rule(examples: tuple[tuple[int, int, int], tuple[int, int, int]], label: str) -> tuple[int, int]:
+    (l1, r1, out1), (l2, r2, out2) = examples
+    det = l1 * r2 - l2 * r1
+    if det == 0:
+        raise OracleError(f"{label}: singular calibrations")
+    a_num, b_num = out1 * r2 - out2 * r1, l1 * out2 - l2 * out1
+    if a_num % det or b_num % det:
+        raise OracleError(f"{label}: non-integer coefficients")
+    a, b = a_num // det, b_num // det
+    if not 1 <= a <= 3 or not 1 <= b <= 3 or a == b:
+        raise OracleError(f"{label}: inferred coefficients outside range")
+    if any(a * left + b * right != out for left, right, out in examples):
+        raise OracleError(f"{label}: inconsistent calibration")
+    return a, b
+
+
+def _classify(array: np.ndarray, cx: int, cy: int, palette: dict[str, np.ndarray], label: str, token: bool = False) -> str:
+    box = (cx - 20, cy - 20, cx - 8, cy - 8) if token else (cx - 55, cy - 23, cx - 40, cy - 8)
+    scores = {name: _fraction(array, box, color, 25) for name, color in palette.items()}
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    if scores[ranked[0]] < 0.78 or scores[ranked[1]] > 0.10:
+        raise OracleError(f"{label}: color is missing or ambiguous")
+    return ranked[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        raise OracleError(f"unexpected image size {rgb.size}")
+    array = np.asarray(rgb)
+    if _fraction(array, (70, 112, 110, 145), MACHINE_COLORS["blue"], 25) < 0.90:
+        raise OracleError("blue calibration panel is missing")
+    if _fraction(array, (660, 112, 700, 145), MACHINE_COLORS["orange"], 25) < 0.90:
+        raise OracleError("orange calibration panel is missing")
+    if _fraction(array, (100, 421, 500, 424), QUERY_COLOR, 25) < 0.90:
+        raise OracleError("question frame is missing")
+
+    rules: dict[str, tuple[int, int]] = {}
+    for name in MACHINES:
+        left_x, right_x, out_x, machine_x = CAL_POSITIONS[name]
+        rows = tuple(
+            (
+                _read_number(array, left_x, y, f"{name} left {index}"),
+                _read_number(array, right_x, y, f"{name} right {index}"),
+                _read_number(array, out_x, y, f"{name} output {index}"),
+            )
+            for index, y in enumerate(CAL_Y, 1)
+        )
+        if _classify(array, machine_x, CAL_Y[0], MACHINE_COLORS, f"{name} example badge") != name:
+            raise OracleError(f"{name}: wrong visible example badge")
+        rules[name] = _infer_rule(rows, name)
+    if rules["blue"] == rules["orange"]:
+        raise OracleError("the mixers visibly have identical rules")
+
+    channels: dict[str, int] = {}
+    build_machines = []
+    for index, y in enumerate(QUERY_Y, 1):
+        left = _read_number(array, BUILD_NUMBER_X[0], y, f"build {index} left")
+        right = _read_number(array, BUILD_NUMBER_X[1], y, f"build {index} right")
+        machine = _classify(array, BUILD_MACHINE_X, y, MACHINE_COLORS, f"build {index} mixer")
+        channel = _classify(array, BUILD_CHANNEL_X, y, CHANNEL_COLORS, f"build {index} channel", token=True)
+        if channel in channels:
+            raise OracleError("duplicate output channel")
+        a, b = rules[machine]
+        channels[channel] = a * left + b * right
+        build_machines.append(machine)
+    if set(channels) != set(CHANNELS) or set(build_machines) != set(MACHINES):
+        raise OracleError("build does not bind both channels and mixers once")
+    if any(not 1 <= value <= 49 for value in channels.values()):
+        raise OracleError("intermediate channel outside supported range")
+
+    outputs = {}
+    final_machines = []
+    final_inputs = []
+    for side, y in zip(SIDES, QUERY_Y, strict=True):
+        inputs = tuple(
+            _classify(array, x, y, CHANNEL_COLORS, f"{side} port {index}", token=True)
+            for index, x in enumerate(FINAL_TOKEN_X, 1)
+        )
+        if set(inputs) != set(CHANNELS):
+            raise OracleError(f"{side}: final must use both channels")
+        machine = _classify(array, FINAL_MACHINE_X, y, MACHINE_COLORS, f"{side} final mixer")
+        a, b = rules[machine]
+        outputs[side] = a * channels[inputs[0]] + b * channels[inputs[1]]
+        final_machines.append(machine)
+        final_inputs.append(inputs)
+    if set(final_machines) != set(MACHINES) or final_inputs[1] != tuple(reversed(final_inputs[0])):
+        raise OracleError("final bindings are not the visible crossed pair")
+    if any(not 1 <= value <= 99 for value in outputs.values()):
+        raise OracleError("final output outside supported range")
+    gap = outputs["left"] - outputs["right"]
+    if abs(gap) > 1:
+        raise OracleError("query is outside the declared one-unit boundary")
+    return "left" if gap > 0 else "right" if gap < 0 else "same"

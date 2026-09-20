@@ -1,0 +1,117 @@
+"""Pixel-only inverse arm for gauge_opening_reveal.
+
+Receives one rendered image and nothing else.  It locates the four coloured
+corner fiducials, measures the printed reference bar, executes the declared
+sanding (a morphological opening by the bar thickness) on the ink layer, and
+reads which lattice edges survive.
+"""
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+TEMPLATES = {
+    "comb": ["H00", "H01", "H02", "V01", "V02", "V03", "V12"],
+    "hood": ["H00", "H01", "H02", "V00", "V10", "V03", "V13"],
+    "jhook": ["V00", "V10", "V20", "H30", "H31", "H32", "V23"],
+    "rungs": ["H10", "H11", "H12", "H30", "H31", "H32", "V21"],
+    "zig": ["H00", "V01", "H11", "V12", "H22", "V23", "H32"],
+}
+EDGE_IDS = ["H%d%d" % (r, c) for r in range(4) for c in range(3)] + [
+    "V%d%d" % (r, c) for r in range(3) for c in range(4)
+]
+
+
+def _masks(arr):
+    hi = arr.max(axis=2).astype(np.int16)
+    lo = arr.min(axis=2).astype(np.int16)
+    chroma = hi - lo
+    ink = (hi < 130) & (chroma < 45)
+    mark = (chroma >= 70) & (hi >= 120)
+    return ink, mark
+
+
+def _shift_reduce(mask, k, grow):
+    r = k // 2
+    pad = np.pad(mask, r + 1, constant_values=False)
+    out = pad
+    for axis in (0, 1):
+        stack = [np.roll(out, s, axis=axis) for s in range(-r, r + 1)]
+        out = np.logical_or.reduce(stack) if grow else np.logical_and.reduce(stack)
+    return out[r + 1: out.shape[0] - r - 1, r + 1: out.shape[1] - r - 1]
+
+
+def _open(mask, k):
+    return _shift_reduce(_shift_reduce(mask, k, False), k, True)
+
+
+def _corner_frame(mark):
+    ys, xs = np.nonzero(mark)
+    cx = 0.5 * (xs.min() + xs.max())
+    cy = 0.5 * (ys.min() + ys.max())
+    left = xs < cx
+    top = ys < cy
+    x0 = 0.5 * (xs[left & top].mean() + xs[left & ~top].mean())
+    x1 = 0.5 * (xs[~left & top].mean() + xs[~left & ~top].mean())
+    y0 = 0.5 * (ys[top & left].mean() + ys[top & ~left].mean())
+    y1 = 0.5 * (ys[~top & left].mean() + ys[~top & ~left].mean())
+    return x0, y0, x1, y1
+
+
+def _gauge_width(ink, y1):
+    below = np.zeros_like(ink)
+    cut = int(y1 + 22)
+    below[cut:, :] = ink[cut:, :]
+    ys, xs = np.nonzero(below)
+    if ys.size == 0:
+        return 0
+    rows = np.unique(ys)
+    return int(rows.max() - rows.min() + 1)
+
+
+def decision_and_margin(image: "Image.Image"):
+    arr = np.asarray(image.convert("RGB"))
+    ink, mark = _masks(arr)
+    if mark.sum() < 40 or ink.sum() < 40:
+        return "abstain", 0.0
+    x0, y0, x1, y1 = _corner_frame(mark)
+    k = _gauge_width(ink, y1)
+    if k < 3:
+        return "abstain", 0.0
+    if k % 2 == 0:
+        k += 1
+    field = np.zeros_like(ink)
+    lo_y, hi_y = max(int(y0) - 40, 0), min(int(y1) + 40, ink.shape[0])
+    field[lo_y:hi_y, :] = ink[lo_y:hi_y, :]
+    kept = _open(field, k)
+
+    def node(r, c):
+        return (x0 + c * (x1 - x0) / 3.0, y0 + r * (y1 - y0) / 3.0)
+
+    bits = []
+    half = 5
+    for edge in EDGE_IDS:
+        kind, r, c = edge[0], int(edge[1]), int(edge[2])
+        if kind == "H":
+            ax, ay = node(r, c)
+            bx, by = node(r, c + 1)
+        else:
+            ax, ay = node(r, c)
+            bx, by = node(r + 1, c)
+        mx, my = int(round(0.5 * (ax + bx))), int(round(0.5 * (ay + by)))
+        win = kept[max(my - half, 0): my + half + 1, max(mx - half, 0): mx + half + 1]
+        bits.append(1 if win.mean() > 0.5 else 0)
+    bits = np.array(bits)
+    scores = []
+    for name in sorted(TEMPLATES):
+        tmpl = np.array([1 if e in TEMPLATES[name] else 0 for e in EDGE_IDS])
+        scores.append((int(np.abs(tmpl - bits).sum()), name))
+    scores.sort()
+    gap = float(scores[1][0] - scores[0][0])
+    if scores[0][0] > 5 or gap < 1.0:
+        return "abstain", gap
+    return scores[0][1], gap
+
+
+def decision_from_image(image: "Image.Image") -> str:
+    return decision_and_margin(image)[0]

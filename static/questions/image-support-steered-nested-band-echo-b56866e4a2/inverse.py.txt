@@ -1,0 +1,169 @@
+"""Independent pixel-only inverse for the nested-band echo seal."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BACKGROUND = np.array((250, 249, 246), dtype=np.int16)
+PLAQUE = np.array((238, 231, 211), dtype=np.int16)
+NAVY = np.array((20, 36, 64), dtype=np.int16)
+RING = np.array((102, 120, 156), dtype=np.int16)
+TAG_COLORS = {
+    "gold": np.array((224, 164, 49), dtype=np.int16),
+    "red": np.array((196, 64, 61), dtype=np.int16),
+    "green": np.array((48, 142, 96), dtype=np.int16),
+    "blue": np.array((55, 103, 190), dtype=np.int16),
+}
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: int = 0) -> np.ndarray:
+    delta = np.abs(array.astype(np.int16) - color[None, None, :])
+    return np.max(delta, axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(y, x)])
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        groups.append(np.asarray(points, dtype=np.float64))
+    return groups
+
+
+def _centroid(points: np.ndarray) -> tuple[float, float]:
+    return float(points[:, 1].mean()), float(points[:, 0].mean())
+
+
+def _ring_centers(array: np.ndarray) -> list[tuple[float, float]]:
+    components = [group for group in _components(_mask(array, RING)) if len(group) >= 18]
+    if len(components) != 12:
+        raise OracleAbstention(f"expected 12 intact visible rings, found {len(components)}")
+    centers = [_centroid(group) for group in components]
+    clusters: list[list[tuple[float, float]]] = []
+    for point in centers:
+        for cluster in clusters:
+            anchor = cluster[0]
+            if math.hypot(point[0] - anchor[0], point[1] - anchor[1]) <= 1.5:
+                cluster.append(point)
+                break
+        else:
+            clusters.append([point])
+    if len(clusters) != 4 or any(len(cluster) != 3 for cluster in clusters):
+        raise OracleAbstention("rings do not form four intact concentric triples")
+    return [
+        (sum(p[0] for p in cluster) / 3.0, sum(p[1] for p in cluster) / 3.0)
+        for cluster in clusters
+    ]
+
+
+def _tag_centers(array: np.ndarray) -> dict[str, tuple[float, float]]:
+    result: dict[str, tuple[float, float]] = {}
+    for name, color in TAG_COLORS.items():
+        components = [group for group in _components(_mask(array, color)) if len(group) >= 30]
+        if len(components) != 1:
+            raise OracleAbstention(f"expected one intact {name} tab")
+        result[name] = _centroid(components[0])
+    return result
+
+
+def _validate_compact_plaque(array: np.ndarray) -> None:
+    plaque = _mask(array, PLAQUE)
+    points = np.argwhere(plaque)
+    if len(points) < 8000:
+        raise OracleAbstention("compact plaque is missing or materially erased")
+    height = int(points[:, 0].max() - points[:, 0].min() + 1)
+    width = int(points[:, 1].max() - points[:, 1].min() + 1)
+    if (width, height) != (100, 100):
+        raise OracleAbstention("compact plaque boundary is damaged")
+    foreground = np.any(np.abs(array.astype(np.int16) - BACKGROUND[None, None, :]) > 0, axis=2)
+    fg = np.argwhere(foreground)
+    if len(fg) == 0:
+        raise OracleAbstention("blank image")
+    if int(fg[:, 1].max() - fg[:, 1].min() + 1) != 104 or int(fg[:, 0].max() - fg[:, 0].min() + 1) != 104:
+        raise OracleAbstention("outer plaque frame is damaged")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape != (512, 512, 3):
+        raise OracleAbstention("unexpected raster size")
+    _validate_compact_plaque(array)
+    centers = _ring_centers(array)
+    tags = _tag_centers(array)
+
+    panel_for_tag: dict[str, tuple[float, float]] = {}
+    unused = set(range(len(centers)))
+    for tag, tag_center in tags.items():
+        ranked = sorted(
+            unused,
+            key=lambda index: math.hypot(
+                centers[index][0] - tag_center[0], centers[index][1] - tag_center[1]
+            ),
+        )
+        if not ranked:
+            raise OracleAbstention("tab-to-seal assignment is incomplete")
+        index = ranked[0]
+        distance = math.hypot(centers[index][0] - tag_center[0], centers[index][1] - tag_center[1])
+        if not 17.0 <= distance <= 26.0:
+            raise OracleAbstention("a tab is not visibly attached to one seal")
+        panel_for_tag[tag] = centers[index]
+        unused.remove(index)
+
+    navy_groups = _components(_mask(array, NAVY))
+    dots = []
+    for group in navy_groups:
+        ys, xs = group[:, 0], group[:, 1]
+        width = xs.max() - xs.min() + 1
+        height = ys.max() - ys.min() + 1
+        if 3 <= len(group) <= 12 and width <= 5 and height <= 5:
+            dots.append(_centroid(group))
+    if len(dots) != 24:
+        raise OracleAbstention(f"expected 24 separated navy dots, found {len(dots)}")
+
+    signatures: dict[str, tuple[int, int, int]] = {}
+    for tag, center in panel_for_tag.items():
+        assigned = []
+        for dot in dots:
+            distance_to_center = math.hypot(dot[0] - center[0], dot[1] - center[1])
+            if distance_to_center < 15.0:
+                assigned.append(distance_to_center)
+        if len(assigned) != 6:
+            raise OracleAbstention(f"{tag} seal does not contain exactly six dots")
+        if any(abs(distance - boundary) < 1.15 for distance in assigned for boundary in (5.0, 10.0, 15.0)):
+            raise OracleAbstention("a dot is ambiguous at a visible ring boundary")
+        signatures[tag] = (
+            sum(distance < 5.0 for distance in assigned),
+            sum(5.0 < distance < 10.0 for distance in assigned),
+            sum(10.0 < distance < 15.0 for distance in assigned),
+        )
+
+    reference = signatures["gold"]
+    matches = [tag for tag in ("red", "green", "blue") if signatures[tag] == reference]
+    if len(matches) != 1:
+        raise OracleAbstention("pixel evidence does not yield one matching candidate")
+    return matches[0]

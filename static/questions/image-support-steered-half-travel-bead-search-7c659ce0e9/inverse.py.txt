@@ -1,0 +1,201 @@
+"""Pixel-only inverse arm for the half-travel bead world.
+
+Route, from the final PNG alone:
+
+1. the modal colour is the page; everything far from it is ink;
+2. the largest connected ink component is the beaded wire (isolated specks are
+   dropped as smaller components);
+3. a nine-by-nine box count over the ink marks the locally solid places, whose
+   connected clusters are the beads; exactly five are required;
+4. a double four-connected breadth-first sweep over the component returns its
+   two extreme end pixels, and the walk starts from whichever end lies further
+   to the left;
+5. a four-connected geodesic sweep from that end gives, for every bead, the
+   travelled distance along the wire, and the wire's own travelled length;
+6. each bead is scored by the absolute difference between its travel from the
+   start end and its travel from the other end; the smallest score wins and the
+   next smallest score is the runner-up margin.
+
+The module never imports renderer, prompts, generate or verify code and never
+receives latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "half_travel_bead_search-oracle-0.1.0"
+ABSTAIN = "abstain"
+
+WORDS = ("second", "third", "fourth")
+CANDIDATE_ORDINALS = (2, 3, 4)
+BEAD_COUNT = 5
+
+INK_DELTA = 40
+MIN_COMPONENT = 400
+BOX = 9                 # box-count window used to find the solid beads
+BOX_SOLID = 55          # a thin wire scores nine, a corner under twenty
+MIN_BEAD_CLUSTER = 4
+MIN_END_DX = 8
+MIN_TOTAL_TRAVEL = 200
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    flat = array.reshape(-1, 3)
+    colours, counts = np.unique(flat, axis=0, return_counts=True)
+    page = colours[int(np.argmax(counts))]
+    return np.abs(array - page.reshape(1, 1, 3)).max(axis=2) > INK_DELTA
+
+
+def _components(mask: np.ndarray, diagonal: bool = True):
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    steps = (
+        [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+        if diagonal
+        else [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    )
+    out = []
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if seen[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        seen[y0, x0] = True
+        blob = []
+        while stack:
+            y, x = stack.pop()
+            blob.append((y, x))
+            for dy, dx in steps:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        out.append(blob)
+    return out
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray | None:
+    blobs = _components(mask)
+    if not blobs:
+        return None
+    best = max(blobs, key=len)
+    if len(best) < MIN_COMPONENT:
+        return None
+    out = np.zeros(mask.shape, dtype=bool)
+    for y, x in best:
+        out[y, x] = True
+    return out
+
+
+def _box_count(mask: np.ndarray, size: int) -> np.ndarray:
+    pad = size // 2
+    padded = np.pad(mask.astype(np.int32), pad + 1)
+    integral = padded.cumsum(axis=0).cumsum(axis=1)
+    height, width = mask.shape
+    y0 = np.arange(height)
+    x0 = np.arange(width)
+    top = y0[:, None]
+    left = x0[None, :]
+    bottom = top + size
+    right = left + size
+    return (
+        integral[bottom, right]
+        - integral[top, right]
+        - integral[bottom, left]
+        + integral[top, left]
+    )
+
+
+def _geodesic(mask: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = mask.shape
+    dist = np.full(mask.shape, -1, dtype=np.int32)
+    dist[start] = 0
+    queue = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        base = dist[y, x] + 1
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and dist[ny, nx] < 0:
+                dist[ny, nx] = base
+                queue.append((ny, nx))
+    return dist
+
+
+def _farthest(dist: np.ndarray) -> tuple[int, int]:
+    index = int(np.argmax(dist))
+    return divmod(index, dist.shape[1])
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Pixel-only measurement report, or ``None`` when the picture is unreadable."""
+
+    component = _largest_component(_ink_mask(image))
+    if component is None:
+        return None
+
+    solid = (_box_count(component, BOX) >= BOX_SOLID) & component
+    clusters = [blob for blob in _components(solid) if len(blob) >= MIN_BEAD_CLUSTER]
+    if len(clusters) != BEAD_COUNT:
+        return None
+    beads = []
+    for blob in clusters:
+        ys = [p[0] for p in blob]
+        xs = [p[1] for p in blob]
+        beads.append((int(round(sum(ys) / len(ys))), int(round(sum(xs) / len(xs)))))
+    if any(not component[y, x] for y, x in beads):
+        return None
+
+    ys, xs = np.nonzero(component)
+    seed = (int(ys[0]), int(xs[0]))
+    first = _geodesic(component, seed)
+    if int(first.max()) <= 0:
+        return None
+    end_a = _farthest(first)
+    from_a = _geodesic(component, end_a)
+    end_b = _farthest(from_a)
+    if int(from_a[end_b]) < MIN_TOTAL_TRAVEL:
+        return None
+    if abs(end_a[1] - end_b[1]) < MIN_END_DX:
+        return None
+    if end_a[1] > end_b[1]:
+        end_a, end_b = end_b, end_a
+        from_a = _geodesic(component, end_a)
+    total = int(from_a[end_b])
+
+    travels = []
+    for y, x in beads:
+        value = int(from_a[y, x])
+        if value < 0:
+            return None
+        travels.append(value)
+    order = sorted(range(BEAD_COUNT), key=lambda i: travels[i])
+    ordered = [travels[i] for i in order]
+    if len(set(ordered)) != BEAD_COUNT:
+        return None
+    scores = [abs(2 * t - total) for t in ordered]
+    winner = min(range(BEAD_COUNT), key=lambda i: scores[i])
+    runner_up = min(s for i, s in enumerate(scores) if i != winner)
+    if runner_up - scores[winner] <= 0:
+        return None
+    if winner + 1 not in CANDIDATE_ORDINALS:
+        return None
+    return {
+        "decision": WORDS[winner - 1],
+        "bead_ordinal": winner + 1,
+        "bead_travels": ordered,
+        "total_travel": total,
+        "pixel_margin": float(runner_up - scores[winner]),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    return report["decision"]

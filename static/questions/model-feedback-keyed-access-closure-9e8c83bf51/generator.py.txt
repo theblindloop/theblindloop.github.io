@@ -1,0 +1,444 @@
+"""Deterministic corridor world whose topology grows by reached-key closure."""
+
+from __future__ import annotations
+
+import random
+from collections import deque
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 900
+HEIGHT = 680
+SCALE = 3
+ROWS = 13
+COLS = 15
+CELL = 38
+ORIGIN_X = 55
+ORIGIN_Y = 155
+
+OPEN_RGB = (248, 250, 252)
+WALL_RGB = (34, 48, 65)
+GRID_RGB = (88, 104, 121)
+INK_RGB = (22, 31, 43)
+MUTED_RGB = (86, 101, 118)
+START_RGB = (20, 132, 74)
+
+LETTERS = tuple("ABCDEFG")
+KEY_RGB = {
+    "A": (45, 88, 230),
+    "B": (188, 40, 196),
+    "C": (0, 157, 132),
+    "D": (218, 82, 12),
+    "E": (119, 55, 221),
+    "F": (185, 30, 91),
+    "G": (0, 133, 170),
+}
+GATE_RGB = {
+    "A": (148, 188, 252),
+    "B": (228, 145, 237),
+    "C": (112, 220, 190),
+    "D": (250, 179, 109),
+    "E": (190, 169, 247),
+    "F": (246, 143, 182),
+    "G": (100, 215, 236),
+}
+EXIT_RGB = {
+    "red": (216, 48, 58),
+    "blue": (18, 100, 180),
+    "orange": (238, 115, 18),
+    "violet": (105, 64, 177),
+}
+EXIT_COLORS = tuple(EXIT_RGB)
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size * SCALE
+    )
+
+
+def _transform(cell: tuple[int, int], variant: int) -> tuple[int, int]:
+    row, col = cell
+    if variant & 1:
+        col = COLS - 1 - col
+    if variant & 2:
+        row = ROWS - 1 - row
+    return row, col
+
+
+def _base_geometry() -> tuple[
+    set[tuple[int, int]],
+    tuple[int, int],
+    dict[str, tuple[int, int]],
+    dict[str, list[tuple[int, int]]],
+    list[tuple[int, int]],
+]:
+    # Role letters define dependencies. Display letters are permuted per scene.
+    open_cells = {
+        # START component and its vertical spine.
+        *((row, 3) for row in range(2, 11)),
+        (6, 1), (6, 2),
+        # Two rooms opened simultaneously by role A.
+        *((4, col) for col in range(5, 8)),
+        *((8, col) for col in range(5, 8)),
+        # Rooms behind role B and C, containing the two final prerequisite keys.
+        *((4, col) for col in range(9, 12)),
+        (3, 11), (2, 11),
+        *((8, col) for col in range(9, 12)),
+        # The target corridor, behind role D then role E.
+        (2, 13), (3, 13), (4, 13), (5, 13), (7, 13),
+        # Two mutually deadlocked decoy rooms.
+        *((2, col) for col in range(5, 8)),
+        *((10, col) for col in range(5, 8)),
+    }
+    start = (6, 1)
+    keys = {
+        "A": (6, 2),
+        "B": (4, 6),
+        "C": (8, 6),
+        "D": (4, 10),
+        "E": (8, 10),
+        # F is trapped behind G and G is trapped behind F.
+        "F": (2, 7),
+        "G": (10, 7),
+    }
+    gates = {
+        "A": [(4, 4), (8, 4)],
+        "B": [(4, 8)],
+        "C": [(8, 8)],
+        "D": [(2, 12)],
+        "E": [(6, 13)],
+        "F": [(10, 4)],
+        "G": [(2, 4)],
+    }
+    # Role 0 is the target; roles 1..3 are inside the F/G deadlock.
+    exit_roles = [(7, 13), (2, 5), (2, 6), (10, 5)]
+    return open_cells, start, keys, gates, exit_roles
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    rng = random.Random(int(seed))
+    open_cells, start, role_keys, role_gates, exit_roles = _base_geometry()
+    variant = (int(seed) // 4) % 4
+    transform = lambda cell: _transform(cell, variant)
+
+    display_letters = list(LETTERS)
+    rng.shuffle(display_letters)
+    role_to_display = dict(zip(LETTERS, display_letters))
+
+    target_color = EXIT_COLORS[int(seed) % len(EXIT_COLORS)]
+    remaining_colors = [color for color in EXIT_COLORS if color != target_color]
+    rng.shuffle(remaining_colors)
+    role_colors = [target_color, *remaining_colors]
+
+    return {
+        "open_cells": [list(transform(cell)) for cell in sorted(open_cells)],
+        "start": list(transform(start)),
+        "keys": {
+            role_to_display[role]: list(transform(cell))
+            for role, cell in role_keys.items()
+        },
+        "gates": {
+            role_to_display[role]: [list(transform(cell)) for cell in cells]
+            for role, cells in role_gates.items()
+        },
+        "exits": {
+            color: list(transform(cell))
+            for color, cell in zip(role_colors, exit_roles)
+        },
+    }
+
+
+def _cell(value: object) -> tuple[int, int] | None:
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        return None
+    row, col = int(value[0]), int(value[1])
+    if not (0 <= row < ROWS and 0 <= col < COLS):
+        return None
+    return row, col
+
+
+def _decode(scene: dict[str, Any]) -> tuple[
+    set[tuple[int, int]],
+    tuple[int, int],
+    dict[str, tuple[int, int]],
+    dict[str, tuple[tuple[int, int], ...]],
+    dict[str, tuple[int, int]],
+] | None:
+    try:
+        raw_open = scene["open_cells"]
+        start = _cell(scene["start"])
+        raw_keys = scene["keys"]
+        raw_gates = scene["gates"]
+        raw_exits = scene["exits"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(raw_open, list) or not isinstance(raw_keys, dict):
+        return None
+    if not isinstance(raw_gates, dict) or not isinstance(raw_exits, dict):
+        return None
+    converted = [_cell(value) for value in raw_open]
+    if any(value is None for value in converted):
+        return None
+    open_cells = {value for value in converted if value is not None}
+    if len(open_cells) != len(converted) or start is None:
+        return None
+    if set(raw_keys) != set(LETTERS) or set(raw_gates) != set(LETTERS):
+        return None
+    if set(raw_exits) != set(EXIT_COLORS):
+        return None
+
+    keys = {letter: _cell(raw_keys[letter]) for letter in LETTERS}
+    exits = {color: _cell(raw_exits[color]) for color in EXIT_COLORS}
+    if any(cell is None for cell in keys.values()) or any(cell is None for cell in exits.values()):
+        return None
+    clean_keys = {letter: cell for letter, cell in keys.items() if cell is not None}
+    clean_exits = {color: cell for color, cell in exits.items() if cell is not None}
+
+    gates: dict[str, tuple[tuple[int, int], ...]] = {}
+    for letter in LETTERS:
+        values = raw_gates[letter]
+        if not isinstance(values, list) or len(values) not in (1, 2):
+            return None
+        cells = tuple(_cell(value) for value in values)
+        if any(cell is None for cell in cells):
+            return None
+        gates[letter] = tuple(cell for cell in cells if cell is not None)
+    if sorted(len(cells) for cells in gates.values()) != [1, 1, 1, 1, 1, 1, 2]:
+        return None
+
+    walkable_special = [start, *clean_keys.values(), *clean_exits.values()]
+    gate_cells = [cell for cells in gates.values() for cell in cells]
+    if len(walkable_special) != len(set(walkable_special)):
+        return None
+    if len(gate_cells) != len(set(gate_cells)):
+        return None
+    if set(walkable_special) & set(gate_cells):
+        return None
+    if any(cell not in open_cells for cell in walkable_special):
+        return None
+    if any(cell in open_cells for cell in gate_cells):
+        return None
+    return open_cells, start, clean_keys, gates, clean_exits
+
+
+def _flood(
+    traversable: set[tuple[int, int]], start: tuple[int, int]
+) -> set[tuple[int, int]]:
+    if start not in traversable:
+        return set()
+    seen = {start}
+    queue = deque([start])
+    while queue:
+        row, col = queue.popleft()
+        for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if neighbor in traversable and neighbor not in seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+    return seen
+
+
+def _closure(scene: dict[str, Any]) -> tuple[set[tuple[int, int]], set[str], int]:
+    decoded = _decode(scene)
+    if decoded is None:
+        return set(), set(), 0
+    open_cells, start, keys, gates, _ = decoded
+    held: set[str] = set()
+    expansions = 0
+    while True:
+        unlocked = {cell for letter in held for cell in gates[letter]}
+        reachable = _flood(open_cells | unlocked, start)
+        found = {letter for letter, cell in keys.items() if cell in reachable}
+        if found == held:
+            return reachable, held, expansions
+        held = found
+        expansions += 1
+        if expansions > len(LETTERS):
+            raise ValueError("key closure failed to stabilize")
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    decoded = _decode(scene)
+    if decoded is None:
+        raise ValueError("malformed scene")
+    _, _, _, _, exits = decoded
+    reachable, _, _ = _closure(scene)
+    answers = [color for color, cell in exits.items() if cell in reachable]
+    if len(answers) != 1:
+        raise ValueError(f"scene has {len(answers)} reachable exits")
+    return answers[0]
+
+
+def margin(scene: dict[str, Any]) -> float:
+    return 16.0
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    decoded = _decode(scene)
+    if decoded is None:
+        return True
+    _, _, keys, _, exits = decoded
+    reachable, held, expansions = _closure(scene)
+    answers = [color for color, cell in exits.items() if cell in reachable]
+    return len(answers) != 1 or len(held) != len(keys) - 2 or expansions < 3
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict]]:
+    return []
+
+
+def _centered_text(
+    draw: ImageDraw.ImageDraw,
+    center: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, int, int] | str,
+) -> None:
+    x, y = center
+    box = draw.textbbox((0, 0), text, font=font)
+    width = box[2] - box[0]
+    height = box[3] - box[1]
+    draw.text(
+        (x * SCALE - width / 2, y * SCALE - height / 2 - 2 * SCALE),
+        text,
+        font=font,
+        fill=fill,
+    )
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    decoded = _decode(scene)
+    if decoded is None:
+        raise ValueError("cannot render malformed scene")
+    open_cells, start, keys, gates, exits = decoded
+
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), (237, 242, 247))
+    draw = ImageDraw.Draw(image)
+    draw.text(
+        (30 * SCALE, 18 * SCALE),
+        "KEY CLOSURE  •  OPEN, FLOOD, REPEAT",
+        font=_font(23),
+        fill=INK_RGB,
+    )
+    draw.text(
+        (31 * SCALE, 58 * SCALE),
+        "A reached round key opens every square A gate",
+        font=_font(14),
+        fill=MUTED_RGB,
+    )
+
+    # Large redundant legend: silhouette distinguishes a key from a locked gate.
+    legend_y = 111
+    draw.ellipse(
+        ((48 - 15) * SCALE, (legend_y - 15) * SCALE, (48 + 15) * SCALE, (legend_y + 15) * SCALE),
+        fill=KEY_RGB["A"], outline=INK_RGB, width=2 * SCALE,
+    )
+    _centered_text(draw, (48, legend_y), "A", _font(16), "white")
+    draw.text((72 * SCALE, 100 * SCALE), "round = KEY", font=_font(12), fill=INK_RGB)
+    draw.rounded_rectangle(
+        ((218 - 17) * SCALE, (legend_y - 17) * SCALE, (218 + 17) * SCALE, (legend_y + 17) * SCALE),
+        radius=5 * SCALE, fill=GATE_RGB["A"], outline=INK_RGB, width=2 * SCALE,
+    )
+    _centered_text(draw, (218, legend_y), "A", _font(16), INK_RGB)
+    draw.text((244 * SCALE, 100 * SCALE), "square = GATE", font=_font(12), fill=INK_RGB)
+    draw.text((414 * SCALE, 100 * SCALE), "gates stay open", font=_font(12), fill=MUTED_RGB)
+
+    left = ORIGIN_X * SCALE
+    top = ORIGIN_Y * SCALE
+    right = (ORIGIN_X + COLS * CELL) * SCALE
+    bottom = (ORIGIN_Y + ROWS * CELL) * SCALE
+    draw.rectangle(
+        (left - 5 * SCALE, top - 5 * SCALE, right + 5 * SCALE, bottom + 5 * SCALE),
+        fill=WALL_RGB,
+        outline=INK_RGB,
+        width=2 * SCALE,
+    )
+    for row in range(ROWS):
+        for col in range(COLS):
+            x0 = (ORIGIN_X + col * CELL) * SCALE
+            y0 = (ORIGIN_Y + row * CELL) * SCALE
+            x1 = x0 + CELL * SCALE
+            y1 = y0 + CELL * SCALE
+            fill = OPEN_RGB if (row, col) in open_cells else WALL_RGB
+            draw.rectangle((x0, y0, x1, y1), fill=fill)
+
+    # Cell boundaries make four-neighbor adjacency explicit.
+    for col in range(COLS + 1):
+        x = (ORIGIN_X + col * CELL) * SCALE
+        draw.line((x, top, x, bottom), fill=GRID_RGB, width=SCALE)
+    for row in range(ROWS + 1):
+        y = (ORIGIN_Y + row * CELL) * SCALE
+        draw.line((left, y, right, y), fill=GRID_RGB, width=SCALE)
+
+    def center(cell: tuple[int, int]) -> tuple[int, int]:
+        row, col = cell
+        return ORIGIN_X + col * CELL + CELL // 2, ORIGIN_Y + row * CELL + CELL // 2
+
+    for letter, cells in gates.items():
+        for cell in cells:
+            cx, cy = center(cell)
+            radius = 16
+            draw.rounded_rectangle(
+                ((cx - radius) * SCALE, (cy - radius) * SCALE,
+                 (cx + radius) * SCALE, (cy + radius) * SCALE),
+                radius=5 * SCALE,
+                fill=GATE_RGB[letter],
+                outline=INK_RGB,
+                width=2 * SCALE,
+            )
+            _centered_text(draw, (cx, cy), letter, _font(16), INK_RGB)
+
+    for letter, cell in keys.items():
+        cx, cy = center(cell)
+        radius = 15
+        draw.ellipse(
+            ((cx - radius) * SCALE, (cy - radius) * SCALE,
+             (cx + radius) * SCALE, (cy + radius) * SCALE),
+            fill=KEY_RGB[letter],
+            outline=INK_RGB,
+            width=2 * SCALE,
+        )
+        _centered_text(draw, (cx, cy), letter, _font(16), "white")
+
+    cx, cy = center(start)
+    draw.ellipse(
+        ((cx - 16) * SCALE, (cy - 16) * SCALE, (cx + 16) * SCALE, (cy + 16) * SCALE),
+        fill=START_RGB, outline=INK_RGB, width=2 * SCALE,
+    )
+    _centered_text(draw, (cx, cy), "S", _font(17), "white")
+
+    for color, cell in exits.items():
+        cx, cy = center(cell)
+        draw.polygon(
+            ((cx * SCALE, (cy - 17) * SCALE), ((cx + 17) * SCALE, cy * SCALE),
+             (cx * SCALE, (cy + 17) * SCALE), ((cx - 17) * SCALE, cy * SCALE)),
+            fill=EXIT_RGB[color], outline=INK_RGB, width=2 * SCALE,
+        )
+        _centered_text(draw, (cx, cy), "X", _font(15), "white")
+
+    panel_x = 650
+    draw.rounded_rectangle(
+        (panel_x * SCALE, 155 * SCALE, 878 * SCALE, 414 * SCALE),
+        radius=12 * SCALE,
+        fill=(250, 252, 254),
+        outline=(174, 186, 199),
+        width=2 * SCALE,
+    )
+    draw.text((671 * SCALE, 177 * SCALE), "EXIT COLORS", font=_font(15), fill=INK_RGB)
+    for index, color in enumerate(EXIT_COLORS):
+        y = 225 + index * 43
+        draw.polygon(
+            ((682 * SCALE, (y - 13) * SCALE), ((682 + 13) * SCALE, y * SCALE),
+             (682 * SCALE, (y + 13) * SCALE), ((682 - 13) * SCALE, y * SCALE)),
+            fill=EXIT_RGB[color], outline=INK_RGB, width=2 * SCALE,
+        )
+        draw.text((707 * SCALE, (y - 10) * SCALE), color, font=_font(13), fill=INK_RGB)
+    draw.text((664 * SCALE, 447 * SCALE), "1. Flood white cells", font=_font(13), fill=INK_RGB)
+    draw.text((664 * SCALE, 482 * SCALE), "2. Collect round keys", font=_font(13), fill=INK_RGB)
+    draw.text((664 * SCALE, 517 * SCALE), "3. Open matching gates", font=_font(13), fill=INK_RGB)
+    draw.text((664 * SCALE, 552 * SCALE), "4. Repeat until stable", font=_font(13), fill=INK_RGB)
+
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)

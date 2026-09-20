@@ -1,0 +1,147 @@
+"""Independent pixel-only inverse arm for Checkpoint Half Tally.
+
+The oracle receives a final RGB raster and public palette/mark conventions.  It
+segments the one navy route, locates colored ring components, and ranks their
+centers by a flood-fill geodesic measured from the blue start.  It neither
+imports nor receives renderer state.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_NAVY = np.array((28, 43, 61), dtype=np.int32)
+_BLUE = np.array((38, 105, 201), dtype=np.int32)
+_ORANGE = np.array((232, 126, 38), dtype=np.int32)
+_RED = np.array((205, 55, 62), dtype=np.int32)
+_GREEN = np.array((34, 148, 92), dtype=np.int32)
+_COLOR_TOL_SQ = 28 * 28
+
+
+class PixelOracleError(ValueError):
+    """Raised when the raster does not expose one unambiguous route tally."""
+
+
+def _mask(array: np.ndarray, color: np.ndarray) -> np.ndarray:
+    # int32 avoids the signed-int16 overflow of squared RGB differences.
+    delta = array.astype(np.int32) - color
+    return np.sum(delta * delta, axis=2) <= _COLOR_TOL_SQ
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 4-connected components as arrays of (y, x) coordinates."""
+
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        seen[sy, sx] = True
+        queue = [(sy, sx)]
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.pop()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _ring_centers(mask: np.ndarray, expected: int, label: str, area_range: tuple[int, int]) -> list[tuple[float, float]]:
+    components = [component for component in _components(mask) if len(component) >= 20]
+    if len(components) != expected:
+        raise PixelOracleError(f"expected {expected} {label} ring components, found {len(components)}")
+    centers: list[tuple[float, float]] = []
+    low, high = area_range
+    for component in components:
+        if not low <= len(component) <= high:
+            raise PixelOracleError(f"{label} ring area {len(component)} is outside [{low}, {high}]")
+        y, x = component.mean(axis=0)
+        centers.append((float(y), float(x)))
+    return centers
+
+
+def _nearest_route(route_points: np.ndarray, center: tuple[float, float]) -> tuple[int, int, float]:
+    delta = route_points.astype(np.float64) - np.asarray(center, dtype=np.float64)
+    distances = np.sum(delta * delta, axis=1)
+    index = int(np.argmin(distances))
+    y, x = route_points[index]
+    return int(y), int(x), float(distances[index])
+
+
+def _geodesic(mask: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = mask.shape
+    distances = np.full((height, width), -1, dtype=np.int32)
+    sy, sx = start
+    distances[sy, sx] = 0
+    queue: deque[tuple[int, int]] = deque([(sy, sx)])
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distances[y, x]) + 1
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and distances[ny, nx] < 0:
+                distances[ny, nx] = next_distance
+                queue.append((ny, nx))
+    return distances
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return ``first`` or ``last`` using pixels alone, or abstain by raising."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 200 or array.shape[1] < 200:
+        raise PixelOracleError("image is too small")
+
+    route_mask = _mask(array, _NAVY)
+    route_components = [component for component in _components(route_mask) if len(component) >= 20]
+    if len(route_components) != 1:
+        raise PixelOracleError(f"navy route is not one connected component ({len(route_components)})")
+    route_points = route_components[0]
+    if len(route_points) < 3000:
+        raise PixelOracleError("navy route has insufficient visible ink")
+    y_span = int(route_points[:, 0].max() - route_points[:, 0].min())
+    x_span = int(route_points[:, 1].max() - route_points[:, 1].min())
+    height, width = route_mask.shape
+    if y_span < 0.58 * height or x_span < 0.58 * width:
+        raise PixelOracleError("route does not span the image")
+
+    blue = _ring_centers(_mask(array, _BLUE), 1, "blue", (190, 520))[0]
+    orange = _ring_centers(_mask(array, _ORANGE), 1, "orange", (190, 520))[0]
+    red = [(center, "red") for center in _ring_centers(_mask(array, _RED), 4, "red", (130, 320))]
+    green = [(center, "green") for center in _ring_centers(_mask(array, _GREEN), 4, "green", (130, 320))]
+
+    sy, sx, start_gap = _nearest_route(route_points, blue)
+    fy, fx, finish_gap = _nearest_route(route_points, orange)
+    if start_gap > 64.0 or finish_gap > 64.0:
+        raise PixelOracleError("an endpoint ring is detached from the navy route")
+    distances = _geodesic(route_mask, (sy, sx))
+    finish_distance = int(distances[fy, fx])
+    if finish_distance < 780:
+        raise PixelOracleError("start-to-finish route is too short or disconnected")
+
+    ordered: list[tuple[int, str]] = []
+    for center, color in red + green:
+        y, x, gap = _nearest_route(route_points, center)
+        if gap > 30.0 * 30.0 or distances[y, x] < 0:
+            raise PixelOracleError(f"{color} checkpoint is detached from the route")
+        ordered.append((int(distances[y, x]), color))
+    ordered.sort()
+    along = [distance for distance, _ in ordered]
+    if len(along) != 8 or any(b - a < 55 for a, b in zip(along, along[1:])):
+        raise PixelOracleError("checkpoint order has inadequate pixel separation")
+    if along[0] < 25 or finish_distance - along[-1] < 25:
+        raise PixelOracleError("checkpoint collides with a role endpoint")
+
+    first_red = sum(color == "red" for _, color in ordered[:4])
+    last_red = sum(color == "red" for _, color in ordered[4:])
+    if first_red == last_red:
+        raise PixelOracleError("red tallies are tied at the visible boundary")
+    return "first" if first_red > last_red else "last"

@@ -1,0 +1,300 @@
+"""Area-median rule binding: renderer, analytic gold, margin and quarantine.
+
+Scene
+-----
+One thick, connected, area-like band sweeps across the full canvas width. Its
+vertical thickness varies smoothly, so the band's *area median* column - the
+column at which the accumulated shaded area first reaches half of the total
+shaded area - depends jointly on widely separated parts of the same region.
+Four full-height coloured rules stand at randomised horizontal positions with a
+randomised colour order. The decision is the colour of the first rule (scanning
+left to right) that carries at least half of the shaded area on its left.
+
+Determinism
+-----------
+The raster is assembled from integer column extents with NumPy, so there is no
+antialiasing anywhere: every shaded pixel is exactly ``BAND_RGB``. The analytic
+arm and the independent pixel arm therefore evaluate the *same* integer column
+areas, and their agreement is exact rather than tolerance-based.
+
+The rules are opaque: a column covered by a rule contributes no shaded area.
+The question declares this, the analytic gold models it, and the pixel oracle
+observes it, so no arm needs to reconstruct hidden geometry.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "area_median_rule-renderer-0.1.0"
+
+# Public palette. These are fixed world constants, not latent scene fields.
+BACKGROUND_RGB = (255, 255, 255)
+BAND_RGB = (154, 154, 154)
+DECOR_RGB = (25, 25, 25)
+RULE_RGB = {
+    "red": (220, 50, 47),
+    "green": (0, 140, 60),
+    "blue": (30, 80, 220),
+    "orange": (245, 150, 20),
+}
+RULE_COLORS = ("red", "green", "blue", "orange")
+RULE_COUNT = 8  # each colour is used twice, in a randomised order
+
+CANVAS_W = 512
+CANVAS_H = 384
+RULE_HALF_WIDTH = 2  # rules are 2 * 2 + 1 = 5 px wide
+BAND_MIN_THICKNESS = 80
+BAND_MAX_THICKNESS = 210
+BAND_TOP_PAD = 10
+BAND_BOTTOM_PAD = 26  # keeps the band clear of the decorative baseline
+AXIS_Y0 = CANVAS_H - 8
+AXIS_Y1 = CANVAS_H - 5
+MARKER_SIZE = 10
+
+# Quarantine policy (finite-resolution ambiguity), declared in candidate.json.
+MARGIN_QUARANTINE_PX = 8.0
+FRACTION_QUARANTINE = 0.015
+
+
+# --------------------------------------------------------------------------
+# latent scene -> geometry (shared by render() and analytic_gold())
+# --------------------------------------------------------------------------
+def _columns(scene: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Integer (top, bottom) row extent of the band for every image column."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    x0 = int(scene["band_x0"])
+    x1 = int(scene["band_x1"])
+    base = float(scene["band_base"])
+    amps = [float(value) for value in scene["band_amp"]]
+    freqs = [float(value) for value in scene["band_freq"]]
+    phases = [float(value) for value in scene["band_phase"]]
+    center_amp = float(scene["band_center_amp"])
+    center_phase = float(scene["band_center_phase"])
+
+    top = np.zeros(width, dtype=np.int64)
+    bottom = np.zeros(width, dtype=np.int64)
+    span = float(x1 - x0)
+    for x in range(x0, x1):
+        u = (x - x0) / span
+        thickness = base
+        for amp, freq, phase in zip(amps, freqs, phases):
+            thickness += amp * math.sin(2.0 * math.pi * (freq * u + phase / 1000.0))
+        thickness = min(max(thickness, BAND_MIN_THICKNESS), BAND_MAX_THICKNESS)
+        center = height / 2.0 + center_amp * math.sin(
+            2.0 * math.pi * (u + center_phase / 1000.0)
+        )
+        low = int(round(center - thickness / 2.0))
+        high = int(round(center + thickness / 2.0))
+        low = min(max(low, BAND_TOP_PAD), height - BAND_BOTTOM_PAD)
+        high = min(max(high, BAND_TOP_PAD), height - BAND_BOTTOM_PAD)
+        if high > low:
+            top[x] = low
+            bottom[x] = high
+    return top, bottom
+
+
+def _rule_positions(scene: dict) -> list[int]:
+    return [int(value) for value in scene["rule_x"]]
+
+
+def _visible_area_per_column(scene: dict) -> np.ndarray:
+    """Shaded pixels per column, after the opaque rules occlude their columns."""
+    top, bottom = _columns(scene)
+    areas = (bottom - top).astype(np.int64)
+    width = areas.shape[0]
+    for center in _rule_positions(scene):
+        lo = max(0, center - RULE_HALF_WIDTH)
+        hi = min(width, center + RULE_HALF_WIDTH + 1)
+        areas[lo:hi] = 0
+    return areas
+
+
+def _area_median_column(scene: dict) -> int:
+    """First column at which cumulative shaded area reaches half the total."""
+    areas = _visible_area_per_column(scene)
+    total = int(areas.sum())
+    if total <= 0:
+        raise ValueError("scene has no shaded area")
+    cumulative = np.cumsum(areas)
+    return int(np.searchsorted(cumulative, total / 2.0, side="left"))
+
+
+def _left_fractions(scene: dict) -> list[float]:
+    """Shaded-area fraction strictly left of each rule, in rule order."""
+    areas = _visible_area_per_column(scene)
+    total = float(areas.sum())
+    cumulative = np.cumsum(areas)
+    fractions = []
+    for center in _rule_positions(scene):
+        index = max(0, min(areas.shape[0] - 1, center - RULE_HALF_WIDTH - 1))
+        fractions.append(float(cumulative[index]) / total)
+    return fractions
+
+
+def _selected_index(scene: dict) -> int:
+    """Index of the first rule at or right of the area-median column."""
+    median = _area_median_column(scene)
+    positions = _rule_positions(scene)
+    for index, center in enumerate(positions):
+        if center >= median:
+            return index
+    return -1
+
+
+# --------------------------------------------------------------------------
+# required contract functions
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    """Colour name of the first rule carrying at least half the area on its left."""
+    index = _selected_index(scene)
+    names = [str(value) for value in scene["rule_colors"]]
+    if index < 0:
+        return "none"
+    return names[index]
+
+
+def margin(scene: dict) -> float:
+    """Horizontal pixel distance from the area-median column to the nearest rule.
+
+    The boundary event is 'the area median coincides with a rule', i.e. that
+    rule splits the shaded region into two equal halves. The margin is the
+    distance to that visible event.
+    """
+    median = _area_median_column(scene)
+    distances = [abs(center - median) for center in _rule_positions(scene)]
+    return float(round(min(distances), 4))
+
+
+def fraction_margin(scene: dict) -> float:
+    """Diagnostic margin: closest rule's left-area fraction to the 0.5 boundary."""
+    return float(round(min(abs(value - 0.5) for value in _left_fractions(scene)), 6))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Boundary cases that finite resolution cannot resolve are excluded."""
+    if _selected_index(scene) < 0:
+        return True
+    return margin(scene) < MARGIN_QUARANTINE_PX or fraction_margin(scene) < FRACTION_QUARANTINE
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases exist: every scene field changes the raster."""
+    return []
+
+
+def render(scene: dict) -> Image.Image:
+    width = int(scene["width"])
+    height = int(scene["height"])
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:, :] = BACKGROUND_RGB
+
+    top, bottom = _columns(scene)
+    rows = np.arange(height, dtype=np.int64)[:, None]
+    band = (rows >= top[None, :]) & (rows < bottom[None, :])
+    canvas[band] = BAND_RGB
+
+    canvas[AXIS_Y0:AXIS_Y1, :] = DECOR_RGB
+    for mx, my in [(int(a), int(b)) for a, b in scene["markers"]]:
+        canvas[my : my + MARKER_SIZE, mx : mx + MARKER_SIZE] = DECOR_RGB
+
+    names = [str(value) for value in scene["rule_colors"]]
+    for center, name in zip(_rule_positions(scene), names):
+        lo = max(0, center - RULE_HALF_WIDTH)
+        hi = min(width, center + RULE_HALF_WIDTH + 1)
+        canvas[:, lo:hi] = RULE_RGB[name]
+    return Image.fromarray(canvas, mode="RGB")
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _sample_rules(rng: random.Random) -> list[int]:
+    positions = [rng.randint(50, 74)]
+    for _ in range(RULE_COUNT - 1):
+        positions.append(positions[-1] + rng.randint(42, 58))
+    return positions
+
+
+def _sample_profile(rng: random.Random) -> dict:
+    return {
+        "band_base": rng.randint(110, 180),
+        "band_amp": [rng.randint(18, 52) for _ in range(3)],
+        "band_freq": [1.0, 2.0, 3.0],
+        "band_phase": [rng.randint(0, 999) for _ in range(3)],
+        "band_center_amp": rng.randint(72, 118),
+        "band_center_phase": rng.randint(0, 999),
+    }
+
+
+def _sample_rule_colors(rng: random.Random) -> list[str]:
+    """Each colour twice, shuffled: colour is decorrelated from rule position."""
+    names = list(RULE_COLORS) * (RULE_COUNT // len(RULE_COLORS))
+    rng.shuffle(names)
+    return names
+
+
+def _sample_markers(rng: random.Random, scene: dict) -> list[list[int]]:
+    top, bottom = _columns(scene)
+    rules = _rule_positions(scene)
+    markers: list[list[int]] = []
+    attempts = 0
+    wanted = rng.randint(2, 5)
+    while len(markers) < wanted and attempts < 400:
+        attempts += 1
+        mx = rng.randint(12, CANVAS_W - MARKER_SIZE - 12)
+        my = rng.randint(6, CANVAS_H - MARKER_SIZE - 20)
+        xs = range(mx - 4, mx + MARKER_SIZE + 4)
+        clear = True
+        for x in xs:
+            if not 0 <= x < CANVAS_W:
+                continue
+            if bottom[x] > top[x] and my + MARKER_SIZE + 5 > top[x] and my - 5 < bottom[x]:
+                clear = False
+                break
+        for center in rules:
+            if abs(center - mx) < MARKER_SIZE + 8 or abs(center - mx - MARKER_SIZE) < 8:
+                clear = False
+        for other in markers:
+            if abs(other[0] - mx) < MARKER_SIZE + 6 and abs(other[1] - my) < MARKER_SIZE + 6:
+                clear = False
+        if clear:
+            markers.append([mx, my])
+    return markers
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced scene.
+
+    Colour assignment is an independent random permutation, so the answer
+    identity is decorrelated from rule position, rule order, band shape and
+    total ink. The profile is resampled until the area median lies strictly
+    left of the rightmost rule and is not pinned to a rule.
+    """
+    rng = random.Random(7919 * int(seed) + 13)
+    scene: dict = {
+        "width": CANVAS_W,
+        "height": CANVAS_H,
+        "band_x0": 8,
+        "band_x1": CANVAS_W - 8,
+        "rule_x": _sample_rules(rng),
+        "rule_colors": _sample_rule_colors(rng),
+    }
+    for attempt in range(600):
+        scene.update(_sample_profile(rng))
+        if attempt % 40 == 39:
+            scene["rule_x"] = _sample_rules(rng)
+        probe = dict(scene)
+        probe["markers"] = []
+        if _selected_index(probe) < 0:
+            continue
+        if not 4.0 <= margin(probe) <= 26.0 or fraction_margin(probe) < 0.004:
+            continue
+        break
+    scene["markers"] = _sample_markers(rng, dict(scene, markers=[]))
+    return scene

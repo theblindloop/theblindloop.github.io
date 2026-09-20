@@ -1,0 +1,131 @@
+"""Pixel-only inverse arm.
+
+Receives one rasterised page and nothing else. It segments the dark ink, splits
+the page at its widest ink-free column corridor, labels ink components and
+enclosed background regions on each side, assigns the strand and frame roles by
+which side traps enclosed regions, and compares the two topological counts.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+DARK = 110
+MIN_AREA = 80
+UNCLEAR = "unclear"
+
+
+def _runs(row: np.ndarray) -> list[tuple[int, int]]:
+    padded = np.concatenate(([False], row, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return list(zip(edges[0::2].tolist(), edges[1::2].tolist()))
+
+
+def _label_runs(mask: np.ndarray) -> tuple[list[list[tuple[int, int, int]]], list[int]]:
+    """Row-run connected components (4-connectivity) via union-find."""
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    rows: list[list[tuple[int, int, int]]] = []
+    prev: list[tuple[int, int, int]] = []
+    for y in range(mask.shape[0]):
+        cur: list[tuple[int, int, int]] = []
+        for s, e in _runs(mask[y]):
+            label = len(parent)
+            parent.append(label)
+            for ps, pe, plabel in prev:
+                if ps < e and s < pe:
+                    union(label, plabel)
+            cur.append((s, e, label))
+        rows.append(cur)
+        prev = cur
+    roots = [find(i) for i in range(len(parent))]
+    return rows, roots
+
+
+def _components(mask: np.ndarray) -> dict[int, int]:
+    rows, roots = _label_runs(mask)
+    areas: dict[int, int] = {}
+    for row in rows:
+        for s, e, label in row:
+            areas[roots[label]] = areas.get(roots[label], 0) + (e - s)
+    return areas
+
+
+def _enclosed_regions(mask: np.ndarray) -> int:
+    """Background regions of `mask` that never reach the sub-image border."""
+    bg = ~mask
+    rows, roots = _label_runs(bg)
+    height = len(rows)
+    open_roots: set[int] = set()
+    areas: dict[int, int] = {}
+    for y, row in enumerate(rows):
+        for s, e, label in row:
+            root = roots[label]
+            areas[root] = areas.get(root, 0) + (e - s)
+            if y == 0 or y == height - 1 or s == 0 or e == bg.shape[1]:
+                open_roots.add(root)
+    return sum(1 for root, area in areas.items() if root not in open_roots and area >= MIN_AREA)
+
+
+def _split_column(ink: np.ndarray) -> int | None:
+    """Centre of the widest ink-free column corridor in the middle of the page."""
+    cols = ink.any(axis=0)
+    width = cols.size
+    lo, hi = width // 4, 3 * width // 4
+    best = None
+    start = None
+    for x in range(lo, hi + 1):
+        if not cols[x]:
+            if start is None:
+                start = x
+        else:
+            if start is not None:
+                if best is None or x - start > best[1] - best[0]:
+                    best = (start, x)
+                start = None
+    if start is not None and (best is None or hi + 1 - start > best[1] - best[0]):
+        best = (start, hi + 1)
+    if best is None or best[1] - best[0] < 24:
+        return None
+    return (best[0] + best[1]) // 2
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    ink = arr.max(axis=2) < DARK
+    if not ink.any():
+        return UNCLEAR
+    split = _split_column(ink)
+    if split is None:
+        return UNCLEAR
+
+    sides = []
+    for mask in (ink[:, :split], ink[:, split:]):
+        areas = _components(mask)
+        pieces = sum(1 for area in areas.values() if area >= MIN_AREA)
+        sides.append((pieces, _enclosed_regions(mask)))
+
+    framed = [i for i, (_p, holes) in enumerate(sides) if holes >= 1]
+    if len(framed) != 1:
+        return UNCLEAR
+    frame_side = framed[0]
+    strand_side = 1 - frame_side
+    pieces = sides[strand_side][0]
+    loops = sides[frame_side][1]
+    if pieces < 1 or loops < 1:
+        return UNCLEAR
+    if pieces == loops:
+        return "equal"
+    return "pieces" if pieces > loops else "loops"

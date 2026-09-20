@@ -1,0 +1,211 @@
+"""Independent pixel-only inverse for mirror-correspondence search.
+
+The implementation recovers red axes and dark square components from the final
+RGB raster.  It does not import or receive latent construction state.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+LABELS = ("A", "B", "C", "D")
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose one safely separated mirror-paired panel."""
+
+
+@dataclass(frozen=True)
+class Component:
+    cx: float
+    cy: float
+    width: int
+    height: int
+    area: int
+    fill_ratio: float
+
+
+def _components(mask: np.ndarray, min_area: int = 1) -> list[Component]:
+    height, width = mask.shape
+    ys, xs = np.nonzero(mask)
+    unseen = set((ys * width + xs).tolist())
+    found: list[Component] = []
+    while unseen:
+        start = unseen.pop()
+        stack = [start]
+        pixels = [start]
+        while stack:
+            value = stack.pop()
+            y, x = divmod(value, width)
+            for neighbor in (value - 1, value + 1, value - width, value + width):
+                if neighbor not in unseen:
+                    continue
+                ny, nx = divmod(neighbor, width)
+                if not (0 <= ny < height and 0 <= nx < width):
+                    continue
+                if abs(nx - x) + abs(ny - y) != 1:
+                    continue
+                unseen.remove(neighbor)
+                stack.append(neighbor)
+                pixels.append(neighbor)
+        if len(pixels) < min_area:
+            continue
+        py = np.fromiter((item // width for item in pixels), dtype=np.int32)
+        px = np.fromiter((item % width for item in pixels), dtype=np.int32)
+        x0, x1 = int(px.min()), int(px.max())
+        y0, y1 = int(py.min()), int(py.max())
+        box_area = (x1 - x0 + 1) * (y1 - y0 + 1)
+        found.append(
+            Component(
+                cx=float(px.mean()),
+                cy=float(py.mean()),
+                width=x1 - x0 + 1,
+                height=y1 - y0 + 1,
+                area=len(pixels),
+                fill_ratio=len(pixels) / box_area,
+            )
+        )
+    return found
+
+
+def _ordered_axes(axes: list[Component]) -> list[Component]:
+    if len(axes) != 4:
+        raise OracleAbstention(f"expected four visible red axes, measured {len(axes)}")
+    by_y = sorted(axes, key=lambda item: item.cy)
+    upper, lower = by_y[:2], by_y[2:]
+    if min(item.cy for item in lower) - max(item.cy for item in upper) < 120:
+        raise OracleAbstention("could not separate the two printed panel rows")
+    upper.sort(key=lambda item: item.cx)
+    lower.sort(key=lambda item: item.cx)
+    if upper[1].cx - upper[0].cx < 180 or lower[1].cx - lower[0].cx < 180:
+        raise OracleAbstention("could not separate the two printed panel columns")
+    return upper + lower
+
+
+def _row_pairs(items: list[Component], square_extent: float) -> list[tuple[Component, Component]]:
+    if len(items) != 10:
+        raise OracleAbstention(f"each panel must contain ten dark squares; measured {len(items)}")
+    ordered = sorted(items, key=lambda item: (item.cy, item.cx))
+    rows: list[tuple[Component, Component]] = []
+    centers: list[float] = []
+    for start in range(0, 10, 2):
+        pair = sorted(ordered[start:start + 2], key=lambda item: item.cx)
+        if abs(pair[0].cy - pair[1].cy) > 2.5:
+            raise OracleAbstention("two squares do not occupy the same visible row")
+        rows.append((pair[0], pair[1]))
+        centers.append(0.5 * (pair[0].cy + pair[1].cy))
+    if any(b - a < 1.25 * square_extent for a, b in zip(centers, centers[1:])):
+        raise OracleAbstention("the five visible rows are not separately recoverable")
+    return rows
+
+
+def analyze_image(image: Image.Image) -> dict:
+    """Enumerate panels and score all row-wise equal-distance correspondences."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red = arr[:, :, 0]
+    green = arr[:, :, 1]
+    blue = arr[:, :, 2]
+
+    axis_mask = (
+        (red >= 150)
+        & (green <= 125)
+        & (red - green >= 55)
+        & (red - blue >= 35)
+    )
+    axes = [
+        item for item in _components(axis_mask, min_area=500)
+        if item.height >= 175 and item.width <= 12 and item.fill_ratio >= 0.55
+    ]
+    ordered_axes = _ordered_axes(axes)
+
+    spread = arr.max(axis=2) - arr.min(axis=2)
+    square_mask = (
+        (spread >= 28)
+        & (arr.max(axis=2) <= 150)
+        & (arr.min(axis=2) <= 112)
+    )
+    squares = [
+        item for item in _components(square_mask, min_area=180)
+        if 17 <= item.width <= 28
+        and 17 <= item.height <= 28
+        and abs(item.width - item.height) <= 2
+        and item.fill_ratio >= 0.78
+    ]
+    if len(squares) != 40:
+        raise OracleAbstention(f"expected forty visible dark squares, measured {len(squares)}")
+    extents = [0.5 * (item.width + item.height) for item in squares]
+    square_extent = float(np.median(extents))
+    if max(abs(value - square_extent) for value in extents) > 2.5:
+        raise OracleAbstention("dark square sizes are not uniform")
+    areas = [item.area for item in squares]
+    if max(areas) / min(areas) > 1.18:
+        raise OracleAbstention("dark square ink areas are not uniform")
+
+    panel_items: list[list[Component]] = [[] for _ in range(4)]
+    for square in squares:
+        panel = min(
+            range(4),
+            key=lambda index: (
+                (square.cx - ordered_axes[index].cx) ** 2
+                + (square.cy - ordered_axes[index].cy) ** 2
+            ),
+        )
+        panel_items[panel].append(square)
+    if [len(items) for items in panel_items] != [10, 10, 10, 10]:
+        raise OracleAbstention("could not assign ten squares to every visible axis")
+
+    tolerance = max(4.0, square_extent * 0.28)
+    scores: list[int] = []
+    unpaired: list[int] = []
+    left_marginals: list[list[float]] = []
+    right_marginals: list[list[float]] = []
+    for axis, items in zip(ordered_axes, panel_items, strict=True):
+        rows = _row_pairs(items, square_extent)
+        bad = 0
+        left_distances: list[float] = []
+        right_distances: list[float] = []
+        for left_square, right_square in rows:
+            if not left_square.cx < axis.cx < right_square.cx:
+                raise OracleAbstention("a visible row lacks one square on each side of its axis")
+            left_distance = axis.cx - left_square.cx
+            right_distance = right_square.cx - axis.cx
+            left_distances.append(left_distance)
+            right_distances.append(right_distance)
+            if abs(left_distance - right_distance) > tolerance:
+                bad += 2
+        if len(left_distances) != 5 or len(right_distances) != 5:
+            raise OracleAbstention("a panel does not expose five left/right square pairs")
+        left_marginals.append(sorted(left_distances))
+        right_marginals.append(sorted(right_distances))
+        unpaired.append(bad)
+        scores.append(10 - bad)
+
+    reference_left = left_marginals[0]
+    reference_right = right_marginals[0]
+    for values in left_marginals[1:]:
+        if max(abs(a - b) for a, b in zip(reference_left, values, strict=True)) > 3.0:
+            raise OracleAbstention("panel left-side distance histograms are not balanced")
+    for values in right_marginals:
+        if max(abs(a - b) for a, b in zip(reference_right, values, strict=True)) > 3.0:
+            raise OracleAbstention("panel right-side distance histograms are not balanced")
+    if max(abs(a - b) for a, b in zip(reference_left, reference_right, strict=True)) > 3.0:
+        raise OracleAbstention("left and right square inventories are not balanced")
+
+    ranking = sorted(range(4), key=lambda index: scores[index], reverse=True)
+    top_gap = scores[ranking[0]] - scores[ranking[1]]
+    if scores[ranking[0]] != 10 or top_gap < 4:
+        raise OracleAbstention("no unique perfect pairing with a four-square runner-up margin")
+    return {
+        "decision": LABELS[ranking[0]],
+        "scores": scores,
+        "unpaired_squares": unpaired,
+        "runner_up_margin": float(top_gap),
+        "square_extent": square_extent,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

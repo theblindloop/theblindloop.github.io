@@ -1,0 +1,166 @@
+"""Independent image-only inverse for the one-per-ring allocation rule.
+
+The implementation deliberately duplicates the public palette and visual rules.
+It discovers the four panel borders, ring outlines, and filled dots from pixels;
+it receives no latent geometry and imports no world-side module.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+_BACKGROUND = (248, 247, 242)
+_PANEL_BORDER = (170, 180, 192)
+_RING_COLOR = (24, 58, 90)
+_DOT_COLOR = (242, 142, 43)
+_TEXT_COLOR = (32, 37, 43)
+_PALETTE = np.asarray(
+    [_BACKGROUND, _PANEL_BORDER, _RING_COLOR, _DOT_COLOR, _TEXT_COLOR],
+    dtype=np.int32,
+)
+_BORDER_CLASS = 1
+_RING_CLASS = 2
+_DOT_CLASS = 3
+_LABELS = "ABCD"
+
+
+@dataclass(frozen=True)
+class _Component:
+    area: int
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    cx: float
+    cy: float
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0 + 1
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0 + 1
+
+
+def _nearest_classes(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int32)
+    diff = arr[:, :, None, :] - _PALETTE[None, None, :, :]
+    return np.sum(diff * diff, axis=3).argmin(axis=2)
+
+
+def _components(mask: np.ndarray) -> list[_Component]:
+    """Return 8-connected components while touching only foreground pixels."""
+
+    work = np.asarray(mask, dtype=bool).copy()
+    starts_y, starts_x = np.nonzero(work)
+    found: list[_Component] = []
+    height, width = work.shape
+    for start_y, start_x in zip(starts_y.tolist(), starts_x.tolist(), strict=True):
+        if not work[start_y, start_x]:
+            continue
+        work[start_y, start_x] = False
+        queue = deque([(start_y, start_x)])
+        count = 0
+        sum_x = 0.0
+        sum_y = 0.0
+        x0 = x1 = start_x
+        y0 = y1 = start_y
+        while queue:
+            y, x = queue.popleft()
+            count += 1
+            sum_x += x
+            sum_y += y
+            x0 = min(x0, x)
+            x1 = max(x1, x)
+            y0 = min(y0, y)
+            y1 = max(y1, y)
+            for yy in range(max(0, y - 1), min(height, y + 2)):
+                for xx in range(max(0, x - 1), min(width, x + 2)):
+                    if work[yy, xx]:
+                        work[yy, xx] = False
+                        queue.append((yy, xx))
+        found.append(_Component(count, x0, y0, x1, y1, sum_x / count, sum_y / count))
+    return found
+
+
+def _discover_panels(classes: np.ndarray) -> list[_Component]:
+    candidates = [
+        component
+        for component in _components(classes == _BORDER_CLASS)
+        if component.area > 1200 and component.width > 250 and component.height > 160
+    ]
+    if len(candidates) != 4:
+        raise ValueError(f"abstain: expected four visible panel borders, found {len(candidates)}")
+    # Infer reading order from discovered centroids, without using nominal coordinates.
+    candidates.sort(key=lambda component: component.cy)
+    top = sorted(candidates[:2], key=lambda component: component.cx)
+    bottom = sorted(candidates[2:], key=lambda component: component.cx)
+    return top + bottom
+
+
+def _inside_components(
+    classes: np.ndarray,
+    panel: _Component,
+    class_index: int,
+    minimum_area: int,
+) -> list[_Component]:
+    pad = 5
+    crop = classes[panel.y0 + pad : panel.y1 - pad + 1, panel.x0 + pad : panel.x1 - pad + 1]
+    components = [component for component in _components(crop == class_index) if component.area >= minimum_area]
+    return [
+        _Component(
+            component.area,
+            component.x0 + panel.x0 + pad,
+            component.y0 + panel.y0 + pad,
+            component.x1 + panel.x0 + pad,
+            component.y1 + panel.y0 + pad,
+            component.cx + panel.x0 + pad,
+            component.cy + panel.y0 + pad,
+        )
+        for component in components
+    ]
+
+
+def _panel_score(classes: np.ndarray, panel: _Component) -> int:
+    rings = _inside_components(classes, panel, _RING_CLASS, 450)
+    dots = _inside_components(classes, panel, _DOT_CLASS, 80)
+    if len(rings) != 3 or len(dots) != 3:
+        raise ValueError(
+            f"abstain: panel inventory is {len(rings)} rings and {len(dots)} dots"
+        )
+
+    occupancies = [0, 0, 0]
+    for dot in dots:
+        dot_radius = (dot.width + dot.height) / 4.0
+        owners = []
+        for ring_index, ring in enumerate(rings):
+            # The ring component's bounding radius estimates its outer edge. Subtract
+            # four pixels to conservatively approximate the visible inner edge.
+            outer_radius = (ring.width + ring.height) / 4.0
+            distance = math.hypot(dot.cx - ring.cx, dot.cy - ring.cy)
+            if distance + dot_radius < outer_radius - 4.0:
+                owners.append(ring_index)
+        if len(owners) != 1:
+            raise ValueError("abstain: a dot is touching, outside, or assigned to multiple rings")
+        occupancies[owners[0]] += 1
+    return sum(value == 1 for value in occupancies)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover A/B/C/D solely from the final raster, or abstain by raising."""
+
+    classes = _nearest_classes(image)
+    panels = _discover_panels(classes)
+    scores = [_panel_score(classes, panel) for panel in panels]
+    best = max(scores)
+    winners = [index for index, score in enumerate(scores) if score == best]
+    if best != 3 or len(winners) != 1:
+        raise ValueError(f"abstain: panel scores {scores} have no unique exact allocation")
+    return _LABELS[winners[0]]
+

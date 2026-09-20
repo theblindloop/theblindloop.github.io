@@ -1,0 +1,160 @@
+"""Independent PNG-only inverse for the network-hub question.
+
+This module intentionally has no dependency on the renderer, prompt, generator,
+verifier, or latent scene code.  It detects blue node components, recovers their
+centres, measures gray line support between every pair, and scores the resulting
+incidence graph by maximum degree.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+
+import numpy as np
+from PIL import Image
+
+PANEL_BOXES = (
+    (35, 90, 465, 355),
+    (495, 90, 925, 355),
+    (35, 405, 465, 670),
+    (495, 405, 925, 670),
+)
+LABELS = ("A", "B", "C", "D")
+NODE_RADIUS = 15.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= 120:
+            components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _node_centres(arr: np.ndarray, box: tuple[int, int, int, int]) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = box
+    crop = arr[y0 + 24 : y1 - 10, x0 + 10 : x1 - 10]
+    red, green, blue = crop[..., 0], crop[..., 1], crop[..., 2]
+    node_mask = (blue > 115) & (blue - red > 55) & (green > 55) & (green < 170)
+    result = []
+    for component in _components(node_mask):
+        ys = component[:, 0] + y0 + 24
+        xs = component[:, 1] + x0 + 10
+        result.append((float(xs.mean()), float(ys.mean())))
+    if len(result) != 5:
+        raise ValueError(f"expected five node components, found {len(result)}")
+    result.sort(key=lambda point: (point[1], point[0]))
+    return result
+
+
+def _point_segment_distance(point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]) -> float:
+    px, py = point
+    ax, ay = start
+    bx, by = end
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0:
+        return math.dist(point, start)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
+    return math.dist(point, (ax + t * dx, ay + t * dy))
+
+
+def _passes_through_other_node(
+    start_index: int,
+    end_index: int,
+    centres: list[tuple[float, float]],
+) -> bool:
+    start, end = centres[start_index], centres[end_index]
+    for index, centre in enumerate(centres):
+        if index in (start_index, end_index):
+            continue
+        if _point_segment_distance(centre, start, end) < NODE_RADIUS * 1.8:
+            return True
+    return False
+
+
+def _edge_support(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    edge_mask: np.ndarray,
+) -> float:
+    height, width = edge_mask.shape
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 2 * NODE_RADIUS + 10:
+        return 0.0
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    sample_count = max(24, int(length - 2 * NODE_RADIUS))
+    hits = 0
+    total = 0
+    for step in range(sample_count):
+        distance = NODE_RADIUS + 4.0 + (step + 0.5) * (length - 2 * NODE_RADIUS - 8.0) / sample_count
+        cx = start[0] + ux * distance
+        cy = start[1] + uy * distance
+        found = False
+        for offset in range(-5, 6):
+            px = int(round(cx + nx * offset))
+            py = int(round(cy + ny * offset))
+            if 0 <= px < width and 0 <= py < height and edge_mask[py, px]:
+                found = True
+                break
+        hits += int(found)
+        total += 1
+    return hits / max(1, total)
+
+
+def _panel_score(arr: np.ndarray, box: tuple[int, int, int, int]) -> int:
+    centres = _node_centres(arr, box)
+    x0, y0, x1, y1 = box
+    crop = arr[y0 + 22 : y1 - 8, x0 + 8 : x1 - 8]
+    red, green, blue = crop[..., 0], crop[..., 1], crop[..., 2]
+    gray = (np.maximum.reduce((red, green, blue)) - np.minimum.reduce((red, green, blue)) <= 10)
+    edge_mask = gray & (red >= 28) & (red <= 135)
+    degrees = [0, 0, 0, 0, 0]
+    for first, second in itertools.combinations(range(5), 2):
+        if _passes_through_other_node(first, second, centres):
+            continue
+        # Convert global centre coordinates into crop coordinates for support.
+        start = (centres[first][0] - (x0 + 8), centres[first][1] - (y0 + 22))
+        end = (centres[second][0] - (x0 + 8), centres[second][1] - (y0 + 22))
+        if _edge_support(start, end, edge_mask) >= 0.58:
+            degrees[first] += 1
+            degrees[second] += 1
+    detected_edges = sum(degrees) // 2
+    if detected_edges != 5:
+        raise ValueError(f"expected five detected connections, found {detected_edges}")
+    return max(degrees)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the unique degree-four panel from the final RGB PNG alone."""
+
+    if not isinstance(image, Image.Image):
+        raise TypeError("decision_from_image expects a PIL image")
+    rgb = image.convert("RGB")
+    if rgb.size != (960, 760):
+        raise ValueError(f"unexpected image size {rgb.size}")
+    arr = np.asarray(rgb, dtype=np.int16)
+    scores = [_panel_score(arr, box) for box in PANEL_BOXES]
+    best = max(scores)
+    winners = [index for index, score in enumerate(scores) if score == best]
+    if best != 4 or len(winners) != 1 or best - sorted(scores)[-2] < 1:
+        raise ValueError(f"ambiguous network graph scores {scores}")
+    return LABELS[winners[0]]

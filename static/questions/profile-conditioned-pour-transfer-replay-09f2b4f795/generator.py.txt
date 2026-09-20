@@ -1,0 +1,426 @@
+"""Scene sampler, renderer, analytic gold, margin and latent symmetries for pour_transfer_replay.
+
+Four vessels are drawn side by side. A vessel is a vertical stack of unit cells:
+the number of cells is that vessel's capacity and the dark cells, which always
+sit at the bottom, are the units it holds to begin with. Each vessel carries one
+coloured label disc underneath it, and the four label colours are all different,
+so a vessel is named by its colour.
+
+Below the vessels is a left-to-right row of cream cards. Each card carries two
+label-coloured discs and one black arrow between them: the card pours from the
+vessel at the arrow's tail into the vessel the arrowhead points at. A pour moves
+as many units as it can, which is the smaller of what the source still holds and
+of the free space still left in the target, so a pour is clamped by two different
+parts of the state at once and is neither a whole-object move nor a fixed step.
+
+A red ring marks one label disc. The levels after the cards have acted are never
+drawn: only the starting stacks are. Gold replays the cards onto the drawn
+starting levels and reports the marked vessel's final level together with the
+number of cards that changed it.
+
+Vessels and cards are stored as unordered bags. A vessel's drawn abscissa comes
+from its own ``slot`` field, a card's moment from its own ``step`` field, and the
+marked vessel is recovered from the drawn ring geometry, so gold depends on what
+the image shows and never on Python list position; ``latent_symmetries``
+exercises that directly.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "pour_transfer_replay-renderer-0.1.0"
+
+WHITE = (255, 255, 255)
+BLACK = (15, 15, 15)
+EMPTY_CELL = (226, 226, 226)
+FILLED_CELL = (40, 72, 152)
+CELL_EDGE = (110, 110, 110)
+CREAM = (250, 242, 215)
+CARD_EDGE = (170, 160, 130)
+RED = (214, 38, 38)
+GUIDE = (120, 120, 120)
+
+# The four vessel names. Every scene draws each label disc exactly once, so
+# colour presence, colour count and label ink are constant across the dataset.
+COLOURS: dict[str, tuple[int, int, int]] = {
+    "green": (26, 150, 72),
+    "orange": (232, 124, 20),
+    "purple": (128, 54, 168),
+    "yellow": (232, 200, 24),
+}
+COLOUR_NAMES = tuple(sorted(COLOURS))
+
+N_VESSELS = 4
+N_CARDS = 5
+MAX_CAP = 6
+MIN_CAP = 3
+
+CANVAS = (900, 560)
+VES_X0 = 150
+VES_PITCH = 180
+CELL_W = 96
+CELL_H = 30
+CELL_GAP = 14
+CELL_EDGE_W = 2
+BASE_Y = 330
+LABEL_Y = 384
+LABEL_R = 22
+RING_R = 32
+RING_W = 5
+
+CARD_X0 = 118
+CARD_PITCH = 166
+CARD_W = 150
+CARD_H = 96
+CARD_Y = 476
+CARD_DISC_DX = 44
+CARD_DISC_R = 14
+
+STROKE = 5
+HEAD_L = 18  # arrowhead length along the shaft
+HEAD_H = 28  # arrowhead base height (the head is the thick end)
+TAIL_H = 10  # tail nub height (the tail is the thin end)
+TAIL_W = 12
+SHAFT_HALF = 26
+
+QUARANTINE_MARGIN = 6.0
+
+# Sampling shape: how many cards actually move units in or out of the marked
+# vessel, i.e. how deep the replay that fixes the answer has to run.
+_TOUCH = (1, 2, 3)
+_TOUCH_W = (0.28, 0.42, 0.30)
+
+
+# --------------------------------------------------------------------------- geometry
+
+
+def _vessel_x(i: int) -> float:
+    return float(VES_X0 + i * VES_PITCH)
+
+
+def _label_center(i: int) -> tuple[float, float]:
+    return (_vessel_x(i), float(LABEL_Y))
+
+
+def _cell_box(i: int, k: int) -> tuple[float, float, float, float]:
+    cx = _vessel_x(i)
+    bottom = BASE_Y - k * (CELL_H + CELL_GAP)
+    return (cx - CELL_W / 2.0, bottom - CELL_H, cx + CELL_W / 2.0, bottom)
+
+
+def _card_x(k: int) -> float:
+    return float(CARD_X0 + k * CARD_PITCH)
+
+
+def _ring_center(scene: dict) -> tuple[float, float]:
+    ring = scene["ring"]
+    cx, cy = _label_center(int(ring["slot"]))
+    return cx + float(ring["dx"]), cy + float(ring["dy"])
+
+
+def _marked_vessel(scene: dict) -> int:
+    """The marked vessel is the one whose label disc is nearest the ring centre."""
+    rx, ry = _ring_center(scene)
+    best = None
+    for i in range(N_VESSELS):
+        lx, ly = _label_center(i)
+        d = math.hypot(rx - lx, ry - ly)
+        if best is None or d < best[0]:
+            best = (d, i)
+    return best[1]
+
+
+def _cards_in_drawn_order(scene: dict) -> list[dict]:
+    return sorted(scene["cards"], key=lambda c: int(c["step"]))
+
+
+def _vessels_by_slot(scene: dict) -> list[dict]:
+    out: list[dict | None] = [None] * N_VESSELS
+    for rec in scene["vessels"]:
+        out[int(rec["slot"])] = rec
+    if any(rec is None for rec in out):
+        raise ValueError("scene does not fill every vessel slot")
+    return out  # type: ignore[return-value]
+
+
+def _caps_and_levels(scene: dict) -> tuple[list[int], list[int]]:
+    recs = _vessels_by_slot(scene)
+    caps = [int(r["cap"]) for r in recs]
+    levels = [int(r["level"]) for r in recs]
+    for cap, lev in zip(caps, levels):
+        if not (MIN_CAP <= cap <= MAX_CAP) or not (0 <= lev <= cap):
+            raise ValueError("vessel capacity or level is out of range")
+    return caps, levels
+
+
+def _replay(caps: list[int], levels: list[int], cards: list[dict], marked: int) -> tuple[int, int]:
+    """Pour the cards in drawn order; return the marked vessel's final level and
+    how many cards changed it."""
+    state = list(levels)
+    changes = 0
+    for card in cards:
+        src, tgt = int(card["src"]), int(card["tgt"])
+        amount = min(state[src], caps[tgt] - state[tgt])
+        if amount > 0:
+            state[src] -= amount
+            state[tgt] += amount
+            if src == marked or tgt == marked:
+                changes += 1
+    return state[marked], changes
+
+
+def _touch_count(caps: list[int], levels: list[int], cards: list[dict], marked: int) -> int:
+    return _replay(caps, levels, cards, marked)[1]
+
+
+def _has_capacity_clamped_pour(caps: list[int], levels: list[int], cards: list[dict]) -> bool:
+    """True when some pour moves less than the source holds because the target
+    filled up: the property that makes the step a two-sided minimum."""
+    state = list(levels)
+    seen = False
+    for card in cards:
+        src, tgt = int(card["src"]), int(card["tgt"])
+        free = caps[tgt] - state[tgt]
+        amount = min(state[src], free)
+        if amount > 0 and free < state[src]:
+            seen = True
+        state[src] -= amount
+        state[tgt] += amount
+    return seen
+
+
+# --------------------------------------------------------------------------- sampling
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    # marker band: an explicit tight mode that pushes the ring far enough toward a
+    # neighbouring label to be uncertifiable, an explicit near-boundary mode just
+    # above the quarantine threshold, and the ordinary well-clear mode.
+    roll = rng.random()
+    band = "tight" if roll < 0.12 else ("near" if roll < 0.26 else "clear")
+    want_level = rng.randrange(0, MAX_CAP + 1)
+    want_touch = rng.choices(_TOUCH, weights=_TOUCH_W, k=1)[0]
+    # counterbalance the cheapest local reading of the marked vessel: how often
+    # the answer happens to be that vessel's own drawn capacity
+    want_saturated = rng.random() < 0.34
+
+    accepted = None
+    for _ in range(40_000):
+        caps = [rng.randrange(MIN_CAP, MAX_CAP + 1) for _ in range(N_VESSELS)]
+        levels = [rng.randrange(0, caps[i] + 1) for i in range(N_VESSELS)]
+        marked = rng.randrange(N_VESSELS)
+        if want_level > caps[marked]:
+            continue
+        cards = []
+        for k in range(N_CARDS):
+            src = rng.randrange(N_VESSELS)
+            tgt = rng.choice([v for v in range(N_VESSELS) if v != src])
+            # which drawn side of the card the source disc sits on, so the
+            # source is not readable from position alone
+            cards.append(
+                {"step": k, "src": src, "tgt": tgt, "head_right": bool(rng.getrandbits(1))}
+            )
+
+        final, touches = _replay(caps, levels, cards, marked)
+        if final != want_level or touches != want_touch:
+            continue
+        # the drawn starting level of the marked vessel is never the answer
+        if final == levels[marked]:
+            continue
+        if (final == caps[marked]) != want_saturated:
+            continue
+        # the two-sided minimum must actually bind somewhere in the picture
+        if not _has_capacity_clamped_pour(caps, levels, cards):
+            continue
+        # evidence erasure: dropping the last card that moved units in or out of
+        # the marked vessel must move the answer
+        state = list(levels)
+        last = None
+        for card in cards:
+            src, tgt = int(card["src"]), int(card["tgt"])
+            amount = min(state[src], caps[tgt] - state[tgt])
+            if amount > 0 and (src == marked or tgt == marked):
+                last = int(card["step"])
+            state[src] -= amount
+            state[tgt] += amount
+        if last is None:
+            continue
+        erased = [c for c in cards if int(c["step"]) != last]
+        if _replay(caps, levels, erased, marked)[0] == final:
+            continue
+        accepted = (caps, levels, marked, cards)
+        break
+
+    if accepted is None:
+        return sample_scene(seed * 7 + 1)
+    caps, levels, marked, cards = accepted
+
+    if band == "clear":
+        off = rng.randrange(0, 7)
+        dirs = [(off, 0), (-off, 0), (0, off), (0, -off)]
+    else:
+        # the ring stops short of the bisector, so the marked vessel is unchanged
+        # while the drawn separation from that bisector is sep pixels
+        sep = rng.randrange(1, 6) if band == "tight" else rng.randrange(6, 9)
+        off = VES_PITCH // 2 - sep
+        dirs = []
+        if marked > 0:
+            dirs.append((-off, 0))
+        if marked < N_VESSELS - 1:
+            dirs.append((off, 0))
+    dx, dy = dirs[rng.randrange(len(dirs))]
+
+    palette = list(COLOUR_NAMES)
+    rng.shuffle(palette)
+    vessels = [
+        {"slot": i, "colour": palette[i], "cap": caps[i], "level": levels[i]}
+        for i in range(N_VESSELS)
+    ]
+    rng.shuffle(vessels)
+    bag = list(cards)
+    rng.shuffle(bag)
+
+    return {
+        "canvas": list(CANVAS),
+        "vessel_x0": VES_X0,
+        "vessel_pitch": VES_PITCH,
+        "n_vessels": N_VESSELS,
+        "n_cards": N_CARDS,
+        "vessels": vessels,
+        "cards": bag,
+        "ring": {"slot": marked, "dx": dx, "dy": dy},
+    }
+
+
+# --------------------------------------------------------------------------- gold
+
+
+def analytic_gold(scene: dict) -> str:
+    caps, levels = _caps_and_levels(scene)
+    marked = _marked_vessel(scene)
+    final, changes = _replay(caps, levels, _cards_in_drawn_order(scene), marked)
+    return f"{final}|{changes}"
+
+
+def margin(scene: dict) -> float:
+    """Smallest drawn clearance that any reading the answer depends on has to the
+    discrete boundary at which that reading flips."""
+    rx, ry = _ring_center(scene)
+    dists = sorted(
+        math.hypot(rx - _label_center(i)[0], ry - _label_center(i)[1]) for i in range(N_VESSELS)
+    )
+    # how far the ring centre is from the bisector between the two nearest labels
+    ring_sep = (dists[1] - dists[0]) / 2.0
+    # white clearance between neighbouring unit cells: below zero a stack's cells
+    # would merge and its capacity and level would stop being countable
+    cell_clear = CELL_GAP / 2.0
+    # horizontal clearance between neighbouring cards, which fixes their order
+    card_clear = (CARD_PITCH - CARD_W) / 2.0
+    # thickness evidence separating a card arrow's head end from its tail end,
+    # which is what fixes the direction of every pour
+    head_evidence = (HEAD_H - TAIL_H) / 2.0
+    # clearance between the drawn ring stroke and the nearest label centre, so a
+    # label is never identified on top of the marker stroke
+    ring_clear = min(abs(d - RING_R) for d in dists)
+    return round(min(ring_sep, cell_clear, card_clear, head_evidence, ring_clear), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Bag re-orderings that must redraw the identical raster and keep gold fixed."""
+    vessels = list(scene["vessels"])
+    cards = list(scene["cards"])
+    return [
+        ("vessels_reversed", dict(scene, vessels=list(reversed(vessels)))),
+        ("vessels_rotated", dict(scene, vessels=vessels[2:] + vessels[:2])),
+        ("cards_reversed", dict(scene, cards=list(reversed(cards)))),
+        ("cards_rotated", dict(scene, cards=cards[3:] + cards[:3])),
+    ]
+
+
+# --------------------------------------------------------------------------- render
+
+
+def _pour_arrow(d: ImageDraw.ImageDraw, xc: float, y: float, to_right: bool) -> None:
+    sign = 1.0 if to_right else -1.0
+    tip = xc + sign * SHAFT_HALF
+    tail = xc - sign * SHAFT_HALF
+    base = tip - sign * HEAD_L
+    d.line([tail, y, base, y], fill=BLACK, width=STROKE)
+    d.polygon([(tip, y), (base, y - HEAD_H / 2.0), (base, y + HEAD_H / 2.0)], fill=BLACK)
+    d.rectangle(
+        [tail - TAIL_W / 2.0, y - TAIL_H / 2.0, tail + TAIL_W / 2.0, y + TAIL_H / 2.0],
+        fill=BLACK,
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    w, h = int(scene["canvas"][0]), int(scene["canvas"][1])
+    img = Image.new("RGB", (w, h), WHITE)
+    d = ImageDraw.Draw(img)
+    recs = _vessels_by_slot(scene)
+
+    # vessels: a stack of unit cells, filled from the bottom
+    for i, rec in enumerate(recs):
+        cap, level = int(rec["cap"]), int(rec["level"])
+        for k in range(cap):
+            d.rectangle(
+                _cell_box(i, k),
+                fill=FILLED_CELL if k < level else EMPTY_CELL,
+                outline=CELL_EDGE,
+                width=CELL_EDGE_W,
+            )
+
+    # label discs
+    for i, rec in enumerate(recs):
+        lx, ly = _label_center(i)
+        d.ellipse(
+            [lx - LABEL_R, ly - LABEL_R, lx + LABEL_R, ly + LABEL_R],
+            fill=COLOURS[str(rec["colour"])],
+        )
+
+    # pour cards, in drawn order from left to right
+    for k, card in enumerate(_cards_in_drawn_order(scene)):
+        xc = _card_x(k)
+        d.rectangle(
+            [xc - CARD_W / 2.0, CARD_Y - CARD_H / 2.0, xc + CARD_W / 2.0, CARD_Y + CARD_H / 2.0],
+            fill=CREAM,
+            outline=CARD_EDGE,
+            width=3,
+        )
+        # each card's own field decides which drawn side its source disc sits on
+        to_right = bool(card["head_right"])
+        src_colour = COLOURS[str(recs[int(card["src"])]["colour"])]
+        tgt_colour = COLOURS[str(recs[int(card["tgt"])]["colour"])]
+        left_colour = src_colour if to_right else tgt_colour
+        right_colour = tgt_colour if to_right else src_colour
+        for dx, colour in ((-CARD_DISC_DX, left_colour), (CARD_DISC_DX, right_colour)):
+            d.ellipse(
+                [
+                    xc + dx - CARD_DISC_R,
+                    CARD_Y - CARD_DISC_R,
+                    xc + dx + CARD_DISC_R,
+                    CARD_Y + CARD_DISC_R,
+                ],
+                fill=colour,
+            )
+        _pour_arrow(d, xc, float(CARD_Y), to_right)
+
+    # order indicator under the card row: the cards act from left to right
+    ay = 545
+    x0, x1 = _card_x(0) - 20, _card_x(N_CARDS - 1) + 20
+    d.line([x0, ay, x1 - 22, ay], fill=GUIDE, width=5)
+    d.polygon([(x1, ay), (x1 - 24, ay - 11), (x1 - 24, ay + 11)], fill=GUIDE)
+
+    # marker ring
+    rx, ry = _ring_center(scene)
+    d.ellipse([rx - RING_R, ry - RING_R, rx + RING_R, ry + RING_R], outline=RED, width=RING_W)
+    return img

@@ -1,0 +1,479 @@
+"""Fold-cord span partner world.
+
+One thin cord is laid out as a single self-avoiding rectilinear route that
+crosses the whole board.  A black CLAMP sits on the route and splits it into a
+teal near arm and a tan far arm.  Beads sit on both arms.  Folding the cord at
+the clamp pairs the two arms by TRAVEL DISTANCE along the cord, so the partner
+of the haloed bead on the teal arm is the bead on the tan arm that lies the same
+cord distance from the clamp.  The route doubles back and carries detours, so
+cord distance is not bead order, not straight-line distance and not height.
+
+The renderer draws on a fixed lattice, so every cord distance is an exact
+integer number of lattice steps and the analytic gold is exact.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "foldcord_span_partner_bind-0.1.0"
+
+CANVAS_W, CANVAS_H = 656, 472
+CELL = 30
+OX, OY = 25, 25
+ROWS = (2, 5, 8, 11, 14)
+I_LO, I_HI = 1, 20
+
+BACKGROUND = (240, 234, 218)
+CORD_NEAR = (74, 160, 170)     # teal arm band, before the clamp
+CORE_NEAR = (16, 70, 80)       # exact one-pixel core of the teal arm
+CORD_FAR = (206, 142, 74)      # tan arm band, after the clamp
+CORE_FAR = (110, 58, 18)       # exact one-pixel core of the tan arm
+CLAMP_INK = (18, 18, 18)
+HALO_INK = (104, 104, 110)     # grey collar around the query bead
+
+BEAD_R = 9
+HALO_R = 13
+CLAMP_HALF = 5
+DECOR_SIZE = 7
+DECOR_CLEAR = 12
+DECOR_COUNT = 26
+
+COLOR_NAMES = ("red", "orange", "yellow", "green", "blue", "purple")
+PALETTE = {
+    "red": (198, 48, 44),
+    "orange": (226, 132, 32),
+    "yellow": (218, 190, 40),
+    "green": (52, 146, 72),
+    "blue": (46, 94, 200),
+    "purple": (134, 60, 178),
+}
+
+QUARANTINE_MARGIN = 45.0       # one lattice step (30 px) is a near-boundary gap
+NEAR_BOUNDARY_EVERY = 5        # every fifth scene is built near the boundary
+MAX_ATTEMPTS = 400
+
+
+# --------------------------------------------------------------------------
+# route construction
+# --------------------------------------------------------------------------
+def _build_path(rng: random.Random) -> list[tuple[int, int]]:
+    """A single self-avoiding rectilinear route: five serpentine rows with
+    upward detour humps, joined at alternating ends."""
+    path: list[tuple[int, int]] = []
+    for r, j in enumerate(ROWS):
+        ltr = r % 2 == 0
+        step = 1 if ltr else -1
+        cols = list(range(I_LO, I_HI + 1)) if ltr else list(range(I_HI, I_LO - 1, -1))
+        if not path:
+            path.append((cols[0], j))
+        else:
+            pi, pj = path[-1]
+            for jj in range(pj + 1, j + 1):
+                path.append((pi, jj))
+        # two upward humps per row; every hump band [j-2, j-1] is private to
+        # this row because rows are three cells apart, so the route stays simple
+        first = rng.randint(3, 5)
+        second = rng.randint(first + 6, len(cols) - 7)
+        humps = {}
+        for start in (first, second):
+            humps[start] = (rng.randint(1, 2), rng.randint(1, 3))
+        k = 0
+        while k < len(cols) - 1:
+            if k in humps and k + humps[k][1] <= len(cols) - 1:
+                height, width = humps[k]
+                ci = cols[k]
+                for t in range(1, height + 1):
+                    path.append((ci, j - t))
+                top = j - height
+                for t in range(1, width + 1):
+                    path.append((ci + step * t, top))
+                for t in range(1, height + 1):
+                    path.append((ci + step * width, top + t))
+                k += width
+            else:
+                path.append((cols[k + 1], j))
+                k += 1
+    return path
+
+
+def _node_px(node: tuple[int, int]) -> tuple[int, int]:
+    return OX + CELL * node[0], OY + CELL * node[1]
+
+
+def _straight(path: list[tuple[int, int]], k: int) -> bool:
+    if k <= 0 or k >= len(path) - 1:
+        return False
+    (ax, ay), (bx, by) = path[k - 1], path[k + 1]
+    return ax == bx or ay == by
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _forbidden_mask(path, clamp_index, bead_indices) -> np.ndarray:
+    """Pixels that decoration must avoid: the route, the beads, the clamp,
+    each grown by DECOR_CLEAR."""
+    mask = np.zeros((CANVAS_H, CANVAS_W), dtype=bool)
+    pad = DECOR_CLEAR + DECOR_SIZE
+    for a, b in zip(path, path[1:]):
+        x0, y0 = _node_px(a)
+        x1, y1 = _node_px(b)
+        lo_x, hi_x = min(x0, x1) - pad, max(x0, x1) + pad
+        lo_y, hi_y = min(y0, y1) - pad, max(y0, y1) + pad
+        mask[max(0, lo_y):hi_y + 1, max(0, lo_x):hi_x + 1] = True
+    for k in list(bead_indices) + [clamp_index]:
+        x, y = _node_px(path[k])
+        rad = HALO_R + pad
+        mask[max(0, y - rad):y + rad + 1, max(0, x - rad):x + rad + 1] = True
+    return mask
+
+
+def _sample_decor(rng: random.Random, forbidden: np.ndarray) -> list[list]:
+    decor: list[list] = []
+    taken: list[tuple[int, int]] = []
+    names = list(COLOR_NAMES) + ["slate", "tan", "ink", "core", "rust"]
+    tries = 0
+    while len(decor) < DECOR_COUNT and tries < 4000:
+        tries += 1
+        x = rng.randint(6, CANVAS_W - DECOR_SIZE - 6)
+        y = rng.randint(6, CANVAS_H - DECOR_SIZE - 6)
+        if forbidden[y, x] or forbidden[y + DECOR_SIZE - 1, x + DECOR_SIZE - 1]:
+            continue
+        if forbidden[y, x + DECOR_SIZE - 1] or forbidden[y + DECOR_SIZE - 1, x]:
+            continue
+        if any(abs(x - px) < DECOR_SIZE + 5 and abs(y - py) < DECOR_SIZE + 5 for px, py in taken):
+            continue
+        taken.append((x, y))
+        decor.append([x, y, names[rng.randrange(len(names))]])
+    return decor
+
+
+def _positions(path, indices):
+    return [_node_px(path[k]) for k in indices]
+
+
+def _try_scene(seed: int, attempt: int, near_boundary: bool):
+    rng = random.Random(seed * 7919 + attempt * 104729 + 17)
+    path = _build_path(rng)
+    n = len(path)
+    if len({node for node in path}) != n:
+        return None
+
+    mid_lo, mid_hi = int(0.42 * n), int(0.58 * n)
+    clamp_choices = [k for k in range(mid_lo, mid_hi) if _straight(path, k)]
+    if not clamp_choices:
+        return None
+    m = clamp_choices[rng.randrange(len(clamp_choices))]
+
+    near_span = [d for d in range(4, min(m - 1, 64)) if _straight(path, m - d)]
+    far_span = [d for d in range(4, min(n - m - 2, 64)) if _straight(path, m + d)]
+    if len(near_span) < 20 or len(far_span) < 20:
+        return None
+
+    gap = 1 if near_boundary else rng.choice([2, 3])
+    shared = [d for d in near_span if d in far_span]
+    if not shared:
+        return None
+    d_answer = shared[rng.randrange(len(shared))]
+    runner_options = [d_answer - gap, d_answer + gap]
+    rng.shuffle(runner_options)
+    d_runner = next((d for d in runner_options if d in far_span), None)
+    if d_runner is None:
+        return None
+
+    # three further far-arm beads, all clearly farther from d_answer than the runner-up
+    pool = [d for d in far_span
+            if abs(d - d_answer) > gap + 1 and abs(d - d_runner) >= 2]
+    if len(pool) < 3:
+        return None
+    rng.shuffle(pool)
+    far_extra = sorted(pool[:3])
+    far_ds = sorted([d_answer, d_runner] + far_extra)
+    if d_answer in (far_ds[0], far_ds[-1]):
+        return None            # never the nearest or farthest bead from the clamp
+
+    near_pool = [d for d in near_span if abs(d - d_answer) >= 3]
+    if len(near_pool) < 3:
+        return None
+    rng.shuffle(near_pool)
+    near_ds = sorted([d_answer] + sorted(near_pool[:3]))
+    if d_answer in (near_ds[0], near_ds[-1]):
+        return None            # the query bead is never an end bead of its arm
+
+    near_idx = [m - d for d in near_ds]
+    far_idx = [m + d for d in far_ds]
+    q_index = m - d_answer
+    a_index = m + d_answer
+
+    # ---- anti-shortcut geometry checks -------------------------------------
+    near_rank = near_ds.index(d_answer)
+    far_rank = far_ds.index(d_answer)
+    if near_rank == far_rank:
+        return None            # bead order along the arms must not give the answer
+    qx, qy = _node_px(path[q_index])
+    far_pos = _positions(path, far_idx)
+    def _argmin(key):
+        vals = [key(p) for p in far_pos]
+        return vals.index(min(vals))
+    if _argmin(lambda p: (p[0] - qx) ** 2 + (p[1] - qy) ** 2) == far_rank:
+        return None            # not the spatially nearest far bead
+    if _argmin(lambda p: abs(p[1] - qy)) == far_rank:
+        return None            # not the far bead at the most similar height
+    if _argmin(lambda p: abs(p[0] - qx)) == far_rank:
+        return None            # not the far bead in the most similar column
+    # the decisive support must span widely separated parts of the board
+    ax, ay = far_pos[far_rank]
+    cx, cy = _node_px(path[m])
+    if abs(ax - qx) < 0.30 * CANVAS_W and abs(ay - qy) < 0.30 * CANVAS_H:
+        return None
+    span_x = max(qx, ax, cx) - min(qx, ax, cx)
+    span_y = max(qy, ay, cy) - min(qy, ay, cy)
+    if span_x < 0.55 * CANVAS_W or span_y < 0.40 * CANVAS_H:
+        return None
+
+    # ---- colours -----------------------------------------------------------
+    answer_colour = COLOR_NAMES[seed % len(COLOR_NAMES)]
+    banned_ranks = {
+        far_rank_other
+        for far_rank_other in (
+            near_rank if near_rank < len(far_ds) else far_rank,
+            _argmin(lambda p: (p[0] - qx) ** 2 + (p[1] - qy) ** 2),
+            _argmin(lambda p: abs(p[1] - qy)),
+            _argmin(lambda p: abs(p[0] - qx)),
+            0,
+            len(far_ds) - 1,
+            far_ds.index(d_runner),
+        )
+    } - {far_rank}
+    colours = None
+    for _ in range(600):
+        near_c = [COLOR_NAMES[rng.randrange(6)] for _ in near_ds]
+        far_c = [COLOR_NAMES[rng.randrange(6)] for _ in far_ds]
+        far_c[far_rank] = answer_colour
+        if any(far_c[r] == answer_colour for r in banned_ranks):
+            continue
+        near_c[near_rank] = answer_colour if False else near_c[near_rank]
+        allc = near_c + far_c
+        if allc.count(answer_colour) < 2:
+            continue
+        best_other = max(allc.count(c) for c in COLOR_NAMES if c != answer_colour)
+        if best_other < allc.count(answer_colour):
+            continue           # the answer colour is never the strict plurality
+        if near_c[near_rank] == answer_colour:
+            continue           # the query bead never wears the answer colour
+        colours = (near_c, far_c)
+        break
+    if colours is None:
+        return None
+    near_c, far_c = colours
+
+    beads = []
+    for k, d, c in zip(near_idx, near_ds, near_c):
+        beads.append({"index": k, "color": c, "query": k == q_index})
+    for k, d, c in zip(far_idx, far_ds, far_c):
+        beads.append({"index": k, "color": c, "query": False})
+    beads.sort(key=lambda b: b["index"])
+
+    forbidden = _forbidden_mask(path, m, [b["index"] for b in beads])
+    decor = _sample_decor(rng, forbidden)
+    if len(decor) < DECOR_COUNT - 4:
+        return None
+
+    scene = {
+        "path": [[int(i), int(j)] for i, j in path],
+        "clamp_index": int(m),
+        "beads": beads,
+        "decor": decor,
+        "gap_cells": int(gap),
+        "answer_index": int(a_index),
+    }
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    near_boundary = (seed % NEAR_BOUNDARY_EVERY) == 3
+    for attempt in range(MAX_ATTEMPTS):
+        scene = _try_scene(seed, attempt, near_boundary)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"no valid scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# analytic gold
+# --------------------------------------------------------------------------
+def _arms(scene: dict):
+    m = int(scene["clamp_index"])
+    query = None
+    near, far = [], []
+    for bead in scene["beads"]:
+        k = int(bead["index"])
+        if k < m:
+            near.append((m - k, bead))
+            if bead.get("query"):
+                query = (m - k, bead)
+        elif k > m:
+            far.append((k - m, bead))
+    return query, sorted(near), sorted(far)
+
+
+def analytic_gold(scene: dict) -> str:
+    query, near, far = _arms(scene)
+    if query is None or not far:
+        raise ValueError("scene has no query bead or no far-arm beads")
+    dq = query[0]
+    errs = sorted((abs(d - dq), bead["color"]) for d, bead in far)
+    if len(errs) > 1 and errs[0][0] == errs[1][0]:
+        raise ValueError("the fold partner is not unique")
+    return errs[0][1]
+
+
+def margin(scene: dict) -> float:
+    """Pixels of cord length by which the runner-up misses the fold pairing."""
+    query, _near, far = _arms(scene)
+    dq = query[0]
+    errs = sorted(abs(d - dq) for d, _bead in far)
+    return float(CELL * (errs[1] - errs[0]))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical re-indexings of the stored lists.
+
+    Beads are drawn in ascending route order and decoration squares never
+    overlap, so rotating or reversing either list re-draws the identical raster
+    and leaves the analytic answer alone.
+    """
+    out: list[tuple[str, dict]] = []
+    beads = scene["beads"]
+    if len(beads) > 1:
+        rotated = dict(scene)
+        rotated["beads"] = beads[1:] + beads[:1]
+        out.append(("bead_list_rotation", rotated))
+        reversed_beads = dict(scene)
+        reversed_beads["beads"] = list(reversed(beads))
+        out.append(("bead_list_reversal", reversed_beads))
+    if len(scene["decor"]) > 1:
+        decor_rev = dict(scene)
+        decor_rev["decor"] = list(reversed(scene["decor"]))
+        out.append(("decor_list_reversal", decor_rev))
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _disk(arr: np.ndarray, cx: int, cy: int, radius: int, rgb) -> None:
+    y0, y1 = max(0, cy - radius), min(CANVAS_H - 1, cy + radius)
+    x0, x1 = max(0, cx - radius), min(CANVAS_W - 1, cx + radius)
+    ys = np.arange(y0, y1 + 1)[:, None]
+    xs = np.arange(x0, x1 + 1)[None, :]
+    hit = (ys - cy) ** 2 + (xs - cx) ** 2 <= radius * radius
+    arr[y0:y1 + 1, x0:x1 + 1][hit] = np.asarray(rgb, dtype=np.uint8)
+
+
+def render(scene: dict) -> Image.Image:
+    arr = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
+    arr[:, :] = np.asarray(BACKGROUND, dtype=np.uint8)
+    decor_ink = dict(PALETTE)
+    decor_ink["slate"] = CORD_NEAR
+    decor_ink["tan"] = CORD_FAR
+    decor_ink["core"] = CORE_NEAR
+    decor_ink["rust"] = CORE_FAR
+    decor_ink["ink"] = CLAMP_INK
+    for x, y, name in scene["decor"]:
+        arr[y:y + DECOR_SIZE, x:x + DECOR_SIZE] = np.asarray(decor_ink[name], dtype=np.uint8)
+
+    path = [tuple(node) for node in scene["path"]]
+    m = int(scene["clamp_index"])
+    beads = sorted(scene["beads"], key=lambda b: int(b["index"]))
+    for bead in beads:
+        x, y = _node_px(path[int(bead["index"])])
+        if bead.get("query"):
+            _disk(arr, x, y, HALO_R, HALO_INK)
+    for bead in beads:
+        x, y = _node_px(path[int(bead["index"])])
+        _disk(arr, x, y, BEAD_R, PALETTE[bead["color"]])
+
+    for k, (a, b) in enumerate(zip(path, path[1:])):
+        band = CORD_NEAR if k + 1 <= m else CORD_FAR
+        x0, y0 = _node_px(a)
+        x1, y1 = _node_px(b)
+        lo_x, hi_x = min(x0, x1), max(x0, x1)
+        lo_y, hi_y = min(y0, y1), max(y0, y1)
+        arr[lo_y - 1:hi_y + 2, lo_x - 1:hi_x + 2] = np.asarray(band, dtype=np.uint8)
+    for k, (a, b) in enumerate(zip(path, path[1:])):
+        core = CORE_NEAR if k + 1 <= m else CORE_FAR
+        x0, y0 = _node_px(a)
+        x1, y1 = _node_px(b)
+        rgb = np.asarray(core, dtype=np.uint8)
+        if y0 == y1:
+            arr[y0, min(x0, x1):max(x0, x1) + 1] = rgb
+        else:
+            arr[min(y0, y1):max(y0, y1) + 1, x0] = rgb
+
+    cx, cy = _node_px(path[m])
+    arr[cy - CLAMP_HALF:cy + CLAMP_HALF + 1,
+        cx - CLAMP_HALF:cx + CLAMP_HALF + 1] = np.asarray(CLAMP_INK, dtype=np.uint8)
+    return Image.fromarray(arr, mode="RGB")
+
+
+# --------------------------------------------------------------------------
+# helpers used by the candidate tests
+# --------------------------------------------------------------------------
+def query_bead(scene: dict) -> dict:
+    return next(b for b in scene["beads"] if b.get("query"))
+
+
+def far_beads(scene: dict) -> list[dict]:
+    m = int(scene["clamp_index"])
+    return [b for b in scene["beads"] if int(b["index"]) > m]
+
+
+def near_beads(scene: dict) -> list[dict]:
+    m = int(scene["clamp_index"])
+    return [b for b in scene["beads"] if int(b["index"]) < m]
+
+
+def bead_px(scene: dict, bead: dict) -> tuple[int, int]:
+    return _node_px(tuple(scene["path"][int(bead["index"])]))
+
+
+def route_distance_cells(scene: dict, bead: dict) -> int:
+    return abs(int(bead["index"]) - int(scene["clamp_index"]))
+
+
+def answer_by_order(scene: dict) -> str:
+    """The answer a bead-order (rank) reader would give."""
+    q, near, far = _arms(scene)
+    rank = [d for d, _b in near].index(q[0])
+    return far[min(rank, len(far) - 1)][1]["color"]
+
+
+def answer_by_proximity(scene: dict) -> str:
+    q = query_bead(scene)
+    qx, qy = bead_px(scene, q)
+    far = far_beads(scene)
+    return min(far, key=lambda b: (bead_px(scene, b)[0] - qx) ** 2
+               + (bead_px(scene, b)[1] - qy) ** 2)["color"]
+
+
+def answer_by_height(scene: dict) -> str:
+    q = query_bead(scene)
+    _qx, qy = bead_px(scene, q)
+    far = far_beads(scene)
+    return min(far, key=lambda b: abs(bead_px(scene, b)[1] - qy))["color"]
+
+
+def answer_by_column(scene: dict) -> str:
+    q = query_bead(scene)
+    qx, _qy = bead_px(scene, q)
+    far = far_beads(scene)
+    return min(far, key=lambda b: abs(bead_px(scene, b)[0] - qx))["color"]

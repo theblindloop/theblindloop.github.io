@@ -1,0 +1,141 @@
+"""Independent pixel-only inverse arm for the loop-depth duel world.
+
+This module never receives the latent scene.  From one rasterised PNG it
+segments the public palette (white paper, near-black ink, one red dot, one blue
+dot), labels the connected components of the ink, and recovers each dot's
+nesting depth by a Jordan-curve parity vote: along many rays leaving the dot it
+counts how often each ink component is crossed, and a component that is crossed
+an odd number of times encloses the dot.  The depth of a dot is the number of
+such components; the answer compares the two depths.
+
+It shares no geometry code with the renderer: there is no Fourier curve model,
+no radius, no centre and no nesting bookkeeping here - only pixels, colour
+thresholds, a union-find over the ink mask, and crossing parity.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "loop_depth_duel-oracle-0.1.0"
+
+DARK = 110
+BRIGHT = 140
+MIN_MARKER_PX = 40
+MIN_COMPONENT_PX = 120
+RAY_COUNT = 61
+RAY_STEP = 0.5
+RAY_OFFSET = 0.0733
+VOTE_FRACTION = 0.6
+
+
+def _masks(image: Image.Image):
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = array[..., 0], array[..., 1], array[..., 2]
+    ink = (red < DARK) & (green < DARK) & (blue < DARK)
+    red_dot = (red > BRIGHT) & (green < DARK) & (blue < DARK)
+    blue_dot = (blue > BRIGHT) & (red < DARK) & (green < DARK)
+    return ink, red_dot, blue_dot
+
+
+def _centroid(mask: np.ndarray):
+    rows, columns = np.nonzero(mask)
+    if rows.size < MIN_MARKER_PX:
+        return None
+    return float(columns.mean()), float(rows.mean())
+
+
+def _components(mask: np.ndarray) -> np.ndarray:
+    """Two-pass 4-connected labelling with union-find (0 means background)."""
+    height, width = mask.shape
+    labels = np.zeros(height * width, dtype=np.int32)
+    parent = [0]
+
+    def find(node: int) -> int:
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left != right:
+            parent[max(left, right)] = min(left, right)
+
+    rows, columns = np.nonzero(mask)
+    for row, column in zip(rows.tolist(), columns.tolist()):
+        offset = row * width + column
+        up = int(labels[offset - width]) if row else 0
+        left = int(labels[offset - 1]) if column else 0
+        if up and left:
+            labels[offset] = min(up, left)
+            union(up, left)
+        elif up or left:
+            labels[offset] = up or left
+        else:
+            parent.append(len(parent))
+            labels[offset] = len(parent) - 1
+    resolved = np.array([find(node) for node in range(len(parent))], dtype=np.int32)
+    labels = resolved[labels].reshape(height, width)
+    counts = np.bincount(labels.reshape(-1))
+    small = np.nonzero(counts < MIN_COMPONENT_PX)[0]
+    if small.size:
+        drop = np.zeros(counts.size, dtype=bool)
+        drop[small] = True
+        labels[drop[labels]] = 0
+    return labels
+
+
+def _depth(labels: np.ndarray, point) -> int | None:
+    """Vote a nesting depth over many rays using per-component crossing parity."""
+    height, width = labels.shape
+    reach = float(math.hypot(height, width)) + 4.0
+    steps = np.arange(3.0, reach, RAY_STEP)
+    votes: dict[int, int] = {}
+    for index in range(RAY_COUNT):
+        angle = 2.0 * math.pi * index / RAY_COUNT + RAY_OFFSET
+        xs = np.rint(point[0] + math.cos(angle) * steps).astype(np.int64)
+        ys = np.rint(point[1] + math.sin(angle) * steps).astype(np.int64)
+        inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        if not inside.any():
+            continue
+        cut = int(np.argmin(inside)) if not inside.all() else inside.size
+        sample = labels[ys[:cut], xs[:cut]]
+        previous = np.concatenate(([0], sample[:-1]))
+        starts = (sample != previous) & (sample != 0)
+        if starts.any():
+            crossings = np.bincount(sample[starts])
+            depth = int(np.count_nonzero(crossings % 2 == 1))
+        else:
+            depth = 0
+        votes[depth] = votes.get(depth, 0) + 1
+    if not votes:
+        return None
+    best = max(votes, key=lambda key: votes[key])
+    if votes[best] < VOTE_FRACTION * RAY_COUNT:
+        return None
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    ink, red_dot, blue_dot = _masks(image)
+    red_center, blue_center = _centroid(red_dot), _centroid(blue_dot)
+    if red_center is None or blue_center is None:
+        return "abstain"
+    labels = _components(ink)
+    if int(labels.max()) == 0:
+        return "abstain"
+    red_depth = _depth(labels, red_center)
+    blue_depth = _depth(labels, blue_center)
+    if red_depth is None or blue_depth is None:
+        return "abstain"
+    if red_depth > blue_depth:
+        return "red"
+    if blue_depth > red_depth:
+        return "blue"
+    return "tie"

@@ -1,0 +1,376 @@
+"""Renderer for the ring-thickness / ring-shade order-binding world.
+
+One small "core button" is drawn somewhere on a large pale instrument sheet.
+The button is a single connected, area-like object: a black centre pip
+surrounded by exactly four concentric coloured rings of differing radial
+thickness.  Two independent measurements are taken on that one object:
+
+* which ring is radially the thickest, and
+* which ring is filled with the darkest colour.
+
+The decision is the radial order of those two rings: ``nearer`` when the
+thickest ring lies closer to the centre than the darkest ring, ``farther``
+otherwise.  The two rings are never the same ring.
+
+Everything else on the sheet - the pale rule marks, the coloured plates and the
+pip-less decoration buttons - is decoration.  Decoration never carries a black
+pip, so it can never be mistaken for the core button, and erasing any amount of
+it leaves the decision untouched.  The whole decisive object is one connected
+blob about a seventh of the sheet across, and its position is resampled for
+every scene.
+
+Every length is an exact integer in raster units and every fill is a flat,
+antialiasing-free colour, so the analytic decision and the pixel-only decision
+are the same function of the same visible integers.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "ring_thickness_shade_order-renderer-0.1.0"
+
+# --- fixed drawing constants (not latent fields: they never vary per scene) ---
+SHEET = 1024              # square sheet side in px
+PIP_R = 12                # black centre pip radius in px
+RING_TOTAL = 62           # total radial thickness of the four rings in px
+RINGS = 4                 # number of concentric coloured rings
+OUTER_R = PIP_R + RING_TOTAL       # 74 px: constant, so total ink is constant
+GRID = 8                  # support lattice used by the ablation probe
+CLEARANCE = 34            # keep every decorative mark this far from the button
+
+PAPER = (238, 236, 230)
+PIP = (16, 16, 16)
+RULE = (206, 204, 198)
+LABEL = (150, 148, 142)
+
+# Ring palette: every entry is far from black (min channel >= 60) so the pixel
+# arm can never confuse a ring with the pip, and the luminances are spread out.
+# Consecutive luminances are at least 20 units apart, so every four-ring subset
+# has a well separated darkest member.
+PALETTE = (
+    (72, 84, 150),
+    (158, 88, 92),
+    (150, 110, 180),
+    (180, 150, 90),
+    (160, 190, 200),
+    (210, 200, 210),
+)
+
+# Decoration buttons and plates only use light fills, so no decoration mark can
+# ever be darker than a ring or be mistaken for the black pip.
+DECOR_COLORS = (
+    (196, 176, 176),
+    (176, 196, 184),
+    (180, 184, 208),
+    (208, 200, 168),
+    (192, 192, 196),
+)
+
+QUARANTINE_MARGIN = 2.5   # px-equivalent composite margin
+LUM_PER_PX = 3.0          # luminance units treated as one px of thickness
+
+
+def luminance(color) -> float:
+    """Rec.601 luminance of a flat fill, in luminance units."""
+    r, g, b = (float(channel) for channel in color)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _widths_for(rng: random.Random, thick_index: int, gap: int) -> list[int]:
+    """Four ring widths summing to ``RING_TOTAL`` whose unique maximum is at
+    ``thick_index`` and whose top-two thickness gap is exactly ``gap`` px."""
+    for _ in range(4000):
+        top = rng.randint(20, 26)
+        second = top - gap
+        rest = RING_TOTAL - top - second
+        low = max(8, rest - second)
+        high = min(second, rest - 8)
+        if low > high:
+            continue
+        first = rng.randint(low, high)
+        others = [second, first, rest - first]
+        if min(others) < 8 or max(others) != second:
+            continue
+        rng.shuffle(others)
+        widths = list(others)
+        widths.insert(thick_index, top)
+        return widths
+    raise RuntimeError("could not sample ring widths")
+
+
+def _colors_for(rng: random.Random, dark_index: int, min_gap: float) -> list[list[int]]:
+    """Four palette fills with pairwise luminance gaps of at least ``min_gap``,
+    the darkest of them placed at ``dark_index``."""
+    order = sorted(range(len(PALETTE)), key=lambda i: luminance(PALETTE[i]))
+    for _ in range(4000):
+        picked = sorted(rng.sample(order, RINGS), key=lambda i: luminance(PALETTE[i]))
+        lums = [luminance(PALETTE[i]) for i in picked]
+        if min(b - a for a, b in zip(lums, lums[1:])) < min_gap:
+            continue
+        darkest = picked[0]
+        others = picked[1:]
+        rng.shuffle(others)
+        chosen = list(others)
+        chosen.insert(dark_index, darkest)
+        return [list(PALETTE[i]) for i in chosen]
+    raise RuntimeError("could not sample ring colours")
+
+
+def _decor(rng: random.Random, cx: int, cy: int) -> list[dict]:
+    """Decoration marks, all kept clear of the core button."""
+    marks: list[dict] = []
+    attempts = 0
+    wanted = rng.randint(7, 12)
+    while len(marks) < wanted and attempts < 400:
+        attempts += 1
+        kind = rng.choice(("button", "plate", "ticks", "label"))
+        size = rng.randint(26, 96)
+        x = rng.randint(24, SHEET - 24 - size)
+        y = rng.randint(24, SHEET - 24 - size)
+        # reject anything that comes near the decisive button
+        if (
+            x - CLEARANCE <= cx + OUTER_R
+            and cx - OUTER_R <= x + size + CLEARANCE
+            and y - CLEARANCE <= cy + OUTER_R
+            and cy - OUTER_R <= y + size + CLEARANCE
+        ):
+            continue
+        if any(
+            x - 12 <= m["x"] + m["size"] and m["x"] - 12 <= x + size
+            and y - 12 <= m["y"] + m["size"] and m["y"] - 12 <= y + size
+            for m in marks
+        ):
+            continue
+        marks.append(
+            {
+                "kind": kind,
+                "x": x,
+                "y": y,
+                "size": size,
+                "color": list(DECOR_COLORS[rng.randrange(len(DECOR_COLORS))]),
+                "step": rng.randint(9, 16),
+                "bands": rng.randint(2, 4),
+            }
+        )
+    return marks
+
+
+def _button_center(rng: random.Random) -> tuple[int, int]:
+    """Pick the button's absolute position on the sheet.
+
+    The position is resampled per scene over a lattice of interior anchors with
+    a few pixels of jitter, so no absolute location is diagnostic.  The anchors
+    are the interior corners of the ``GRID`` support lattice: a button centred
+    on a corner is substantially covered by each of the four widened cells that
+    meet there, so the decisive region of the sheet is a compact block of
+    neighbouring cells rather than a single cell whose exact tessellation phase
+    happens to swallow the whole object.
+    """
+    cell = SHEET // GRID
+    jitter = 5
+    cx = cell * rng.randint(1, GRID - 1) + rng.randint(-jitter, jitter)
+    cy = cell * rng.randint(1, GRID - 1) + rng.randint(-jitter, jitter)
+    limit = OUTER_R + 30
+    cx = min(max(cx, limit), SHEET - limit)
+    cy = min(max(cy, limit), SHEET - limit)
+    return cx, cy
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one answerable scene deterministically from ``seed``.
+
+    The thickest-ring index and the darkest-ring index are drawn independently
+    from all ordered pairs of distinct positions, so the answer, the radial
+    position of each decisive ring and the colour of each decisive ring are
+    counterbalanced by construction.  The button always carries the same total
+    ink because the four widths always sum to ``RING_TOTAL``.
+    """
+    rng = random.Random(seed * 7919 + 13)
+    thick_index = rng.randrange(RINGS)
+    dark_index = rng.randrange(RINGS - 1)
+    if dark_index >= thick_index:
+        dark_index += 1
+    near_boundary = rng.random() < 0.20
+    gap = 2 if near_boundary else rng.randint(3, 6)
+    lum_gap = 18.0
+    cx, cy = _button_center(rng)
+    widths = _widths_for(rng, thick_index, gap)
+    colors = _colors_for(rng, dark_index, lum_gap)
+    scene = {
+        "width": SHEET,
+        "height": SHEET,
+        "cx": cx,
+        "cy": cy,
+        "pip_r": PIP_R,
+        "widths": widths,
+        "colors": colors,
+        "rule_y": rng.randint(40, 70),
+        "rule_step": rng.randint(22, 34),
+        "decor": _decor(rng, cx, cy),
+    }
+    return scene
+
+
+def decisive_indices(scene: dict) -> tuple[int, int]:
+    """``(thickest ring index, darkest ring index)``, innermost ring is 0."""
+    widths = [int(w) for w in scene["widths"]]
+    lums = [luminance(c) for c in scene["colors"]]
+    thick = max(range(len(widths)), key=lambda i: (widths[i], -i))
+    dark = min(range(len(lums)), key=lambda i: (lums[i], i))
+    return thick, dark
+
+
+def analytic_gold(scene: dict) -> str:
+    """``nearer`` when the thickest ring is inside the darkest ring."""
+    thick, dark = decisive_indices(scene)
+    if thick == dark:
+        raise ValueError("thickest and darkest ring coincide; scene is unanswerable")
+    return "nearer" if thick < dark else "farther"
+
+
+def margin(scene: dict) -> float:
+    """Composite margin: the smaller of the two decisive gaps, in px-equivalent.
+
+    The thickness gap is the px difference between the thickest and the second
+    thickest ring; the shade gap is the luminance difference between the darkest
+    and the second darkest ring, converted at ``LUM_PER_PX`` luminance units per
+    px.  Either gap closing makes the binding flip, so the binding's margin is
+    their minimum.
+    """
+    widths = sorted((int(w) for w in scene["widths"]), reverse=True)
+    lums = sorted(luminance(c) for c in scene["colors"])
+    thickness_gap = float(widths[0] - widths[1])
+    shade_gap = float(lums[1] - lums[0]) / LUM_PER_PX
+    return float(min(thickness_gap, shade_gap))
+
+
+def thickness_gap(scene: dict) -> float:
+    widths = sorted((int(w) for w in scene["widths"]), reverse=True)
+    return float(widths[0] - widths[1])
+
+
+def shade_gap(scene: dict) -> float:
+    lums = sorted(luminance(c) for c in scene["colors"])
+    return float(lums[1] - lums[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Near-boundary scenes: a decisive gap too small for headline claims."""
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def button_box(scene: dict) -> tuple[int, int, int, int]:
+    """Inclusive bounding box of the one decisive object."""
+    cx, cy = int(scene["cx"]), int(scene["cy"])
+    return (cx - OUTER_R, cy - OUTER_R, cx + OUTER_R, cy + OUTER_R)
+
+
+def ring_radii(scene: dict) -> list[tuple[int, int]]:
+    """Inclusive ``(inner, outer)`` radius of each ring, innermost first."""
+    radius = int(scene["pip_r"])
+    out = []
+    for width in (int(w) for w in scene["widths"]):
+        out.append((radius, radius + width))
+        radius += width
+    return out
+
+
+def _draw_decor(draw: ImageDraw.ImageDraw, scene: dict) -> None:
+    for x in range(30, int(scene["width"]) - 30, int(scene["rule_step"])):
+        draw.rectangle([x, int(scene["rule_y"]), x + 2, int(scene["rule_y"]) + 11], fill=RULE)
+    for mark in scene["decor"]:
+        x, y, size = int(mark["x"]), int(mark["y"]), int(mark["size"])
+        color = tuple(int(c) for c in mark["color"])
+        kind = mark["kind"]
+        if kind == "plate":
+            draw.rectangle([x, y, x + size, y + size // 2], fill=color)
+        elif kind == "button":
+            bands = int(mark["bands"])
+            step = max(5, size // (2 * bands + 2))
+            for band in range(bands):
+                inset = band * step
+                if size - 2 * inset < 8:
+                    break
+                shade = tuple(min(255, c + 10 * band) for c in color)
+                draw.ellipse([x + inset, y + inset, x + size - inset, y + size - inset], fill=shade)
+        elif kind == "ticks":
+            for index in range(0, size, int(mark["step"])):
+                draw.rectangle([x + index, y, x + index + 2, y + size // 3], fill=color)
+        else:
+            for row in range(int(mark["bands"])):
+                top = y + row * 9
+                draw.rectangle([x, top, x + size - row * 7, top + 4], fill=LABEL)
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize a scene.  Rings are painted by exact integer radius tests, so
+    no edge is antialiased and both arms read the same integers."""
+    width, height = int(scene["width"]), int(scene["height"])
+    image = Image.new("RGB", (width, height), PAPER)
+    _draw_decor(ImageDraw.Draw(image), scene)
+
+    array = np.asarray(image, dtype=np.uint8).copy()
+    cx, cy = int(scene["cx"]), int(scene["cy"])
+    box = OUTER_R + 1
+    ys = np.arange(cy - box, cy + box + 1)
+    xs = np.arange(cx - box, cx + box + 1)
+    dy = (ys - cy).astype(np.int64)[:, None]
+    dx = (xs - cx).astype(np.int64)[None, :]
+    dist2 = dy * dy + dx * dx
+    patch = array[cy - box : cy + box + 1, cx - box : cx + box + 1]
+    for (inner, outer), color in zip(ring_radii(scene), scene["colors"]):
+        band = (dist2 > inner * inner) & (dist2 <= outer * outer)
+        patch[band] = np.asarray([int(c) for c in color], dtype=np.uint8)
+    pip = int(scene["pip_r"])
+    patch[dist2 <= pip * pip] = np.asarray(PIP, dtype=np.uint8)
+    array[cy - box : cy + box + 1, cx - box : cx + box + 1] = patch
+    return Image.fromarray(array, mode="RGB")
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases are declared: every sampled field is rendered."""
+    return []
+
+
+# --- label-preserving variants used by the candidate tests -------------------
+
+
+def translated(scene: dict, dx: int, dy: int) -> dict:
+    """Move the whole decisive button; the binding is translation invariant."""
+    out = dict(scene)
+    out["decor"] = [dict(mark) for mark in scene["decor"]]
+    limit_lo = OUTER_R + 6
+    out["cx"] = int(min(max(int(scene["cx"]) + dx, limit_lo), int(scene["width"]) - limit_lo))
+    out["cy"] = int(min(max(int(scene["cy"]) + dy, limit_lo), int(scene["height"]) - limit_lo))
+    return out
+
+
+def repalette(scene: dict, shift: int) -> dict:
+    """Re-map ring fills onto a different palette subset while preserving the
+    luminance order, so the darkest ring keeps its radial position."""
+    out = dict(scene)
+    order = sorted(range(len(PALETTE)), key=lambda i: luminance(PALETTE[i]))
+    ranks = sorted(range(RINGS), key=lambda i: luminance(scene["colors"][i]))
+    rotated = [order[(index + shift) % len(order)] for index in range(RINGS)]
+    rotated = sorted(rotated, key=lambda i: luminance(PALETTE[i]))
+    colors = [None] * RINGS
+    for rank, ring in enumerate(ranks):
+        colors[ring] = list(PALETTE[rotated[rank]])
+    out["colors"] = colors
+    return out
+
+
+def permuted_distractors(scene: dict) -> dict:
+    """Shuffle and recolour decoration; decoration is never decisive."""
+    out = dict(scene)
+    marks = [dict(mark) for mark in scene["decor"]]
+    rng = random.Random(len(marks) * 31 + int(scene["cx"]))
+    rng.shuffle(marks)
+    for index, mark in enumerate(marks):
+        mark["color"] = list(DECOR_COLORS[(index + 2) % len(DECOR_COLORS)])
+    out["decor"] = marks
+    return out

@@ -1,0 +1,105 @@
+"""Independent PNG-only inverse for fragmented contour closure.
+
+This module intentionally repeats only public raster constants.  It never
+imports the renderer, scene sampler, prompt code, or analytic gold.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+_COLORS = ("red", "blue", "green")
+_PALETTE = {
+    "red": np.array((211.0, 62.0, 65.0)),
+    "blue": np.array((52.0, 99.0, 192.0)),
+    "green": np.array((42.0, 153.0, 92.0)),
+}
+_TAU = 2.0 * math.pi
+
+
+def _ink_mask(array: np.ndarray, color: str) -> np.ndarray:
+    palette = np.stack([_PALETTE[name] for name in _COLORS], axis=0)
+    distances = np.sqrt(((array[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=3))
+    index = _COLORS.index(color)
+    distance = distances[:, :, index]
+    spread = array.max(axis=2) - array.min(axis=2)
+    # Interior and antialiased colored pixels are separated from the neutral
+    # panel/background by both palette distance and chroma.
+    nearest = np.argmin(distances, axis=2)
+    return (nearest == index) & (distance < 180.0) & (spread > 25.0)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if visited[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        visited[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(points) >= 50:
+            components.append(np.asarray([(x, y) for y, x in points], dtype=np.float64))
+    return components
+
+
+def _component_centers(image: Image.Image, color: str) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float64)
+    components = _components(_ink_mask(array, color))
+    if not components:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.asarray([component.mean(axis=0) for component in components], dtype=np.float64)
+
+
+def _closure_score(centers: np.ndarray) -> float:
+    if len(centers) < 8:
+        return -10.0 - abs(10 - len(centers))
+    # The hidden ellipse center and orientation are not read from the scene.
+    # Estimate them from the component centers, whiten by the two principal
+    # spreads, and measure the largest angular opening in that recovered frame.
+    points = centers - np.median(centers, axis=0)
+    covariance = np.cov(points, rowvar=False)
+    if covariance.shape != (2, 2) or not np.isfinite(covariance).all():
+        return -10.0
+    values, vectors = np.linalg.eigh(covariance)
+    if float(values[0]) <= 1e-6 or float(values[1]) <= 1e-6:
+        return -10.0
+    normalized = points @ vectors
+    normalized /= np.sqrt(values)
+    angles = np.sort(np.arctan2(normalized[:, 1], normalized[:, 0]))
+    gaps = np.diff(np.r_[angles, angles[0] + _TAU])
+    largest = float(np.max(gaps))
+    # Component-count mismatch is evidence that the proposed grouping is not
+    # a clean fragmented contour, but all valid sampled fields have ten.
+    count_penalty = 0.025 * abs(len(centers) - 10)
+    return 1.0 - largest / _TAU - count_penalty
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the color whose visible fragments make the most closed loop."""
+
+    if not isinstance(image, Image.Image):
+        raise TypeError("decision_from_image expects a PIL image")
+    scores = {
+        color: _closure_score(_component_centers(image, color)) for color in _COLORS
+    }
+    best = max(_COLORS, key=lambda color: (scores[color], color))
+    if scores[best] < -1.0:
+        return "unknown"
+    return best

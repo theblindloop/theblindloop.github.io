@@ -1,0 +1,207 @@
+"""Pixel-only inverse arm for the patch-pair parallel search world.
+
+This module receives one RGB image and the public question contract. It never
+imports the renderer, prompts, generator or verifier, and never sees latent
+scene data.
+
+Route: the modal colour is the background and every other colour is ink. Each
+ink colour is labelled into connected components; components whose area is far
+from the median component area are discarded, which removes background specks
+and any clipped fragment. Every surviving component is one stroke, and its
+orientation is the principal axis of its own pixels. Components are grouped by
+ink colour, each colour group is split at its widest horizontal gap into two
+clusters, and each cluster reports the circular median of its stroke
+orientations. A station's score is the undirected angular difference between
+its two clusters. The smallest score wins when it is near zero, when the
+runner-up station is clearly larger, and when at least two stations are
+readable; the answer is the horizontal band holding the winning station.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "patch_pair_parallel_search-oracle-0.1.0"
+
+WORDS = ("first", "second", "third", "fourth")
+ABSTAIN = "abstain"
+
+BANDS = 4
+MIN_AREA = 30            # a background speck covers nine pixels
+AREA_LOW = 0.72          # keep components close to the median stroke area
+AREA_HIGH = 1.35
+MIN_ELONGATION = 1.7     # a stroke is clearly longer than it is thick
+MIN_CLUSTER = 2          # a readable cluster keeps at least two whole strokes
+MIN_SPLIT_GAP = 150      # the two clusters of a station are two cells apart
+MIN_GROUP_SPAN = 300     # a readable station spans both of its cells
+PARALLEL_TOLERANCE = 8.0
+MIN_PIXEL_MARGIN = 6.0
+
+
+def _axial_gap(first: float, second: float) -> float:
+    raw = abs(float(first) - float(second)) % 180.0
+    return min(raw, 180.0 - raw)
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Run-based eight-connected labelling of one ink mask."""
+
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(node: int) -> int:
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list[tuple[int, int, int, int]] = []
+    previous: list[tuple[int, int, int]] = []
+    for y in range(height):
+        row = mask[y].astype(np.int8)
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], row, [0]))))
+        current = []
+        for index in range(0, len(edges), 2):
+            x0 = int(edges[index])
+            x1 = int(edges[index + 1]) - 1
+            label = len(parent)
+            parent.append(label)
+            for px0, px1, plabel in previous:
+                if x0 <= px1 + 1 and px0 <= x1 + 1:
+                    union(label, plabel)
+            current.append((x0, x1, label))
+            runs.append((y, x0, x1, label))
+        previous = current
+
+    pixels: dict[int, list[tuple[int, int]]] = {}
+    for y, x0, x1, label in runs:
+        root = find(label)
+        bucket = pixels.setdefault(root, [])
+        for x in range(x0, x1 + 1):
+            bucket.append((x, y))
+
+    blobs = []
+    for points in pixels.values():
+        array = np.asarray(points, dtype=np.float64)
+        area = int(len(array))
+        centre = array.mean(axis=0)
+        centred = array - centre
+        cov = centred.T @ centred / max(1, area)
+        values, vectors = np.linalg.eigh(cov)
+        axis = vectors[:, int(np.argmax(values))]
+        angle = math.degrees(math.atan2(-float(axis[1]), float(axis[0]))) % 180.0
+        spread = float(values[1]) / max(1e-6, float(values[0]))
+        blobs.append(
+            {
+                "area": area,
+                "x": float(centre[0]),
+                "y": float(centre[1]),
+                "angle": angle,
+                "elongation": math.sqrt(max(1.0, spread)),
+            }
+        )
+    return blobs
+
+
+def _circular_median(angles: list[float]) -> float:
+    """Orientation minimising the total undirected angular deviation."""
+
+    best = angles[0]
+    best_cost = None
+    for candidate in angles:
+        cost = sum(_axial_gap(candidate, other) for other in angles)
+        if best_cost is None or cost < best_cost:
+            best, best_cost = candidate, cost
+    return best
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Per-station orientation gaps, the winner and the runner-up margin."""
+
+    array = np.asarray(image.convert("RGB")).astype(np.int32)
+    keys = (array[:, :, 0] << 16) + (array[:, :, 1] << 8) + array[:, :, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    if len(values) < 2:
+        return None
+    background = int(values[int(np.argmax(counts))])
+    height, width = keys.shape
+
+    blobs: list[dict] = []
+    for value, count in zip(values.tolist(), counts.tolist()):
+        if value == background or count < 4 * MIN_AREA:
+            continue
+        for blob in _components(keys == value):
+            blob["colour"] = int(value)
+            blobs.append(blob)
+
+    coarse = [blob for blob in blobs if blob["area"] >= MIN_AREA]
+    if len(coarse) < 8:
+        return None
+    reference = float(np.median([blob["area"] for blob in coarse]))
+    strokes = [
+        blob
+        for blob in coarse
+        if AREA_LOW * reference <= blob["area"] <= AREA_HIGH * reference
+        and blob["elongation"] >= MIN_ELONGATION
+    ]
+
+    grouped: dict[int, list[dict]] = {}
+    for blob in strokes:
+        grouped.setdefault(blob["colour"], []).append(blob)
+
+    stations = []
+    for members in grouped.values():
+        if len(members) < 2 * MIN_CLUSTER:
+            continue
+        members.sort(key=lambda blob: blob["x"])
+        if members[-1]["x"] - members[0]["x"] < MIN_GROUP_SPAN:
+            continue
+        gaps = [members[i + 1]["x"] - members[i]["x"] for i in range(len(members) - 1)]
+        cut = int(np.argmax(gaps))
+        if gaps[cut] < MIN_SPLIT_GAP:
+            continue
+        left = members[: cut + 1]
+        right = members[cut + 1 :]
+        if len(left) < MIN_CLUSTER or len(right) < MIN_CLUSTER:
+            continue
+        angle_left = _circular_median([blob["angle"] for blob in left])
+        angle_right = _circular_median([blob["angle"] for blob in right])
+        centre_y = float(np.mean([blob["y"] for blob in members]))
+        band = min(BANDS - 1, max(0, int(centre_y * BANDS / height)))
+        stations.append({"gap": _axial_gap(angle_left, angle_right), "band": band})
+
+    if len(stations) < 2:
+        return None
+    stations.sort(key=lambda item: item["gap"])
+    return {
+        "stations": stations,
+        "best_gap": stations[0]["gap"],
+        "runner_gap": stations[1]["gap"],
+        "winner": stations[0]["band"],
+        "pixel_margin": stations[1]["gap"] - stations[0]["gap"],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Which horizontal band holds the only station with parallel clusters."""
+
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    if report["best_gap"] > PARALLEL_TOLERANCE:
+        return ABSTAIN
+    if report["runner_gap"] <= PARALLEL_TOLERANCE:
+        return ABSTAIN
+    if report["pixel_margin"] < MIN_PIXEL_MARGIN:
+        return ABSTAIN
+    return WORDS[report["winner"]]

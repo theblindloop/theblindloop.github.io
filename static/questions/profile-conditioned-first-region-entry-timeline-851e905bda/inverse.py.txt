@@ -1,0 +1,193 @@
+"""Independent image-only inverse for first home-direction return."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_ARROW_BG = (232, 235, 241)
+_LABELS = tuple("ABCD")
+
+
+def _near(arr: np.ndarray, color: tuple[int, int, int], tolerance: int = 2) -> np.ndarray:
+    target = np.asarray(color, dtype=np.int16)
+    return np.max(np.abs(arr.astype(np.int16) - target), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 4-connected components as arrays of (y, x) coordinates."""
+    remaining = set(zip(*np.nonzero(mask), strict=True))
+    groups: list[np.ndarray] = []
+    while remaining:
+        start = remaining.pop()
+        queue: deque[tuple[int, int]] = deque([start])
+        points = [start]
+        while queue:
+            y, x = queue.popleft()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    queue.append(neighbor)
+                    points.append(neighbor)
+        groups.append(np.asarray(points, dtype=np.int32))
+    return groups
+
+
+def _boxes_for_arrow_cards(arr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    boxes: list[tuple[int, int, int, int]] = []
+    for points in _components(_near(arr, _ARROW_BG)):
+        if not 2200 <= len(points) <= 3100:
+            continue
+        y0, x0 = points.min(axis=0)
+        y1, x1 = points.max(axis=0)
+        if 50 <= x1 - x0 <= 55 and 50 <= y1 - y0 <= 55:
+            boxes.append((int(x0), int(y0), int(x1), int(y1)))
+    boxes.sort(key=lambda box: (box[0], box[1]))
+    if len(boxes) != 20:
+        raise ValueError(f"expected twenty arrow cards, recovered {len(boxes)}")
+    return boxes
+
+
+def _token_components(arr: np.ndarray) -> list[np.ndarray]:
+    work = arr.astype(np.int16)
+    spread = work.max(axis=2) - work.min(axis=2)
+    saturated = (spread >= 65) & (work.max(axis=2) >= 125) & (work.min(axis=2) <= 190)
+    tokens = []
+    for points in _components(saturated):
+        if not 1150 <= len(points) <= 1900:
+            continue
+        y0, x0 = points.min(axis=0)
+        y1, x1 = points.max(axis=0)
+        if 42 <= x1 - x0 <= 48 and 42 <= y1 - y0 <= 48:
+            tokens.append(points)
+    if len(tokens) != 20:
+        raise ValueError(f"expected twenty colored tokens, recovered {len(tokens)}")
+    return tokens
+
+
+def _pip_identity(arr: np.ndarray, token: np.ndarray) -> int:
+    y0, x0 = token.min(axis=0)
+    y1, x1 = token.max(axis=0)
+    crop = arr[max(0, y0 - 1) : y1 + 2, max(0, x0 - 1) : x1 + 2]
+    dark = crop.max(axis=2) <= 75
+    pips = 0
+    for points in _components(dark):
+        if 20 <= len(points) <= 60:
+            py0, px0 = points.min(axis=0)
+            py1, px1 = points.max(axis=0)
+            if px1 - px0 <= 8 and py1 - py0 <= 8:
+                pips += 1
+    if pips not in (1, 2, 3, 4):
+        raise ValueError(f"token pip label is invalid: {pips}")
+    return pips - 1
+
+
+def _arrow_direction(arr: np.ndarray, box: tuple[int, int, int, int]) -> tuple[int, float]:
+    x0, y0, x1, y1 = box
+    crop = arr[y0 : y1 + 1, x0 : x1 + 1]
+    dark = crop.max(axis=2) <= 75
+    ys, xs = np.nonzero(dark)
+    if not 120 <= len(xs) <= 500:
+        raise ValueError("arrow ink is missing or malformed")
+    cx, cy = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+    vx, vy = float(xs.mean() - cx), float(ys.mean() - cy)
+    scores = (-vy, vx, vy, -vx)  # north, east, south, west
+    ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)
+    margin = float(ranked[0][1] - ranked[1][1])
+    if ranked[0][1] < 2.5 or margin < 3.0:
+        raise ValueError("arrow direction has insufficient runner-up margin")
+    return int(ranked[0][0]), margin
+
+
+def _panel_groups(boxes: list[tuple[int, int, int, int]]) -> list[list[tuple[int, int, int, int]]]:
+    groups: list[list[tuple[int, int, int, int]]] = []
+    for box in boxes:
+        center_x = (box[0] + box[2]) / 2
+        if not groups or abs(center_x - (groups[-1][0][0] + groups[-1][0][2]) / 2) > 20:
+            groups.append([box])
+        else:
+            groups[-1].append(box)
+    if len(groups) != 5 or any(len(group) != 4 for group in groups):
+        raise ValueError("arrow cards do not resolve into five ordered panels")
+    for group in groups:
+        group.sort(key=lambda box: box[1])
+    return groups
+
+
+def _parse(image: Image.Image) -> tuple[list[list[int]], float]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 600 or arr.shape[1] < 1100:
+        raise ValueError("raster is too small")
+    panel_boxes = _panel_groups(_boxes_for_arrow_cards(arr))
+    tokens = _token_components(arr)
+    token_info = []
+    for token in tokens:
+        identity = _pip_identity(arr, token)
+        cy, cx = token.mean(axis=0)
+        token_info.append((identity, float(cx), float(cy)))
+
+    states: list[list[int]] = []
+    margins: list[float] = []
+    used: set[int] = set()
+    for boxes in panel_boxes:
+        panel = [-1] * 4
+        panel_center_x = sum((box[0] + box[2]) / 2 for box in boxes) / 4
+        candidates = [
+            (index, info)
+            for index, info in enumerate(token_info)
+            if index not in used and 35 <= panel_center_x - info[1] <= 100
+        ]
+        if len(candidates) != 4:
+            raise ValueError("a panel does not contain four token identities")
+        for box in boxes:
+            box_cy = (box[1] + box[3]) / 2
+            ranked = sorted(candidates, key=lambda item: abs(item[1][2] - box_cy))
+            index, (identity, _cx, token_cy) = ranked[0]
+            if abs(token_cy - box_cy) > 8 or index in used:
+                raise ValueError("token-to-arrow row binding is ambiguous")
+            if panel[identity] != -1:
+                raise ValueError("duplicate pip identity in one panel")
+            direction, direction_margin = _arrow_direction(arr, box)
+            panel[identity] = direction
+            margins.append(direction_margin)
+            used.add(index)
+            candidates = [item for item in candidates if item[0] != index]
+        if sorted(panel) == [-1, 0, 1, 2]:
+            # This check intentionally cannot validate identities; use explicit below.
+            pass
+        if any(value < 0 for value in panel):
+            raise ValueError("panel identity set is incomplete")
+        states.append(panel)
+    if len(used) != 20:
+        raise ValueError("unassigned colored tokens remain")
+    return states, min(margins)
+
+
+def _winner(states: list[list[int]]) -> int:
+    events = []
+    for identity in range(4):
+        initial = states[0][identity]
+        left = False
+        for panel in range(1, 5):
+            if states[panel][identity] != initial:
+                left = True
+            elif left:
+                events.append((panel, identity))
+                break
+    if not events:
+        raise ValueError("no return event is visible")
+    earliest = min(panel for panel, _ in events)
+    identities = [identity for panel, identity in events if panel == earliest]
+    if len(identities) != 1:
+        raise ValueError("earliest return is not unique")
+    return identities[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover panel order, identities, and arrows, then detect first recurrence."""
+    states, runner_up_margin = _parse(image)
+    if runner_up_margin < 3.0:
+        raise ValueError("pixel runner-up margin is too small")
+    return _LABELS[_winner(states)]

@@ -1,0 +1,154 @@
+"""Independent pixel-only inverse for the loop-center transform.
+
+The module knows the public visual contract but has no access to latent data or
+renderer code.  It segments the endpoint roles, finds enclosed light regions
+inside the dark connected carrier, uses their raster centroids as the derived
+points, and classifies the reconnected centerline.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_NAMES = ("arch", "cup", "wave")
+_CENTER_TEMPLATES = {
+    # Positive is the geometric left side of red-to-gold travel.
+    "arch": np.asarray([0.0, 1.0, 2.0, 1.0, 0.0]),
+    "cup": np.asarray([0.0, -1.0, -2.0, -1.0, 0.0]),
+    "wave": np.asarray([0.0, 1.0, 0.0, -1.0, 0.0]),
+}
+
+
+def _centroid(mask: np.ndarray, label: str, minimum: int = 10) -> np.ndarray:
+    parts = _components(mask, eight_connected=True)
+    points = max(parts, key=len) if parts else np.empty((0, 2), dtype=np.int32)
+    if len(points) < minimum:
+        raise ValueError(f"missing {label} fiducial")
+    # Return x, y rather than array row, column.
+    return points[:, ::-1].mean(axis=0).astype(np.float64)
+
+
+def _components(mask: np.ndarray, eight_connected: bool) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    if eight_connected:
+        steps = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+    else:
+        steps = ((-1, 0), (0, -1), (0, 1), (1, 0))
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if visited[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        visited[sy, sx] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for dy, dx in steps:
+                ny, nx = y + dy, x + dx
+                if (
+                    0 <= ny < height
+                    and 0 <= nx < width
+                    and mask[ny, nx]
+                    and not visited[ny, nx]
+                ):
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _loop_centroids(dark: np.ndarray) -> list[np.ndarray]:
+    points = np.argwhere(dark)
+    if len(points) < 80:
+        raise ValueError("dark thread is missing")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    pad = 2
+    y0, x0 = max(0, int(y0) - pad), max(0, int(x0) - pad)
+    y1 = min(dark.shape[0] - 1, int(y1) + pad)
+    x1 = min(dark.shape[1] - 1, int(x1) + pad)
+    crop = dark[y0 : y1 + 1, x0 : x1 + 1]
+
+    dark_parts = _components(crop, eight_connected=True)
+    dark_sizes = sorted((len(part) for part in dark_parts), reverse=True)
+    if not dark_sizes or dark_sizes[0] < 0.72 * int(crop.sum()):
+        raise ValueError("dark carrier is not one dominant connected component")
+
+    enclosed: list[np.ndarray] = []
+    for part in _components(~crop, eight_connected=False):
+        ys, xs = part[:, 0], part[:, 1]
+        touches_border = (
+            int(ys.min()) == 0
+            or int(xs.min()) == 0
+            or int(ys.max()) == crop.shape[0] - 1
+            or int(xs.max()) == crop.shape[1] - 1
+        )
+        box_h = int(ys.max() - ys.min() + 1)
+        box_w = int(xs.max() - xs.min() + 1)
+        if not touches_border and 8 <= len(part) <= 120 and 3 <= box_h <= 13 and 3 <= box_w <= 13:
+            xy = part[:, ::-1].astype(np.float64)
+            xy[:, 0] += x0
+            xy[:, 1] += y0
+            enclosed.append(xy.mean(axis=0))
+    if len(enclosed) != 5:
+        raise ValueError(f"expected five closed loop interiors, found {len(enclosed)}")
+    return enclosed
+
+
+def _classify(centers: list[np.ndarray], start: np.ndarray, end: np.ndarray) -> tuple[str, float]:
+    axis = end - start
+    axis_length = float(np.linalg.norm(axis))
+    if axis_length < 35.0:
+        raise ValueError("endpoint direction is too short")
+    axis /= axis_length
+    normal_left = np.asarray([axis[1], -axis[0]], dtype=np.float64)
+    ordered = sorted(centers, key=lambda value: float(np.dot(value - start, axis)))
+    progress = np.asarray([np.dot(value - start, axis) for value in ordered])
+    gaps = np.diff(progress)
+    if np.any(gaps < 6.0) or float(gaps.max() / gaps.min()) > 1.8:
+        raise ValueError("loop order or spacing is unstable")
+    if progress[0] <= 2.0 or progress[-1] >= axis_length - 2.0:
+        raise ValueError("loop centers do not lie between the endpoint fiducials")
+
+    lateral = np.asarray([np.dot(value - start, normal_left) for value in ordered])
+    lateral -= np.linspace(lateral[0], lateral[-1], 5)
+    scores: dict[str, float] = {}
+    for name, template in _CENTER_TEMPLATES.items():
+        scale = max(0.0, float(np.dot(lateral, template) / np.dot(template, template)))
+        scores[name] = float(np.mean((lateral - scale * template) ** 2))
+    ranked = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    gap = ranked[1][1] - ranked[0][1]
+    if gap <= 0.12:
+        raise ValueError("ambiguous loop-center template margin")
+    return ranked[0][0], gap
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return arch/cup/wave using only pixels from the final raster."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected RGB raster")
+    red = (
+        (array[:, :, 0] > 150)
+        & (array[:, :, 1] < 125)
+        & (array[:, :, 2] < 120)
+        & (array[:, :, 0] > 1.65 * array[:, :, 1].astype(np.float32))
+    )
+    gold = (
+        (array[:, :, 0] > 160)
+        & (array[:, :, 1] > 105)
+        & (array[:, :, 2] < 115)
+        & (array[:, :, 0] > array[:, :, 1])
+    )
+    start = _centroid(red, "red start")
+    end = _centroid(gold, "gold end")
+    dark = np.max(array, axis=2) < 108
+    centers = _loop_centroids(dark)
+    return _classify(centers, start, end)[0]

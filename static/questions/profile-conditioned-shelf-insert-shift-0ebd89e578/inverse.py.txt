@@ -1,0 +1,225 @@
+"""Scene-free pixel inverse arm for shelf_insert_shift.
+
+Input: the final PNG only.  No renderer, prompt, generator, verifier or gold
+code is imported, and no latent scene data is accepted.  The arm segments the
+image by colour, recovers the shelf, the ring, the ordered row of cards, each
+card's operation and each card's pointed-at slot, replays the program from the
+drawn starting shelf, and reports the colour left in the ringed slot.  It
+returns "abstain" whenever the parse is not self-consistent.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "shelf_insert_shift-oracle-0.1.0"
+
+_DISC_COLOURS = {
+    "red": (206, 48, 42),
+    "orange": (238, 150, 26),
+    "blue": (46, 86, 196),
+    "green": (36, 142, 72),
+}
+_EMPTY = "empty"
+_ABSTAIN = "abstain"
+
+_CELL_FILL = (228, 228, 232)
+_CARD_FILL = (250, 238, 205)
+_MINI_FILL = (255, 255, 255)
+
+
+def _mask_exact(arr: np.ndarray, rgb: tuple[int, int, int], tol: int = 6) -> np.ndarray:
+    diff = np.abs(arr.astype(np.int16) - np.array(rgb, dtype=np.int16))
+    return (diff.max(axis=2) <= tol)
+
+
+def _row_runs(row: np.ndarray) -> list[tuple[int, int]]:
+    idx = np.nonzero(np.diff(np.concatenate(([0], row.view(np.int8), [0]))))[0]
+    return list(zip(idx[0::2].tolist(), (idx[1::2] - 1).tolist()))
+
+
+def _components(mask: np.ndarray, min_pixels: int = 30) -> list[dict]:
+    """Four-connected components as dicts with bbox, area and centroid.
+
+    Row runs plus union-find; equivalent to a flood fill but linear in runs.
+    """
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list[tuple[int, int, int, int]] = []   # (y, x0, x1, label)
+    prev: list[tuple[int, int, int]] = []        # (x0, x1, label) of previous row
+    for y in range(mask.shape[0]):
+        row = mask[y]
+        if not row.any():
+            prev = []
+            continue
+        cur: list[tuple[int, int, int]] = []
+        for x0, x1 in _row_runs(row):
+            label = len(parent)
+            parent.append(label)
+            for px0, px1, plabel in prev:
+                if px0 <= x1 and x0 <= px1:
+                    union(label, plabel)
+            cur.append((x0, x1, label))
+            runs.append((y, x0, x1, label))
+        prev = cur
+
+    acc: dict[int, dict] = {}
+    for y, x0, x1, label in runs:
+        root = find(label)
+        n = x1 - x0 + 1
+        a = acc.get(root)
+        if a is None:
+            acc[root] = {
+                "y0": y, "y1": y, "x0": x0, "x1": x1, "area": n,
+                "sx": (x0 + x1) * n / 2.0, "sy": y * n,
+            }
+        else:
+            a["y0"] = min(a["y0"], y)
+            a["y1"] = max(a["y1"], y)
+            a["x0"] = min(a["x0"], x0)
+            a["x1"] = max(a["x1"], x1)
+            a["area"] += n
+            a["sx"] += (x0 + x1) * n / 2.0
+            a["sy"] += y * n
+
+    out: list[dict] = []
+    for a in acc.values():
+        if a["area"] >= min_pixels:
+            out.append(
+                {
+                    "y0": a["y0"], "y1": a["y1"], "x0": a["x0"], "x1": a["x1"],
+                    "area": a["area"],
+                    "cx": a["sx"] / a["area"], "cy": a["sy"] / a["area"],
+                }
+            )
+    return out
+
+
+def _nearest_disc_colour(rgb: tuple[float, float, float]) -> tuple[str, float]:
+    best, best_d = None, None
+    for name, ref in _DISC_COLOURS.items():
+        d = sum((rgb[i] - ref[i]) ** 2 for i in range(3)) ** 0.5
+        if best_d is None or d < best_d:
+            best, best_d = name, d
+    return best, best_d
+
+
+def _region_disc_colour(arr: np.ndarray, y0: int, y1: int, x0: int, x1: int) -> str | None:
+    """The dominant saturated colour in a box, or None when nothing is there."""
+    sub = arr[y0:y1 + 1, x0:x1 + 1].astype(np.int16)
+    if sub.size == 0:
+        return None
+    spread = sub.max(axis=2) - sub.min(axis=2)
+    sel = spread >= 90          # discs only; the cream card stock is far duller
+    if int(sel.sum()) < 200:
+        return None
+    mean = tuple(float(sub[..., c][sel].mean()) for c in range(3))
+    name, dist = _nearest_disc_colour(mean)
+    if dist > 70.0:
+        return None
+    return name
+
+
+def _is_grey_block(arr: np.ndarray, y0: int, y1: int, x0: int, x1: int) -> bool:
+    sub = arr[y0:y1 + 1, x0:x1 + 1].astype(np.int16)
+    spread = sub.max(axis=2) - sub.min(axis=2)
+    val = sub.mean(axis=2)
+    sel = (spread <= 12) & (val >= 60) & (val <= 130)
+    return int(sel.sum()) >= 400
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+
+    # ---- shelf slots: the light grey cell fills, left to right --------------
+    cells = sorted(_components(_mask_exact(arr, _CELL_FILL), 400), key=lambda c: c["x0"])
+    if len(cells) < 4:
+        return _ABSTAIN
+    n_slots = len(cells)
+
+    initial: list[str] = []
+    for c in cells:
+        colour = _region_disc_colour(arr, c["y0"], c["y1"], c["x0"], c["x1"])
+        initial.append(colour if colour is not None else _EMPTY)
+
+    # ---- the ring: dark ink drawn around exactly one slot -------------------
+    dark = arr.astype(np.int16).max(axis=2) <= 55
+    shelf_top = min(c["y0"] for c in cells) - 20
+    shelf_bot = max(c["y1"] for c in cells) + 20
+    band = np.zeros_like(dark)
+    band[max(shelf_top, 0):shelf_bot + 1, :] = dark[max(shelf_top, 0):shelf_bot + 1, :]
+    rings = _components(band, 200)
+    if len(rings) != 1:
+        return _ABSTAIN
+    ring = rings[0]
+    ring_slot, ring_d = None, None
+    for i, c in enumerate(cells):
+        d = abs(c["cx"] - ring["cx"])
+        if ring_d is None or d < ring_d:
+            ring_slot, ring_d = i, d
+    if ring_d is None or ring_d > 20:
+        return _ABSTAIN
+
+    # ---- cards, ordered by drawn horizontal position ------------------------
+    cards = sorted(_components(_mask_exact(arr, _CARD_FILL), 2000), key=lambda c: c["x0"])
+    if not 2 <= len(cards) <= 8:
+        return _ABSTAIN
+
+    mini_all = _components(_mask_exact(arr, _MINI_FILL, 3), 120)
+
+    program: list[tuple[str, str, int]] = []
+    for card in cards:
+        cy0, cy1, cx0, cx1 = card["y0"], card["y1"], card["x0"], card["x1"]
+        minis = sorted(
+            [m for m in mini_all if cy0 <= m["cy"] <= cy1 and cx0 <= m["cx"] <= cx1],
+            key=lambda m: m["cx"],
+        )
+        if len(minis) != n_slots:
+            return _ABSTAIN
+        strip_top = min(m["y0"] for m in minis)
+        strip_bot = max(m["y1"] for m in minis)
+
+        # operation glyph: above the mini strip
+        if _is_grey_block(arr, cy0, strip_top - 1, cx0, cx1):
+            op, colour = "del", _EMPTY
+        else:
+            colour = _region_disc_colour(arr, cy0, strip_top - 1, cx0, cx1)
+            if colour is None:
+                return _ABSTAIN
+            op = "ins"
+
+        # pointer: dark ink below the mini strip
+        sub_dark = np.zeros_like(dark)
+        sub_dark[strip_bot + 1:cy1 + 1, cx0:cx1 + 1] = dark[strip_bot + 1:cy1 + 1, cx0:cx1 + 1]
+        tips = _components(sub_dark, 40)
+        if len(tips) != 1:
+            return _ABSTAIN
+        px = tips[0]["cx"]
+        target, best_d = None, None
+        for i, m in enumerate(minis):
+            d = abs(px - m["cx"])
+            if best_d is None or d < best_d:
+                target, best_d = i, d
+        program.append((op, colour, target))
+
+    # ---- replay -------------------------------------------------------------
+    state = list(initial)
+    for op, colour, k in program:
+        if op == "ins":
+            state = (state[:k] + [colour] + state[k:])[:n_slots]
+        else:
+            state = state[:k] + state[k + 1:] + [_EMPTY]
+    result = state[ring_slot]
+    return result if result in _DISC_COLOURS else _ABSTAIN

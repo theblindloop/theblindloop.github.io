@@ -1,0 +1,226 @@
+"""Pixel-only arm for the grain-axis-relation world.
+
+It receives one RGB image and nothing else.  It rebuilds two things from the
+raster: the tinted patch as a filled area-like support, and the texture field
+of dark strokes carried by that support.  It then compares the aggregate axial
+direction of the field with the principal axis of the support.
+
+This module imports no renderer, prompt, generator, verifier, or gold code and
+never sees a latent scene.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "grain_axis_relation-oracle-0.1.0"
+
+DARK_LUMA = 110.0
+TINT_SAT = 20.0
+CLOSE_RADIUS = 4
+MIN_STROKE_PIXELS = 22
+MAX_STROKE_PIXELS = 400
+MIN_ELONGATION = 3.0
+MIN_STROKES = 8
+MIN_PATCH_PIXELS = 4000
+MIN_SOLIDITY = 0.94
+
+ALONG_MAX_DEG = 35.0
+ACROSS_MIN_DEG = 55.0
+
+_ABSTAIN = "unclear"
+
+
+def _disk_offsets(radius: int) -> list[tuple[int, int]]:
+    return [
+        (dy, dx)
+        for dy in range(-radius, radius + 1)
+        for dx in range(-radius, radius + 1)
+        if dy * dy + dx * dx <= radius * radius
+    ]
+
+
+def _shift_or(mask: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    out = np.zeros_like(mask)
+    h, w = mask.shape
+    ys0, ys1 = max(0, dy), min(h, h + dy)
+    xs0, xs1 = max(0, dx), min(w, w + dx)
+    if ys0 >= ys1 or xs0 >= xs1:
+        return out
+    out[ys0:ys1, xs0:xs1] = mask[ys0 - dy : ys1 - dy, xs0 - dx : xs1 - dx]
+    return out
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    out = np.zeros_like(mask)
+    for dy, dx in _disk_offsets(radius):
+        out |= _shift_or(mask, dy, dx)
+    return out
+
+
+def _erode(mask: np.ndarray, radius: int) -> np.ndarray:
+    return ~_dilate(~mask, radius)
+
+
+def _close(mask: np.ndarray, radius: int) -> np.ndarray:
+    return _erode(_dilate(mask, radius), radius)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Eight-connected components, returned as arrays of flat pixel indices."""
+    h, w = mask.shape
+    flat = mask.reshape(-1)
+    todo = np.flatnonzero(flat)
+    seen = np.zeros(flat.shape, dtype=bool)
+    groups: list[np.ndarray] = []
+    for start in todo:
+        if seen[start]:
+            continue
+        stack = [int(start)]
+        seen[start] = True
+        members: list[int] = []
+        while stack:
+            here = stack.pop()
+            members.append(here)
+            y, x = divmod(here, w)
+            for dy in (-1, 0, 1):
+                ny = y + dy
+                if ny < 0 or ny >= h:
+                    continue
+                for dx in (-1, 0, 1):
+                    nx = x + dx
+                    if nx < 0 or nx >= w or (dy == 0 and dx == 0):
+                        continue
+                    idx = ny * w + nx
+                    if flat[idx] and not seen[idx]:
+                        seen[idx] = True
+                        stack.append(idx)
+        groups.append(np.array(members, dtype=np.int64))
+    return groups
+
+
+def _axis_from_indices(indices: np.ndarray, width: int) -> tuple[float, float]:
+    """Principal-axis angle in degrees mod 180, plus the eigenvalue ratio."""
+    ys = (indices // width).astype(np.float64)
+    xs = (indices % width).astype(np.float64)
+    ys -= ys.mean()
+    xs -= xs.mean()
+    sxx = float((xs * xs).mean())
+    syy = float((ys * ys).mean())
+    sxy = float((xs * ys).mean())
+    trace = sxx + syy
+    diff = math.hypot(sxx - syy, 2.0 * sxy)
+    lam1 = (trace + diff) * 0.5
+    lam2 = (trace - diff) * 0.5
+    angle = 0.5 * math.degrees(math.atan2(2.0 * sxy, sxx - syy)) % 180.0
+    ratio = float("inf") if lam2 <= 1e-9 else lam1 / lam2
+    return angle, ratio
+
+
+def _axial_delta_deg(a: float, b: float) -> float:
+    d = abs(a - b) % 180.0
+    return d if d <= 90.0 else 180.0 - d
+
+
+def _hull_area(mask: np.ndarray) -> float:
+    """Area of the convex hull of a pixel mask.
+
+    The hull of a pixel set is the hull of its per-row extreme pixels, so a few
+    hundred candidate points suffice.
+    """
+    points: list[tuple[int, int]] = []
+    for y in np.flatnonzero(mask.any(axis=1)):
+        xs = np.flatnonzero(mask[y])
+        points.append((int(xs[0]), int(y)))
+        points.append((int(xs[-1]), int(y)))
+    points = sorted(set(points))
+    if len(points) < 3:
+        return 0.0
+
+    def half(seq):
+        out: list[tuple[int, int]] = []
+        for p in seq:
+            while len(out) >= 2:
+                (x1, y1), (x2, y2) = out[-2], out[-1]
+                if (x2 - x1) * (p[1] - y1) - (y2 - y1) * (p[0] - x1) <= 0:
+                    out.pop()
+                else:
+                    break
+            out.append(p)
+        return out
+
+    hull = half(points)[:-1] + half(reversed(points))[:-1]
+    if len(hull) < 3:
+        return 0.0
+    area = 0.0
+    for i, (x1, y1) in enumerate(hull):
+        x2, y2 = hull[(i + 1) % len(hull)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+
+def _solidity(mask: np.ndarray) -> float:
+    """How completely the support fills its own convex hull.
+
+    The question declares one *solid* patch. A support that has had a bite
+    taken out of it, or that has been punched through, is not that patch, and
+    the pixel arm must refuse to read a long axis off it.
+    """
+    hull = _hull_area(mask)
+    return 0.0 if hull <= 0.0 else float(mask.sum()) / hull
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    height, width = arr.shape[0], arr.shape[1]
+    luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    sat = arr.max(axis=2) - arr.min(axis=2)
+
+    dark = luma < DARK_LUMA
+    tint = (sat >= TINT_SAT) & (~dark)
+
+    tint_groups = _components(tint)
+    if not tint_groups:
+        return _ABSTAIN
+    biggest = max(tint_groups, key=len)
+    support = np.zeros(height * width, dtype=bool)
+    support[biggest] = True
+    support = _close(support.reshape(height, width), CLOSE_RADIUS)
+    support_idx = np.flatnonzero(support.reshape(-1))
+    if support_idx.size < MIN_PATCH_PIXELS:
+        return _ABSTAIN
+    if _solidity(support) < MIN_SOLIDITY:
+        return _ABSTAIN  # not one solid patch: the support has been broken
+    patch_axis, patch_ratio = _axis_from_indices(support_idx, width)
+    if patch_ratio < 1.12:
+        return _ABSTAIN  # no readable long axis
+
+    support_flat = support.reshape(-1)
+    sin2 = 0.0
+    cos2 = 0.0
+    used = 0
+    for group in _components(dark):
+        if not (MIN_STROKE_PIXELS <= group.size <= MAX_STROKE_PIXELS):
+            continue
+        if support_flat[group].mean() < 0.85:
+            continue  # a stroke of the decoy field outside the patch
+        angle, ratio = _axis_from_indices(group, width)
+        if ratio < MIN_ELONGATION:
+            continue
+        weight = float(group.size)
+        sin2 += weight * math.sin(2.0 * math.radians(angle))
+        cos2 += weight * math.cos(2.0 * math.radians(angle))
+        used += 1
+    if used < MIN_STROKES or (sin2 == 0.0 and cos2 == 0.0):
+        return _ABSTAIN
+
+    grain = math.degrees(math.atan2(sin2, cos2)) * 0.5 % 180.0
+    delta = _axial_delta_deg(grain, patch_axis)
+    if delta < ALONG_MAX_DEG:
+        return "along"
+    if delta > ACROSS_MIN_DEG:
+        return "across"
+    return "unclear"

@@ -1,0 +1,188 @@
+"""Independent PNG-only inverse for the registered mosaic change rule."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_N = 12
+_FIDUCIAL_RGB = {
+    "a": (224, 177, 34),
+    "b": (225, 92, 42),
+    "c": (126, 72, 168),
+}
+
+# Public answer prototypes, independently restated for image classification.
+_PROTOTYPES: dict[str, frozenset[tuple[int, int]]] = {
+    "plus": frozenset(
+        {(5, column) for column in range(2, 10)}
+        | {(row, 6) for row in range(2, 10)}
+        | {(6, 5)}
+    ),
+    "x": frozenset(
+        {(row, row) for row in range(2, 10)}
+        | {(row, 11 - row) for row in range(2, 10)}
+    ),
+    "diamond": frozenset(
+        (row, column)
+        for row in range(_N)
+        for column in range(_N)
+        if abs(2 * row - 11) + abs(2 * column - 11) == 8
+    ),
+    "dashed_square": frozenset(
+        {(row, column) for row in (2, 9) for column in (2, 3, 5, 6, 8, 9)}
+        | {(row, column) for row in (4, 7) for column in (2, 9)}
+    ),
+}
+
+
+class OracleAbstention(ValueError):
+    """Required visible registration or change evidence is ambiguous."""
+
+
+def _components(mask: np.ndarray, minimum_area: int = 30) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[dict] = []
+    for y_value, x_value in np.argwhere(mask):
+        y, x = int(y_value), int(x_value)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(xs) >= minimum_area:
+            found.append(
+                {"area": len(xs), "x": float(np.mean(xs)), "y": float(np.mean(ys))}
+            )
+    return found
+
+
+def _locate_cards(arr: np.ndarray) -> list[dict[str, np.ndarray]]:
+    centers: dict[str, list[dict]] = {}
+    for name, rgb in _FIDUCIAL_RGB.items():
+        mask = np.all(arr == np.asarray(rgb, dtype=np.uint8), axis=2)
+        items = sorted(_components(mask), key=lambda item: item["x"])
+        if len(items) != 2:
+            raise OracleAbstention(
+                f"need two visible {name} corner dots; found {len(items)}"
+            )
+        centers[name] = items
+
+    cards: list[dict[str, np.ndarray]] = []
+    for side in range(2):
+        card = {
+            name: np.array((centers[name][side]["x"], centers[name][side]["y"]), dtype=float)
+            for name in ("a", "b", "c")
+        }
+        across = card["b"] - card["a"]
+        down = card["c"] - card["a"]
+        across_length = float(np.linalg.norm(across))
+        down_length = float(np.linalg.norm(down))
+        cosine = abs(float(np.dot(across, down))) / max(across_length * down_length, 1.0)
+        if not (210.0 <= across_length <= 275.0 and 210.0 <= down_length <= 275.0):
+            raise OracleAbstention("corner-dot span is outside the visible 12-cell calibration")
+        if abs(across_length - down_length) > 2.5 or cosine > 0.02:
+            raise OracleAbstention("corner dots do not define a stable square registration")
+        cards.append(card)
+    return cards
+
+
+def _modal_patch(arr: np.ndarray, x: float, y: float) -> tuple[int, int, int]:
+    cx, cy = int(round(x)), int(round(y))
+    if not (2 <= cx < arr.shape[1] - 2 and 2 <= cy < arr.shape[0] - 2):
+        raise OracleAbstention("registered cell center lies outside the raster")
+    patch = arr[cy - 2 : cy + 3, cx - 2 : cx + 3].reshape(-1, 3)
+    colors, counts = np.unique(patch, axis=0, return_counts=True)
+    winner = int(np.argmax(counts))
+    if int(counts[winner]) < 20:
+        raise OracleAbstention("cell-center color is unstable")
+    return tuple(int(value) for value in colors[winner])
+
+
+def _sample_card(arr: np.ndarray, card: dict[str, np.ndarray]) -> list[list[tuple[int, int, int]]]:
+    across = card["b"] - card["a"]
+    down = card["c"] - card["a"]
+    values: list[list[tuple[int, int, int]]] = []
+    for row in range(_N):
+        line: list[tuple[int, int, int]] = []
+        for column in range(_N):
+            point = (
+                card["a"]
+                + ((column + 0.5) / _N) * across
+                + ((row + 0.5) / _N) * down
+            )
+            line.append(_modal_patch(arr, float(point[0]), float(point[1])))
+        values.append(line)
+    return values
+
+
+def _shifted(prototype: frozenset[tuple[int, int]], row_shift: int, column_shift: int) -> set[tuple[int, int]]:
+    return {(row + row_shift, column + column_shift) for row, column in prototype}
+
+
+def analyze_image(image: Image.Image) -> dict:
+    """Locate both cards, register their cells, compute inequality, and rank shapes."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    cards = _locate_cards(arr)
+    sampled = [_sample_card(arr, card) for card in cards]
+    observed_colors = {color for card in sampled for row in card for color in row}
+    if len(observed_colors) != 2:
+        raise OracleAbstention(
+            f"registered cell centers must use exactly two colors; found {len(observed_colors)}"
+        )
+
+    changed = {
+        (row, column)
+        for row in range(_N)
+        for column in range(_N)
+        if sampled[0][row][column] != sampled[1][row][column]
+    }
+    if not 12 <= len(changed) <= 20:
+        raise OracleAbstention(f"change map has implausible ink count {len(changed)}")
+
+    scores: dict[str, tuple[int, tuple[int, int]]] = {}
+    for name, prototype in _PROTOTYPES.items():
+        best = (_N * _N, (0, 0))
+        for row_shift in range(-2, 3):
+            for column_shift in range(-2, 3):
+                candidate = _shifted(prototype, row_shift, column_shift)
+                if any(not (0 <= row < _N and 0 <= column < _N) for row, column in candidate):
+                    continue
+                score = len(changed ^ candidate)
+                if score < best[0]:
+                    best = (score, (row_shift, column_shift))
+        scores[name] = best
+
+    ranking = sorted(scores.items(), key=lambda item: (item[1][0], item[0]))
+    best_name, (best_score, best_shift) = ranking[0]
+    runner_name, (runner_score, _) = ranking[1]
+    decision_margin = float(runner_score - best_score)
+    if best_score > 2 or decision_margin < 4.0:
+        raise OracleAbstention(
+            f"change shape is ambiguous: best={best_name}/{best_score}, "
+            f"runner={runner_name}/{runner_score}"
+        )
+    return {
+        "decision": best_name,
+        "margin": decision_margin,
+        "best_mismatches": int(best_score),
+        "runner_up": runner_name,
+        "translation": [int(best_shift[0]), int(best_shift[1])],
+        "change_cells": len(changed),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

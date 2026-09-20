@@ -1,0 +1,158 @@
+"""Pixel-only inverse arm for the annulus-unwrap world.
+
+Receives a PIL image and nothing else.  It locates the visible fiducials (hub
+disk, rim ring, sector tab), executes the declared polar-to-rectangular
+rectification by sampling the interior of every curved cell, and classifies the
+rebuilt 5x7 pattern against the five symbols named in the public question.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "annulus_unwrap_reveal-oracle-0.1.0"
+
+BANDS = 5
+SECTORS = 7
+TAU = 2.0 * math.pi
+DELTA = TAU / SECTORS
+
+TEMPLATES: dict[str, tuple[str, ...]] = {
+    "cross": ("..###..", "...#...", "#######", "...#...", "..###.."),
+    "diamond": ("...#...", "..###..", "#######", "..###..", "...#..."),
+    "flag": ("#######", "#.##...", "#.##...", "#......", "#......"),
+    "goalpost": ("#######", "#.....#", "#.....#", "#.....#", "#.....#"),
+    "zigzag": ("#####..", "....#..", "..###..", "..#....", "..#####"),
+}
+
+ABSTAIN = "abstain"
+
+
+def _template_bits(name: str) -> list[int]:
+    rows = TEMPLATES[name]
+    return [1 if rows[r][c] == "#" else 0 for r in range(BANDS) for c in range(SECTORS)]
+
+
+def _lum(color) -> float:
+    return 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+
+
+def _analyse(image: Image.Image):
+    arr = np.asarray(image.convert("RGB"), dtype=np.int64)
+    h, w = arr.shape[:2]
+    keys = arr[:, :, 0] * 65536 + arr[:, :, 1] * 256 + arr[:, :, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    background = int(keys[0, 0])
+
+    ys, xs = np.mgrid[0:h, 0:w]
+    groups = []
+    for value, count in zip(values, counts):
+        if int(value) == background or count < 200:
+            continue
+        mask = keys == int(value)
+        gy = ys[mask].astype(float)
+        gx = xs[mask].astype(float)
+        groups.append(
+            {
+                "key": int(value),
+                "count": int(count),
+                "cy": float(gy.mean()),
+                "cx": float(gx.mean()),
+                "mask": mask,
+                "ys": gy,
+                "xs": gx,
+            }
+        )
+    if len(groups) < 4:
+        return None
+
+    # The hub is the only solid disk: its pixels fill the circle around their
+    # own centroid.
+    hub = None
+    for group in groups:
+        rad = np.hypot(group["xs"] - group["cx"], group["ys"] - group["cy"])
+        rmax = float(rad.max())
+        if rmax < 1.0:
+            continue
+        fill = group["count"] / (math.pi * rmax * rmax)
+        near_centre = math.hypot(group["cx"] - w / 2.0, group["cy"] - h / 2.0) < 0.15 * w
+        solid = bool(group["mask"][int(round(group["cy"])), int(round(group["cx"]))])
+        if fill > 0.9 and near_centre and solid and (hub is None or rmax < hub[1]):
+            hub = (group, rmax)
+    if hub is None:
+        return None
+    hub_group = hub[0]
+    cx, cy = hub_group["cx"], hub_group["cy"]
+
+    rest = [g for g in groups if g["key"] != hub_group["key"]]
+    if len(rest) < 3:
+        return None
+    for group in rest:
+        rad = np.hypot(group["xs"] - cx, group["ys"] - cy)
+        group["rmin"] = float(rad.min())
+        group["rmax"] = float(rad.max())
+    rest.sort(key=lambda g: g["rmin"])
+    tab = rest[-1]
+    rim = rest[-2]
+    ring = rest[:-2]
+    if len(ring) != 2:
+        return None
+    ring.sort(key=lambda g: _lum(np.array([(g["key"] >> 16) & 255, (g["key"] >> 8) & 255, g["key"] & 255])))
+    ink_key = ring[0]["key"]
+    plate_key = ring[1]["key"]
+    r_out = rim["rmin"]
+    r_in = min(ring[0]["rmin"], ring[1]["rmin"])
+    band_w = (r_out - r_in) / BANDS
+    if band_w < 4.0 or r_in < 8.0:
+        return None
+
+    angles = np.mod(np.arctan2(tab["ys"] - cy, tab["xs"] - cx), TAU)
+    mean_vec = complex(float(np.cos(angles).mean()), float(np.sin(angles).mean()))
+    mid = math.atan2(mean_vec.imag, mean_vec.real) % TAU
+    start = (mid - DELTA / 2.0) % TAU
+
+    rad = np.hypot(xs - cx, ys - cy)
+    rel = np.mod(np.mod(np.arctan2(ys - cy, xs - cx), TAU) - start, TAU)
+    bits: list[int] = []
+    purity = 1.0
+    for band in range(BANDS):
+        lo_r = r_in + (band + 0.28) * band_w
+        hi_r = r_in + (band + 0.72) * band_w
+        for sector in range(SECTORS):
+            lo_a = (sector + 0.28) * DELTA
+            hi_a = (sector + 0.72) * DELTA
+            patch = (rad >= lo_r) & (rad < hi_r) & (rel >= lo_a) & (rel < hi_a)
+            sel = keys[patch]
+            n_ink = int(np.count_nonzero(sel == ink_key))
+            n_plate = int(np.count_nonzero(sel == plate_key))
+            total = n_ink + n_plate
+            if total < 8:
+                return None
+            share = n_ink / total
+            bits.append(1 if share > 0.5 else 0)
+            purity = min(purity, abs(share - 0.5) * 2.0)
+    scored = sorted((sum(1 for a, b in zip(bits, _template_bits(name)) if a != b), name)
+                    for name in sorted(TEMPLATES))
+    return bits, scored, purity
+
+
+def decision_from_image(image: Image.Image) -> str:
+    result = _analyse(image)
+    if result is None:
+        return ABSTAIN
+    _bits, scored, purity = result
+    if purity < 0.5 or scored[1][0] - scored[0][0] <= 0:
+        return ABSTAIN
+    return scored[0][1]
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    """Diagnostic: the decision plus the runner-up template distance gap."""
+    result = _analyse(image)
+    if result is None:
+        return ABSTAIN, 0.0
+    _bits, scored, _purity = result
+    return decision_from_image(image), float(scored[1][0] - scored[0][0])

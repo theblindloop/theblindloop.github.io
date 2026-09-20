@@ -1,0 +1,363 @@
+"""Lattice-row-drift world: which way do the hole columns of one thick
+perforated plate lean as you go down the plate?
+
+The latent scene is one solid dark plate (a single connected, high-fill region
+that spans the canvas) pierced by ``rows x cols`` equal rectangular holes. Row
+``i`` is shifted sideways by ``i * drift`` pixels, so the negative space of the
+plate organises into columns that are either exactly straight or consistently
+staggered. The shift accumulates: a single row, or any one part of the plate,
+cannot reveal it -- only the top row measured against the bottom row can.
+
+The analytic decision rasterises the plate from the latent geometry, recovers
+the plate's enclosed background pockets, rebuilds the lattice from those
+pockets, and reads the least-squares slope of row-mean hole position against
+row index. The pixel-only arm reconstructs the same evidence from the PNG.
+
+The decision rule shared by both arms:
+
+    slope > +DRIFT_T  -> steps_right
+    slope < -DRIFT_T  -> steps_left
+    otherwise         -> in_line
+
+with an explicit ``unclear`` class whenever the lattice is not fully recovered
+or the slope sits within MARGIN_MIN of the threshold.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "lattice_row_drift-0.1.0"
+
+CANVAS = 336
+
+# Declared decision rule constants (shared, by declaration, with the pixel arm).
+DRIFT_T = 4.5
+MARGIN_MIN = 1.5
+MIN_ROWS = 4
+MIN_COLS = 3
+MIN_HOLES = 12
+MAX_HOLES = 64
+MAX_RESIDUAL = 1.0
+
+STEPS_LEFT = "steps_left"
+STEPS_RIGHT = "steps_right"
+IN_LINE = "in_line"
+UNCLEAR = "unclear"
+
+# Sampler-side drift budget: the plate's outer rectangle is sized for this much
+# stagger whatever the actual drift is, so plate size and ink never leak it.
+DRIFT_BUDGET = 12
+
+# Deterministic construction cycle over the classes plus explicit near-boundary
+# cases; the sampler never emits an intermediate drift outside this cycle.
+CONSTRUCTIONS = (
+    0,
+    11,
+    -10,
+    0,
+    -12,
+    9,
+    5,
+    -9,
+    12,
+    0,
+    10,
+    -11,
+    -4,
+    9,
+    -12,
+    11,
+    0,
+    -10,
+    4,
+    12,
+)
+
+FG_PALETTE = (
+    (26, 34, 78),
+    (86, 24, 32),
+    (22, 68, 52),
+    (58, 30, 84),
+    (34, 34, 34),
+    (18, 58, 88),
+)
+BG_PALETTE = ((246, 246, 240), (240, 244, 250), (250, 244, 236), (238, 242, 238))
+CLUTTER_PALETTE = ((198, 200, 206), (206, 196, 182), (188, 202, 200), (204, 200, 210))
+
+
+# --------------------------------------------------------------------------
+# plate raster (analytic path; reads only slab, holes, width, height)
+# --------------------------------------------------------------------------
+def _plate_mask(scene: dict) -> np.ndarray:
+    """Boolean raster of the dark plate: its outer rectangle minus its holes."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    mask = np.zeros((height, width), dtype=bool)
+    x0, y0, x1, y1 = (int(value) for value in scene["slab"])
+    mask[y0:y1, x0:x1] = True
+    for hole in scene["holes"]:
+        hx, hy, hw, hh = (int(value) for value in hole)
+        mask[hy : hy + hh, hx : hx + hw] = False
+    return mask
+
+
+# --------------------------------------------------------------------------
+# lattice reconstruction from a plate mask and the declared decision rule
+# --------------------------------------------------------------------------
+def _enclosed_pockets(plate: np.ndarray) -> np.ndarray:
+    """Background pixels the outside flood cannot reach: the plate's holes."""
+    background = ~plate
+    reached = np.zeros_like(background)
+    reached[0, :] = background[0, :]
+    reached[-1, :] = background[-1, :]
+    reached[:, 0] = background[:, 0]
+    reached[:, -1] = background[:, -1]
+    while True:
+        grown = reached.copy()
+        grown[1:, :] |= reached[:-1, :]
+        grown[:-1, :] |= reached[1:, :]
+        grown[:, 1:] |= reached[:, :-1]
+        grown[:, :-1] |= reached[:, 1:]
+        grown &= background
+        if np.array_equal(grown, reached):
+            break
+        reached = grown
+    return background & ~reached
+
+
+def _pocket_rects(pockets: np.ndarray) -> list[tuple[int, int, int, int]] | None:
+    """Every enclosed pocket as an exact solid rectangle, or None if any pocket
+    is not a solid rectangle isolated from the others."""
+    height, width = pockets.shape
+    remaining = pockets.copy()
+    rects: list[tuple[int, int, int, int]] = []
+    while bool(remaining.any()):
+        if len(rects) >= MAX_HOLES:
+            return None
+        flat = int(np.argmax(remaining))
+        top, left = divmod(flat, width)
+        run = remaining[top, left:]
+        stops = np.nonzero(~run)[0]
+        span = int(stops[0]) if stops.size else int(run.size)
+        depth = 1
+        while top + depth < height and bool(remaining[top + depth, left : left + span].all()):
+            depth += 1
+        if not bool(pockets[top : top + depth, left : left + span].all()):
+            return None
+        above, below = top - 1, top + depth
+        before, after = left - 1, left + span
+        cols = slice(max(before, 0), min(after + 1, width))
+        rows = slice(max(above, 0), min(below + 1, height))
+        if above >= 0 and bool(pockets[above, cols].any()):
+            return None
+        if below < height and bool(pockets[below, cols].any()):
+            return None
+        if before >= 0 and bool(pockets[rows, before].any()):
+            return None
+        if after < width and bool(pockets[rows, after].any()):
+            return None
+        rects.append((left, top, span, depth))
+        remaining[top : top + depth, left : left + span] = False
+    return rects
+
+
+def _uniform(values: list[int]) -> int | None:
+    """The common step of an increasing sequence, or None if it is not uniform."""
+    if len(values) < 2:
+        return None
+    steps = [values[index + 1] - values[index] for index in range(len(values) - 1)]
+    if min(steps) <= 0 or max(steps) != min(steps):
+        return None
+    return steps[0]
+
+
+def _lattice_slope(plate: np.ndarray) -> float | None:
+    """Least-squares sideways step per row of the plate's hole lattice."""
+    if int(np.count_nonzero(plate)) == 0:
+        return None
+    labels = _pocket_rects(_enclosed_pockets(plate))
+    if labels is None or len(labels) < MIN_HOLES:
+        return None
+    widths = {rect[2] for rect in labels}
+    heights = {rect[3] for rect in labels}
+    if len(widths) != 1 or len(heights) != 1:
+        return None
+    rows: dict[int, list[int]] = {}
+    for left, top, _, _ in labels:
+        rows.setdefault(top, []).append(left)
+    tops = sorted(rows)
+    if len(tops) < MIN_ROWS:
+        return None
+    if _uniform(tops) is None:
+        return None
+    counts = {len(rows[top]) for top in tops}
+    if len(counts) != 1 or counts.pop() < MIN_COLS:
+        return None
+    pitches = set()
+    means: list[float] = []
+    for top in tops:
+        lefts = sorted(rows[top])
+        pitch = _uniform(lefts)
+        if pitch is None:
+            return None
+        pitches.add(pitch)
+        means.append(sum(lefts) / len(lefts))
+    if len(pitches) != 1:
+        return None
+    count = len(means)
+    index_mean = (count - 1) / 2.0
+    value_mean = sum(means) / count
+    numerator = sum(
+        (index - index_mean) * (value - value_mean) for index, value in enumerate(means)
+    )
+    denominator = sum((index - index_mean) ** 2 for index in range(count))
+    slope = numerator / denominator
+    intercept = value_mean - slope * index_mean
+    residual = max(abs(value - (intercept + slope * index)) for index, value in enumerate(means))
+    if residual > MAX_RESIDUAL:
+        return None
+    return slope
+
+
+def _decide(slope: float | None) -> tuple[str, float]:
+    """Declared decision rule shared by the analytic and the pixel-only arm."""
+    if slope is None:
+        return UNCLEAR, 0.0
+    gap = abs(abs(slope) - DRIFT_T)
+    if gap < MARGIN_MIN:
+        return UNCLEAR, gap
+    if slope > DRIFT_T:
+        return STEPS_RIGHT, gap
+    if slope < -DRIFT_T:
+        return STEPS_LEFT, gap
+    return IN_LINE, gap
+
+
+def analytic_gold(scene: dict) -> str:
+    return _decide(_lattice_slope(_plate_mask(scene)))[0]
+
+
+def margin(scene: dict) -> float:
+    return round(_decide(_lattice_slope(_plate_mask(scene)))[1], 9)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return analytic_gold(scene) == UNCLEAR
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _layout(rng: random.Random, drift: int) -> dict | None:
+    """One plate-and-lattice geometry, or None when the draw does not fit."""
+    rows = rng.randint(MIN_ROWS, 6)
+    cols = rng.randint(MIN_COLS, 5)
+    if rows * cols < MIN_HOLES:
+        return None
+    hole_w = rng.randrange(30, 37, 2) + 1
+    hole_h = rng.randrange(26, 31, 2) + 1
+    pitch_x = hole_w + rng.randint(19, 30)
+    pitch_y = hole_h + rng.randint(19, 28)
+    budget = int(math.ceil(DRIFT_BUDGET * (rows - 1) / 2.0))
+    wall_l, wall_r = rng.randint(11, 18), rng.randint(11, 18)
+    wall_t, wall_b = rng.randint(11, 18), rng.randint(11, 18)
+    need_w = (cols - 1) * pitch_x + hole_w + 2 * budget + wall_l + wall_r
+    need_h = (rows - 1) * pitch_y + hole_h + wall_t + wall_b
+    if need_w > CANVAS - 16 or need_h > CANVAS - 16:
+        return None
+    slab_x = (CANVAS - need_w) // 2 + rng.randint(-5, 5)
+    slab_y = (CANVAS - need_h) // 2 + rng.randint(-5, 5)
+    if slab_x < 6 or slab_y < 6:
+        return None
+    if slab_x + need_w > CANVAS - 6 or slab_y + need_h > CANVAS - 6:
+        return None
+    base_x = slab_x + wall_l + budget
+    base_y = slab_y + wall_t
+    centre = ((rows - 1) * drift) // 2
+    holes = []
+    for row in range(rows):
+        offset = row * drift - centre
+        for col in range(cols):
+            holes.append([base_x + col * pitch_x + offset, base_y + row * pitch_y, hole_w, hole_h])
+    return {
+        "slab": [slab_x, slab_y, slab_x + need_w, slab_y + need_h],
+        "holes": holes,
+    }
+
+
+def _clutter(rng: random.Random, count: int) -> list[list[int]]:
+    return [
+        [rng.randint(4, CANVAS - 4), rng.randint(4, CANVAS - 4), rng.randint(4, 12)]
+        for _ in range(count)
+    ]
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic scene for ``seed``; the construction cycles over the classes."""
+    rng = random.Random(seed * 7919 + 17)
+    drift = CONSTRUCTIONS[seed % len(CONSTRUCTIONS)]
+    wanted, _ = _decide(float(drift))
+    fallback = None
+    for _ in range(80):
+        layout = _layout(rng, drift)
+        if layout is None:
+            continue
+        scene = {
+            "width": CANVAS,
+            "height": CANVAS,
+            "slab": layout["slab"],
+            "holes": layout["holes"],
+            "fg": list(FG_PALETTE[rng.randrange(len(FG_PALETTE))]),
+            "bg": list(BG_PALETTE[rng.randrange(len(BG_PALETTE))]),
+            "dfg": list(CLUTTER_PALETTE[rng.randrange(len(CLUTTER_PALETTE))]),
+            "clutter": _clutter(rng, rng.randint(6, 14)),
+        }
+        fallback = fallback or scene
+        if analytic_gold(scene) == wanted:
+            return scene
+    return fallback
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    """Flat-colour render: pale clutter first, then the dark plate on top.
+
+    No antialiasing or noise touches the plate, so the set of dark pixels in the
+    PNG is exactly the analytic plate raster and the enclosed pockets of the PNG
+    are exactly the latent holes.
+    """
+    width = int(scene["width"])
+    height = int(scene["height"])
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:, :] = np.asarray(scene["bg"], dtype=np.uint8)
+    ys, xs = np.mgrid[0:height, 0:width]
+    clutter = np.zeros((height, width), dtype=bool)
+    for x, y, radius in scene["clutter"]:
+        clutter |= (xs - float(x)) ** 2 + (ys - float(y)) ** 2 <= float(radius) ** 2
+    canvas[clutter] = np.asarray(scene["dfg"], dtype=np.uint8)
+    canvas[_plate_mask(scene)] = np.asarray(scene["fg"], dtype=np.uint8)
+    return Image.fromarray(canvas, mode="RGB")
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical latent aliases: the plate raster is its outer rectangle
+    minus a *set* of holes and the clutter is a flat-colour union, so the order
+    of either list is unobservable."""
+    reversed_holes = dict(scene)
+    reversed_holes["holes"] = list(reversed(scene["holes"]))
+    rolled_holes = dict(scene)
+    rolled_holes["holes"] = scene["holes"][5:] + scene["holes"][:5]
+    rolled_clutter = dict(scene)
+    rolled_clutter["clutter"] = scene["clutter"][3:] + scene["clutter"][:3]
+    return [
+        ("hole_punch_order_reversed", reversed_holes),
+        ("hole_punch_order_rolled", rolled_holes),
+        ("clutter_paint_order", rolled_clutter),
+    ]

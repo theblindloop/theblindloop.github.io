@@ -1,0 +1,402 @@
+"""route_required_node: sample, render and score a drawn junction network.
+
+A network of round junctions is wired into a single tree: every junction is
+reachable from every other one, and between any two junctions there is exactly
+one route.  Two junctions are terminals (one green, one red) and three interior
+junctions are coloured blue, orange and purple.  Exactly one of those three
+coloured junctions lies on the unique route from green to red, and naming it is
+the decision.
+
+The scene record is a plain JSON-serialisable dict.  ``analytic_gold`` re-derives
+the route from the drawn node/edge list, so it consumes only quantities that are
+painted into the raster.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "route_required_node-renderer-0.1.0"
+
+CANVAS = 640
+GRID = 4
+CELL = 152
+ORIGIN = 92
+JITTER = 20
+
+EDGE_WIDTH = 5
+PLAIN_RADIUS = 12
+SPECIAL_RADIUS = 16
+
+BACKGROUND = (255, 255, 255)
+EDGE_COLOR = (150, 150, 150)
+PLAIN_COLOR = (70, 70, 70)
+
+TERMINAL_COLORS = {"green": (0, 150, 60), "red": (210, 35, 35)}
+MARK_COLORS = {
+    "blue": (30, 70, 210),
+    "orange": (240, 140, 0),
+    "purple": (140, 45, 175),
+}
+MARK_ORDER = ("blue", "orange", "purple")
+
+MIN_ROUTE_EDGES = 5
+QUARANTINE_CLEARANCE = 14.0
+FANOUT_RADIUS = 42.0
+SAMPLE_STEP = 3.0
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+def _edge_points(scene: dict, edge: dict) -> list[tuple[float, float]]:
+    nodes = scene["nodes"]
+    a, b = nodes[edge["a"]], nodes[edge["b"]]
+    ax, ay, bx, by = a["x"], a["y"], b["x"], b["y"]
+    mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy) or 1.0
+    px, py = -dy / length, dx / length
+    off = edge["offset"]
+    return [(ax, ay), (mx + px * off, my + py * off), (bx, by)]
+
+
+def _polyline_samples(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        seg = math.hypot(x1 - x0, y1 - y0)
+        steps = max(2, int(seg / SAMPLE_STEP))
+        for i in range(steps + 1):
+            t = i / steps
+            out.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+    return out
+
+
+def _node_radius(node: dict) -> int:
+    return SPECIAL_RADIUS if node["role"] != "plain" else PLAIN_RADIUS
+
+
+def _clearance(scene: dict) -> float:
+    """Smallest ink-to-ink gap between drawn elements that are not incident.
+
+    This is the resolution at which the drawn graph stops being readable: when
+    it reaches zero a stroke merges with a junction or another stroke it is not
+    wired to, and the network the picture shows is no longer the network that
+    was sampled.
+    """
+    nodes = scene["nodes"]
+    edges = scene["edges"]
+    samples = [_polyline_samples(_edge_points(scene, e)) for e in edges]
+    best = float("inf")
+
+    for ei, edge in enumerate(edges):
+        for vi, node in enumerate(nodes):
+            if vi in (edge["a"], edge["b"]):
+                continue
+            d = min(math.hypot(sx - node["x"], sy - node["y"]) for sx, sy in samples[ei])
+            best = min(best, d - _node_radius(node) - EDGE_WIDTH / 2.0)
+
+    for i in range(len(edges)):
+        for j in range(i + 1, len(edges)):
+            shared = {edges[i]["a"], edges[i]["b"]} & {edges[j]["a"], edges[j]["b"]}
+            si, sj = samples[i], samples[j]
+            if shared:
+                # Two wires leaving the same junction are meant to touch at that
+                # junction, so only the part of each wire beyond the junction's
+                # fan-out neighbourhood is compared.
+                v = nodes[next(iter(shared))]
+                keep = lambda pts: [
+                    p for p in pts
+                    if math.hypot(p[0] - v["x"], p[1] - v["y"]) > FANOUT_RADIUS
+                ]
+                si, sj = keep(si), keep(sj)
+                if not si or not sj:
+                    continue
+            d = min(
+                math.hypot(ax - bx, ay - by) for ax, ay in si for bx, by in sj
+            )
+            best = min(best, d - EDGE_WIDTH)
+    return float(best)
+
+
+# --------------------------------------------------------------------------
+# graph helpers (operate only on drawn node/edge records)
+# --------------------------------------------------------------------------
+def _adjacency(scene: dict) -> dict[int, list[int]]:
+    adj: dict[int, list[int]] = {i: [] for i in range(len(scene["nodes"]))}
+    for e in scene["edges"]:
+        adj[e["a"]].append(e["b"])
+        adj[e["b"]].append(e["a"])
+    return adj
+
+
+def _route(scene: dict, src: int, dst: int) -> list[int]:
+    adj = _adjacency(scene)
+    prev = {src: -1}
+    queue = [src]
+    while queue:
+        cur = queue.pop(0)
+        if cur == dst:
+            break
+        for nxt in adj[cur]:
+            if nxt not in prev:
+                prev[nxt] = cur
+                queue.append(nxt)
+    if dst not in prev:
+        return []
+    path = [dst]
+    while path[-1] != src:
+        path.append(prev[path[-1]])
+    return list(reversed(path))
+
+
+def _terminal_index(scene: dict, role: str) -> int:
+    for i, node in enumerate(scene["nodes"]):
+        if node["role"] == role:
+            return i
+    raise ValueError(f"scene has no {role} terminal")
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _random_spanning_tree(rng: random.Random) -> list[tuple[int, int]]:
+    def idx(cx, cy):
+        return cy * GRID + cx
+
+    inside = {idx(0, 0)}
+    frontier = []
+    for cx in range(GRID):
+        for cy in range(GRID):
+            pass
+    frontier = [(idx(0, 0), idx(1, 0)), (idx(0, 0), idx(0, 1))]
+    tree: list[tuple[int, int]] = []
+    while len(inside) < GRID * GRID:
+        rng.shuffle(frontier)
+        a, b = frontier.pop()
+        if b in inside:
+            continue
+        inside.add(b)
+        tree.append((a, b))
+        bx, by = b % GRID, b // GRID
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = bx + dx, by + dy
+            if 0 <= nx < GRID and 0 <= ny < GRID and idx(nx, ny) not in inside:
+                frontier.append((b, idx(nx, ny)))
+    return tree
+
+
+def _dist_to_segment(px, py, ax, ay, bx, by) -> float:
+    dx, dy = bx - ax, by - ay
+    denom = dx * dx + dy * dy
+    t = 0.0 if denom == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / denom))
+    return math.hypot(px - (ax + dx * t), py - (ay + dy * t))
+
+
+def _rank_of(target: int, others: list[int], key) -> int:
+    values = sorted(others + [target], key=key)
+    return values.index(target)
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one junction network."""
+    answer_color = MARK_ORDER[seed % 3]
+
+    for attempt in range(400):
+        rng = random.Random((seed * 1_000_003) ^ (attempt * 7919) ^ 0x5EED)
+
+        coords = []
+        for cell in range(GRID * GRID):
+            cx, cy = cell % GRID, cell // GRID
+            coords.append(
+                (
+                    float(ORIGIN + cx * CELL + rng.uniform(-JITTER, JITTER)),
+                    float(ORIGIN + cy * CELL + rng.uniform(-JITTER, JITTER)),
+                )
+            )
+
+        tree = _random_spanning_tree(rng)
+        tight = rng.randrange(len(tree))
+        edges = []
+        for k, (a, b) in enumerate(tree):
+            span = 44.0 if (k == tight and rng.random() < 0.4) else 30.0
+            off = rng.uniform(11.0, span) * rng.choice((-1.0, 1.0))
+            edges.append({"a": int(a), "b": int(b), "offset": round(off, 4)})
+
+        nodes = [
+            {"x": round(coords[i][0], 4), "y": round(coords[i][1], 4), "role": "plain", "color": None}
+            for i in range(GRID * GRID)
+        ]
+        scene = {
+            "canvas": CANVAS,
+            "background": list(BACKGROUND),
+            "edge_width": EDGE_WIDTH,
+            "nodes": nodes,
+            "edges": edges,
+            "terminals": {"green": -1, "red": -1},
+        }
+
+        degree = {i: 0 for i in range(GRID * GRID)}
+        for e in edges:
+            degree[e["a"]] += 1
+            degree[e["b"]] += 1
+        leaves = [i for i, d in degree.items() if d == 1]
+        if len(leaves) < 2:
+            continue
+
+        rng.shuffle(leaves)
+        chosen = None
+        for gi in leaves:
+            for ri in leaves:
+                if gi == ri:
+                    continue
+                path = _route(scene, gi, ri)
+                if len(path) - 1 >= MIN_ROUTE_EDGES:
+                    chosen = (gi, ri, path)
+                    break
+            if chosen:
+                break
+        if not chosen:
+            continue
+        green_i, red_i, path = chosen
+        on_pool = [i for i in path[1:-1]]
+        off_pool = [i for i in range(GRID * GRID) if i not in path]
+        if len(on_pool) < 1 or len(off_pool) < 2:
+            continue
+
+        target_chord_rank = rng.randrange(3)
+        target_near_rank = rng.randrange(3)
+        gx, gy = coords[green_i]
+        rx, ry = coords[red_i]
+
+        picked = None
+        for _ in range(3000):
+            on = rng.choice(on_pool)
+            off = rng.sample(off_pool, 2)
+            chord = lambda i: _dist_to_segment(coords[i][0], coords[i][1], gx, gy, rx, ry)
+            near = lambda i: math.hypot(coords[i][0] - gx, coords[i][1] - gy)
+            if _rank_of(on, off, chord) != target_chord_rank:
+                continue
+            if _rank_of(on, off, near) != target_near_rank:
+                continue
+            picked = (on, off)
+            break
+        if not picked:
+            continue
+        on_node, off_nodes = picked
+
+        spare = [c for c in MARK_ORDER if c != answer_color]
+        rng.shuffle(spare)
+        nodes[green_i].update(role="green", color="green")
+        nodes[red_i].update(role="red", color="red")
+        nodes[on_node].update(role="mark", color=answer_color)
+        nodes[off_nodes[0]].update(role="mark", color=spare[0])
+        nodes[off_nodes[1]].update(role="mark", color=spare[1])
+        scene["terminals"] = {"green": int(green_i), "red": int(red_i)}
+
+        # Every fourth seed is deliberately pushed towards the readability
+        # threshold by swinging one wire out until it nearly grazes something it
+        # is not wired to, so the gallery covers near-boundary clearances too.
+        if seed % 4 == 0:
+            target = rng.uniform(9.0, 34.0)
+            base = edges[tight]["offset"]
+            sign = 1.0 if base >= 0 else -1.0
+            best_off, best_err = base, abs(_clearance(scene) - target)
+            for step in range(1, 26):
+                edges[tight]["offset"] = round(sign * (11.0 + step * 1.6), 4)
+                err = abs(_clearance(scene) - target)
+                if err < best_err:
+                    best_off, best_err = edges[tight]["offset"], err
+            edges[tight]["offset"] = best_off
+
+        clear = _clearance(scene)
+        if clear < 6.0:
+            continue
+        scene["clearance"] = round(clear, 4)
+        return scene
+
+    raise RuntimeError(f"failed to sample a scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (scene["canvas"], scene["canvas"]), tuple(scene["background"]))
+    draw = ImageDraw.Draw(img)
+
+    for edge in scene["edges"]:
+        pts = _polyline_samples(_edge_points(scene, edge))
+        draw.line(pts, fill=EDGE_COLOR, width=scene["edge_width"], joint="curve")
+
+    for node in scene["nodes"]:
+        r = _node_radius(node)
+        if node["role"] == "plain":
+            fill = PLAIN_COLOR
+        elif node["role"] in TERMINAL_COLORS:
+            fill = TERMINAL_COLORS[node["role"]]
+        else:
+            fill = MARK_COLORS[node["color"]]
+        draw.ellipse(
+            [node["x"] - r, node["y"] - r, node["x"] + r, node["y"] + r], fill=fill
+        )
+    return img
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine, symmetries
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    """Colour of the marked junction lying on the unique green-to-red route."""
+    green_i = _terminal_index(scene, "green")
+    red_i = _terminal_index(scene, "red")
+    path = _route(scene, green_i, red_i)
+    on = [scene["nodes"][i]["color"] for i in path if scene["nodes"][i]["role"] == "mark"]
+    if len(on) != 1:
+        raise ValueError(f"route carries {len(on)} marked junctions, expected exactly 1")
+    return on[0]
+
+
+def margin(scene: dict) -> float:
+    return float(round(_clearance(scene), 4))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_CLEARANCE
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabellings of the latent record.
+
+    Strokes and junctions are pairwise disjoint at a positive clearance, so the
+    raster does not depend on the order in which edges are drawn nor on the
+    integer names given to junctions.  Both transforms rewrite the latent record
+    substantially while leaving every painted pixel and the gold answer intact.
+    """
+    import copy
+
+    out: list[tuple[str, dict]] = []
+
+    reversed_edges = copy.deepcopy(scene)
+    reversed_edges["edges"] = list(reversed(reversed_edges["edges"]))
+    out.append(("edge_draw_order_reversal", reversed_edges))
+
+    n = len(scene["nodes"])
+    perm = [(i * 7 + 3) % n for i in range(n)]
+    while len(set(perm)) != n:  # pragma: no cover - 7 is coprime with 16
+        perm = list(range(n))
+    relabelled = copy.deepcopy(scene)
+    relabelled["nodes"] = [None] * n
+    for old, new in enumerate(perm):
+        relabelled["nodes"][new] = copy.deepcopy(scene["nodes"][old])
+    for e in relabelled["edges"]:
+        e["a"], e["b"] = perm[e["a"]], perm[e["b"]]
+    relabelled["terminals"] = {
+        "green": perm[scene["terminals"]["green"]],
+        "red": perm[scene["terminals"]["red"]],
+    }
+    out.append(("junction_relabelling", relabelled))
+    return out

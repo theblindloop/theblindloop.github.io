@@ -1,0 +1,217 @@
+"""Symmetry-axis selection world: which colored line is the reflection axis.
+
+A solid dark kite figure (which has exactly one reflection symmetry axis) is
+drawn on a white canvas. Three labeled colored lines pass through the figure's
+center; exactly one of them is the true mirror-symmetry axis of the dark
+figure. The decision is which color line that is, recovered from the final
+raster by reflecting the whole figure across each candidate line and selecting
+the line that maps the figure onto itself.
+
+The renderer owns scene sampling + rasterization + the structural analytic
+gold. The independent pixel-only inverse arm (``oracle.py``) recovers the same
+decision from the final PNG alone, from the colored lines and the dark figure
+recovered in the raster.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+CENTER = [256, 256]
+BACKGROUND = (255, 255, 255)
+FIGURE_COLOR = (45, 45, 58)
+LINE_WIDTH = 6
+LINE_HALF = 270
+
+# Three candidate line colors; exactly one is the figure's symmetry axis.
+LINE_COLORS = {
+    "red": (222, 40, 40),
+    "green": (38, 178, 84),
+    "blue": (44, 92, 224),
+}
+COLOR_NAMES = ["red", "green", "blue"]
+
+# Kite (deltoid) proportions symmetric about the axis direction.
+_A1 = 130.0
+_A2 = 100.0
+_B = 66.0
+_T = 6.0
+
+_TRUE_LABEL = "true"
+_OFFSET_SET = [math.radians(38), math.radians(47), math.radians(56), math.radians(66)]
+
+# Quarantine band on the top-two overlap gap (fraction of figure area).
+QUAR_MIN = 0.12
+
+
+def _unit(angle: float) -> tuple[float, float]:
+    return (math.cos(angle), math.sin(angle))
+
+
+def _kite_vertices(center, theta):
+    """Convex kite symmetric about the line through center along angle theta."""
+    ux, uy = _unit(theta)
+    vx, vy = (-uy, ux)
+    cx, cy = center
+    a1, a2, b, t = _A1, _A2, _B, _T
+    return [
+        (cx + a1 * ux, cy + a1 * uy),
+        (cx + t * ux + b * vx, cy + t * uy + b * vy),
+        (cx - a2 * ux, cy - a2 * uy),
+        (cx + t * ux - b * vx, cy + t * uy - b * vy),
+    ]
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``."""
+    rng = np.random.default_rng(seed)
+    center = list(CENTER)
+
+    # Figure axis direction (the true symmetry axis passes through the center
+    # along this angle).
+    true_angle = float(rng.uniform(0.0, 2.0 * math.pi))
+
+    # Two distractor offsets, clearly away from the true axis. Line order is
+    # [true, off1, off2]; line 0 lies exactly on the axis (offset 0).
+    offsets = sorted(rng.choice(_OFFSET_SET, size=2, replace=False).tolist())
+    sign = [1.0, -1.0]
+    rng.shuffle(sign)
+    offsets = [0.0, sign[0] * float(offsets[0]), sign[1] * float(offsets[1])]
+
+    # Line order is [true, off1, off2]; the true-axis color is line_colors[0].
+    # Randomly assign which palette color labels the true (first) line.
+    colors = list(COLOR_NAMES)
+    rng.shuffle(colors)
+
+    figure = {"a1": _A1, "a2": _A2, "b": _B, "t": _T}
+
+    return {
+        "center": center,
+        "theta": true_angle,
+        "offsets": offsets,
+        "line_colors": colors,
+        "figure": figure,
+    }
+
+
+def _figure_vertices(scene: dict):
+    return _kite_vertices(scene["center"], scene["theta"])
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the latent scene (a deterministic PNG)."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    d = ImageDraw.Draw(img)
+    d.polygon(_figure_vertices(scene), fill=FIGURE_COLOR)
+    theta = scene["theta"]
+    offsets = scene["offsets"]
+    colors = scene["line_colors"]
+    for i, ox in enumerate(offsets):
+        ang = theta + ox
+        col = LINE_COLORS[colors[i % len(colors)]]
+        dx, dy = math.cos(ang), math.sin(ang)
+        cx, cy = scene["center"]
+        d.line(
+            [(cx - LINE_HALF * dx, cy - LINE_HALF * dy), (cx + LINE_HALF * dx, cy + LINE_HALF * dy)],
+            fill=col,
+            width=LINE_WIDTH,
+        )
+    return img
+
+
+def _line_from_pixels(coords) -> tuple[float, float, float]:
+    """Principal-axis line fit over a set of pixel coordinates.
+
+    Returns (nx, ny, c) with unit normal, so the line is nx*x + ny*y + c = 0.
+    """
+    xs = coords[:, 1].astype(float)
+    ys = coords[:, 0].astype(float)
+    mx, my = xs.mean(), ys.mean()
+    cov = np.cov(np.stack([xs, ys]))
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    # Principal direction = eigenvector of the largest eigenvalue.
+    d = eigvecs[:, int(np.argmax(eigvals))]
+    norm = math.hypot(d[0], d[1])
+    d = d / norm
+    nx, ny = -d[1], d[0]
+    c = -(nx * mx + ny * my)
+    return (float(nx), float(ny), float(c))
+
+
+def _reflect_overlap(fig_mask: np.ndarray, nx: float, ny: float, c: float) -> float:
+    """Fraction of figure pixels whose mirror across the line is also figure."""
+    rows, cols = np.nonzero(fig_mask)
+    if len(rows) == 0:
+        return 0.0
+    xs = cols.astype(float)
+    ys = rows.astype(float)
+    s = nx * xs + ny * ys + c
+    # reflection: p' = p - 2*s*n
+    rx = xs - 2.0 * s * nx
+    ry = ys - 2.0 * s * ny
+    irx = np.rint(rx).astype(int)
+    iry = np.rint(ry).astype(int)
+    h, w = fig_mask.shape
+    ok = (irx >= 0) & (irx < w) & (iry >= 0) & (iry < h)
+    matched = np.zeros(len(rows), dtype=bool)
+    matched[ok] = fig_mask[iry[ok], irx[ok]]
+    return float(matched.mean())
+
+
+def _measure(scene: dict, img: Image.Image) -> list[float]:
+    """Per-line mirror overlap of the dark figure, in line order (true, off1, off2)."""
+    arr = np.asarray(img.convert("RGB"), dtype=np.int32)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    # Figure = dark pixels (near FIGURE_COLOR, far from white and from line colors).
+    fig = (
+        (np.abs(r - FIGURE_COLOR[0]) < 40)
+        & (np.abs(g - FIGURE_COLOR[1]) < 40)
+        & (np.abs(b - FIGURE_COLOR[2]) < 40)
+    )
+    fig_mask = fig
+    overlaps = []
+    for _, color in enumerate(scene["line_colors"]):
+        rc, gc, bc = LINE_COLORS[color]
+        mask = (
+            (np.abs(r - rc) < 48)
+            & (np.abs(g - gc) < 48)
+            & (np.abs(b - bc) < 48)
+        )
+        coords = np.argwhere(mask)
+        if len(coords) < 20:
+            overlaps.append(0.0)
+            continue
+        nx, ny, c = _line_from_pixels(coords)
+        overlaps.append(_reflect_overlap(fig_mask, nx, ny, c))
+    # Return overlaps ordered by the true first, matching line index 0.
+    return overlaps
+
+
+def analytic_gold(scene: dict) -> str:
+    """Structural gold: the color label of the figure's symmetry axis."""
+    return scene["line_colors"][0]
+
+
+def margin(scene: dict) -> float:
+    """Top-two overlap gap among the three candidate lines (fraction)."""
+    img = render(scene)
+    overlaps = _measure(scene, img)
+    if len(overlaps) < 3:
+        return 0.0
+    ordered = sorted(overlaps, reverse=True)
+    return float(ordered[0] - ordered[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine scenes where the top-two candidate overlap gap is ambiguous."""
+    return margin(scene) < QUAR_MIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """The scene is injectively rendered; no latent aliases are declared."""
+    return []

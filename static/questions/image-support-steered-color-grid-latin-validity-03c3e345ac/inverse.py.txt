@@ -1,0 +1,195 @@
+"""Independent pixel-only inverse for visible color-grid validity.
+
+The inverse discovers the solid board from the border-estimated page color,
+checks that the connected grid support is intact, segments sixteen saturated
+tokens, clusters their positions into rows and columns, and clusters their
+interior colors by equality.  It has no renderer, scene, coordinate, palette,
+or analytic-label access.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _border_background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:5].reshape(-1, 3),
+            array[-5:].reshape(-1, 3),
+            array[:, :5].reshape(-1, 3),
+            array[:, -5:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    return np.median(border, axis=0)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for raw_y, raw_x in np.argwhere(mask):
+        y, x = int(raw_y), int(raw_x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    padded = np.pad(mask.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1) - 1
+    return list(zip(starts.tolist(), ends.tolist(), strict=True))
+
+
+def _axis_groups(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    order = np.argsort(values)
+    sorted_values = values[order]
+    gaps = np.diff(sorted_values)
+    split_after = sorted(np.argsort(gaps)[-3:].tolist())
+    bounds = [0] + [index + 1 for index in split_after] + [len(values)]
+    groups = [order[bounds[index] : bounds[index + 1]] for index in range(4)]
+    if any(len(group) != 4 for group in groups):
+        raise OracleAbstention("token positions do not form four equal axis groups")
+    centers = np.asarray([values[group].mean() for group in groups])
+    if np.min(np.diff(centers)) < 70.0:
+        raise OracleAbstention("row or column centers are not visibly separated")
+    if any(float(np.ptp(values[group])) > 2.5 for group in groups):
+        raise OracleAbstention("tokens are not aligned within rows or columns")
+    labels = np.empty(len(values), dtype=np.int32)
+    for label, group in enumerate(groups):
+        labels[group] = label
+    return labels, centers
+
+
+def _color_groups(signatures: list[np.ndarray]) -> tuple[np.ndarray, float]:
+    centers: list[np.ndarray] = []
+    labels = []
+    for signature in signatures:
+        if not centers:
+            centers.append(signature)
+            labels.append(0)
+            continue
+        distances = [float(np.linalg.norm(signature - center)) for center in centers]
+        nearest = int(np.argmin(distances))
+        if distances[nearest] <= 28.0:
+            labels.append(nearest)
+        else:
+            centers.append(signature)
+            labels.append(len(centers) - 1)
+    if len(centers) != 4:
+        raise OracleAbstention(f"expected four visible color classes, found {len(centers)}")
+    counts = [labels.count(index) for index in range(4)]
+    if counts != [4, 4, 4, 4]:
+        raise OracleAbstention(f"global color histogram is not four-per-color: {counts}")
+    separations = [
+        float(np.linalg.norm(centers[first] - centers[second]))
+        for first in range(4)
+        for second in range(first + 1, 4)
+    ]
+    runner_up_margin = min(separations) - 56.0
+    if runner_up_margin <= 18.0:
+        raise OracleAbstention("color equality classes have insufficient separation")
+    return np.asarray(labels, dtype=np.int32), runner_up_margin
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or array.shape[0] < 400 or array.shape[1] < 400:
+        raise OracleAbstention("raster is too small")
+
+    background = _border_background(array)
+    distance = np.linalg.norm(array - background[None, None, :], axis=2)
+    support = distance > 25.0
+    ys, xs = np.nonzero(support)
+    if len(xs) < 120000:
+        raise OracleAbstention("connected board support is missing")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if not (360 <= width <= 400 and 360 <= height <= 400 and abs(width - height) <= 4):
+        raise OracleAbstention("board bounds are not a supported square")
+    if np.count_nonzero(support[:y0]) or np.count_nonzero(support[y1 + 1 :]):
+        raise OracleAbstention("unexpected support outside the board")
+    core = support[y0 + 3 : y1 - 2, x0 + 3 : x1 - 2]
+    if core.size == 0 or float(core.mean()) < 0.975:
+        raise OracleAbstention("solid board support has been interrupted")
+    if float(core.mean(axis=1).min()) < 0.93 or float(core.mean(axis=0).min()) < 0.93:
+        raise OracleAbstention("a row or column of the connected board is damaged")
+
+    high = array.max(axis=2)
+    low = array.min(axis=2)
+    saturated = (high - low > 62.0) & (high > 115.0)
+    token_points = []
+    for points in _components(saturated):
+        if len(points) < 30:
+            continue
+        area = len(points)
+        if not 1550 <= area <= 2700:
+            raise OracleAbstention(f"saturated component has unsupported area {area}")
+        py, px = points[:, 0], points[:, 1]
+        token_width = int(px.max() - px.min() + 1)
+        token_height = int(py.max() - py.min() + 1)
+        fill = area / float(token_width * token_height)
+        if not (46 <= token_width <= 58 and 46 <= token_height <= 58 and 0.66 <= fill <= 0.88):
+            raise OracleAbstention("saturated component is not a supported round token")
+        token_points.append(points)
+    if len(token_points) != 16:
+        raise OracleAbstention(f"expected sixteen visible tokens, found {len(token_points)}")
+
+    centers_x = np.asarray([points[:, 1].mean() for points in token_points])
+    centers_y = np.asarray([points[:, 0].mean() for points in token_points])
+    columns, x_centers = _axis_groups(centers_x)
+    rows, y_centers = _axis_groups(centers_y)
+    if abs(float(np.mean(np.diff(x_centers))) - float(np.mean(np.diff(y_centers)))) > 3.0:
+        raise OracleAbstention("row and column spacing disagree")
+
+    signatures = []
+    for points in token_points:
+        cy = int(round(float(points[:, 0].mean())))
+        cx = int(round(float(points[:, 1].mean())))
+        signatures.append(np.median(array[cy - 6 : cy + 7, cx - 6 : cx + 7], axis=(0, 1)))
+    colors, _runner_up_margin = _color_groups(signatures)
+
+    matrix = np.full((4, 4), -1, dtype=np.int32)
+    for index in range(16):
+        row, column = int(rows[index]), int(columns[index])
+        if matrix[row, column] != -1:
+            raise OracleAbstention("multiple tokens occupy one visible cell")
+        matrix[row, column] = int(colors[index])
+    if np.any(matrix < 0):
+        raise OracleAbstention("a visible cell has no token")
+    valid = all(len(set(matrix[row].tolist())) == 4 for row in range(4)) and all(
+        len(set(matrix[:, column].tolist())) == 4 for column in range(4)
+    )
+    return "yes" if valid else "no"
+

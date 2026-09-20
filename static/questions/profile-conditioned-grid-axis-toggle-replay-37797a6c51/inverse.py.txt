@@ -1,0 +1,138 @@
+"""Independent image-only inverse for the grid-axis toggle raster.
+
+This module deliberately imports no candidate renderer, scene, prompt,
+generator, verifier, or gold code. It discovers visual objects by color and
+connected components and uses only geometry relative to recovered objects.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[dict]:
+    """Return 4-connected component measurements for a Boolean raster."""
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=np.uint8)
+    found: list[dict] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = 1
+        count = 0
+        xmin = xmax = int(x)
+        ymin = ymax = int(y)
+        sx = sy = 0
+        while queue:
+            yy, xx = queue.popleft()
+            count += 1
+            sx += xx
+            sy += yy
+            xmin, xmax = min(xmin, xx), max(xmax, xx)
+            ymin, ymax = min(ymin, yy), max(ymax, yy)
+            for ny, nx in ((yy - 1, xx), (yy + 1, xx), (yy, xx - 1), (yy, xx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = 1
+                    queue.append((ny, nx))
+        if count >= minimum:
+            found.append(
+                {
+                    "area": count,
+                    "box": (xmin, ymin, xmax, ymax),
+                    "center": (sx / count, sy / count),
+                    "width": xmax - xmin + 1,
+                    "height": ymax - ymin + 1,
+                }
+            )
+    return found
+
+
+def _inside(inner: dict, outer: dict) -> bool:
+    x, y = inner["center"]
+    x0, y0, x1, y1 = outer["box"]
+    return x0 < x < x1 and y0 < y < y1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    high = rgb.max(axis=2)
+    low = rgb.min(axis=2)
+    saturation = high - low
+
+    on_mask = (blue > 150) & (blue > green + 25) & (blue > red + 20) & (red < 175)
+    off_mask = (high >= 215) & (high < 245) & (saturation < 26)
+    lamp_parts = [
+        item
+        for item in _components(on_mask | off_mask, minimum=1200)
+        if 45 <= item["width"] <= 60 and 45 <= item["height"] <= 60
+    ]
+    if len(lamp_parts) != 9:
+        raise ValueError(f"expected nine recoverable lamp interiors, found {len(lamp_parts)}")
+
+    xs = sorted({round(item["center"][0], 1) for item in lamp_parts})
+    ys = sorted({round(item["center"][1], 1) for item in lamp_parts})
+    if len(xs) != 3 or len(ys) != 3:
+        raise ValueError("lamp centers do not form a unique 3-by-3 grid")
+
+    target_mask = (red > 165) & (green < 105) & (blue < 125) & (red > green + 80)
+    target_parts = [
+        item
+        for item in _components(target_mask, minimum=200)
+        if 60 <= item["width"] <= 80 and 60 <= item["height"] <= 80
+    ]
+    if len(target_parts) != 1:
+        raise ValueError(f"expected one target ring, found {len(target_parts)}")
+    tx, ty = target_parts[0]["center"]
+    target = min(lamp_parts, key=lambda item: (item["center"][0] - tx) ** 2 + (item["center"][1] - ty) ** 2)
+    target_col = min(range(3), key=lambda index: abs(xs[index] - target["center"][0]))
+    target_row = min(range(3), key=lambda index: abs(ys[index] - target["center"][1]))
+    cx, cy = (int(round(value)) for value in target["center"])
+    initial_on = int(saturation[cy, cx]) > 40
+
+    dark_mask = (high < 95) & (saturation < 45)
+    dark_parts = _components(dark_mask, minimum=80)
+    cards = sorted(
+        [
+            item
+            for item in dark_parts
+            if 78 <= item["width"] <= 86 and 124 <= item["height"] <= 132
+        ],
+        key=lambda item: item["center"][0],
+    )
+    if len(cards) != 5:
+        raise ValueError(f"expected five ordered card borders, found {len(cards)}")
+
+    command_mask = ((red > 180) & (green > 80) & (green < 195) & (blue < 125)) | (
+        (green > 120) & (red < 105) & (blue < 195) & (green > red + 35)
+    )
+    command_parts = [item for item in _components(command_mask, minimum=250) if item["area"] > 350]
+    mini_grids = [
+        item for item in dark_parts if 46 <= item["width"] <= 52 and 46 <= item["height"] <= 52
+    ]
+
+    state = bool(initial_on)
+    for card in cards:
+        bars = [item for item in command_parts if _inside(item, card)]
+        minis = [item for item in mini_grids if _inside(item, card)]
+        if len(bars) != 1 or len(minis) != 1:
+            raise ValueError("each card must contain one command bar and one miniature grid")
+        bar, mini = bars[0], minis[0]
+        bx, by = bar["center"]
+        mx0, my0, mx1, my1 = mini["box"]
+        if bar["width"] >= 3 * bar["height"]:
+            axis = "row"
+            index = int((by - my0) * 3 / max(1, my1 - my0 + 1))
+        elif bar["height"] >= 3 * bar["width"]:
+            axis = "col"
+            index = int((bx - mx0) * 3 / max(1, mx1 - mx0 + 1))
+        else:
+            raise ValueError("command bar has ambiguous orientation")
+        index = max(0, min(2, index))
+        if (axis == "row" and index == target_row) or (axis == "col" and index == target_col):
+            state = not state
+    return "ON" if state else "OFF"

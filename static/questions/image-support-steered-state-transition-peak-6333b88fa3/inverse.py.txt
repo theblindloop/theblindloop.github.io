@@ -1,0 +1,163 @@
+"""Independent image-only inverse for the snapshot transition peak.
+
+The inverse locates the large bordered ledger in the raster, samples the twenty
+colored glyphs at the recovered grid positions, classifies circle versus
+diamond by the colored silhouette's area-to-box ratio, then counts adjacent
+shape changes in every row. It receives no latent scene and imports no
+renderer, prompt, generator, verifier, or analytic-gold code.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 900
+HEIGHT = 640
+PANEL_WIDTH = 620
+PANEL_HEIGHT = 438
+GRID_LEFT = 92
+GRID_TOP = 94
+CELL_WIDTH = 84
+CELL_HEIGHT = 62
+CELL_GAP = 10
+ROW_COUNT = 4
+SNAPSHOT_COUNT = 5
+ROW_LABELS = ("A", "B", "C", "D")
+PANEL_EDGE = np.asarray((52, 72, 84), dtype=np.float32)
+GLYPH_COLOR_LIST = np.asarray(
+    (
+        (221, 78, 82),
+        (54, 132, 213),
+        (73, 166, 111),
+        (223, 156, 48),
+        (160, 92, 190),
+        (29, 164, 157),
+    ),
+    dtype=np.float32,
+)
+
+
+class PixelOracleError(ValueError):
+    """The raster does not expose an unambiguous transition ledger."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not dy and not dx:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _recover_panel_origin(array: np.ndarray) -> tuple[int, int]:
+    distance = np.linalg.norm(array.astype(np.float32) - PANEL_EDGE, axis=2)
+    edge_mask = distance <= 38.0
+    candidates: list[tuple[int, int, int, int, int]] = []
+    for points in _components(edge_mask):
+        if len(points) < 500:
+            continue
+        ys = points[:, 0]
+        xs = points[:, 1]
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        if 560 <= width <= 680 and 390 <= height <= 480:
+            candidates.append((len(points), x0, y0, width, height))
+    if len(candidates) != 1:
+        raise PixelOracleError(f"expected one bordered ledger, found {len(candidates)}")
+    _, x0, y0, width, height = candidates[0]
+    if abs(width - PANEL_WIDTH) > 12 or abs(height - PANEL_HEIGHT) > 12:
+        raise PixelOracleError("ledger border has unresolved extent")
+    return x0, y0
+
+
+def _colored_components(crop: np.ndarray) -> list[np.ndarray]:
+    values = crop.astype(np.float32)
+    spread = values.max(axis=2) - values.min(axis=2)
+    near_palette = np.min(
+        np.linalg.norm(values[:, :, None, :] - GLYPH_COLOR_LIST[None, None, :, :], axis=3),
+        axis=2,
+    )
+    mask = (spread >= 34.0) & (near_palette <= 90.0)
+    return _components(mask)
+
+
+def _classify_glyph(array: np.ndarray, center_x: float, center_y: float) -> int:
+    cx, cy = int(round(center_x)), int(round(center_y))
+    x0, x1 = cx - 28, cx + 29
+    y0, y1 = cy - 28, cy + 29
+    if x0 < 0 or y0 < 0 or x1 > WIDTH or y1 > HEIGHT:
+        raise PixelOracleError("glyph crop falls outside the raster")
+    components = _colored_components(array[y0:y1, x0:x1])
+    candidates: list[tuple[float, int, int, int, int]] = []
+    for points in components:
+        ys = points[:, 0]
+        xs = points[:, 1]
+        left, right = int(xs.min()), int(xs.max())
+        top, bottom = int(ys.min()), int(ys.max())
+        width = right - left + 1
+        height = bottom - top + 1
+        area = len(points)
+        if 25 <= width <= 49 and 25 <= height <= 49 and 0.70 <= width / height <= 1.30 and 350 <= area <= 1500:
+            ratio = area / float(width * height)
+            candidates.append((ratio, area, width, height, int(points[:, 1].mean())))
+    if len(candidates) != 1:
+        raise PixelOracleError(f"expected one colored state glyph, found {len(candidates)}")
+    ratio, area, width, height, _ = candidates[0]
+    if not (0.38 <= ratio <= 0.86 and 0.65 <= width / height <= 1.5):
+        raise PixelOracleError("glyph silhouette is ambiguous")
+    # The circle occupies much more of its bounding box than the diamond.
+    if ratio >= 0.61:
+        return 0
+    return 1
+
+
+def _recover_sequences(array: np.ndarray, origin_x: int, origin_y: int) -> list[list[int]]:
+    sequences: list[list[int]] = []
+    for row in range(ROW_COUNT):
+        sequence: list[int] = []
+        for column in range(SNAPSHOT_COUNT):
+            center_x = origin_x + GRID_LEFT + column * (CELL_WIDTH + CELL_GAP) + CELL_WIDTH / 2
+            center_y = origin_y + GRID_TOP + row * (CELL_HEIGHT + CELL_GAP) + CELL_HEIGHT / 2
+            sequence.append(_classify_glyph(array, center_x, center_y))
+        sequences.append(sequence)
+    return sequences
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the unique row with the largest transition count from pixels alone."""
+
+    if image.size != (WIDTH, HEIGHT):
+        raise PixelOracleError(f"unexpected raster size {image.size}")
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    origin_x, origin_y = _recover_panel_origin(array)
+    sequences = _recover_sequences(array, origin_x, origin_y)
+    counts = [
+        sum(sequence[index] != sequence[index - 1] for index in range(1, SNAPSHOT_COUNT))
+        for sequence in sequences
+    ]
+    best = max(counts)
+    if counts.count(best) != 1:
+        raise PixelOracleError("transition peak is tied")
+    return ROW_LABELS[counts.index(best)]

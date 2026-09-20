@@ -1,0 +1,179 @@
+"""Independent image-only inverse for the projective emblem world.
+
+This module deliberately repeats only public visual rules. It never imports the
+renderer, latent-scene sampler, prompt code, generator, verifier, or gold code.
+"""
+
+from __future__ import annotations
+
+import math
+import hashlib
+
+import numpy as np
+from PIL import Image
+
+
+_SIZE = 240
+_MARKS = np.asarray(
+    [
+        (220, 63, 76),
+        (42, 118, 210),
+        (226, 166, 42),
+        (134, 77, 185),
+    ],
+    dtype=np.float64,
+)
+_LABELS = ("diamond", "hourglass", "chevron", "crown")
+_DECISION_CACHE: dict[bytes, str] = {}
+
+
+def _ordered_fiducials(image: Image.Image) -> np.ndarray:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.float64)
+    found = []
+    for color in _MARKS:
+        distance = np.sqrt(np.sum((pixels - color) ** 2, axis=2))
+        rows, columns = np.where(distance < 28.0)
+        if len(rows) < 40:
+            raise ValueError("missing colored corner fiducial")
+        found.append((float(np.mean(columns)), float(np.mean(rows))))
+    points = np.asarray(found, dtype=np.float64)
+    center = points.mean(axis=0)
+    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+    ordered = points[np.argsort(angles)]
+    start = int(np.argmin(ordered[:, 0] + ordered[:, 1]))
+    return np.roll(ordered, -start, axis=0)
+
+
+def _fit_forward_map(corners: np.ndarray) -> np.ndarray:
+    """Fit canonical-square coordinates to image coordinates from four marks."""
+
+    canonical = np.asarray(
+        [[0.0, 0.0], [_SIZE - 1.0, 0.0], [_SIZE - 1.0, _SIZE - 1.0], [0.0, _SIZE - 1.0]],
+        dtype=np.float64,
+    )
+    equations = []
+    target = []
+    for (u, v), (x, y) in zip(canonical, corners):
+        equations.append([u, v, 1.0, 0.0, 0.0, 0.0, -x * u, -x * v])
+        target.append(float(x))
+        equations.append([0.0, 0.0, 0.0, u, v, 1.0, -y * u, -y * v])
+        target.append(float(y))
+    coeff = np.linalg.solve(np.asarray(equations), np.asarray(target))
+    return np.array(
+        [[coeff[0], coeff[1], coeff[2]], [coeff[3], coeff[4], coeff[5]], [coeff[6], coeff[7], 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _bilinear(image: Image.Image, mapping: np.ndarray) -> np.ndarray:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float64)
+    axis = np.arange(_SIZE, dtype=np.float64) + 0.5
+    uu, vv = np.meshgrid(axis, axis)
+    denominator = mapping[2, 0] * uu + mapping[2, 1] * vv + mapping[2, 2]
+    xx = (mapping[0, 0] * uu + mapping[0, 1] * vv + mapping[0, 2]) / denominator
+    yy = (mapping[1, 0] * uu + mapping[1, 1] * vv + mapping[1, 2]) / denominator
+    xx = np.clip(xx, 0.0, rgb.shape[1] - 1.001)
+    yy = np.clip(yy, 0.0, rgb.shape[0] - 1.001)
+    x0 = np.floor(xx).astype(np.int64)
+    y0 = np.floor(yy).astype(np.int64)
+    x1 = np.minimum(x0 + 1, rgb.shape[1] - 1)
+    y1 = np.minimum(y0 + 1, rgb.shape[0] - 1)
+    fx = xx - x0
+    fy = yy - y0
+    top = rgb[y0, x0] * (1.0 - fx[..., None]) + rgb[y0, x1] * fx[..., None]
+    bottom = rgb[y1, x0] * (1.0 - fx[..., None]) + rgb[y1, x1] * fx[..., None]
+    return top * (1.0 - fy[..., None]) + bottom * fy[..., None]
+
+
+def _segments(name: str):
+    if name == "diamond":
+        points = ((48.0, 120.0), (120.0, 48.0), (192.0, 120.0), (120.0, 192.0), (48.0, 120.0))
+    elif name == "hourglass":
+        points = ((52.0, 54.0), (188.0, 54.0), (120.0, 120.0), (188.0, 186.0), (52.0, 186.0), (120.0, 120.0), (52.0, 54.0))
+    elif name == "chevron":
+        points = ((48.0, 66.0), (120.0, 174.0), (192.0, 66.0))
+    elif name == "crown":
+        points = ((44.0, 180.0), (44.0, 74.0), (88.0, 132.0), (120.0, 54.0), (152.0, 132.0), (196.0, 74.0), (196.0, 180.0), (44.0, 180.0))
+    else:
+        raise ValueError(name)
+    return tuple(zip(points[:-1], points[1:]))
+
+
+def _template(name: str, shift_x: float, shift_y: float, scale: float) -> np.ndarray:
+    # Work at the same 4x reduced resolution used for evidence extraction.
+    axis = np.arange(60, dtype=np.float64) * 4.0 + 2.0
+    x, y = np.meshgrid(axis, axis)
+    minimum = np.full(x.shape, np.inf, dtype=np.float64)
+    for (ax, ay), (bx, by) in _segments(name):
+        ax = 120.0 + scale * (ax - 120.0) + shift_x
+        ay = 120.0 + scale * (ay - 120.0) + shift_y
+        bx = 120.0 + scale * (bx - 120.0) + shift_x
+        by = 120.0 + scale * (by - 120.0) + shift_y
+        vx, vy = bx - ax, by - ay
+        t = ((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy)
+        t = np.clip(t, 0.0, 1.0)
+        px, py = ax + t * vx, ay + t * vy
+        minimum = np.minimum(minimum, np.hypot(x - px, y - py))
+    mask = (minimum <= 7.0).astype(np.float64)
+    # Give every candidate the same aggregate weight so ink amount is not a cue.
+    mask -= mask.mean()
+    norm = np.linalg.norm(mask)
+    return mask / norm if norm else mask
+
+
+def _evidence(square: np.ndarray) -> np.ndarray:
+    gray = 0.2126 * square[..., 0] + 0.7152 * square[..., 1] + 0.0722 * square[..., 2]
+    reduced = gray.reshape(60, 4, 60, 4).mean(axis=(1, 3))
+    padded = np.pad(reduced, 1, mode="edge")
+    smooth = (
+        padded[:-2, :-2]
+        + padded[:-2, 1:-1]
+        + padded[:-2, 2:]
+        + padded[1:-1, :-2]
+        + padded[1:-1, 1:-1]
+        + padded[1:-1, 2:]
+        + padded[2:, :-2]
+        + padded[2:, 1:-1]
+        + padded[2:, 2:]
+    ) / 9.0
+    inside = smooth[6:54, 6:54]
+    signal = np.median(inside) - inside
+    signal -= signal.mean()
+    return signal
+
+
+def _template_bank() -> tuple[tuple[str, ...], np.ndarray]:
+    names: list[str] = []
+    templates: list[np.ndarray] = []
+    for shift_x in (-16.0, -12.0, -8.0, -4.0, 0.0, 4.0, 8.0, 12.0, 16.0):
+        for shift_y in (-16.0, -12.0, -8.0, -4.0, 0.0, 4.0, 8.0, 12.0, 16.0):
+            for scale in (0.90, 0.96, 1.02, 1.08):
+                for name in _LABELS:
+                    names.append(name)
+                    templates.append(_template(name, shift_x, shift_y, scale)[6:54, 6:54].ravel())
+    return tuple(names), np.asarray(templates, dtype=np.float64)
+
+
+_BANK_NAMES, _BANK = _template_bank()
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the emblem from a final PNG and public visual rules only."""
+
+    pixels = image.convert("RGB").tobytes()
+    cache_key = hashlib.sha1(pixels).digest()
+    cached = _DECISION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    corners = _ordered_fiducials(image)
+    forward = _fit_forward_map(corners)
+    square = _bilinear(image, forward)
+    evidence = _evidence(square)
+    scores = _BANK @ evidence.ravel()
+    best = {name: -math.inf for name in _LABELS}
+    for name, score in zip(_BANK_NAMES, scores):
+        if score > best[name]:
+            best[name] = float(score)
+    answer = max(_LABELS, key=lambda name: (best[name], -_LABELS.index(name)))
+    _DECISION_CACHE[cache_key] = answer
+    return answer

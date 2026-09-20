@@ -1,0 +1,131 @@
+"""Pixel-only inverse arm for the cocircular-arc-pair world.
+
+Receives one rasterised page and nothing else. It segments the flat dark ink,
+groups it into contour fragments by connectivity, reconstructs the full circle
+implied by each fragment with an algebraic (Kasa) circle fit, and classifies the
+resulting four-centre configuration: the pair of fragments whose reconstructed
+circle centres coincide is the co-circular pair. No renderer, prompt, generator,
+verifier or gold code is imported and no scene data is accepted.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "cocircular_arc_pair-oracle-0.1.0"
+
+INK_MAX_MEAN = 120.0
+MIN_COMPONENT_PIXELS = 260
+MAX_COMPONENTS = 12
+COINCIDENCE_TOLERANCE = 15.0
+SEPARATION_TOLERANCE = 28.0
+SLOT_ORDER = ("top", "bottom", "left", "right")
+UNCLEAR = "unclear"
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float64)
+    return rgb.mean(axis=2) < INK_MAX_MEAN
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Eight-connected components of the ink mask, as (row, col) index arrays."""
+    height, width = mask.shape
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    groups: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    current = 0
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if labels[start_y, start_x]:
+            continue
+        current += 1
+        stack = [(start_y, start_x)]
+        labels[start_y, start_x] = current
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width:
+                        if mask[ny, nx] and not labels[ny, nx]:
+                            labels[ny, nx] = current
+                            stack.append((ny, nx))
+        groups.append(np.asarray(pixels, dtype=np.float64))
+        if current > MAX_COMPONENTS + 4:
+            break
+    return groups
+
+
+def _fit_circle(pixels: np.ndarray) -> tuple[float, float, float, float] | None:
+    """Algebraic circle fit; returns centre, radius and the residual spread."""
+    y = pixels[:, 0]
+    x = pixels[:, 1]
+    design = np.column_stack([x, y, np.ones_like(x)])
+    target = x * x + y * y
+    solution, *_ = np.linalg.lstsq(design, target, rcond=None)
+    cx = solution[0] / 2.0
+    cy = solution[1] / 2.0
+    under = solution[2] + cx * cx + cy * cy
+    if under <= 0.0:
+        return None
+    radius = math.sqrt(under)
+    distances = np.hypot(x - cx, y - cy)
+    residual = float(np.sqrt(np.mean((distances - radius) ** 2)))
+    return float(cx), float(cy), float(radius), residual
+
+
+def _slot_of_point(px: float, py: float, width: int, height: int) -> str:
+    dx = px - width / 2.0
+    dy = py - height / 2.0
+    if abs(dy) >= abs(dx):
+        return "top" if dy < 0 else "bottom"
+    return "left" if dx < 0 else "right"
+
+
+def decision_from_image(image: Image.Image) -> str:
+    mask = _ink_mask(image)
+    height, width = mask.shape
+    groups = [g for g in _components(mask) if len(g) >= MIN_COMPONENT_PIXELS]
+    if len(groups) != 4:
+        return UNCLEAR
+
+    fits = []
+    slots = []
+    for pixels in groups:
+        fit = _fit_circle(pixels)
+        if fit is None:
+            return UNCLEAR
+        cx, cy, radius, residual = fit
+        if residual > 4.0 or not 40.0 < radius < 3.0 * max(width, height):
+            return UNCLEAR
+        fits.append((cx, cy, radius))
+        centroid_x = float(pixels[:, 1].mean())
+        centroid_y = float(pixels[:, 0].mean())
+        slots.append(_slot_of_point(centroid_x, centroid_y, width, height))
+
+    if sorted(slots) != sorted(SLOT_ORDER):
+        return UNCLEAR
+
+    radii = [fit[2] for fit in fits]
+    if max(radii) - min(radii) > 0.25 * max(radii):
+        return UNCLEAR
+
+    ranked = sorted(
+        (math.dist((fits[a][0], fits[a][1]), (fits[b][0], fits[b][1])), a, b)
+        for a in range(4)
+        for b in range(a + 1, 4)
+    )
+    best, first, second = ranked[0]
+    if best > COINCIDENCE_TOLERANCE:
+        return UNCLEAR
+    if ranked[1][0] - best < SEPARATION_TOLERANCE:
+        return UNCLEAR
+
+    order = {name: index for index, name in enumerate(SLOT_ORDER)}
+    low, high = sorted((slots[first], slots[second]), key=lambda name: order[name])
+    return f"{low} and {high}"

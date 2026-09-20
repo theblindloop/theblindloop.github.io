@@ -1,0 +1,217 @@
+"""Scene sampler, renderer, analytic gold and margin for focus_shift_tally.
+
+The image shows four coloured towers of unit blocks standing on one baseline, a
+black pointer under one tower (the focus), a hollow ring above one tower (the
+queried tower), and a left-to-right row of operation cards.  A slate card with
+white pips adds that many blocks to the tower the pointer is *currently* under;
+a grey card with a white triangle moves the pointer one tower that way.  The
+final configuration is never drawn, so both answered quantities are consequences
+of executing the drawn programme.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "focus_shift_tally-0.1.0"
+
+W, H = 780, 440
+BASE = 290
+BLOCK_W, STEP = 60, 24
+TOWER_X = (140, 290, 440, 590)
+RING_Y, RING_R = 34, 13
+PTR_TOP, PTR_H, PTR_W = 298, 22, 30
+ARROW_Y = 345
+ARROW_X0, ARROW_X1 = 96, 684
+CARD, CARD_TOP = 46, 370
+MAX_H = 9
+
+QUARANTINE = 10.0
+GAP_SCALE = 3.0
+
+TOWER_ANCHORS = {
+    "red": (208, 58, 50),
+    "blue": (46, 96, 190),
+    "green": (34, 140, 72),
+    "orange": (226, 140, 28),
+    "purple": (128, 62, 170),
+}
+CARD_ANCHORS = {"add": (60, 66, 84), "shift": (120, 120, 124)}
+ALL_ANCHORS = tuple(TOWER_ANCHORS.values()) + tuple(CARD_ANCHORS.values())
+STRUCT_INK = (28, 28, 32)
+BG = (255, 255, 255)
+
+
+def _jitter(rng: random.Random, rgb: tuple[int, int, int]) -> list[int]:
+    return [max(0, min(255, c + rng.randint(-9, 9))) for c in rgb]
+
+
+def _clearance(rgb) -> float:
+    ds = sorted(
+        ((rgb[0] - a[0]) ** 2 + (rgb[1] - a[1]) ** 2 + (rgb[2] - a[2]) ** 2) ** 0.5
+        for a in ALL_ANCHORS
+    )
+    return 0.5 * (ds[1] - ds[0])
+
+
+def _simulate(towers, cards, focus_id, ring_id):
+    """Replay the drawn programme.  Ordering comes only from drawn geometry."""
+    order = sorted(towers, key=lambda t: t["x"])
+    pos = {t["id"]: i for i, t in enumerate(order)}
+    heights = [t["height"] for t in order]
+    focus = pos[focus_id]
+    for card in sorted(cards, key=lambda c: c["x"]):
+        if card["kind"] == "add":
+            heights[focus] += card["pips"]
+        else:
+            focus += card["dir"]
+        if not 0 <= focus < len(order):
+            raise ValueError("focus left the row of towers")
+    return heights, focus, order, pos
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random((seed * 2654435761) ^ 0x5F3A7C1)
+    for _ in range(20000):
+        names = rng.sample(sorted(TOWER_ANCHORS), 4)
+        heights = [rng.randint(1, 3) for _ in range(4)]
+        n = rng.randint(5, 8)
+        kinds = ["add" if rng.random() < 0.6 else "shift" for _ in range(n)]
+        if kinds.count("add") < 3 or kinds.count("shift") < 2:
+            continue
+        gap = rng.randint(2, 14)
+        total = n * CARD + (n - 1) * gap
+        x0 = (W - total) // 2
+        cards = []
+        for i, kind in enumerate(kinds):
+            card = {
+                "x": x0 + i * (CARD + gap),
+                "kind": kind,
+                "pips": rng.randint(1, 3) if kind == "add" else 0,
+                "dir": 0 if kind == "add" else rng.choice((-1, 1)),
+            }
+            cards.append(card)
+        focus0 = rng.randrange(4)
+        ring = rng.randrange(4)
+        towers = [
+            {"id": i, "x": TOWER_X[i], "name": names[i], "height": heights[i]}
+            for i in range(4)
+        ]
+        try:
+            final_h, final_focus, order, pos = _simulate(towers, cards, focus0, ring)
+        except ValueError:
+            continue
+        if max(final_h) > MAX_H:
+            continue
+        ring_pos = pos[ring]
+        # shortcut blocks, all enforced at sampling time
+        if final_h[ring_pos] == heights[ring_pos]:
+            continue  # the drawn ringed tower is never already the answer
+        if final_h[ring_pos] == heights[ring_pos] + sum(c["pips"] for c in cards):
+            continue  # "pour every pip into the ring" is never right
+        if final_focus == pos[focus0]:
+            continue  # the pointer always ends somewhere else
+        if not 2 <= final_h[ring_pos] <= MAX_H:
+            continue
+
+        for t in towers:
+            t["rgb"] = _jitter(rng, TOWER_ANCHORS[t["name"]])
+        for c in cards:
+            c["rgb"] = _jitter(rng, CARD_ANCHORS[c["kind"]])
+        rng.shuffle(towers)
+        rng.shuffle(cards)
+        return {
+            "towers": towers,
+            "cards": cards,
+            "focus_id": focus0,
+            "ring_id": ring,
+            "gap": gap,
+            "canvas": [W, H],
+        }
+    raise RuntimeError(f"scene rejection sampling failed for seed {seed}")
+
+
+def analytic_gold(scene: dict) -> str:
+    heights, focus, order, pos = _simulate(
+        scene["towers"], scene["cards"], scene["focus_id"], scene["ring_id"]
+    )
+    return f"{heights[pos[scene['ring_id']]]}|{order[focus]['name']}"
+
+
+def margin(scene: dict) -> float:
+    inks = [t["rgb"] for t in scene["towers"]] + [c["rgb"] for c in scene["cards"]]
+    return round(min(min(_clearance(rgb) for rgb in inks), GAP_SCALE * scene["gap"]), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Storage-order permutations: pixel-identical and gold-preserving."""
+    out = []
+    rev_t = dict(scene, towers=list(reversed(scene["towers"])))
+    out.append(("reverse_tower_storage", rev_t))
+    rev_c = dict(scene, cards=list(reversed(scene["cards"])))
+    out.append(("reverse_card_storage", rev_c))
+    rot = dict(
+        scene,
+        towers=scene["towers"][1:] + scene["towers"][:1],
+        cards=scene["cards"][2:] + scene["cards"][:2],
+    )
+    out.append(("rotate_both_storages", rot))
+    return out
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    towers = sorted(scene["towers"], key=lambda t: t["x"])
+    by_id = {t["id"]: t for t in towers}
+
+    ring_x = by_id[scene["ring_id"]]["x"]
+    d.ellipse(
+        [ring_x - RING_R, RING_Y - RING_R, ring_x + RING_R, RING_Y + RING_R],
+        outline=STRUCT_INK,
+        width=3,
+    )
+
+    for t in towers:
+        left = t["x"] - BLOCK_W // 2
+        n = t["height"]
+        d.rectangle([left, BASE - n * STEP, left + BLOCK_W - 1, BASE - 1],
+                    fill=tuple(t["rgb"]))
+        for k in range(1, n):  # visible seam between consecutive unit blocks
+            seam = BASE - k * STEP
+            d.rectangle([left, seam - 1, left + BLOCK_W - 1, seam], fill=STRUCT_INK)
+
+    fx = by_id[scene["focus_id"]]["x"]
+    d.polygon(
+        [(fx - PTR_W // 2, PTR_TOP + PTR_H), (fx + PTR_W // 2, PTR_TOP + PTR_H), (fx, PTR_TOP)],
+        fill=STRUCT_INK,
+    )
+
+    d.rectangle([ARROW_X0, ARROW_Y - 2, ARROW_X1 - 14, ARROW_Y + 2], fill=STRUCT_INK)
+    d.polygon(
+        [(ARROW_X1 - 16, ARROW_Y - 9), (ARROW_X1 - 16, ARROW_Y + 9), (ARROW_X1, ARROW_Y)],
+        fill=STRUCT_INK,
+    )
+
+    for c in sorted(scene["cards"], key=lambda c: c["x"]):
+        x, y = c["x"], CARD_TOP
+        d.rectangle([x, y, x + CARD - 1, y + CARD - 1], fill=tuple(c["rgb"]))
+        cx, cy = x + CARD // 2, y + CARD // 2
+        if c["kind"] == "add":
+            k = c["pips"]
+            for i in range(k):
+                px = cx + (i - (k - 1) / 2.0) * 14
+                d.ellipse([px - 5, cy - 5, px + 5, cy + 5], fill=BG)
+        else:
+            if c["dir"] > 0:
+                pts = [(cx - 9, cy - 11), (cx - 9, cy + 11), (cx + 11, cy)]
+            else:
+                pts = [(cx + 9, cy - 11), (cx + 9, cy + 11), (cx - 11, cy)]
+            d.polygon(pts, fill=BG)
+    return img

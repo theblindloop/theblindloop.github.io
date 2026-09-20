@@ -1,0 +1,170 @@
+"""Deterministic sampler and renderer for an implicit proximity cut-vertex graph."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+
+def _rotate(point: tuple[float, float], angle: float, center: tuple[float, float]) -> list[float]:
+    x, y = point
+    c, s = math.cos(angle), math.sin(angle)
+    return [round(center[0] + c * x - s * y, 4), round(center[1] + s * x + c * y, 4)]
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    threshold = rng.randint(68, 71)
+    separation = rng.uniform(154.0, 158.0)
+    radius = rng.uniform(27.0, 29.0)
+    inner_angle = rng.uniform(31.0, 36.0) * math.pi / 180.0
+    rotation = rng.uniform(0.0, 2.0 * math.pi)
+    center = (256.0 + rng.uniform(-24.0, 24.0), 222.0 + rng.uniform(-18.0, 18.0))
+
+    raw: list[tuple[float, float]] = [(0.0, 0.0)]  # shared cut vertex
+    cluster_centers: list[int] = []
+    for side in (-1.0, 1.0):
+        cx = side * separation / 2.0
+        cluster_centers.append(len(raw))
+        raw.append((cx, 0.0))
+        toward = 0.0 if side < 0 else math.pi
+        # Two inward vertices see the cut vertex; two outward vertices do not.
+        for delta in (-inner_angle, inner_angle, math.pi - inner_angle, math.pi + inner_angle):
+            a = toward + delta
+            raw.append((cx + radius * math.cos(a), radius * math.sin(a)))
+
+    points = [_rotate(p, rotation, center) for p in raw]
+    cut_old = 0
+    decoy_old = rng.choice(cluster_centers)
+
+    order = list(range(len(points)))
+    rng.shuffle(order)
+    points = [points[i] for i in order]
+    cut_index = order.index(cut_old)
+    decoy_index = order.index(decoy_old)
+    if int(seed) % 2 == 0:
+        candidates = {"red": cut_index, "blue": decoy_index}
+    else:
+        candidates = {"red": decoy_index, "blue": cut_index}
+
+    bar_x = rng.randint(192, 250)
+    bar_y = rng.randint(466, 476)
+    return {
+        "points": points,
+        "candidate_indices": candidates,
+        "dot_radius": 7,
+        "threshold": threshold,
+        "bar_box": [bar_x, bar_y, 9],
+        "palette": {
+            "background": [250, 250, 247],
+            "dots": [24, 26, 30],
+            "red": [210, 52, 55],
+            "blue": [35, 102, 205],
+            "bar": [143, 151, 160]
+        },
+        "canvas": [512, 512]
+    }
+
+
+def _graph(scene: dict) -> list[set[int]]:
+    points = scene["points"]
+    threshold = float(scene["threshold"])
+    graph = [set() for _ in points]
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            if math.dist(points[i], points[j]) < threshold:
+                graph[i].add(j)
+                graph[j].add(i)
+    return graph
+
+
+def _components(graph: list[set[int]], removed: int | None = None) -> int:
+    unseen = set(range(len(graph)))
+    if removed is not None:
+        unseen.discard(removed)
+    count = 0
+    while unseen:
+        count += 1
+        start = unseen.pop()
+        queue = deque([start])
+        while queue:
+            node = queue.popleft()
+            for neighbor in graph[node]:
+                if neighbor != removed and neighbor in unseen:
+                    unseen.remove(neighbor)
+                    queue.append(neighbor)
+    return count
+
+
+def _scores(scene: dict) -> dict[str, int]:
+    graph = _graph(scene)
+    base = _components(graph)
+    return {color: _components(graph, int(index)) - base for color, index in scene["candidate_indices"].items()}
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _scores(scene)
+    winners = [color for color, score in scores.items() if score > 0]
+    if len(winners) != 1 or set(scores) != {"red", "blue"}:
+        raise ValueError(f"expected one colored cut vertex, got {scores}")
+    return winners[0]
+
+
+def margin(scene: dict) -> float:
+    points = scene["points"]
+    threshold = float(scene["threshold"])
+    threshold_clearance = min(
+        abs(math.dist(points[i], points[j]) - threshold)
+        for i in range(len(points)) for j in range(i + 1, len(points))
+    )
+    ordered = sorted(_scores(scene).values(), reverse=True)
+    score_gap_px = threshold * float(ordered[0] - ordered[1])
+    return min(threshold_clearance, score_gap_px)
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        graph = _graph(scene)
+        scores = _scores(scene)
+        candidate_degrees = [len(graph[int(scene["candidate_indices"][c])]) for c in ("red", "blue")]
+        return (
+            _components(graph) != 1
+            or sorted(scores.values()) != [0, 1]
+            or candidate_degrees[0] != candidate_degrees[1]
+            or margin(scene) < 6.0
+        )
+    except (KeyError, TypeError, ValueError, IndexError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    transformed = copy.deepcopy(scene)
+    n = len(scene["points"])
+    transformed["points"] = list(reversed(scene["points"]))
+    transformed["candidate_indices"] = {
+        color: n - 1 - int(index) for color, index in scene["candidate_indices"].items()
+    }
+    return [("reverse_point_order", transformed)]
+
+
+def render(scene: dict) -> Image.Image:
+    canvas = scene["canvas"]
+    palette = scene["palette"]
+    image = Image.new("RGB", (int(canvas[0]), int(canvas[1])), tuple(palette["background"]))
+    draw = ImageDraw.Draw(image)
+    radius = int(scene["dot_radius"])
+    index_to_color = {int(index): color for color, index in scene["candidate_indices"].items()}
+    for index, (x, y) in enumerate(scene["points"]):
+        color = index_to_color.get(index, "dots")
+        draw.ellipse(
+            [round(x) - radius, round(y) - radius, round(x) + radius, round(y) + radius],
+            fill=tuple(palette[color]),
+        )
+    bar_x, bar_y, bar_h = [int(v) for v in scene["bar_box"]]
+    threshold = int(scene["threshold"])
+    draw.rectangle([bar_x, bar_y, bar_x + threshold - 1, bar_y + bar_h - 1], fill=tuple(palette["bar"]))
+    return image

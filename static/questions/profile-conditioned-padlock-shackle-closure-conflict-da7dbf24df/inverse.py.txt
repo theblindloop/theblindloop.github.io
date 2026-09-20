@@ -1,0 +1,159 @@
+"""Independent pixel-only inverse for the padlock closure question.
+
+Only the public color families and visible raster geometry are used.  The body
+top and horizontal support are inferred from body pixels.  The two lower ends of
+the dark U are recovered on opposite sides of that inferred center, then each is
+classified as robustly seated, robustly clear, or ambiguous.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_BODY_PALETTE = np.array(
+    [(42, 111, 177), (24, 137, 118), (177, 92, 43), (116, 78, 164)],
+    dtype=np.int16,
+)
+_SHACKLE_PALETTE = np.array(
+    [(28, 34, 43), (48, 38, 55), (27, 52, 50), (58, 45, 31)],
+    dtype=np.int16,
+)
+_TOLERANCE = 30.0
+
+
+class AmbiguousImage(ValueError):
+    """The raster does not expose two reliably classifiable shackle ends."""
+
+
+def _palette_mask(array: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    pixels = array.astype(np.int16)
+    delta = pixels[:, :, None, :] - palette[None, None, :, :]
+    distance = np.sqrt(np.sum(delta.astype(np.float32) ** 2, axis=3))
+    return np.min(distance, axis=2) <= _TOLERANCE
+
+
+def _bbox(mask: np.ndarray) -> dict:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise AmbiguousImage("required color family is absent")
+    left, right = int(xs.min()), int(xs.max())
+    top, bottom = int(ys.min()), int(ys.max())
+    return {
+        "left": left,
+        "right": right,
+        "top": top,
+        "bottom": bottom,
+        "width": right - left + 1,
+        "height": bottom - top + 1,
+        "area": int(len(xs)),
+        "cx": (left + right) / 2.0,
+    }
+
+
+def _component_areas(mask: np.ndarray) -> list[int]:
+    """Return 4-connected areas; used only on the sparse shackle mask."""
+
+    work = mask.copy()
+    height, width = work.shape
+    areas: list[int] = []
+    while bool(work.any()):
+        y0, x0 = np.argwhere(work)[0]
+        queue = deque([(int(y0), int(x0))])
+        work[y0, x0] = False
+        area = 0
+        while queue:
+            y, x = queue.popleft()
+            area += 1
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and work[yy, xx]:
+                    work[yy, xx] = False
+                    queue.append((yy, xx))
+        areas.append(area)
+    return sorted(areas, reverse=True)
+
+
+def _end_measurement(mask: np.ndarray, center_x: float, side: int, body: dict) -> dict:
+    columns = np.arange(mask.shape[1], dtype=np.float32)[None, :]
+    side_mask = mask & (columns < center_x if side == 0 else columns > center_x)
+    ys, xs = np.nonzero(side_mask)
+    if len(xs) < 300:
+        raise AmbiguousImage("one side of the shackle is missing")
+    max_y = int(ys.max())
+    cap = xs[ys >= max_y - 3]
+    if len(cap) < 4:
+        raise AmbiguousImage("a shackle endpoint is not resolved")
+    end_x = float(np.median(cap))
+    signed_vertical = float(max_y - int(body["top"]))
+    horizontally_supported = (
+        float(body["left"]) + 4.0 <= end_x <= float(body["right"]) - 4.0
+    )
+    if signed_vertical >= 8.0 and horizontally_supported:
+        state = "contact"
+    elif signed_vertical <= -7.0 or not horizontally_supported:
+        state = "clear"
+    else:
+        state = "ambiguous"
+    return {
+        "state": state,
+        "end_x": end_x,
+        "max_y": max_y,
+        "signed_vertical": signed_vertical,
+        "horizontally_supported": horizontally_supported,
+    }
+
+
+def measure_image(image: Image.Image) -> dict:
+    """Recover both terminal states and a runner-up boundary margin."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[0] < 180 or rgb.shape[1] < 220:
+        raise AmbiguousImage("image is too small")
+    body_mask = _palette_mask(rgb, _BODY_PALETTE)
+    shackle_mask = _palette_mask(rgb, _SHACKLE_PALETTE)
+    body = _bbox(body_mask)
+    shackle = _bbox(shackle_mask)
+    if body["area"] < 12000 or body["width"] < 150 or body["height"] < 95:
+        raise AmbiguousImage("lock body is absent or malformed")
+    if shackle["area"] < 1800 or shackle["height"] < 90 or shackle["width"] < 90:
+        raise AmbiguousImage("U-shaped shackle is absent or malformed")
+    if shackle["top"] >= body["top"] - 55:
+        raise AmbiguousImage("shackle does not visibly rise above the body")
+    components = _component_areas(shackle_mask)
+    if not components or components[0] < 0.96 * int(shackle_mask.sum()):
+        raise AmbiguousImage("dark shackle is not one coherent U-shaped component")
+
+    ends = [
+        _end_measurement(shackle_mask, float(body["cx"]), 0, body),
+        _end_measurement(shackle_mask, float(body["cx"]), 1, body),
+    ]
+    states = [item["state"] for item in ends]
+    if "ambiguous" in states:
+        raise AmbiguousImage("an endpoint lies within the finite-resolution boundary band")
+    contacts = states.count("contact")
+    if contacts == 2:
+        decision = "yes"
+    elif contacts == 1 and states.count("clear") == 1:
+        decision = "no"
+    else:
+        raise AmbiguousImage("expected either two contacts or one contact and one clear end")
+    runner_up_margin = min(abs(float(item["signed_vertical"])) for item in ends)
+    return {
+        "decision": decision,
+        "margin": float(runner_up_margin),
+        "body_bbox": body,
+        "shackle_bbox": shackle,
+        "end_measurements": ends,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return ``yes``/``no`` from pixels alone, or ``abstain`` if ambiguous."""
+
+    try:
+        return str(measure_image(image)["decision"])
+    except (AmbiguousImage, ValueError, IndexError, TypeError):
+        return "abstain"

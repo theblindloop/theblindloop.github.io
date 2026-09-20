@@ -1,0 +1,209 @@
+"""Texture-energy silhouette world: a shape revealed by mark-density.
+
+A random dot field fills the whole canvas. Inside one central region the small
+dots are packed densely; outside the region they are scattered sparsely. The
+figure exists only as a texture-energy modulation -- local dot density -- not as
+a solid object or a differently coloured object. The decision is: which of four
+shapes (circle, square, diamond, triangle) is outlined by the dense cluster?
+
+The renderer owns scene sampling + rasterization + the structural analytic gold.
+The independent pixel-only inverse arm (``oracle.py``) reconstructs the local
+mark-density field from the final PNG alone, thresholds it to recover the dense
+silhouette, and classifies the result.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from collections import deque
+from PIL import Image
+
+WIDTH = 384
+HEIGHT = 384
+CENTER = WIDTH // 2
+RADIUS = 105
+DENSE_COVER = 0.5       # mark-area fraction inside the shape
+SPARSE_COVER = 0.03     # mark-area fraction in the background
+DOT_R = 1               # small-dot radius (produces a smooth density field)
+WINDOW = 11             # local-density smoothing window
+DENSITY_THRESHOLD = 0.30
+BACKGROUND = (255, 255, 255)
+SHAPES = ["circle", "square", "diamond", "triangle"]
+
+# Silhouette classification thresholds (fill ratio in the bounding box).
+_SQUARE_MIN = 0.90
+_CIRCLE_MIN = 0.68
+_OFFSET_MIN = 0.08
+
+# Shape-fit reference geometry used to report a decision margin.
+_SQUARE_R = 1.0
+_CIRCLE_R = np.pi / 4
+_HALF_R = 0.5
+_OFFSET_TRIANGLE = 1.0 / 6.0
+_OFFSET_DIAMOND = 0.0
+_MARGIN_QUARANTINE = 0.05
+
+_DOT_OFFSETS = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+
+
+def _inside_mask(shape: str) -> np.ndarray:
+    yy, xx = np.mgrid[0:HEIGHT, 0:WIDTH].astype(float)
+    dx = xx - CENTER
+    dy = yy - CENTER
+    if shape == "circle":
+        return (dx * dx + dy * dy) <= RADIUS * RADIUS
+    if shape == "square":
+        return (np.abs(dx) <= RADIUS) & (np.abs(dy) <= RADIUS)
+    if shape == "diamond":
+        return (np.abs(dx) + np.abs(dy)) <= RADIUS
+    if shape == "triangle":
+        ax, ay = float(CENTER), float(CENTER - RADIUS)
+        bx, by = float(CENTER - 0.9 * RADIUS), float(CENTER + 0.7 * RADIUS)
+        cx, cy = float(CENTER + 0.9 * RADIUS), float(CENTER + 0.7 * RADIUS)
+
+        def sign(p1, p2, p3):
+            return (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+
+        d1 = sign((ax, ay), (bx, by), (xx, yy))
+        d2 = sign((bx, by), (cx, cy), (xx, yy))
+        d3 = sign((cx, cy), (ax, ay), (xx, yy))
+        has_neg = (d1 < 0) | (d2 < 0) | (d3 < 0)
+        has_pos = (d1 > 0) | (d2 > 0) | (d3 > 0)
+        return ~(has_neg & has_pos)
+    raise ValueError(f"unknown shape {shape!r}")
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``."""
+    rng = np.random.default_rng(seed)
+    shape = SHAPES[int(rng.integers(0, len(SHAPES)))]
+    ins = _inside_mask(shape)
+    dot_area = np.pi * DOT_R * DOT_R
+    ys, xs = np.where(ins)
+    n_dense = int(ins.sum() * DENSE_COVER / dot_area)
+    idx = rng.integers(0, len(xs), size=n_dense)
+    dots = [[int(x), int(y)] for x, y in zip(xs[idx], ys[idx])]
+
+    n_sparse = int(WIDTH * HEIGHT * SPARSE_COVER / dot_area)
+    count = 0
+    while count < n_sparse:
+        x = int(rng.integers(0, WIDTH))
+        y = int(rng.integers(0, HEIGHT))
+        if not ins[y, x]:
+            dots.append([x, y])
+            count += 1
+    return {"shape": shape, "dots": dots}
+
+
+def _paint(arr: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> None:
+    for dx, dy in _DOT_OFFSETS:
+        px = xs + dx
+        py = ys + dy
+        valid = (px >= 0) & (px < WIDTH) & (py >= 0) & (py < HEIGHT)
+        arr[py[valid], px[valid]] = 0
+
+
+def _draw_scene(scene: dict) -> Image.Image:
+    arr = np.full((HEIGHT, WIDTH), 255, dtype=np.uint8)
+    shape = scene["shape"]
+    if shape not in SHAPES:
+        raise ValueError(f"unknown shape {shape!r}")
+    dots = scene["dots"]
+    if dots:
+        _paint(arr, np.array([d[0] for d in dots], dtype=int),
+               np.array([d[1] for d in dots], dtype=int))
+    return Image.fromarray(arr, mode="L").convert("RGB")
+
+
+def render(scene: dict) -> Image.Image:
+    return _draw_scene(scene)
+
+
+def analytic_gold(scene: dict) -> str:
+    return scene["shape"]
+
+
+def _box_sum(a: np.ndarray, win: int) -> np.ndarray:
+    h, w = a.shape
+    pad = np.zeros((h + 1, w + 1))
+    pad[1:, 1:] = np.cumsum(np.cumsum(a, axis=0), axis=1)
+    return pad[:-win, :-win] + pad[win:, win:] - pad[:-win, win:] - pad[win:, :-win]
+
+
+def _largest_interior(init: np.ndarray) -> np.ndarray:
+    lab = np.zeros_like(init, bool)
+    best = np.zeros_like(init, bool)
+    h, w = init.shape
+    for sy, sx in np.argwhere(init):
+        if lab[sy, sx]:
+            continue
+        comp = np.zeros_like(init, bool)
+        stack = [(int(sy), int(sx))]
+        lab[sy, sx] = True
+        while stack:
+            y, x = stack.pop()
+            comp[y, x] = True
+            for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                if 0 <= ny < h and 0 <= nx < w and init[ny, nx] and not lab[ny, nx]:
+                    lab[ny, nx] = True
+                    stack.append((ny, nx))
+        if comp.sum() > best.sum():
+            best = comp
+    return best
+
+
+def _dense_silhouette(arr: np.ndarray) -> np.ndarray:
+    mask = (np.asarray(arr).astype(int)[..., 0] < 120).astype(float)
+    dens = _box_sum(mask, WINDOW) / (WINDOW * WINDOW)
+    half = WINDOW // 2
+    dens = np.pad(dens, ((half, WINDOW - 1 - half), (half, WINDOW - 1 - half)),
+                  mode="edge")[:HEIGHT, :WIDTH]
+    thresh = dens > DENSITY_THRESHOLD
+    thresh[0, :] = False
+    thresh[-1, :] = False
+    thresh[:, 0] = False
+    thresh[:, -1] = False
+    return _largest_interior(thresh)
+
+
+def _silhouette_features(mask: np.ndarray) -> tuple[float, float]:
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return 0.0, 0.0
+    th = int(ys.max()) - int(ys.min()) + 1
+    tw = int(xs.max()) - int(xs.min()) + 1
+    fill = float(mask.sum()) / float(th * tw)
+    centre = (int(ys.min()) + int(ys.max())) / 2.0
+    offset = abs(float(ys.mean()) - centre) / th
+    return fill, offset
+
+
+def classify_shape(fill: float, offset: float) -> str:
+    if fill >= _SQUARE_MIN:
+        return "square"
+    if fill >= _CIRCLE_MIN:
+        return "circle"
+    return "triangle" if offset > _OFFSET_MIN else "diamond"
+
+
+def _shape_scores(fill: float, offset: float) -> dict[str, float]:
+    return {
+        "square": 1.0 / (1.0 + 3.0 * abs(fill - _SQUARE_R)),
+        "circle": 1.0 / (1.0 + 3.0 * abs(fill - _CIRCLE_R)),
+        "diamond": 1.0 / (1.0 + 2.0 * abs(fill - _HALF_R) + 6.0 * abs(offset - _OFFSET_DIAMOND)),
+        "triangle": 1.0 / (1.0 + 2.0 * abs(fill - _HALF_R) + 6.0 * abs(offset - _OFFSET_TRIANGLE)),
+    }
+
+
+def margin(scene: dict) -> float:
+    fill, offset = _silhouette_features(_dense_silhouette(_draw_scene(scene)))
+    scores = sorted(_shape_scores(fill, offset).values(), reverse=True)
+    return float(scores[0] - scores[1] if len(scores) > 1 else scores[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < _MARGIN_QUARANTINE
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

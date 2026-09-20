@@ -1,0 +1,138 @@
+"""Independent image-only inverse for the left-turn checkpoint task."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+# These are public visible label colors, repeated independently of the rasterizer.
+COLORS = {
+    "black": (28, 31, 36),
+    "green": (28, 154, 91),
+    "purple": (132, 74, 175),
+    "red": (216, 55, 56),
+    "blue": (48, 105, 190),
+    "orange": (238, 137, 35),
+}
+ANSWERS = ("red", "blue", "orange")
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[list[tuple[int, int]]] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(y, x)])
+        group: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            group.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(group) >= 40:
+            groups.append(group)
+    return groups
+
+
+def _center(mask: np.ndarray, label: str) -> tuple[int, int]:
+    groups = _components(mask)
+    if len(groups) != 1:
+        raise ValueError(f"expected one visible {label} component, found {len(groups)}")
+    values = groups[0]
+    y = int(round(sum(point[0] for point in values) / len(values)))
+    x = int(round(sum(point[1] for point in values) / len(values)))
+    return x, y
+
+
+def _distances(walk: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = walk.shape
+    sx, sy = start
+    if not (0 <= sx < width and 0 <= sy < height and walk[sy, sx]):
+        raise ValueError("green START center is not on the reconstructed route")
+    dist = np.full((height, width), -1, dtype=np.int32)
+    dist[sy, sx] = 0
+    queue = deque([(sy, sx)])
+    while queue:
+        y, x = queue.popleft()
+        value = int(dist[y, x]) + 1
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and walk[ny, nx] and dist[ny, nx] < 0:
+                dist[ny, nx] = value
+                queue.append((ny, nx))
+    return dist
+
+
+def _arm_present(black: np.ndarray, center: tuple[int, int], direction: tuple[int, int]) -> bool:
+    cx, cy = center
+    dx, dy = direction
+    hits = 0
+    total = 0
+    # Inspect a narrow strip outside the colored disk, without assuming its exact radius.
+    for radius in range(16, 31):
+        for side in range(-3, 4):
+            x = cx + dx * radius + (-dy) * side
+            y = cy + dy * radius + dx * side
+            if 0 <= y < black.shape[0] and 0 <= x < black.shape[1]:
+                total += 1
+                hits += int(black[y, x])
+    return total > 0 and hits / total > 0.48
+
+
+def _probe_distance(dist: np.ndarray, center: tuple[int, int], direction: tuple[int, int]) -> int:
+    cx, cy = center
+    dx, dy = direction
+    values = []
+    for radius in range(19, 27):
+        for side in range(-2, 3):
+            x = cx + dx * radius + (-dy) * side
+            y = cy + dy * radius + dx * side
+            if 0 <= y < dist.shape[0] and 0 <= x < dist.shape[1] and dist[y, x] >= 0:
+                values.append(int(dist[y, x]))
+    if not values:
+        raise ValueError("checkpoint arm is disconnected from START")
+    return min(values)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+    masks = {
+        name: np.all(array == np.asarray(rgb, dtype=np.uint8), axis=2)
+        for name, rgb in COLORS.items()
+    }
+    start = _center(masks["green"], "green START")
+    _center(masks["purple"], "purple FINISH")
+    centers = {color: _center(masks[color], color) for color in ANSWERS}
+
+    # Restore continuity through the five visible disks using only segmented pixels.
+    colored = masks["green"] | masks["purple"]
+    for color in ANSWERS:
+        colored |= masks[color]
+    walk = masks["black"] | colored
+    dist = _distances(walk, start)
+    directions = ((1, 0), (0, 1), (-1, 0), (0, -1))
+    left_colors: list[str] = []
+    for color, center in centers.items():
+        arms = [direction for direction in directions if _arm_present(masks["black"], center, direction)]
+        if len(arms) != 2 or arms[0][0] * arms[1][0] + arms[0][1] * arms[1][1] != 0:
+            raise ValueError(f"{color} checkpoint does not expose one right-angle route bend")
+        ranked = sorted((_probe_distance(dist, center, arm), arm) for arm in arms)
+        if ranked[1][0] - ranked[0][0] < 12:
+            raise ValueError(f"{color} checkpoint traversal direction is ambiguous")
+        back = ranked[0][1]
+        forward = ranked[1][1]
+        incoming = (-back[0], -back[1])
+        cross_screen = incoming[0] * forward[1] - incoming[1] * forward[0]
+        if cross_screen < 0:
+            left_colors.append(color)
+    if len(left_colors) != 1:
+        raise ValueError(f"expected one marked left turn, found {left_colors}")
+    return left_colors[0]

@@ -1,0 +1,168 @@
+"""Independent pixel-only recovery of a common constellation scale center."""
+
+from __future__ import annotations
+
+import colorsys
+import itertools
+import math
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+COLOR_NAMES = ("red", "blue", "green", "orange")
+
+
+@dataclass(frozen=True)
+class Measurement:
+    decision: str
+    margin: float
+    residuals: dict[str, float]
+    fitted_scales: dict[str, float]
+    filled_count: int
+    hollow_count: int
+
+
+def _components(mask: np.ndarray) -> list[dict[str, float]]:
+    """Four-connected component geometry from a binary pixel mask."""
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    found: list[dict[str, float]] = []
+    for start_y, start_x in np.argwhere(mask):
+        sy, sx = int(start_y), int(start_x)
+        if visited[sy, sx]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(sy, sx)])
+        visited[sy, sx] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            xs.append(x)
+            ys.append(y)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        found.append(
+            {
+                "x": float(sum(xs) / len(xs)),
+                "y": float(sum(ys) / len(ys)),
+                "area": float(len(xs)),
+                "box_w": float(max(xs) - min(xs) + 1),
+                "box_h": float(max(ys) - min(ys) + 1),
+            }
+        )
+    return found
+
+
+def _fit_residual(
+    filled: list[tuple[float, float]],
+    hollow: list[tuple[float, float]],
+    center: tuple[float, float],
+) -> tuple[float, float]:
+    cx, cy = center
+    source = [(x - cx, y - cy) for x, y in filled]
+    target = [(x - cx, y - cy) for x, y in hollow]
+    denominator = sum(x * x + y * y for x, y in source)
+    if len(source) != len(target) or not source or denominator <= 1e-9:
+        return float("inf"), 0.0
+    best_residual = float("inf")
+    best_scale = 0.0
+    for ordering in itertools.permutations(target):
+        scale = sum(
+            sx * tx + sy * ty
+            for (sx, sy), (tx, ty) in zip(source, ordering, strict=True)
+        ) / denominator
+        if not 0.05 <= scale <= 5.0:
+            continue
+        squared = sum(
+            (tx - scale * sx) ** 2 + (ty - scale * sy) ** 2
+            for (sx, sy), (tx, ty) in zip(source, ordering, strict=True)
+        )
+        residual = math.sqrt(squared / len(source))
+        if residual < best_residual:
+            best_residual, best_scale = residual, scale
+    return best_residual, best_scale
+
+
+def _hue_name(rgb: tuple[float, float, float]) -> str:
+    red, green, blue = (value / 255.0 for value in rgb)
+    hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
+    degrees = hue * 360.0
+    if saturation < 0.35 or value < 0.30:
+        raise ValueError("candidate mark is not visibly chromatic")
+    if degrees < 16.0 or degrees >= 345.0:
+        return "red"
+    if 16.0 <= degrees < 58.0:
+        return "orange"
+    if 70.0 <= degrees < 175.0:
+        return "green"
+    if 185.0 <= degrees < 255.0:
+        return "blue"
+    raise ValueError(f"candidate hue {degrees:.1f} does not name a declared answer color")
+
+
+def measure(image: Image.Image) -> Measurement:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    maximum = array.max(axis=2)
+    minimum = array.min(axis=2)
+    dark_mask = maximum < 95
+    dark_components = _components(dark_mask)
+    filled: list[tuple[float, float]] = []
+    hollow: list[tuple[float, float]] = []
+    for component in dark_components:
+        box = max(component["box_w"], component["box_h"])
+        if 11 <= box <= 15 and 90 <= component["area"] <= 170:
+            filled.append((component["x"], component["y"]))
+        elif 20 <= box <= 24 and 130 <= component["area"] <= 240:
+            hollow.append((component["x"], component["y"]))
+        elif component["area"] >= 20:
+            raise ValueError("dark evidence contains a fused, erased, or malformed mark")
+    if len(filled) != 6 or len(hollow) != 6:
+        raise ValueError(f"expected 6 solid and 6 hollow marks, recovered {len(filled)}/{len(hollow)}")
+
+    chroma = maximum.astype(np.int16) - minimum.astype(np.int16)
+    color_mask = (chroma > 55) & (maximum > 90)
+    color_components = [item for item in _components(color_mask) if item["area"] >= 80]
+    if len(color_components) != 4:
+        raise ValueError(f"expected four colored candidate rings, recovered {len(color_components)}")
+    candidates: dict[str, tuple[float, float]] = {}
+    for component in color_components:
+        x, y = component["x"], component["y"]
+        left = max(0, int(round(x)) - 10)
+        right = min(array.shape[1], int(round(x)) + 11)
+        top = max(0, int(round(y)) - 10)
+        bottom = min(array.shape[0], int(round(y)) + 11)
+        local_mask = color_mask[top:bottom, left:right]
+        local = array[top:bottom, left:right][local_mask]
+        if len(local) < 50:
+            raise ValueError("candidate ring has insufficient colored ink")
+        name = _hue_name(tuple(float(value) for value in local.mean(axis=0)))
+        if name in candidates:
+            raise ValueError(f"duplicate visible candidate hue {name}")
+        candidates[name] = (x, y)
+    if set(candidates) != set(COLOR_NAMES):
+        raise ValueError("colored candidates do not cover red, blue, green, and orange")
+
+    fits = {name: _fit_residual(filled, hollow, center) for name, center in candidates.items()}
+    residuals = {name: value[0] for name, value in fits.items()}
+    fitted_scales = {name: value[1] for name, value in fits.items()}
+    ordered = sorted(residuals, key=lambda name: (residuals[name], name))
+    best, runner = ordered[:2]
+    runner_margin = residuals[runner] - residuals[best]
+    if not 1.30 <= fitted_scales[best] <= 2.10 or residuals[best] > 3.0 or runner_margin < 8.0:
+        raise ValueError("common-scale evidence is erased, weak, or ambiguous")
+    return Measurement(
+        best,
+        float(runner_margin),
+        residuals,
+        fitted_scales,
+        len(filled),
+        len(hollow),
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure(image).decision

@@ -1,0 +1,209 @@
+"""Pixel-only inverse arm for the chain-reflow reveal world.
+
+Receives one rendered PNG and the public question contract only. It locates the
+visible fiducials (the teal tape, its dot markers, and the black corner brackets
+that mark the start tile), executes the declared raster transform by tracing the
+chain and reflowing its ordered dots into a 5x5 grid, classifies the resulting
+glyph, and abstains whenever the trace, the tone split, or the glyph match is
+not unambiguous. It never imports renderer, prompts, generate, verify, or gold
+code and never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+from typing import Iterable
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "chain_reflow_reveal-oracle-0.1.0"
+
+TAPE_RGB = (34, 128, 141)
+TAPE_TOL = 12
+GRAY_SPREAD = 8
+DOT_VALUE_LO = 40
+DOT_VALUE_HI = 232
+DOT_AREA_LO = 260
+DOT_AREA_HI = 520
+ANNULUS_R = 14
+CHAIN_LEN = 25
+GRID = 5
+READ_R = 6
+BLACK_MAX = 30
+BRACKET_HALF = 17
+BRACKET_MIN_PIXELS = 24
+MIN_TONE_SPLIT = 12.0
+ABSTAIN = "abstain"
+
+GLYPHS: dict[str, tuple[str, ...]] = {
+    "plus": ("..#..", "..#..", "#####", "..#..", "..#.."),
+    "ex": ("#...#", ".#.#.", "..#..", ".#.#.", "#...#"),
+    "tee": ("#####", "..#..", "..#..", "..#..", "..#.."),
+    "ell": ("#....", "#....", "#....", "#....", "#####"),
+}
+BITMAPS = {
+    name: tuple(1 if ch == "#" else 0 for row in rows for ch in row)
+    for name, rows in GLYPHS.items()
+}
+
+
+def _label(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    """4-connected components of a boolean mask, as pixel lists."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    blobs: list[list[tuple[int, int]]] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        blobs.append(pixels)
+    return blobs
+
+
+def _all_true(mask: np.ndarray, points: Iterable[tuple[float, float]]) -> bool:
+    height, width = mask.shape
+    for y, x in points:
+        iy, ix = int(round(y)), int(round(x))
+        if not (0 <= iy < height and 0 <= ix < width) or not mask[iy, ix]:
+            return False
+    return True
+
+
+def _trace(centres: list[tuple[float, float]], tape: np.ndarray) -> list[list[int]] | None:
+    count = len(centres)
+    best = None
+    for i in range(count):
+        for j in range(i + 1, count):
+            dy = centres[i][0] - centres[j][0]
+            dx = centres[i][1] - centres[j][1]
+            dist = (dy * dy + dx * dx) ** 0.5
+            if best is None or dist < best:
+                best = dist
+    if not best or best <= 0:
+        return None
+    pitch = best
+    adjacency: list[list[int]] = [[] for _ in range(count)]
+    for i in range(count):
+        for j in range(i + 1, count):
+            dy = centres[i][0] - centres[j][0]
+            dx = centres[i][1] - centres[j][1]
+            axial = (abs(dy) <= 2.5 and 0.8 * pitch <= abs(dx) <= 1.2 * pitch) or (
+                abs(dx) <= 2.5 and 0.8 * pitch <= abs(dy) <= 1.2 * pitch
+            )
+            if not axial:
+                continue
+            samples = [
+                (
+                    centres[i][0] + t * (centres[j][0] - centres[i][0]),
+                    centres[i][1] + t * (centres[j][1] - centres[i][1]),
+                )
+                for t in (0.32, 0.4, 0.5, 0.6, 0.68)
+            ]
+            if _all_true(tape, samples):
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+    return adjacency
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the revealed glyph from the final pixels alone."""
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.ndim != 3 or array.shape[2] != 3:
+        return ABSTAIN
+
+    tape = np.all(np.abs(array - np.array(TAPE_RGB, dtype=np.int16)) <= TAPE_TOL, axis=2)
+    if not tape.any():
+        return ABSTAIN
+
+    spread = array.max(axis=2) - array.min(axis=2)
+    value = array.mean(axis=2)
+    gray = (spread <= GRAY_SPREAD) & (value >= DOT_VALUE_LO) & (value <= DOT_VALUE_HI)
+    black = np.all(array <= BLACK_MAX, axis=2)
+
+    centres: list[tuple[float, float]] = []
+    for pixels in _label(gray):
+        if not (DOT_AREA_LO <= len(pixels) <= DOT_AREA_HI):
+            continue
+        cy = sum(p[0] for p in pixels) / len(pixels)
+        cx = sum(p[1] for p in pixels) / len(pixels)
+        probes = [
+            (cy - ANNULUS_R, cx),
+            (cy + ANNULUS_R, cx),
+            (cy, cx - ANNULUS_R),
+            (cy, cx + ANNULUS_R),
+        ]
+        if _all_true(tape, probes):
+            centres.append((cy, cx))
+    if len(centres) != CHAIN_LEN:
+        return ABSTAIN
+
+    adjacency = _trace(centres, tape)
+    if adjacency is None:
+        return ABSTAIN
+    degrees = [len(adjacency[i]) for i in range(CHAIN_LEN)]
+    endpoints = [i for i, deg in enumerate(degrees) if deg == 1]
+    if len(endpoints) != 2 or any(deg not in (1, 2) for deg in degrees):
+        return ABSTAIN
+
+    height, width = black.shape
+    marked = []
+    for index in endpoints:
+        cy, cx = centres[index]
+        y0 = max(0, int(cy) - BRACKET_HALF)
+        y1 = min(height, int(cy) + BRACKET_HALF + 1)
+        x0 = max(0, int(cx) - BRACKET_HALF)
+        x1 = min(width, int(cx) + BRACKET_HALF + 1)
+        if int(black[y0:y1, x0:x1].sum()) >= BRACKET_MIN_PIXELS:
+            marked.append(index)
+    if len(marked) != 1:
+        return ABSTAIN
+
+    order = [marked[0]]
+    previous = -1
+    current = marked[0]
+    while True:
+        nexts = [n for n in adjacency[current] if n != previous]
+        if not nexts:
+            break
+        if len(nexts) != 1:
+            return ABSTAIN
+        previous, current = current, nexts[0]
+        order.append(current)
+        if len(order) > CHAIN_LEN:
+            return ABSTAIN
+    if len(order) != CHAIN_LEN or len(set(order)) != CHAIN_LEN:
+        return ABSTAIN
+
+    yy, xx = np.mgrid[0:height, 0:width]
+    readings = []
+    for index in order:
+        cy, cx = centres[index]
+        disk = ((yy - cy) ** 2 + (xx - cx) ** 2) <= READ_R * READ_R
+        if not disk.any():
+            return ABSTAIN
+        readings.append(float(value[disk].mean()))
+
+    ranked = sorted(readings)
+    gaps = [(ranked[i + 1] - ranked[i], i) for i in range(len(ranked) - 1)]
+    widest, cut = max(gaps)
+    if widest < MIN_TONE_SPLIT:
+        return ABSTAIN
+    split = (ranked[cut] + ranked[cut + 1]) / 2.0
+    if not (0 < cut + 1 < len(ranked)):
+        return ABSTAIN
+
+    bits = tuple(1 if reading < split else 0 for reading in readings)
+    for name, pattern in BITMAPS.items():
+        if pattern == bits:
+            return name
+    return ABSTAIN

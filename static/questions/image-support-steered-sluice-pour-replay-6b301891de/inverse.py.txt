@@ -1,0 +1,153 @@
+"""Pixel-only inverse arm for the sluice-pour replay world.
+
+This module sees a single RGB image and the public question contract.  It never
+imports the renderer, the generator, the prompt module or the verifier, and it
+never receives latent scene data.  It segments the picture by colour, recovers
+the two tank levels and the ordered pour instructions from ink alone, replays
+the declared saturating-pour rule and reports the final pair of levels.  Any
+reading it cannot resolve raises, which the harness treats as an abstention.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "sluice_pour_replay-oracle-0.1.0"
+
+CAPACITY = 6
+TOTAL = 6
+STEPS = 3
+
+
+def _components(mask: np.ndarray) -> list:
+    """Four-connected components of a boolean mask, as coordinate arrays."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        arr = np.asarray(pixels, dtype=int)
+        out.append(
+            {
+                "ys": arr[:, 0],
+                "xs": arr[:, 1],
+                "y0": int(arr[:, 0].min()),
+                "y1": int(arr[:, 0].max()),
+                "x0": int(arr[:, 1].min()),
+                "x1": int(arr[:, 1].max()),
+                "size": int(arr.shape[0]),
+            }
+        )
+    return out
+
+
+def _near(arr: np.ndarray, colour, tol: int) -> np.ndarray:
+    target = np.asarray(colour, dtype=int)
+    return (np.abs(arr - target) <= tol).all(axis=2)
+
+
+def _tank_level(dark: np.ndarray, liquid: np.ndarray, tank: dict) -> int:
+    """Level of one tank, read as the height of its liquid column in cells."""
+    y0, y1, x0, x1 = tank["y0"], tank["y1"], tank["x0"], tank["x1"]
+    mid = (x0 + x1) // 2
+    wall = 0
+    while y0 + wall <= y1 and dark[y0 + wall, mid]:
+        wall += 1
+    if not 1 <= wall <= 4:
+        raise ValueError("tank wall thickness is unreadable")
+    inner_h = (y1 - y0 + 1) - 2 * wall
+    if inner_h < 6 * 4:
+        raise ValueError("tank interior is too small to hold six cells")
+    column = liquid[y0 + wall : y1 - wall + 1, x0 + wall : x1 - wall + 1]
+    if column.size == 0:
+        raise ValueError("empty tank interior")
+    filled_rows = column.mean(axis=1) > 0.5
+    height = int(filled_rows.sum())
+    if height and not filled_rows[-1]:
+        raise ValueError("liquid does not rest on the tank floor")
+    if height and int(np.diff(np.nonzero(filled_rows)[0]).max(initial=1)) != 1:
+        raise ValueError("liquid column is broken")
+    exact = height * CAPACITY / inner_h
+    level = int(round(exact))
+    if abs(exact - level) > 0.3 or not 0 <= level <= CAPACITY:
+        raise ValueError("liquid height does not quantise to whole cells")
+    return level
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=int)
+    dark = arr.max(axis=2) < 90
+    liquid = _near(arr, (0, 128, 140), 45)
+    arrow = _near(arr, (230, 120, 20), 45)
+    if dark.sum() < 200:
+        raise ValueError("no block ink found")
+
+    dark_parts = _components(dark)
+    tanks = [
+        part
+        for part in dark_parts
+        if (part["y1"] - part["y0"]) >= 38
+        and 16 <= (part["x1"] - part["x0"]) <= 40
+        and (part["y1"] - part["y0"]) > (part["x1"] - part["x0"])
+    ]
+    if len(tanks) != 2:
+        raise ValueError(f"expected two tanks, found {len(tanks)}")
+    tanks.sort(key=lambda part: part["x0"])
+    levels = [_tank_level(dark, liquid, tank) for tank in tanks]
+    if sum(levels) != TOTAL:
+        raise ValueError(f"tank levels {levels} do not hold the declared six cells")
+
+    arrows = _components(arrow)
+    arrows = [part for part in arrows if part["size"] >= 40]
+    if len(arrows) != STEPS:
+        raise ValueError(f"expected {STEPS} pour arrows, found {len(arrows)}")
+    arrows.sort(key=lambda part: part["y0"] + part["y1"])
+
+    pips = [
+        part
+        for part in dark_parts
+        if 3 <= (part["x1"] - part["x0"] + 1) <= 9 and 3 <= (part["y1"] - part["y0"] + 1) <= 9
+    ]
+
+    ops = []
+    for part in arrows:
+        centre = (part["x0"] + part["x1"]) / 2.0
+        offset = float(part["xs"].mean()) - centre
+        if abs(offset) < 0.8:
+            raise ValueError("pour arrow direction is unreadable")
+        direction = "left" if offset > 0 else "right"
+        row_mid = (part["y0"] + part["y1"]) / 2.0
+        half = (part["y1"] - part["y0"] + 1) / 2.0 + 2.0
+        amount = sum(
+            1
+            for pip in pips
+            if pip["x0"] > part["x1"] and abs((pip["y0"] + pip["y1"]) / 2.0 - row_mid) <= half
+        )
+        if not 1 <= amount <= 3:
+            raise ValueError(f"unreadable pip count {amount}")
+        ops.append((direction, amount))
+
+    left, right = levels
+    for direction, amount in ops:
+        if direction == "right":
+            moved = min(amount, left, CAPACITY - right)
+            left -= moved
+            right += moved
+        else:
+            moved = min(amount, right, CAPACITY - left)
+            right -= moved
+            left += moved
+    return f"{left}-{right}"

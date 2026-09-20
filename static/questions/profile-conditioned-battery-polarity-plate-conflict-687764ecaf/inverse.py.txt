@@ -1,0 +1,132 @@
+"""Independent image-only inverse for the battery plate/glyph binding task.
+
+This module deliberately duplicates only the public visual palette families. It
+does not import or inspect latent-scene, generation, prompt, or gold code.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_PLATE_PALETTE = np.array(
+    [(28, 35, 52), (49, 36, 62), (21, 55, 50), (56, 43, 27)], dtype=np.int16
+)
+_SIGN_PALETTE = np.array(
+    [(196, 45, 52), (33, 104, 190), (135, 62, 170), (208, 112, 25)],
+    dtype=np.int16,
+)
+_COLOR_TOLERANCE = 28.0
+
+
+class AmbiguousImage(ValueError):
+    """Raised when the raster does not expose a unique, adequately separated answer."""
+
+
+def _palette_mask(array: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    pixels = array.astype(np.int16)
+    delta = pixels[:, :, None, :] - palette[None, None, :, :]
+    distance = np.sqrt(np.sum(delta.astype(np.float32) ** 2, axis=3))
+    return np.min(distance, axis=2) <= _COLOR_TOLERANCE
+
+
+def _components(mask: np.ndarray, minimum_area: int) -> list[dict]:
+    """Return 4-connected component bounding summaries for a sparse ink mask."""
+
+    work = mask.copy()
+    height, width = work.shape
+    output: list[dict] = []
+    while bool(work.any()):
+        y0, x0 = np.argwhere(work)[0]
+        queue = deque([(int(y0), int(x0))])
+        work[y0, x0] = False
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            xs.append(x)
+            ys.append(y)
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and work[yy, xx]:
+                    work[yy, xx] = False
+                    queue.append((yy, xx))
+        if len(xs) >= minimum_area:
+            left, right = min(xs), max(xs)
+            top, bottom = min(ys), max(ys)
+            output.append(
+                {
+                    "area": len(xs),
+                    "left": left,
+                    "right": right,
+                    "top": top,
+                    "bottom": bottom,
+                    "width": right - left + 1,
+                    "height": bottom - top + 1,
+                    "cx": (left + right) / 2.0,
+                    "cy": (top + bottom) / 2.0,
+                }
+            )
+    return output
+
+
+def measure_image(image: Image.Image) -> dict:
+    """Recover plates, glyph identities, the selected answer, and runner-up margin."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[0] < 120 or rgb.shape[1] < 160:
+        raise AmbiguousImage("image is too small")
+
+    plates = _components(_palette_mask(rgb, _PLATE_PALETTE), minimum_area=350)
+    if len(plates) != 2:
+        raise AmbiguousImage(f"expected two dark plates, found {len(plates)}")
+    if any(item["height"] < 4.0 * item["width"] for item in plates):
+        raise AmbiguousImage("dark plate geometry is not vertically elongated")
+    plates.sort(key=lambda item: item["cx"])
+    if plates[1]["cx"] - plates[0]["cx"] < 48.0:
+        raise AmbiguousImage("plate centers are insufficiently separated")
+    by_length = sorted(plates, key=lambda item: item["height"], reverse=True)
+    if by_length[0]["height"] - by_length[1]["height"] < 24.0:
+        raise AmbiguousImage("plate lengths do not have a unique winner")
+    long_plate = by_length[0]
+
+    signs = _components(_palette_mask(rgb, _SIGN_PALETTE), minimum_area=80)
+    if len(signs) != 2:
+        raise AmbiguousImage(f"expected two polarity glyphs, found {len(signs)}")
+    plus = [item for item in signs if item["height"] / item["width"] >= 0.65]
+    minus = [item for item in signs if item["height"] / item["width"] <= 0.40]
+    if len(plus) != 1 or len(minus) != 1:
+        raise AmbiguousImage("could not uniquely decode one plus and one minus glyph")
+    if plus[0]["cy"] >= min(item["top"] for item in plates):
+        raise AmbiguousImage("polarity glyphs are not visibly above the plates")
+    if minus[0]["cy"] >= min(item["top"] for item in plates):
+        raise AmbiguousImage("polarity glyphs are not visibly above the plates")
+
+    distances = {
+        "plus": abs(float(plus[0]["cx"]) - float(long_plate["cx"])),
+        "minus": abs(float(minus[0]["cx"]) - float(long_plate["cx"])),
+    }
+    ranked = sorted(distances.items(), key=lambda item: item[1])
+    runner_up_margin = ranked[1][1] - ranked[0][1]
+    if ranked[0][1] > 10.0 or runner_up_margin < 24.0:
+        raise AmbiguousImage("long-plate-to-glyph alignment is ambiguous")
+    return {
+        "decision": ranked[0][0],
+        "margin": float(runner_up_margin),
+        "long_plate_height": int(long_plate["height"]),
+        "short_plate_height": int(by_length[1]["height"]),
+        "plate_centers_x": [float(item["cx"]) for item in plates],
+        "plus_center_x": float(plus[0]["cx"]),
+        "minus_center_x": float(minus[0]["cx"]),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return ``plus``/``minus`` from pixels, or abstain on erased/ambiguous evidence."""
+
+    try:
+        return str(measure_image(image)["decision"])
+    except (AmbiguousImage, ValueError, IndexError, TypeError):
+        return "abstain"

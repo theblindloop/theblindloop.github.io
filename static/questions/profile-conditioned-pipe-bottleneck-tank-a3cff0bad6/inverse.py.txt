@@ -1,0 +1,163 @@
+"""Pixel-only inverse arm for pipe_bottleneck_tank.
+
+Receives the final PNG and the public question contract only: the pipes are
+grey, the pump is green, the tanks are red / blue / orange, and a route's
+capacity is the thickness of its thinnest pipe. It recovers the lattice from
+stroke profiles, measures every pipe's connectivity and drawn thickness
+directly from the raster, and runs a widest-path search from the green square.
+
+It imports no renderer, prompt, generator or gold code and never sees a scene.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "pipe_bottleneck_tank-oracle-0.1.0"
+
+ABSTAIN = "unknown"
+_PIPE_REF = (80, 80, 80)
+_MARK_REF = {
+    "pump": (0, 150, 60),
+    "red": (215, 40, 40),
+    "blue": (40, 70, 210),
+    "orange": (240, 150, 20),
+}
+_MIN_GAP = 3.0
+
+
+def _mask(arr: np.ndarray, ref: tuple[int, int, int], tol: float) -> np.ndarray:
+    diff = arr - np.array(ref, dtype=np.int16)
+    return (np.abs(diff).sum(axis=2) <= tol)
+
+
+def _longest_runs(mask: np.ndarray, axis: int) -> np.ndarray:
+    """Longest contiguous stroke run in each line along `axis`.
+
+    Lattice lines carry a stroke running a whole span between junctions, while
+    perpendicular strokes only ever contribute a run as long as one thickness.
+    """
+    m = mask if axis == 0 else mask.T  # columns of `m` are the scanned lines
+    pad = np.zeros((1, m.shape[1]), dtype=bool)
+    padded = np.vstack([pad, m, pad])
+    out = np.zeros(m.shape[1], dtype=int)
+    for j in range(m.shape[1]):
+        col = padded[:, j]
+        edges = np.flatnonzero(col[1:].astype(np.int8) - col[:-1].astype(np.int8))
+        if edges.size:
+            starts, ends = edges[0::2], edges[1::2]
+            out[j] = int((ends - starts).max())
+    return out
+
+
+def _cluster_centers(flags: np.ndarray) -> list[int]:
+    centers, run = [], []
+    for i, on in enumerate(flags):
+        if on:
+            run.append(i)
+        elif run:
+            centers.append(int(round(sum(run) / len(run))))
+            run = []
+    if run:
+        centers.append(int(round(sum(run) / len(run))))
+    return centers
+
+
+def _run_width(mask: np.ndarray, x: int, y: int, axis: int) -> int:
+    """Length of the contiguous stroke run through (x, y) across `axis`."""
+    h, w = mask.shape
+    if not (0 <= y < h and 0 <= x < w) or not mask[y, x]:
+        return 0
+    n = 1
+    if axis == 0:  # measure vertically
+        i = y - 1
+        while i >= 0 and mask[i, x]:
+            n += 1
+            i -= 1
+        i = y + 1
+        while i < h and mask[i, x]:
+            n += 1
+            i += 1
+    else:  # measure horizontally
+        i = x - 1
+        while i >= 0 and mask[y, i]:
+            n += 1
+            i -= 1
+        i = x + 1
+        while i < w and mask[y, i]:
+            n += 1
+            i += 1
+    return n
+
+
+def _widest_path(adj: dict, source) -> dict:
+    best = {source: float("inf")}
+    todo = {source}
+    while todo:
+        node = max(todo, key=lambda n: best[n])
+        todo.discard(node)
+        for nxt, cap in adj.get(node, []):
+            val = min(best[node], cap)
+            if val > best.get(nxt, -1.0):
+                best[nxt] = val
+                todo.add(nxt)
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    h, w, _ = arr.shape
+    pipe = _mask(arr, _PIPE_REF, 60)
+    if pipe.sum() < 500:
+        return ABSTAIN
+
+    # 1. lattice lines: only long strokes survive the profile threshold.
+    xs = _cluster_centers(_longest_runs(pipe, axis=0) >= 40)
+    ys = _cluster_centers(_longest_runs(pipe, axis=1) >= 40)
+    if len(xs) < 2 or len(ys) < 2:
+        return ABSTAIN
+
+    # 2. markers -> lattice nodes.
+    nodes = {}
+    for name, ref in _MARK_REF.items():
+        m = _mask(arr, ref, 90)
+        if m.sum() < 200:
+            return ABSTAIN
+        yy, xx = np.nonzero(m)
+        cx, cy = float(xx.mean()), float(yy.mean())
+        gx = min(range(len(xs)), key=lambda i: abs(xs[i] - cx))
+        gy = min(range(len(ys)), key=lambda i: abs(ys[i] - cy))
+        if abs(xs[gx] - cx) > 12 or abs(ys[gy] - cy) > 12:
+            return ABSTAIN
+        nodes[name] = (gx, gy)
+
+    # 3. edges and their drawn thickness, measured at each span's midpoint.
+    adj: dict[tuple[int, int], list] = {}
+
+    def link(a, b, cap):
+        adj.setdefault(a, []).append((b, cap))
+        adj.setdefault(b, []).append((a, cap))
+
+    for gy, y in enumerate(ys):
+        for gx in range(len(xs) - 1):
+            mx = (xs[gx] + xs[gx + 1]) // 2
+            width = _run_width(pipe, mx, int(y), axis=0)
+            if width >= 4:
+                link((gx, gy), (gx + 1, gy), float(width))
+    for gx, x in enumerate(xs):
+        for gy in range(len(ys) - 1):
+            my = (ys[gy] + ys[gy + 1]) // 2
+            width = _run_width(pipe, int(x), my, axis=1)
+            if width >= 4:
+                link((gx, gy), (gx, gy + 1), float(width))
+
+    # 4. widest-path capacity from the pump to each tank.
+    caps = _widest_path(adj, nodes["pump"])
+    scored = sorted(
+        ((caps.get(nodes[c], 0.0), c) for c in ("red", "blue", "orange")),
+        key=lambda kv: (-kv[0], kv[1]),
+    )
+    if scored[0][0] <= 0.0 or scored[0][0] - scored[1][0] < _MIN_GAP:
+        return ABSTAIN
+    return scored[0][1]

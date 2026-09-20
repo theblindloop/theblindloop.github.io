@@ -1,0 +1,150 @@
+"""Pixel-only oracle for the weak-link pair search world.
+
+The module receives one RGB image and the public question contract. It never
+imports the renderer, prompts, generator or verifier and never receives latent
+scene data.
+
+Route: the modal colour of the image is the background. Every other colour that
+covers enough pixels is kept only when it is clearly chromatic, which discards
+the neutral grey background specks, and is then named by the nearest of the four
+declared hue prototypes red, blue, green and purple. For each named colour the
+connected components of its own mask are taken, small fragments are dropped, and
+the colour is scored by the *shortest* bounding-box height among its surviving
+components; a colour showing fewer than two components scores zero because such
+a pair has no second bar. The colour with the greatest score wins when the
+runner-up score is strictly smaller.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "weak_link_pair_search-oracle-0.1.0"
+
+COLOUR_NAMES = ("red", "blue", "green", "purple")
+PROTOTYPES = {
+    "red": (1.0, 0.15, 0.15),
+    "blue": (0.15, 0.35, 1.0),
+    "green": (0.15, 1.0, 0.30),
+    "purple": (0.70, 0.25, 1.0),
+}
+ABSTAIN = "abstain"
+
+MIN_COLOUR_PIXELS = 100      # two bars cover far more pixels than this
+MIN_COMPONENT = 60           # one bar covers far more pixels than this
+MIN_PIXEL_MARGIN = 2.0       # the runner-up must be strictly shorter
+
+
+def _chromatic_name(rgb: tuple) -> str | None:
+    """Name a flat colour by hue, or ``None`` when it is neutral grey."""
+
+    red, green, blue = (float(channel) for channel in rgb)
+    high, low = max(red, green, blue), min(red, green, blue)
+    if high <= 0 or (high - low) / high < 0.30:
+        return None
+    vector = np.asarray([red, green, blue], dtype=np.float64)
+    norm = np.linalg.norm(vector)
+    if norm <= 0:
+        return None
+    vector = vector / norm
+    best, best_distance = None, None
+    for name in COLOUR_NAMES:
+        prototype = np.asarray(PROTOTYPES[name], dtype=np.float64)
+        prototype = prototype / np.linalg.norm(prototype)
+        distance = float(np.linalg.norm(vector - prototype))
+        if best_distance is None or distance < best_distance:
+            best, best_distance = name, distance
+    return best
+
+
+def _components(mask: np.ndarray) -> list:
+    """Four-connected components of a boolean mask, as pixel lists."""
+
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    blobs = []
+    for start in zip(*np.nonzero(mask)):
+        if seen[start]:
+            continue
+        stack = [start]
+        seen[start] = True
+        cells = []
+        while stack:
+            y, x = stack.pop()
+            cells.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        blobs.append(cells)
+    return blobs
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Per-colour weak-link score and the runner-up pixel margin, or ``None``."""
+
+    array = np.asarray(image.convert("RGB")).astype(np.int32)
+    keys = (array[:, :, 0] << 16) + (array[:, :, 1] << 8) + array[:, :, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    if len(values) < 2:
+        return None
+    background = int(values[int(np.argmax(counts))])
+
+    masks: dict = {}
+    for value, count in zip(values.tolist(), counts.tolist(), strict=True):
+        if value == background or count < MIN_COLOUR_PIXELS:
+            continue
+        rgb = ((value >> 16) & 255, (value >> 8) & 255, value & 255)
+        name = _chromatic_name(rgb)
+        if name is None:
+            continue
+        layer = keys == value
+        masks[name] = layer if name not in masks else (masks[name] | layer)
+    if not masks:
+        return None
+
+    records = {}
+    for name in COLOUR_NAMES:
+        mask = masks.get(name)
+        if mask is None:
+            records[name] = {"bars": 0, "score": 0.0, "centre_x": 0.0, "centre_y": 0.0}
+            continue
+        blobs = [cells for cells in _components(mask) if len(cells) >= MIN_COMPONENT]
+        if len(blobs) < 2:
+            records[name] = {"bars": len(blobs), "score": 0.0, "centre_x": 0.0, "centre_y": 0.0}
+            continue
+        heights = []
+        for cells in blobs:
+            ys = [y for y, _ in cells]
+            heights.append(max(ys) - min(ys) + 1)
+        ys = [y for cells in blobs for y, _ in cells]
+        xs = [x for cells in blobs for _, x in cells]
+        records[name] = {
+            "bars": len(blobs),
+            "score": float(min(heights)),
+            "centre_x": float(sum(xs) / len(xs)),
+            "centre_y": float(sum(ys) / len(ys)),
+        }
+
+    ranked = sorted(COLOUR_NAMES, key=lambda name: -records[name]["score"])
+    best, second = records[ranked[0]]["score"], records[ranked[1]]["score"]
+    return {
+        "records": records,
+        "winner": ranked[0],
+        "winner_score": float(best),
+        "pixel_margin": float(best - second),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Name the colour of the pair whose shorter bar is the longest."""
+
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    if report["winner_score"] <= 0.0:
+        return ABSTAIN
+    if report["pixel_margin"] < MIN_PIXEL_MARGIN:
+        return ABSTAIN
+    return report["winner"]

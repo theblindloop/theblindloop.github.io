@@ -1,0 +1,111 @@
+"""Independent pixel-only inverse for primary-arm count.
+
+The inverse segments the sole filled silhouette from its border-estimated
+background, estimates the silhouette centroid, and samples its outer radius on
+840 rays.  Long-tip runs give the decision.  Star-convex continuity and cyclic
+repeatability checks deliberately abstain after evidence erasure or severe
+corruption; no renderer state, coordinates, palette, or latent fields are used.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_ANGLE_SAMPLES = 840  # divisible by 5, 6, 7, and 8
+_MAX_RADIUS = 232
+_INK_DISTANCE = 42.0
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _border_background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:6].reshape(-1, 3),
+            array[-6:].reshape(-1, 3),
+            array[:, :6].reshape(-1, 3),
+            array[:, -6:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    return np.median(border, axis=0)
+
+
+def _circular_smooth(values: np.ndarray, half_width: int = 2) -> np.ndarray:
+    return np.mean(
+        np.stack([np.roll(values, shift) for shift in range(-half_width, half_width + 1)]),
+        axis=0,
+    )
+
+
+def _run_count(mask: np.ndarray) -> int:
+    return int(np.count_nonzero(mask & ~np.roll(mask, 1)))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or array.shape[0] < 400 or array.shape[1] < 400:
+        raise OracleAbstention("image is too small for the radial arm measurement")
+
+    background = _border_background(array)
+    distance = np.linalg.norm(array - background[None, None, :], axis=2)
+    ink = distance > _INK_DISTANCE
+    area = int(ink.sum())
+    if not 70000 <= area <= 145000:
+        raise OracleAbstention("foreground area is inconsistent with one snowflake medallion")
+
+    ys, xs = np.nonzero(ink)
+    if len(xs) == 0:
+        raise OracleAbstention("no silhouette found")
+    cx = float(xs.mean())
+    cy = float(ys.mean())
+    if not (220.0 <= cx <= array.shape[1] - 220.0 and 220.0 <= cy <= array.shape[0] - 220.0):
+        raise OracleAbstention("silhouette centroid is implausibly close to the border")
+
+    angles = np.arange(_ANGLE_SAMPLES, dtype=np.float64) * (2.0 * np.pi / _ANGLE_SAMPLES)
+    radii = np.arange(_MAX_RADIUS + 1, dtype=np.float64)
+    sample_x = np.rint(cx + np.cos(angles)[:, None] * radii[None, :]).astype(np.int32)
+    sample_y = np.rint(cy + np.sin(angles)[:, None] * radii[None, :]).astype(np.int32)
+    if (
+        sample_x.min() < 0
+        or sample_y.min() < 0
+        or sample_x.max() >= ink.shape[1]
+        or sample_y.max() >= ink.shape[0]
+    ):
+        raise OracleAbstention("radial samples leave the raster")
+    rays = ink[sample_y, sample_x]
+
+    radius_index = np.arange(_MAX_RADIUS + 1, dtype=np.int32)[None, :]
+    extents = np.max(np.where(rays, radius_index, -1), axis=1).astype(np.float64)
+    # A clean filled silhouette is star-convex.  Interior erasure makes a gap
+    # before a later foreground pixel and therefore causes explicit abstention.
+    interior = radius_index < (extents[:, None] - 2.0)
+    broken_rays = np.count_nonzero(np.any(interior & ~rays, axis=1))
+    if broken_rays > 2:
+        raise OracleAbstention("filled radial support has been interrupted")
+    if float(extents.min()) < 145.0 or not 190.0 <= float(extents.max()) <= 230.0:
+        raise OracleAbstention("radial extent is outside the supported visual regime")
+
+    smooth = _circular_smooth(extents)
+    valley = float(np.percentile(smooth, 30.0))
+    peak = float(np.percentile(smooth, 99.5))
+    if peak - valley < 28.0:
+        raise OracleAbstention("primary tips are not visibly prominent")
+    high = smooth > valley + 0.70 * (peak - valley)
+    count = _run_count(high)
+    if count not in (5, 6, 7, 8):
+        raise OracleAbstention(f"found {count} plausible primary-tip runs")
+
+    # The same within-sector radial profile must repeat around the full image.
+    # This uses every arm, exposes a continuous runner-up margin, and rejects a
+    # local crop/erasure even when the surviving peaks could still be counted.
+    sector = _ANGLE_SAMPLES // count
+    blocks = smooth.reshape(count, sector)
+    template = np.median(blocks, axis=0)
+    repeat_error = float(np.mean(np.abs(blocks - template[None, :])))
+    if repeat_error > 3.25:
+        raise OracleAbstention("radial sectors are not mutually consistent")
+    return str(count)

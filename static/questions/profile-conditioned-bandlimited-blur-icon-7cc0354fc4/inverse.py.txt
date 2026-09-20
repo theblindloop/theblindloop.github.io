@@ -1,0 +1,224 @@
+"""Independent image-only inverse for the bandlimited blur icon."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+import numpy as np
+from PIL import Image
+
+TILE_SIZE = 256
+MARK_SIZE = 12
+MARK_OFFSET = 14
+CARRIER_TILE = 16
+BLUR_SIZE = 13
+TARGET_INK = 2400
+SYMBOLS = ("ring", "cross", "triangle", "zigzag")
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[tuple[int, int, int, int, int]] = []
+    for start_y, start_x in zip(*np.where(mask)):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(int(start_y), int(start_x))]
+        seen[start_y, start_x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for next_y, next_x in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if (
+                    0 <= next_y < height
+                    and 0 <= next_x < width
+                    and mask[next_y, next_x]
+                    and not seen[next_y, next_x]
+                ):
+                    seen[next_y, next_x] = True
+                    stack.append((next_y, next_x))
+        if len(points) >= 60:
+            ys = np.asarray([point[0] for point in points], dtype=int)
+            xs = np.asarray([point[1] for point in points], dtype=int)
+            found.append((len(points), int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())))
+    return found
+
+
+def _tile_from_image(image: Image.Image) -> np.ndarray:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    chroma = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+    markers = _components(chroma > 50)
+    if len(markers) != 4 or any(area < MARK_SIZE * MARK_SIZE for area, *_ in markers):
+        raise ValueError("expected four colored corner fiducials")
+    min_x = min(item[1] for item in markers)
+    min_y = min(item[2] for item in markers)
+    max_x = max(item[3] for item in markers)
+    max_y = max(item[4] for item in markers)
+    if max_x - min_x < TILE_SIZE or max_y - min_y < TILE_SIZE:
+        raise ValueError("fiducials do not enclose a tile")
+    tile_x = min_x + MARK_OFFSET
+    tile_y = min_y + MARK_OFFSET
+    gray = np.asarray(image.convert("L"), dtype=np.float64)
+    tile = gray[tile_y : tile_y + TILE_SIZE, tile_x : tile_x + TILE_SIZE]
+    if tile.shape != (TILE_SIZE, TILE_SIZE):
+        raise ValueError("marked tile is incomplete")
+    return tile
+
+
+def _box_blur(values: np.ndarray) -> np.ndarray:
+    radius = BLUR_SIZE // 2
+    padded = np.pad(values, ((radius, radius), (radius, radius)), mode="edge")
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(0).cumsum(1)
+    size = BLUR_SIZE
+    return (
+        integral[size:, size:]
+        - integral[:-size, size:]
+        - integral[size:, :-size]
+        + integral[:-size, :-size]
+    ) / float(size * size)
+
+
+def _segment_distance(
+    x: np.ndarray,
+    y: np.ndarray,
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> np.ndarray:
+    ax, ay = a
+    bx, by = b
+    vx = bx - ax
+    vy = by - ay
+    denominator = vx * vx + vy * vy
+    t = ((x - ax) * vx + (y - ay) * vy) / denominator
+    t = np.clip(t, 0.0, 1.0)
+    return np.hypot(x - (ax + t * vx), y - (ay + t * vy))
+
+
+def _glyph_mask(symbol: str) -> np.ndarray:
+    yy, xx = np.indices((TILE_SIZE, TILE_SIZE), dtype=np.float64)
+    x = xx - TILE_SIZE / 2.0
+    y = yy - TILE_SIZE / 2.0
+    radius = np.hypot(x, y)
+    if symbol == "ring":
+        score = np.abs(radius - 42.0) + 0.001 * radius
+        score = np.where(radius <= 58.0, score, score + 100.0)
+    elif symbol == "cross":
+        score = np.minimum(np.abs(x), np.abs(y)) + 0.018 * np.maximum(np.abs(x), np.abs(y))
+        score = np.where(np.maximum(np.abs(x), np.abs(y)) <= 52.0, score, score + 100.0)
+    elif symbol == "triangle":
+        points = [(0.0, -52.0), (-52.0, 45.0), (52.0, 45.0), (0.0, -52.0)]
+        score = np.minimum.reduce(
+            [_segment_distance(x, y, a, b) for a, b in zip(points, points[1:])]
+        )
+        score = np.where((np.abs(x) <= 58.0) & (y >= -60.0) & (y <= 54.0), score, score + 100.0)
+        score = score + 0.002 * radius
+    elif symbol == "zigzag":
+        points = [(-54.0, -38.0), (-18.0, 38.0), (18.0, -38.0), (54.0, 38.0)]
+        score = np.minimum.reduce(
+            [_segment_distance(x, y, a, b) for a, b in zip(points, points[1:])]
+        )
+        score = np.where((np.abs(x) <= 62.0) & (np.abs(y) <= 52.0), score, score + 100.0)
+        score = score + 0.002 * radius
+    else:
+        raise ValueError(f"unknown symbol: {symbol}")
+    order = np.lexsort((xx.ravel(), yy.ravel(), score.ravel()))
+    mask = np.zeros(TILE_SIZE * TILE_SIZE, dtype=bool)
+    mask[order[:TARGET_INK]] = True
+    return mask.reshape((TILE_SIZE, TILE_SIZE))
+
+
+@lru_cache(maxsize=8)
+def _template_blur(symbol: str) -> np.ndarray:
+    return _box_blur(_glyph_mask(symbol).astype(np.float64))
+
+
+def _shift(values: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    shifted = np.zeros_like(values)
+    source_y0 = max(0, -int(dy))
+    source_y1 = min(values.shape[0], values.shape[0] - int(dy))
+    source_x0 = max(0, -int(dx))
+    source_x1 = min(values.shape[1], values.shape[1] - int(dx))
+    target_y0 = source_y0 + int(dy)
+    target_y1 = source_y1 + int(dy)
+    target_x0 = source_x0 + int(dx)
+    target_x1 = source_x1 + int(dx)
+    shifted[target_y0:target_y1, target_x0:target_x1] = values[source_y0:source_y1, source_x0:source_x1]
+    return shifted
+
+
+def _pool(values: np.ndarray) -> np.ndarray:
+    factor = 4
+    height, width = values.shape
+    return values.reshape(height // factor, factor, width // factor, factor).mean(axis=(1, 3))
+
+
+def _decode(rgb: np.ndarray) -> tuple[str, float]:
+    image = Image.fromarray(rgb, mode="RGB")
+    tile = _tile_from_image(image)
+    blurred = _box_blur(tile)
+    border = np.concatenate(
+        (
+            blurred[:24, :].ravel(),
+            blurred[-24:, :].ravel(),
+            blurred[:, :24].ravel(),
+            blurred[:, -24:].ravel(),
+        )
+    )
+    baseline = float(np.median(border))
+    positive = np.maximum(blurred - baseline - 1.5, 0.0)
+    positive[:24, :] = 0.0
+    positive[-24:, :] = 0.0
+    positive[:, :24] = 0.0
+    positive[:, -24:] = 0.0
+    total = float(positive.sum())
+    if total < 4000.0:
+        raise ValueError("blurred evidence has insufficient positive mass")
+    yy, xx = np.indices(blurred.shape, dtype=np.float64)
+    estimate_dx = int(round(float((positive * xx).sum() / total - TILE_SIZE / 2.0)))
+    estimate_dy = int(round(float((positive * yy).sum() / total - TILE_SIZE / 2.0)))
+    observed = _pool(blurred)
+    roi = (slice(6, 58), slice(6, 58))
+    observed_roi = observed[roi]
+    observed_zero = observed_roi - observed_roi.mean()
+    observed_norm = float(np.linalg.norm(observed_zero))
+    if observed_norm <= 1e-6:
+        raise ValueError("blurred evidence is flat")
+    scores: list[tuple[float, str]] = []
+    for symbol in SYMBOLS:
+        base = _template_blur(symbol)
+        best = -1.0
+        for dy in range(estimate_dy - 4, estimate_dy + 5):
+            for dx in range(estimate_dx - 4, estimate_dx + 5):
+                template = _pool(_shift(base, dx, dy))[roi]
+                template_zero = template - template.mean()
+                denominator = observed_norm * float(np.linalg.norm(template_zero))
+                if denominator > 0.0:
+                    best = max(best, float(np.sum(observed_zero * template_zero) / denominator))
+        scores.append((best, symbol))
+    scores.sort(reverse=True)
+    top, runner = scores[0], scores[1]
+    margin = float(top[0] - runner[0])
+    if top[0] < 0.34 or margin < 0.025:
+        raise ValueError("blurred glyph is ambiguous")
+    return top[1], margin
+
+
+@lru_cache(maxsize=4096)
+def _decode_cached(data: bytes, width: int, height: int) -> tuple[str, float]:
+    rgb = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+    return _decode(rgb)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Classify the revealed symbol using only the final raster."""
+
+    rgb = image.convert("RGB")
+    return _decode_cached(rgb.tobytes(), rgb.width, rgb.height)[0]
+
+
+def confidence_margin(image: Image.Image) -> float:
+    """Return the top-versus-runner-up correlation margin after blurring."""
+
+    rgb = image.convert("RGB")
+    return _decode_cached(rgb.tobytes(), rgb.width, rgb.height)[1]

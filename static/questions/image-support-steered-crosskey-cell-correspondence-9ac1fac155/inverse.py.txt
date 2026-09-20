@@ -1,0 +1,243 @@
+"""Independent pixel-only inverse for Cross-Key Cell Correspondence.
+
+The implementation discovers colored role frames rather than using canvas
+coordinates. It classifies the query and both key inventories locally, then
+recovers the matrix color at the joined row and column.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+INK = np.array((35, 43, 54), dtype=np.int32)
+DOT_BLUE = np.array((37, 99, 235), dtype=np.int32)
+QUERY_MAGENTA = np.array((219, 39, 119), dtype=np.int32)
+KEY_GRAY = np.array((107, 114, 128), dtype=np.int32)
+GRID_TEAL = np.array((13, 148, 136), dtype=np.int32)
+TAG_COLORS = {
+    "amber": np.array((217, 119, 6), dtype=np.int32),
+    "cyan": np.array((8, 145, 178), dtype=np.int32),
+    "violet": np.array((124, 58, 237), dtype=np.int32),
+}
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose one complete, unique lookup."""
+
+
+@dataclass(frozen=True)
+class Component:
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    area: int
+    cx: float
+    cy: float
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0 + 1
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0 + 1
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float = 8.0) -> np.ndarray:
+    delta = array.astype(np.int32) - color
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum_area: int = 1) -> list[Component]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[Component] = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        seen[sy, sx] = True
+        stack = [(sy, sx)]
+        xs: list[int] = []
+        ys: list[int] = []
+        while stack:
+            y, x = stack.pop()
+            xs.append(x)
+            ys.append(y)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(xs) >= minimum_area:
+            output.append(
+                Component(
+                    min(xs), min(ys), max(xs), max(ys), len(xs),
+                    float(sum(xs) / len(xs)), float(sum(ys) / len(ys)),
+                )
+            )
+    return output
+
+
+def _shifted_components(
+    mask: np.ndarray, minimum_area: int, *, offset_x: int = 0, offset_y: int = 0
+) -> list[Component]:
+    return [
+        Component(
+            item.x0 + offset_x, item.y0 + offset_y,
+            item.x1 + offset_x, item.y1 + offset_y,
+            item.area, item.cx + offset_x, item.cy + offset_y,
+        )
+        for item in _components(mask, minimum_area)
+    ]
+
+
+def _valid_frame(raw: np.ndarray, item: Component) -> bool:
+    crop = raw[item.y0 : item.y1 + 1, item.x0 : item.x1 + 1]
+    if crop.shape[0] < 70 or crop.shape[1] < 70:
+        return False
+    return min(
+        float(crop[:6].mean()), float(crop[-6:].mean()),
+        float(crop[:, :6].mean()), float(crop[:, -6:].mean()),
+    ) >= 0.96
+
+
+def _frames(array: np.ndarray, color: np.ndarray, expected: int) -> list[Component]:
+    raw = _mask(array, color)
+    frames = [
+        item for item in _components(raw, 500)
+        if item.width >= 100 and item.height >= 100 and _valid_frame(raw, item)
+    ]
+    if len(frames) != expected:
+        raise OracleAbstention(f"expected {expected} intact role frame(s), found {len(frames)}")
+    return frames
+
+
+def _inside(
+    array: np.ndarray, frame: Component, color: np.ndarray, minimum_area: int
+) -> list[Component]:
+    x0, y0 = frame.x0 + 9, frame.y0 + 9
+    x1, y1 = frame.x1 - 8, frame.y1 - 8
+    crop = _mask(array[y0:y1, x0:x1], color)
+    return _shifted_components(crop, minimum_area, offset_x=x0, offset_y=y0)
+
+
+def _shape_code(item: Component) -> str:
+    fill = item.area / float(item.width * item.height)
+    if fill > 0.94:
+        return "square"
+    if fill > 0.68:
+        return "circle"
+    if 0.42 < fill < 0.68:
+        return "triangle"
+    raise OracleAbstention("ambiguous black glyph geometry")
+
+
+def _query(array: np.ndarray, frame: Component) -> tuple[str, int]:
+    glyphs = _inside(array, frame, INK, 350)
+    dots = _inside(array, frame, DOT_BLUE, 90)
+    if len(glyphs) != 1 or len(dots) not in {1, 2, 3}:
+        raise OracleAbstention("query card has an incomplete shape or dot group")
+    if glyphs[0].cx >= min(dot.cx for dot in dots):
+        raise OracleAbstention("query part roles are unclear")
+    if max(dot.cy for dot in dots) - min(dot.cy for dot in dots) > 5.0:
+        raise OracleAbstention("query dots are not one group")
+    return _shape_code(glyphs[0]), len(dots)
+
+
+def _column_key(array: np.ndarray, frame: Component) -> list[str]:
+    glyphs = sorted(_inside(array, frame, INK, 350), key=lambda item: item.cx)
+    if len(glyphs) != 3:
+        raise OracleAbstention("column key lacks three glyphs")
+    codes = [_shape_code(item) for item in glyphs]
+    if sorted(codes) != ["circle", "square", "triangle"]:
+        raise OracleAbstention("column key glyph inventory is not unique")
+    return codes
+
+
+def _row_key(array: np.ndarray, frame: Component) -> list[int]:
+    dots = _inside(array, frame, DOT_BLUE, 90)
+    if len(dots) != 6:
+        raise OracleAbstention("row key must contain six dots across three groups")
+    levels: list[list[Component]] = []
+    for dot in sorted(dots, key=lambda item: item.cy):
+        if not levels or abs(dot.cy - levels[-1][0].cy) > 8.0:
+            levels.append([dot])
+        else:
+            levels[-1].append(dot)
+    counts = [len(level) for level in levels]
+    if len(levels) != 3 or sorted(counts) != [1, 2, 3]:
+        raise OracleAbstention("row key dot groups are ambiguous")
+    return counts
+
+
+def _cluster(values: list[float]) -> list[float]:
+    groups: list[list[float]] = []
+    for value in sorted(values):
+        if not groups or abs(value - sum(groups[-1]) / len(groups[-1])) > 20.0:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    if len(groups) != 3 or any(len(group) != 3 for group in groups):
+        raise OracleAbstention("grid coordinates do not form three rows and columns")
+    return [sum(group) / len(group) for group in groups]
+
+
+def _nearest_index(value: float, centers: list[float]) -> int:
+    distances = [abs(value - center) for center in centers]
+    index = int(np.argmin(distances))
+    if distances[index] > 8.0:
+        raise OracleAbstention("grid cell is off its recovered lattice")
+    return index
+
+
+def _grid(array: np.ndarray, frame: Component) -> list[list[str]]:
+    cells: list[tuple[str, Component]] = []
+    for tag, color in TAG_COLORS.items():
+        found = _inside(array, frame, color, 1800)
+        if len(found) != 3:
+            raise OracleAbstention(f"grid lacks three {tag} cells")
+        cells.extend((tag, item) for item in found)
+    xs = _cluster([item.cx for _, item in cells])
+    ys = _cluster([item.cy for _, item in cells])
+    output: list[list[str | None]] = [[None] * 3 for _ in range(3)]
+    for tag, item in cells:
+        row = _nearest_index(item.cy, ys)
+        column = _nearest_index(item.cx, xs)
+        if output[row][column] is not None:
+            raise OracleAbstention("grid has overlapping cell identities")
+        output[row][column] = tag
+    if any(value is None for row in output for value in row):
+        raise OracleAbstention("grid has a missing lattice cell")
+    matrix = [[str(value) for value in row] for row in output]
+    tags = sorted(TAG_COLORS)
+    if any(sorted(row) != tags for row in matrix):
+        raise OracleAbstention("grid rows are not balanced")
+    if any(sorted(matrix[row][column] for row in range(3)) != tags for column in range(3)):
+        raise OracleAbstention("grid columns are not balanced")
+    return matrix
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    query_frame = _frames(array, QUERY_MAGENTA, 1)[0]
+    grid_frame = _frames(array, GRID_TEAL, 1)[0]
+    gray_frames = _frames(array, KEY_GRAY, 2)
+    wide = [frame for frame in gray_frames if frame.width / frame.height > 1.6]
+    tall = [frame for frame in gray_frames if frame.height / frame.width > 1.6]
+    if len(wide) != 1 or len(tall) != 1:
+        raise OracleAbstention("row and column key roles are ambiguous")
+
+    query_shape, query_count = _query(array, query_frame)
+    shape_order = _column_key(array, wide[0])
+    count_order = _row_key(array, tall[0])
+    matrix = _grid(array, grid_frame)
+    try:
+        column = shape_order.index(query_shape)
+        row = count_order.index(query_count)
+    except ValueError as exc:
+        raise OracleAbstention("query has no unique key correspondence") from exc
+    return matrix[row][column]

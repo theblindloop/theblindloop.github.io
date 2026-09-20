@@ -1,0 +1,151 @@
+"""Independent image-only inverse for the perspective-frame puzzle."""
+
+from __future__ import annotations
+
+import functools
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_ANCHOR_RGBS = (
+    (12, 158, 179),
+    (226, 181, 25),
+    (132, 76, 184),
+    (76, 142, 112),
+)
+_TARGET_RGBS = {
+    "red": (218, 55, 65),
+    "green": (42, 150, 88),
+    "blue": (45, 98, 210),
+    "orange": (236, 137, 32),
+}
+_MAGENTA = (204, 38, 151)
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _mask(array: np.ndarray, rgb: tuple[int, int, int], tolerance: int = 5) -> np.ndarray:
+    delta = array.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[tuple[float, float, int]]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return []
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = mask[y0:y1, x0:x1]
+    seen = np.zeros_like(sub, dtype=bool)
+    height, width = sub.shape
+    found: list[tuple[float, float, int]] = []
+    for start_y, start_x in np.argwhere(sub):
+        sy, sx = int(start_y), int(start_x)
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and sub[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            px = np.asarray([point[1] + x0 for point in points], dtype=float)
+            py = np.asarray([point[0] + y0 for point in points], dtype=float)
+            found.append((float(px.mean()), float(py.mean()), len(points)))
+    return found
+
+
+def _homography(source: list[tuple[float, float]], destination: list[tuple[float, float]]) -> np.ndarray:
+    if len(source) != 4 or len(destination) != 4:
+        raise PixelParseError("a projective calibration needs four anchor pairs")
+    rows: list[list[float]] = []
+    values: list[float] = []
+    for (u, v), (x, y) in zip(source, destination, strict=True):
+        rows.append([u, v, 1.0, 0.0, 0.0, 0.0, -u * x, -v * x])
+        rows.append([0.0, 0.0, 0.0, u, v, 1.0, -u * y, -v * y])
+        values.extend([x, y])
+    try:
+        solution = np.linalg.solve(np.asarray(rows, dtype=float), np.asarray(values, dtype=float))
+    except np.linalg.LinAlgError as exc:
+        raise PixelParseError("corner anchors do not define a stable projective map") from exc
+    return np.asarray(
+        [[solution[0], solution[1], solution[2]],
+         [solution[3], solution[4], solution[5]],
+         [solution[6], solution[7], 1.0]],
+        dtype=float,
+    )
+
+
+def _project(matrix: np.ndarray, point: tuple[float, float]) -> tuple[float, float]:
+    value = matrix @ np.asarray([point[0], point[1], 1.0], dtype=float)
+    if abs(float(value[2])) < 1e-8:
+        raise PixelParseError("transported point is at infinity")
+    return float(value[0] / value[2]), float(value[1] / value[2])
+
+
+def _centroid(mask: np.ndarray, label: str) -> tuple[float, float]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 100:
+        raise PixelParseError(f"missing {label}")
+    return float(xs.mean()), float(ys.mean())
+
+
+@functools.lru_cache(maxsize=256)
+def _decision_from_bytes(size: tuple[int, int], pixels: bytes) -> str:
+    array = np.frombuffer(pixels, dtype=np.uint8).reshape((size[1], size[0], 3))
+    source_anchors: list[tuple[float, float]] = []
+    target_anchors: list[tuple[float, float]] = []
+    for rgb in _ANCHOR_RGBS:
+        components = _components(_mask(array, rgb), minimum=250)
+        if len(components) != 2:
+            raise PixelParseError(f"anchor color {rgb} produced {len(components)} large components")
+        components.sort(key=lambda item: item[0])
+        left, right = components
+        if left[0] >= size[0] / 2 or right[0] <= size[0] / 2:
+            raise PixelParseError("matching anchor pair does not span both panels")
+        source_anchors.append((left[0], left[1]))
+        target_anchors.append((right[0], right[1]))
+
+    query = _centroid(_mask(array, _MAGENTA), "magenta query")
+    if query[0] >= size[0] / 2:
+        raise PixelParseError("magenta query is not in the reference panel")
+    mapping = _homography(source_anchors, target_anchors)
+    predicted = _project(mapping, query)
+
+    targets: list[tuple[float, float, str]] = []
+    for name, rgb in _TARGET_RGBS.items():
+        components = _components(_mask(array, rgb), minimum=180)
+        if len(components) != 2:
+            raise PixelParseError(f"target color {name} produced {len(components)} dots")
+        for x, y, _area in components:
+            if x <= size[0] / 2:
+                raise PixelParseError(f"target color {name} leaked into the reference panel")
+            targets.append((x, y, name))
+    if len(targets) != 8:
+        raise PixelParseError("expected exactly eight target dots")
+    ranked = sorted(
+        (
+            (math.hypot(x - predicted[0], y - predicted[1]), name)
+            for x, y, name in targets
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    if ranked[0][0] > 9.0:
+        raise PixelParseError(f"no target dot at transported point (residual {ranked[0][0]:.2f}px)")
+    if ranked[1][0] - ranked[0][0] < 28.0:
+        raise PixelParseError("transported point has no unique target dot")
+    return ranked[0][1]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = image.convert("RGB")
+    return _decision_from_bytes(rgb.size, rgb.tobytes())

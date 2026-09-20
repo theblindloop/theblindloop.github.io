@@ -1,0 +1,166 @@
+"""Occluded continuation world: which symbol continues behind the bars.
+
+A single filled symbol (one of {circle, square, diamond, triangle}) is drawn at
+the centre of a white canvas. Three full-width horizontal bars in a fixed
+orthogonal colour are painted on top and hide the symbol's middle strip. The
+figure is recovered by Gestalt amodal continuation: interpolate each image
+column vertically across the occluding bar bands to reconstruct the whole
+silhouette, then classify it.
+
+The renderer owns scene sampling + rasterization + the structural analytic
+gold. The independent pixel-only inverse arm (``oracle.py``) performs the same
+column continuation on the final PNG alone (never reading the latent scene) and
+classifies the reconstructed silhouette.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+CENTER = WIDTH // 2
+RADIUS = 148
+BACKGROUND = (255, 255, 255)
+SYMBOL_COLOR = (30, 60, 140)
+BAR_COLOR = (70, 70, 70)
+BAR_THICK = 40
+BAR_TOP = [160, 256, 362]
+SHAPES = ["circle", "square", "diamond", "triangle"]
+
+_SQUARE_R = 1.0
+_CIRCLE_R = np.pi / 4
+_HALF_R = 0.5
+_R_SQUARE_MIN = 0.90
+_R_CIRCLE_MIN = 0.68
+_OFFSET_TRIANGLE = 1.0 / 6.0
+_OFFSET_DIAMOND = 0.0
+_OFFSET_MIN = 0.08
+_MARGIN_QUARANTINE = 0.05
+_NEAR = 8
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``."""
+    rng = np.random.default_rng(seed)
+    shape = SHAPES[int(rng.integers(0, len(SHAPES)))]
+    return {"shape": shape}
+
+
+def _draw_symbol(draw: ImageDraw.ImageDraw, shape: str) -> None:
+    """Draw the filled symbol silhouette at the canvas centre."""
+    c = CENTER
+    r = RADIUS
+    if shape == "square":
+        draw.rectangle([c - r, c - r, c + r, c + r], fill=SYMBOL_COLOR)
+    elif shape == "circle":
+        draw.ellipse([c - r, c - r, c + r, c + r], fill=SYMBOL_COLOR)
+    elif shape == "diamond":
+        draw.polygon(
+            [(c, c - r), (c + r, c), (c, c + r), (c - r, c)], fill=SYMBOL_COLOR
+        )
+    elif shape == "triangle":
+        draw.polygon(
+            [(c, c - r), (c - r, c + r), (c + r, c + r)], fill=SYMBOL_COLOR
+        )
+    else:
+        raise ValueError(f"unknown symbol shape {shape!r}")
+
+
+def _draw_bars(draw: ImageDraw.ImageDraw) -> None:
+    """Paint three full-width horizontal occluding bars over the canvas."""
+    for top in BAR_TOP:
+        draw.rectangle([0, top, WIDTH, top + BAR_THICK], fill=BAR_COLOR)
+
+
+def _draw_scene(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    d = ImageDraw.Draw(img)
+    _draw_symbol(d, scene["shape"])
+    _draw_bars(d)
+    return img
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the latent scene (a deterministic PNG)."""
+    return _draw_scene(scene)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Structural gold: the continued symbol shape is the latent shape."""
+    return scene["shape"]
+
+
+def _symbol_mask(scene: dict) -> np.ndarray:
+    arr = np.asarray(_draw_scene(scene).convert("RGB")).astype(int)
+    return (
+        (abs(arr[..., 0] - SYMBOL_COLOR[0]) <= _NEAR)
+        & (abs(arr[..., 1] - SYMBOL_COLOR[1]) <= _NEAR)
+        & (abs(arr[..., 2] - SYMBOL_COLOR[2]) <= _NEAR)
+    )
+
+
+def _continue_mask(mask: np.ndarray) -> np.ndarray:
+    """Vertical column interpolation across the occluding bar bands.
+
+    For each image column where the symbol is visible, fill every row between
+    the topmost and bottommost visible symbol pixel. Because each bounded
+    symbol is column-convex (a single interval per column) and the bars only
+    hide horizontal strips, this exactly recovers the whole continued symbol.
+    """
+    h = mask.shape[0]
+    out = np.zeros_like(mask)
+    for x in range(mask.shape[1]):
+        ys = np.where(mask[:, x])[0]
+        if ys.size == 0:
+            continue
+        out[ys.min(): ys.max() + 1, x] = True
+    return out
+
+
+def _features(mask: np.ndarray) -> tuple[float, float]:
+    """Return (fill-ratio within bounding box, vertical centroid offset frac)."""
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return 0.0, 0.0
+    h = int(ys.max()) - int(ys.min()) + 1
+    w = int(xs.max()) - int(xs.min()) + 1
+    fill = float(mask.sum()) / float(h * w)
+    centre_y = (int(ys.min()) + int(ys.max())) / 2.0
+    offset = abs(float(ys.mean()) - centre_y) / h
+    return fill, offset
+
+
+def classify_shape(fill: float, offset: float) -> str:
+    if fill >= _R_SQUARE_MIN:
+        return "square"
+    if fill >= _R_CIRCLE_MIN:
+        return "circle"
+    return "triangle" if offset > _OFFSET_MIN else "diamond"
+
+
+def _shape_scores(fill: float, offset: float) -> dict[str, float]:
+    return {
+        "square": 1.0 / (1.0 + 3.0 * abs(fill - _SQUARE_R)),
+        "circle": 1.0 / (1.0 + 3.0 * abs(fill - _CIRCLE_R)),
+        "diamond": 1.0 / (1.0 + 2.0 * abs(fill - _HALF_R) + 6.0 * abs(offset - _OFFSET_DIAMOND)),
+        "triangle": 1.0 / (1.0 + 2.0 * abs(fill - _HALF_R) + 6.0 * abs(offset - _OFFSET_TRIANGLE)),
+    }
+
+
+def margin(scene: dict) -> float:
+    """Commitment: best-minus-second continued-shape fit score."""
+    fill, offset = _features(_continue_mask(_symbol_mask(scene)))
+    scores = sorted(_shape_scores(fill, offset).values(), reverse=True)
+    return float(scores[0] - scores[1] if len(scores) > 1 else scores[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine near-boundary symbols whose continued silhouette is ambiguous."""
+    return margin(scene) < _MARGIN_QUARANTINE
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """The scene is injectively rendered; no latent aliases are declared."""
+    return []

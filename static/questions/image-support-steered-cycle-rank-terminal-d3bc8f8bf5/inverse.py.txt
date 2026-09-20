@@ -1,0 +1,161 @@
+"""Independent RGB-only inverse for the cycle-rank route question."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ROUTE_RGB = np.asarray((37, 52, 68), dtype=np.float32)
+COLOR_RGB = {
+    "green": np.asarray((37, 171, 104), dtype=np.float32),
+    "amber": np.asarray((230, 153, 35), dtype=np.float32),
+    "violet": np.asarray((135, 84, 193), dtype=np.float32),
+}
+
+
+class OracleFitError(ValueError):
+    """The final raster does not expose an unambiguous route comparison."""
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        queue: deque[tuple[int, int]] = deque([(y0, x0)])
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            found.append(np.asarray(pixels, dtype=np.int32))
+    return sorted(found, key=len, reverse=True)
+
+
+def _route_components(array: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+    distance = np.linalg.norm(array - ROUTE_RGB[None, None, :], axis=2)
+    mask = distance < 86.0
+    components = _components(mask, minimum=350)
+    if len(components) != 2:
+        raise OracleFitError(f"expected two disconnected route components, found {len(components)}")
+    return mask, components
+
+
+def _marker_centers(array: np.ndarray, color: str, expected: int) -> list[np.ndarray]:
+    distance = np.linalg.norm(array - COLOR_RGB[color][None, None, :], axis=2)
+    parts = _components(distance < 72.0, minimum=30)
+    if len(parts) != expected:
+        raise OracleFitError(f"expected {expected} {color} markers, found {len(parts)}")
+    return [part.astype(np.float64).mean(axis=0) for part in parts]
+
+
+def _nearest_component(center: np.ndarray, components: list[np.ndarray]) -> tuple[int, float]:
+    distances = [
+        float(np.linalg.norm(part.astype(np.float64) - center[None, :], axis=1).min())
+        for part in components
+    ]
+    order = np.argsort(np.asarray(distances))
+    if len(order) < 2 or distances[int(order[1])] - distances[int(order[0])] < 25.0:
+        raise OracleFitError("marker-to-network binding is ambiguous")
+    return int(order[0]), distances[int(order[0])]
+
+
+def _enclosed_regions(component: np.ndarray, shape: tuple[int, int]) -> int:
+    """Count sizable white regions enclosed by one dark route component."""
+
+    height, width = shape
+    ys = component[:, 0]
+    xs = component[:, 1]
+    pad = 12
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(height, int(ys.max()) + pad + 1)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(width, int(xs.max()) + pad + 1)
+    blocked = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+    local_y = component[:, 0] - y0
+    local_x = component[:, 1] - x0
+    blocked[local_y, local_x] = True
+    white = ~blocked
+
+    outside = np.zeros_like(white, dtype=bool)
+    queue: deque[tuple[int, int]] = deque()
+    local_height, local_width = white.shape
+    for x in range(local_width):
+        for y in (0, local_height - 1):
+            if white[y, x] and not outside[y, x]:
+                outside[y, x] = True
+                queue.append((y, x))
+    for y in range(local_height):
+        for x in (0, local_width - 1):
+            if white[y, x] and not outside[y, x]:
+                outside[y, x] = True
+                queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < local_height and 0 <= nx < local_width:
+                if white[ny, nx] and not outside[ny, nx]:
+                    outside[ny, nx] = True
+                    queue.append((ny, nx))
+    enclosed = white & ~outside
+    regions = _components(enclosed, minimum=250)
+    sizable = 0
+    for region in regions:
+        region_height = int(region[:, 0].max() - region[:, 0].min() + 1)
+        region_width = int(region[:, 1].max() - region[:, 1].min() + 1)
+        if len(region) >= 250 and region_height >= 12 and region_width >= 12:
+            sizable += 1
+    return sizable
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the terminal attached to the route with more enclosed cycles."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    route_mask, components = _route_components(array)
+    greens = _marker_centers(array, "green", 2)
+    terminals = {
+        color: _marker_centers(array, color, 1)[0] for color in ("amber", "violet")
+    }
+
+    green_links = [_nearest_component(center, components) for center in greens]
+    if any(distance > 30.0 for _, distance in green_links):
+        raise OracleFitError("green start is not bound to a route")
+    if len({index for index, _ in green_links}) != 2:
+        raise OracleFitError("green starts do not bind one per route")
+
+    terminal_links: list[tuple[str, int]] = []
+    for color, center in terminals.items():
+        index, distance = _nearest_component(center, components)
+        if distance > 30.0:
+            raise OracleFitError(f"{color} terminal is not bound to a route")
+        terminal_links.append((color, index))
+    if len({index for _, index in terminal_links}) != 2:
+        raise OracleFitError("terminals do not bind one per route")
+
+    counts = {index: _enclosed_regions(component, route_mask.shape) for index, component in enumerate(components)}
+    if sorted(counts.values()) != [1, 2]:
+        raise OracleFitError(f"expected enclosed-cycle counts one and two, found {counts}")
+    terminal_by_component = {index: color for color, index in terminal_links}
+    winner = max(counts, key=lambda index: counts[index])
+    return terminal_by_component[winner]

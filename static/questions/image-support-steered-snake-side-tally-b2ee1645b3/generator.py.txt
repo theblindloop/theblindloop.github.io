@@ -1,0 +1,469 @@
+"""snake_side_tally renderer, analytic gold, margin and latent bookkeeping.
+
+One connected teal wire zigzags between two horizontal levels inside a bounded
+strip.  A violet ring marks the port at one end of the wire; the other end is
+bare.  Five orange squares sit beside interior pieces of the wire with a visible
+gap, three gray squares are decoys.  Walking from the ringed port to the bare
+end, each orange square falls on the walker's left or right hand.  The answer is
+the majority hand.
+
+Nothing here is read by ``oracle.py``: the inverse arm receives only the PNG.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "snake_side_tally-renderer-0.1.0"
+
+WIDTH = 700
+HEIGHT = 460
+STEP = 76
+NCOL = 7
+STROKE_HALF = 3
+MARKER_HALF = 6
+PORT_OUTER = 17
+PORT_INNER = 11
+N_MARKERS = 5
+N_DECOYS = 3
+QUARANTINE_PX = 5.0
+GAP_SCALE = 12.0
+
+# Offsets by near-boundary tier: normal / near-boundary / quarantined.
+OFFSET_TIERS = (18.0, 15.0, 12.0)
+
+BG = (246, 246, 241)
+ROUTE = (13, 110, 110)
+PORT = (108, 32, 158)
+MARKER = (240, 138, 20)
+DECOY = (140, 140, 146)
+
+BASE_X = (WIDTH - (NCOL - 1) * STEP) // 2
+BASE_Y = 170
+
+# Run-length patterns over the 7 columns: every pattern has at least three row
+# changes (three vertical rungs) so at least nine wire pieces exist.
+_RUN_PATTERNS = (
+    (1, 2, 2, 2),
+    (2, 1, 2, 2),
+    (2, 2, 1, 2),
+    (2, 2, 2, 1),
+    (1, 1, 2, 2, 1),
+    (1, 2, 1, 2, 1),
+    (2, 1, 1, 2, 1),
+    (1, 2, 2, 1, 1),
+    (2, 2, 1, 1, 1),
+    (1, 1, 1, 2, 2),
+    (1, 1, 2, 1, 2),
+    (2, 1, 2, 1, 1),
+    (1, 1, 1, 1, 1, 2),
+    (1, 1, 1, 2, 1, 1),
+    (2, 1, 1, 1, 1, 1),
+)
+
+_JITTERS = (-3.0, 0.0, 3.0)
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+
+
+def _nodes_for(rows, x0, ytop):
+    """Ordered wire vertices for a per-column row assignment."""
+    levels = (float(ytop), float(ytop + STEP))
+    pts = [(float(x0), levels[rows[0]])]
+    for c in range(len(rows) - 1):
+        pts.append((float(x0 + (c + 1) * STEP), levels[rows[c]]))
+        if rows[c + 1] != rows[c]:
+            pts.append((float(x0 + (c + 1) * STEP), levels[rows[c + 1]]))
+    return pts
+
+
+def _edge(scene, i):
+    nodes = scene["nodes"]
+    return tuple(nodes[i]), tuple(nodes[i + 1])
+
+
+def _n_edges(scene):
+    return len(scene["nodes"]) - 1
+
+
+def _edge_dir(scene, i):
+    (x0, y0), (x1, y1) = _edge(scene, i)
+    length = math.hypot(x1 - x0, y1 - y0)
+    return ((x1 - x0) / length, (y1 - y0) / length)
+
+
+def _left_of(u):
+    """Left-hand unit vector for a walker heading along ``u`` (y grows down)."""
+    return (u[1], -u[0])
+
+
+def _edge_kind(scene, i):
+    (_, y0), (_, y1) = _edge(scene, i)
+    return "h" if y0 == y1 else "v"
+
+
+def _square_center(scene, item):
+    (x0, y0), (x1, y1) = _edge(scene, item["edge"])
+    u = _edge_dir(scene, item["edge"])
+    lv = _left_of(u)
+    mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    off = scene["offset"] * item["sign"]
+    j = item["jitter"]
+    return (mx + u[0] * j + lv[0] * off, my + u[1] * j + lv[1] * off)
+
+
+def _square_rect(scene, item):
+    cx, cy = _square_center(scene, item)
+    h = scene["marker_half"]
+    return (round(cx) - h, round(cy) - h, round(cx) + h, round(cy) + h)
+
+
+def _edge_rect(scene, i):
+    (x0, y0), (x1, y1) = _edge(scene, i)
+    h = scene["stroke"] // 2
+    return (
+        round(min(x0, x1)) - h,
+        round(min(y0, y1)) - h,
+        round(max(x0, x1)) + h,
+        round(max(y0, y1)) + h,
+    )
+
+
+def _port_center(scene):
+    nodes = scene["nodes"]
+    return tuple(nodes[0] if scene["port_end"] == 0 else nodes[-1])
+
+
+def _far_center(scene):
+    nodes = scene["nodes"]
+    return tuple(nodes[-1] if scene["port_end"] == 0 else nodes[0])
+
+
+def _rect_gap(a, b):
+    dx = max(a[0] - b[2], b[0] - a[2], 0)
+    dy = max(a[1] - b[3], b[1] - a[3], 0)
+    return math.hypot(dx, dy)
+
+
+def _point_rect_gap(p, r):
+    dx = max(r[0] - p[0], p[0] - r[2], 0.0)
+    dy = max(r[1] - p[1], p[1] - r[3], 0.0)
+    return math.hypot(dx, dy)
+
+
+# --------------------------------------------------------------------------
+# hands
+
+
+def _walk_order(scene):
+    """Edge indices in walking order, with the sign of the stored direction."""
+    n = _n_edges(scene)
+    if scene["port_end"] == 0:
+        return [(i, 1) for i in range(n)]
+    return [(i, -1) for i in range(n - 1, -1, -1)]
+
+
+def _hand(scene, item):
+    """'left' or 'right': the hand the square falls on while walking."""
+    flip = 1 if scene["port_end"] == 0 else -1
+    return "left" if item["sign"] * flip > 0 else "right"
+
+
+def _tally(scene):
+    hands = [_hand(scene, m) for m in scene["markers"]]
+    return hands.count("left"), hands.count("right")
+
+
+def analytic_gold(scene: dict) -> str:
+    left, right = _tally(scene)
+    if left == right:
+        return "tie"
+    return "left" if left > right else "right"
+
+
+# --------------------------------------------------------------------------
+# cheap-cue readings that must be counterbalanced
+
+
+def _chord_reading(scene):
+    """Majority hand if the walker used the straight end-to-end chord."""
+    px, py = _port_center(scene)
+    fx, fy = _far_center(scene)
+    length = math.hypot(fx - px, fy - py)
+    u = ((fx - px) / length, (fy - py) / length)
+    lv = _left_of(u)
+    left = 0
+    right = 0
+    for m in scene["markers"]:
+        cx, cy = _square_center(scene, m)
+        # position of the square relative to the wire piece it sits beside
+        (x0, y0), (x1, y1) = _edge(scene, m["edge"])
+        ax, ay = cx - (x0 + x1) / 2.0, cy - (y0 + y1) / 2.0
+        if ax * lv[0] + ay * lv[1] > 0:
+            left += 1
+        else:
+            right += 1
+    if left == right:
+        return "tie"
+    return "left" if left > right else "right"
+
+
+def _frame_reading(scene):
+    """Majority hand if every piece were assumed to run +x (or +y down)."""
+    left = 0
+    right = 0
+    for m in scene["markers"]:
+        u = _edge_dir(scene, m["edge"])
+        canonical = 1 if (u[0] + u[1]) > 0 else -1
+        if m["sign"] * canonical > 0:
+            left += 1
+        else:
+            right += 1
+    if left == right:
+        return "tie"
+    return "left" if left > right else "right"
+
+
+def _first_reading(scene):
+    """Hand of the first orange square met along the walk."""
+    order = {i: k for k, (i, _s) in enumerate(_walk_order(scene))}
+    first = min(scene["markers"], key=lambda m: order[m["edge"]])
+    return _hand(scene, first)
+
+
+# --------------------------------------------------------------------------
+# margin / quarantine
+
+
+def _clearances(scene):
+    squares = [("marker", m) for m in scene["markers"]]
+    squares += [("decoy", d) for d in scene["decoys"]]
+    rects = [_square_rect(scene, it) for _k, it in squares]
+    n = _n_edges(scene)
+    edge_rects = [_edge_rect(scene, i) for i in range(n)]
+    port = _port_center(scene)
+    vals = []
+
+    for k, (_kind, item) in enumerate(squares):
+        own = item["edge"]
+        for i in range(n):
+            gap = _rect_gap(rects[k], edge_rects[i])
+            if i == own:
+                vals.append(gap)  # the handedness boundary quantity
+            else:
+                vals.append(gap)
+        half_len = math.hypot(
+            _edge(scene, own)[1][0] - _edge(scene, own)[0][0],
+            _edge(scene, own)[1][1] - _edge(scene, own)[0][1],
+        ) / 2.0
+        vals.append(half_len - abs(item["jitter"]) - scene["marker_half"])
+        vals.append(_point_rect_gap(port, rects[k]) - scene["port_radius"])
+
+    for a in range(len(rects)):
+        for b in range(a + 1, len(rects)):
+            vals.append(_rect_gap(rects[a], rects[b]))
+
+    for a in range(n):
+        for b in range(a + 2, n):
+            vals.append(_rect_gap(edge_rects[a], edge_rects[b]))
+
+    return min(vals)
+
+
+def margin(scene: dict) -> float:
+    left, right = _tally(scene)
+    gap = abs(left - right)
+    if gap == 0:
+        return 0.0
+    return round(min(_clearances(scene), GAP_SCALE * gap), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+# --------------------------------------------------------------------------
+# sampling
+
+
+def _bits(seed: int) -> int:
+    digest = hashlib.sha256(f"snake_side_tally:{seed}".encode()).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def _draw_candidate(rng, offset, port_end):
+    runs = list(rng.choice(_RUN_PATTERNS))
+    start_row = rng.randrange(2)
+    rows = []
+    row = start_row
+    for run in runs:
+        rows.extend([row] * run)
+        row = 1 - row
+    rows = rows[:NCOL]
+
+    dx = rng.randrange(-14, 15)
+    dy = rng.randrange(-18, 19)
+    nodes = _nodes_for(rows, BASE_X + dx, BASE_Y + dy)
+
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "step": STEP,
+        "origin": [BASE_X + dx, BASE_Y + dy],
+        "nodes": [[float(x), float(y)] for x, y in nodes],
+        "port_end": port_end,
+        "markers": [],
+        "decoys": [],
+        "stroke": 2 * STROKE_HALF + 1,
+        "marker_half": MARKER_HALF,
+        "offset": offset,
+        "port_radius": PORT_OUTER,
+    }
+
+    n = _n_edges(scene)
+    horiz = [i for i in range(n) if _edge_kind(scene, i) == "h"]
+    vert = [i for i in range(n) if _edge_kind(scene, i) == "v"]
+    if len(vert) < 2 or len(horiz) < 3:
+        return None
+
+    n_vert = rng.choice((2, 3)) if len(vert) >= 3 else 2
+    n_horiz = N_MARKERS - n_vert
+    if n_horiz > len(horiz):
+        return None
+    pick_v = rng.sample(vert, n_vert)
+    # a walked zigzag alternates rung direction, so mixed parity is required
+    if len({i % 2 for i in range(len(vert)) if vert[i] in pick_v}) < 2:
+        return None
+    pick_h = rng.sample(horiz, n_horiz)
+
+    used = set(pick_v) | set(pick_h)
+    rest = [i for i in range(n) if i not in used]
+    if len(rest) < N_DECOYS:
+        return None
+    decoy_edges = rng.sample(rest, N_DECOYS)
+
+    marker_edges = pick_v + pick_h
+    rng.shuffle(marker_edges)
+    scene["markers"] = [
+        {"edge": i, "sign": rng.choice((-1, 1)), "jitter": rng.choice(_JITTERS)}
+        for i in marker_edges
+    ]
+    scene["decoys"] = [
+        {"edge": i, "sign": rng.choice((-1, 1)), "jitter": rng.choice(_JITTERS)}
+        for i in decoy_edges
+    ]
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic counterbalanced scene for ``seed``."""
+    bits = _bits(seed)
+    want_answer = "left" if bits & 1 else "right"
+    want_chord = bool((bits >> 1) & 1)
+    want_frame = bool((bits >> 2) & 1)
+    port_end = (bits >> 3) & 1
+    tier_draw = (bits >> 4) % 10
+    tier = 0 if tier_draw < 7 else (1 if tier_draw < 9 else 2)
+    offset = OFFSET_TIERS[tier]
+    want_quarantine = tier == 2
+
+    rng = random.Random(0x5A5A ^ (seed * 2654435761 % (1 << 61)))
+    relax = 0
+    for attempt in range(24000):
+        if attempt == 9000:
+            relax = 1  # drop the first-square balance, keep the strong cues
+        if attempt == 18000:
+            relax = 2  # drop the frame-cue balance
+        scene = _draw_candidate(rng, offset, port_end)
+        if scene is None:
+            continue
+        left, right = _tally(scene)
+        if abs(left - right) not in (1, 3):
+            continue
+        if analytic_gold(scene) != want_answer:
+            continue
+        if is_quarantined(scene) != want_quarantine:
+            continue
+        if relax < 2 and (_frame_reading(scene) == want_answer) != want_frame:
+            continue
+        if (_chord_reading(scene) == want_answer) != want_chord:
+            continue
+        if relax < 1 and _first_reading(scene) != ("left" if (bits >> 5) & 1 else "right"):
+            continue
+        scene["_cues"] = {
+            "chord": _chord_reading(scene),
+            "frame": _frame_reading(scene),
+            "first": _first_reading(scene),
+            "tier": tier,
+            "relaxed": relax,
+        }
+        return scene
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BG)
+    draw = ImageDraw.Draw(img)
+
+    px, py = _port_center(scene)
+    r = scene["port_radius"]
+    draw.ellipse([px - r, py - r, px + r, py + r], fill=PORT)
+    inner = r - (PORT_OUTER - PORT_INNER)
+    draw.ellipse([px - inner, py - inner, px + inner, py + inner], fill=BG)
+
+    for i in range(_n_edges(scene)):
+        draw.rectangle(_edge_rect(scene, i), fill=ROUTE)
+    for m in scene["markers"]:
+        draw.rectangle(_square_rect(scene, m), fill=MARKER)
+    for d in scene["decoys"]:
+        draw.rectangle(_square_rect(scene, d), fill=DECOY)
+    return img
+
+
+# --------------------------------------------------------------------------
+# latent aliases
+
+
+def _clone(scene):
+    out = dict(scene)
+    out["nodes"] = [list(p) for p in scene["nodes"]]
+    out["markers"] = [dict(m) for m in scene["markers"]]
+    out["decoys"] = [dict(d) for d in scene["decoys"]]
+    out["origin"] = list(scene["origin"])
+    out.pop("_cues", None)
+    return out
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Latent rewrites that must leave the raster and the gold untouched."""
+    out = []
+
+    rot = _clone(scene)
+    rot["markers"] = rot["markers"][2:] + rot["markers"][:2]
+    out.append(("orange_marker_paint_order", rot))
+
+    dec = _clone(scene)
+    dec["decoys"] = dec["decoys"][1:] + dec["decoys"][:1]
+    out.append(("gray_decoy_paint_order", dec))
+
+    rev = _clone(scene)
+    n = _n_edges(scene)
+    rev["nodes"] = list(reversed(rev["nodes"]))
+    rev["port_end"] = 1 - rev["port_end"]
+    for group in ("markers", "decoys"):
+        for item in rev[group]:
+            item["edge"] = n - 1 - item["edge"]
+            item["sign"] = -item["sign"]
+            item["jitter"] = -item["jitter"]
+    out.append(("node_list_reversal", rev))
+    return out

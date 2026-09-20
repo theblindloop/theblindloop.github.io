@@ -1,0 +1,186 @@
+"""Pixel-only decision arm. Receives a PNG image and nothing else."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "red": (214, 40, 40),
+    "blue": (40, 70, 210),
+    "green": (25, 145, 60),
+    "orange": (238, 150, 20),
+}
+ABSTAIN = "abstain"
+
+
+def _label_pixels(arr):
+    """Split an RGB array into named pixel-coordinate lists, vectorized."""
+    r = arr[:, :, 0].astype(np.int32)
+    g = arr[:, :, 1].astype(np.int32)
+    b = arr[:, :, 2].astype(np.int32)
+    neutral = (
+        (np.abs(r - g) < 26) & (np.abs(g - b) < 26) & (np.abs(r - b) < 26)
+    )
+    out = {}
+    frame = neutral & (r < 60)
+    gray = neutral & (r > 70) & (r < 175)
+    for name, mask in (("frame", frame), ("gray", gray)):
+        ys, xs = np.nonzero(mask)
+        out[name] = list(zip(xs.tolist(), ys.tolist()))
+    chromatic = ~neutral
+    for name, ref in PALETTE.items():
+        dist = (r - ref[0]) ** 2 + (g - ref[1]) ** 2 + (b - ref[2]) ** 2
+        ys, xs = np.nonzero(chromatic & (dist < 9000))
+        out[name] = list(zip(xs.tolist(), ys.tolist()))
+    return out
+
+
+def _blobs(points):
+    """Group pixel coordinates into 4-connected blobs."""
+    remaining = set(points)
+    out = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        blob = [start]
+        while stack:
+            x, y = stack.pop()
+            for nb in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if nb in remaining:
+                    remaining.discard(nb)
+                    stack.append(nb)
+                    blob.append(nb)
+        out.append(blob)
+    return out
+
+
+def _centroid(blob):
+    return (sum(p[0] for p in blob) / len(blob), sum(p[1] for p in blob) / len(blob))
+
+
+def _pitch(centres):
+    best = None
+    for i in range(len(centres)):
+        for j in range(i + 1, len(centres)):
+            d = abs(centres[i][0] - centres[j][0]) + abs(centres[i][1] - centres[j][1])
+            if d > 4 and (best is None or d < best):
+                best = d
+    return best
+
+
+def _cells(centres, pitch):
+    xs = min(c[0] for c in centres)
+    ys = min(c[1] for c in centres)
+    return tuple(
+        sorted(
+            (int(round((c[0] - xs) / pitch)), int(round((c[1] - ys) / pitch)))
+            for c in centres
+        )
+    )
+
+
+def _rotate(cells, quarter):
+    out = list(cells)
+    for _ in range(quarter % 4):
+        out = [(y, -x) for (x, y) in out]
+    xs = min(c[0] for c in out)
+    ys = min(c[1] for c in out)
+    return tuple(sorted((c[0] - xs, c[1] - ys) for c in out))
+
+
+def _distance(a, b):
+    sa = set(a)
+    return min(len(sa ^ set(_rotate(b, q))) for q in range(4))
+
+
+def _group(blobs, pitch):
+    """Link cell blobs whose centres sit within a cell pitch of each other."""
+    centres = [_centroid(b) for b in blobs]
+    parent = list(range(len(blobs)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(centres)):
+        for j in range(i + 1, len(centres)):
+            dx = abs(centres[i][0] - centres[j][0])
+            dy = abs(centres[i][1] - centres[j][1])
+            if max(dx, dy) < pitch * 1.6 and min(dx, dy) < pitch * 0.6:
+                parent[find(i)] = find(j)
+    groups = {}
+    for i, centre in enumerate(centres):
+        groups.setdefault(find(i), []).append(centre)
+    return list(groups.values())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    labelled = _label_pixels(np.asarray(rgb))
+    labelled = {k: v for k, v in labelled.items() if v}
+
+    if "gray" not in labelled or "frame" not in labelled:
+        return ABSTAIN
+
+    # The divider is the widest gray-ish run spanning the image; locate it by
+    # finding rows whose gray pixels cover almost the whole width.
+    rows = {}
+    for x, y in labelled["gray"]:
+        rows.setdefault(y, 0)
+        rows[y] += 1
+    divider_rows = {y for y, count in rows.items() if count > width * 0.9}
+    if not divider_rows:
+        return ABSTAIN
+    split = max(divider_rows)
+
+    colour_blobs = {}
+    for name in PALETTE:
+        pts = labelled.get(name, [])
+        pts = [p for p in pts if p[1] < split]
+        if not pts:
+            return ABSTAIN
+        blobs = _blobs(pts)
+        if len(blobs) != 4:
+            return ABSTAIN
+        colour_blobs[name] = [_centroid(b) for b in blobs]
+
+    all_top = [c for cs in colour_blobs.values() for c in cs]
+    pitch = _pitch(all_top)
+    if not pitch:
+        return ABSTAIN
+
+    reference = {name: _cells(cs, pitch) for name, cs in colour_blobs.items()}
+
+    bottom_pts = [p for p in labelled["gray"] if p[1] > split + 2]
+    if not bottom_pts:
+        return ABSTAIN
+    bottom_blobs = [b for b in _blobs(bottom_pts) if len(b) > 40]
+    groups = _group(bottom_blobs, pitch)
+    groups = [g for g in groups if len(g) == 4]
+    if len(groups) != 4:
+        return ABSTAIN
+
+    frame_pts = [p for p in labelled["frame"] if p[1] > split]
+    if not frame_pts:
+        return ABSTAIN
+    fx0 = min(p[0] for p in frame_pts)
+    fx1 = max(p[0] for p in frame_pts)
+    fy0 = min(p[1] for p in frame_pts)
+    fy1 = max(p[1] for p in frame_pts)
+    inside = [
+        g
+        for g in groups
+        if all(fx0 < c[0] < fx1 and fy0 < c[1] < fy1 for c in g)
+    ]
+    if len(inside) != 1:
+        return ABSTAIN
+
+    marked = _cells(inside[0], pitch)
+    scored = sorted((_distance(marked, cells), name) for name, cells in reference.items())
+    if scored[0][0] != 0 or scored[1][0] == 0:
+        return ABSTAIN
+    return scored[0][1]

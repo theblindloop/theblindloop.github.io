@@ -1,0 +1,174 @@
+"""Deterministic perspective-transfer world."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH, HEIGHT = 1000, 720
+BG = (247, 247, 242)
+PAPER = (255, 255, 252)
+INK = (38, 43, 52)
+MUTED = (103, 110, 118)
+MARKER = (246, 190, 34)
+CORNER_COLORS = [(216, 67, 67), (42, 117, 203), (43, 157, 94), (145, 83, 181)]
+CUP_COLORS = {"A": (229, 121, 45), "B": (30, 166, 184), "C": (215, 71, 139), "D": (112, 86, 64)}
+LABELS = ("A", "B", "C", "D")
+
+
+def _font(size: int, bold: bool = False):
+    face = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    return ImageFont.truetype(f"/usr/share/fonts/truetype/dejavu/{face}", size)
+
+
+def _homography(src, dst):
+    rows, rhs = [], []
+    for (x, y), (u, v) in zip(src, dst):
+        rows.extend(([x, y, 1, 0, 0, 0, -u*x, -u*y],
+                     [0, 0, 0, x, y, 1, -v*x, -v*y]))
+        rhs.extend((u, v))
+    h = np.linalg.solve(np.asarray(rows, float), np.asarray(rhs, float))
+    return np.append(h, 1.0).reshape(3, 3)
+
+
+def _apply_h(h, point):
+    q = h @ np.asarray([point[0], point[1], 1.0], float)
+    return [float(q[0]/q[2]), float(q[1]/q[2])]
+
+
+def _projective_point(source, target, point):
+    return _apply_h(_homography(source, target), point)
+
+
+def _canonical_point(quad, u, v):
+    return _apply_h(_homography([[0,0],[1,0],[1,1],[0,1]], quad), [u, v])
+
+
+def _bilinear(quad, u, v):
+    weights = ((1-u)*(1-v), u*(1-v), u*v, (1-u)*v)
+    return [sum(w*p[k] for w,p in zip(weights, quad)) for k in (0,1)]
+
+
+def _affine_three(source, target, point):
+    a = np.array([[source[i][0], source[i][1], 1.0] for i in range(3)], float)
+    coeff_x = np.linalg.solve(a, np.array([target[i][0] for i in range(3)], float))
+    coeff_y = np.linalg.solve(a, np.array([target[i][1] for i in range(3)], float))
+    z = np.array([point[0], point[1], 1.0])
+    return [float(z@coeff_x), float(z@coeff_y)]
+
+
+def _inside_canvas(point, pad=38):
+    return pad <= point[0] <= WIDTH-pad and 120+pad <= point[1] <= HEIGHT-pad
+
+
+def _area(poly):
+    return abs(sum(poly[i][0]*poly[(i+1)%4][1]-poly[(i+1)%4][0]*poly[i][1] for i in range(4)))/2
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    answer = LABELS[int(seed) % 4]
+    for _ in range(30000):
+        source = [
+            [rng.uniform(58,115), rng.uniform(158,235)],
+            [rng.uniform(370,455), rng.uniform(145,245)],
+            [rng.uniform(355,455), rng.uniform(505,650)],
+            [rng.uniform(58,145), rng.uniform(490,650)],
+        ]
+        target = [
+            [rng.uniform(520,680), rng.uniform(145,285)],
+            [rng.uniform(825,945), rng.uniform(145,295)],
+            [rng.uniform(775,945), rng.uniform(490,655)],
+            [rng.uniform(510,705), rng.uniform(470,655)],
+        ]
+        if _area(source) < 90000 or _area(target) < 70000:
+            continue
+        u, v = rng.uniform(.20,.80), rng.uniform(.20,.80)
+        marker = _canonical_point(source, u, v)
+        gold = _projective_point(source, target, marker)
+        bilinear = _bilinear(target, u, v)
+        affine = _affine_three(source, target, marker)
+        transposed = _canonical_point(target, v, u)
+        points = [gold, bilinear, affine, transposed]
+        if not all(_inside_canvas(p, 42) for p in [marker, *points]):
+            continue
+        separations = [math.dist(points[i], points[j]) for i in range(4) for j in range(i)]
+        if min(separations) < 58:
+            continue
+        # Force a genuinely projective scene: both common affine/bilinear shortcuts miss visibly.
+        if math.dist(gold, affine) < 70 or math.dist(gold, bilinear) < 58:
+            continue
+        distractors = points[1:]
+        rng.shuffle(distractors)
+        cups, cursor = [], 0
+        for label in LABELS:
+            center = gold if label == answer else distractors[cursor]
+            cursor += int(label != answer)
+            cups.append({"label": label, "color": list(CUP_COLORS[label]), "center": center})
+        return {"source": source, "target": target, "marker": marker, "cups": cups}
+    raise RuntimeError("could not sample separated projective scene")
+
+
+def _endpoint(scene):
+    return _projective_point(scene["source"], scene["target"], scene["marker"])
+
+
+def analytic_gold(scene: dict) -> str:
+    endpoint = _endpoint(scene)
+    return min(LABELS, key=lambda label: math.dist(endpoint, next(c["center"] for c in scene["cups"] if c["label"] == label)))
+
+
+def margin(scene: dict) -> float:
+    endpoint = _endpoint(scene)
+    distances = sorted(math.dist(endpoint, c["center"]) for c in scene["cups"])
+    return float(distances[1]-distances[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    endpoint = _endpoint(scene)
+    centers = [c["center"] for c in scene["cups"]]
+    return (min(math.dist(centers[i], centers[j]) for i in range(4) for j in range(i)) < 52
+            or min(math.dist(endpoint, p) for p in centers) > 2
+            or not all(_inside_canvas(p, 32) for p in [scene["marker"], *centers])
+            or _area(scene["source"]) < 70000 or _area(scene["target"]) < 60000)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["cups"] = list(reversed(twin["cups"]))
+    return [("reverse_label_keyed_cup_serialization", twin)]
+
+
+def _polygon(draw, quad):
+    draw.polygon([tuple(p) for p in quad], fill=PAPER, outline=INK, width=5)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((18,14,982,105), radius=18, fill=(255,255,255), outline=(184,187,191), width=2)
+    draw.text((42,29), "PERSPECTIVE TRANSFER", font=_font(27, True), fill=INK)
+    draw.text((42,67), "match the four corners by color", font=_font(18), fill=MUTED)
+    draw.text((150,116), "SOURCE", font=_font(22, True), fill=INK)
+    draw.text((690,116), "WARPED VIEW", font=_font(22, True), fill=INK)
+    _polygon(draw, scene["source"])
+    _polygon(draw, scene["target"])
+    for quad in (scene["source"], scene["target"]):
+        for p, color in zip(quad, CORNER_COLORS):
+            x,y = p
+            draw.ellipse((x-18,y-18,x+18,y+18), fill=(255,255,255), outline=INK, width=3)
+            draw.ellipse((x-12,y-12,x+12,y+12), fill=color)
+    x,y = scene["marker"]
+    draw.ellipse((x-20,y-20,x+20,y+20), fill=(255,255,255), outline=INK, width=3)
+    draw.ellipse((x-13,y-13,x+13,y+13), fill=MARKER)
+    for cup in sorted(scene["cups"], key=lambda c:c["label"]):
+        x,y = cup["center"]
+        draw.ellipse((x-27,y-27,x+27,y+27), fill=(255,255,255), outline=INK, width=3)
+        draw.ellipse((x-20,y-20,x+20,y+20), fill=tuple(cup["color"]))
+        box = draw.textbbox((0,0), cup["label"], font=_font(21, True))
+        draw.text((x-(box[2]-box[0])/2, y-(box[3]-box[1])/2-2), cup["label"], font=_font(21, True), fill=(255,255,255))
+    return image

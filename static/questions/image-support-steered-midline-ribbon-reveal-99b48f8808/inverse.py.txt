@@ -1,0 +1,122 @@
+"""Independent pixel-only inverse for the declared midline transform."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+SHAPES = ("arch", "cup", "wave")
+MIN_RIBBON_SPAN = 340
+MAX_INVALID_FRACTION = 0.025
+MIN_EDGE_GAP = 24.0
+MAX_EDGE_GAP = 78.0
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _component_sizes(mask: np.ndarray) -> list[int]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    sizes: list[int] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        size = 0
+        while stack:
+            cy, cx = stack.pop()
+            size += 1
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        sizes.append(size)
+    return sorted(sizes, reverse=True)
+
+
+def _masks(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red = (array[..., 0] > 135) & (array[..., 1] < 120) & (array[..., 0] > array[..., 1] + 55) & (array[..., 0] > array[..., 2] + 45)
+    gold = (array[..., 0] > 150) & (array[..., 1] > 95) & (array[..., 1] > 0.55 * array[..., 0]) & (array[..., 1] < array[..., 0] - 25) & (array[..., 2] < 115)
+    dark = (array.max(axis=2) < 105) & (array.mean(axis=2) < 76)
+    midpoint = array.shape[1] // 2
+    red[:, midpoint:] = False
+    gold[:, :midpoint] = False
+    return dark, red, gold
+
+
+def classify_from_image(image: Image.Image) -> tuple[str, float]:
+    dark, red, gold = _masks(image)
+    red_sizes = _component_sizes(red)
+    gold_sizes = _component_sizes(gold)
+    if not red_sizes or red_sizes[0] < 80:
+        raise OracleAbstention("red ring is missing or damaged")
+    if not gold_sizes or gold_sizes[0] < 100:
+        raise OracleAbstention("gold triangle is missing or damaged")
+    ry, rx = np.argwhere(red).mean(axis=0)
+    gy, gx = np.argwhere(gold).mean(axis=0)
+    if not rx + 250 < gx:
+        raise OracleAbstention("endpoint direction is absent or ambiguous")
+
+    ys, xs = np.nonzero(dark)
+    if len(xs) < 2500:
+        raise OracleAbstention("dark outline has insufficient ink")
+    x0, x1 = int(xs.min()), int(xs.max())
+    if x1 - x0 < MIN_RIBBON_SPAN:
+        raise OracleAbstention("dark outline does not span the image")
+    if not rx < x0 + 5 or not gx > x1 - 5:
+        raise OracleAbstention("fiducials do not bracket the ribbon")
+
+    columns: list[float] = []
+    centers: list[float] = []
+    invalid = 0
+    for x in range(x0 + 7, x1 - 6):
+        values = np.flatnonzero(dark[:, x])
+        if len(values) < 4:
+            invalid += 1
+            continue
+        gaps = np.diff(values)
+        split = int(np.argmax(gaps))
+        if gaps[split] < 10:
+            invalid += 1
+            continue
+        upper = values[: split + 1]
+        lower = values[split + 1 :]
+        edge_gap = float(lower.mean() - upper.mean())
+        if not MIN_EDGE_GAP <= edge_gap <= MAX_EDGE_GAP:
+            invalid += 1
+            continue
+        columns.append(float(x))
+        centers.append(float(upper.mean() + lower.mean()) / 2.0)
+    attempted = max(1, x1 - x0 - 13)
+    if invalid / attempted > MAX_INVALID_FRACTION or len(columns) < 330:
+        raise OracleAbstention("opposing edges are not continuously measurable")
+
+    x = np.asarray(columns, dtype=np.float64)
+    y = np.asarray(centers, dtype=np.float64)
+    t = (x - float(x0)) / float(x1 - x0)
+    design = np.column_stack(
+        [np.ones_like(t), t - 0.5, np.cos(2.0 * math.pi * t), np.sin(2.0 * math.pi * t)]
+    )
+    coefficients, *_ = np.linalg.lstsq(design, y, rcond=None)
+    fitted = design @ coefficients
+    rms = float(np.sqrt(np.mean((y - fitted) ** 2)))
+    if rms > 1.8:
+        raise OracleAbstention(f"midline is not a stable declared path (rms={rms:.2f})")
+    cosine, sine = float(coefficients[2]), float(coefficients[3])
+    amplitude = math.hypot(cosine, sine)
+    if not 10.0 <= amplitude <= 32.0:
+        raise OracleAbstention("recovered midline amplitude is outside the visible range")
+    scores = {"arch": cosine / amplitude, "cup": -cosine / amplitude, "wave": sine / amplitude}
+    ranking = sorted(scores.items(), key=lambda item: (-item[1], SHAPES.index(item[0])))
+    return ranking[0][0], float(ranking[0][1] - ranking[1][1])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return classify_from_image(image)[0]

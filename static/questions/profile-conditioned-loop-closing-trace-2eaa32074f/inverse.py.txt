@@ -1,0 +1,111 @@
+"""Independent image-only inverse arm for loop-closing contour traces.
+
+The implementation deliberately duplicates the public palette specification and
+uses no latent geometry. It segments the raster, reconstructs connected dark
+components, binds each colored marker centroid to its nearest component, then
+selects the sole color whose two markers share a component.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+from typing import Any
+
+import numpy as np
+from PIL import Image
+
+_COLORS = ("red", "blue", "green", "orange")
+_PROTOTYPES = np.asarray(
+    ([220, 54, 68], [43, 105, 205], [31, 151, 91], [234, 126, 29]),
+    dtype=np.int32,
+)
+_INK = np.asarray([36, 38, 43], dtype=np.int32)
+_COLOR_MAX_DISTANCE_SQ = 72 * 72
+_INK_MAX_DISTANCE_SQ = 72 * 72
+_MIN_MARKER_AREA = 110
+_MIN_CONTOUR_AREA = 700
+_MAX_ENDPOINT_DISTANCE = 18.0
+_MIN_ASSOCIATION_ADVANTAGE = 5.0
+
+
+def _components(mask: np.ndarray, minimum_area: int) -> list[np.ndarray]:
+    """Return 8-connected component coordinates as (y,x) arrays."""
+    height, width = mask.shape
+    active = set(np.flatnonzero(mask).tolist())
+    components: list[np.ndarray] = []
+    offsets = (-width - 1, -width, -width + 1, -1, 1, width - 1, width, width + 1)
+    while active:
+        root = active.pop()
+        stack: deque[int] = deque([root])
+        found = [root]
+        while stack:
+            current = stack.pop()
+            y, x = divmod(current, width)
+            for offset in offsets:
+                neighbor = current + offset
+                if neighbor not in active:
+                    continue
+                ny, nx = divmod(neighbor, width)
+                if 0 <= ny < height and 0 <= nx < width and abs(ny - y) <= 1 and abs(nx - x) <= 1:
+                    active.remove(neighbor)
+                    stack.append(neighbor)
+                    found.append(neighbor)
+        if len(found) >= minimum_area:
+            flat = np.asarray(found, dtype=np.int64)
+            components.append(np.column_stack((flat // width, flat % width)))
+    return components
+
+
+def _measure(image: Image.Image) -> dict[str, Any]:
+    # int32 prevents overflow when squaring channel differences up to 255.
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int32)
+    color_d2 = ((rgb[:, :, None, :] - _PROTOTYPES[None, None, :, :]) ** 2).sum(axis=3)
+    nearest_color = color_d2.argmin(axis=2)
+    nearest_d2 = color_d2.min(axis=2)
+
+    marker_centroids: dict[str, list[np.ndarray]] = {}
+    for color_index, color_name in enumerate(_COLORS):
+        mask = (nearest_color == color_index) & (nearest_d2 <= _COLOR_MAX_DISTANCE_SQ)
+        components = _components(mask, _MIN_MARKER_AREA)
+        if len(components) != 2:
+            raise ValueError(f"expected two {color_name} marker components, found {len(components)}")
+        marker_centroids[color_name] = [component.mean(axis=0) for component in components]
+
+    ink_d2 = ((rgb - _INK[None, None, :]) ** 2).sum(axis=2)
+    contour_components = _components(ink_d2 <= _INK_MAX_DISTANCE_SQ, _MIN_CONTOUR_AREA)
+    if len(contour_components) != 4:
+        raise ValueError(f"expected four continuous dark contours, found {len(contour_components)}")
+
+    memberships: dict[str, list[int]] = {}
+    smallest_advantage = math.inf
+    for color_name, centroids in marker_centroids.items():
+        memberships[color_name] = []
+        for centroid in centroids:
+            distances = []
+            for component in contour_components:
+                delta = component.astype(np.float64) - centroid[None, :]
+                distances.append(float(np.sqrt((delta * delta).sum(axis=1).min())))
+            order = np.argsort(distances)
+            best = int(order[0])
+            advantage = distances[int(order[1])] - distances[best]
+            if distances[best] > _MAX_ENDPOINT_DISTANCE:
+                raise ValueError(f"{color_name} marker is not visibly attached to a dark endpoint")
+            if advantage < _MIN_ASSOCIATION_ADVANTAGE:
+                raise ValueError(f"{color_name} marker has ambiguous contour association")
+            memberships[color_name].append(best)
+            smallest_advantage = min(smallest_advantage, advantage)
+
+    winners = [color for color, pair in memberships.items() if pair[0] == pair[1]]
+    if len(winners) != 1:
+        raise ValueError(f"expected one same-contour color, found {winners!r}")
+    return {
+        "decision": winners[0],
+        "memberships": memberships,
+        "runner_up_margin_px": round(float(smallest_advantage), 3),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the answer from final RGB pixels alone."""
+    return str(_measure(image)["decision"])

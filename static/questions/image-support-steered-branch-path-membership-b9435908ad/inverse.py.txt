@@ -1,0 +1,135 @@
+"""Independent PNG-only inverse for the tree-path membership question."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= minimum:
+            found.append(np.asarray(points, dtype=np.int32))
+    return found
+
+
+def _marker_masks(array: np.ndarray) -> dict[str, np.ndarray]:
+    values = array.astype(np.int16)
+    red, green, blue = values[:, :, 0], values[:, :, 1], values[:, :, 2]
+    return {
+        "red": (red > green + 32) & (red > blue + 22) & (red > 115),
+        "green": (green > red + 22) & (green > blue + 8) & (green > 105),
+        "blue": (blue > red + 28) & (blue > green + 18) & (blue > 105),
+    }
+
+
+def _marker_centers(array: np.ndarray) -> dict[str, tuple[float, float]]:
+    centers: dict[str, tuple[float, float]] = {}
+    for name, mask in _marker_masks(array).items():
+        components = _components(mask, minimum=30)
+        if len(components) != 1:
+            raise ValueError(f"expected one {name} marker, found {len(components)}")
+        points = components[0].astype(np.float32)
+        centers[name] = (float(points[:, 0].mean()), float(points[:, 1].mean()))
+    return centers
+
+
+def _disk(shape: tuple[int, int], center: tuple[float, float], radius: float) -> np.ndarray:
+    height, width = shape
+    cy, cx = center
+    y0 = max(0, int(np.floor(cy - radius - 1)))
+    y1 = min(height, int(np.ceil(cy + radius + 2)))
+    x0 = max(0, int(np.floor(cx - radius - 1)))
+    x1 = min(width, int(np.ceil(cx + radius + 2)))
+    output = np.zeros(shape, dtype=bool)
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    output[y0:y1, x0:x1] = (yy - cy) ** 2 + (xx - cx) ** 2 <= radius * radius
+    return output
+
+
+def _label_map(mask: np.ndarray) -> tuple[np.ndarray, list[int]]:
+    labels = np.full(mask.shape, -1, dtype=np.int32)
+    sizes: list[int] = []
+    height, width = mask.shape
+    label = 0
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if labels[y, x] >= 0:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        labels[y, x] = label
+        size = 0
+        while queue:
+            cy, cx = queue.popleft()
+            size += 1
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and labels[ny, nx] < 0:
+                        labels[ny, nx] = label
+                        queue.append((ny, nx))
+        sizes.append(size)
+        label += 1
+    return labels, sizes
+
+
+def _network_mask(array: np.ndarray, centers: dict[str, tuple[float, float]]) -> np.ndarray:
+    values = array.astype(np.int16)
+    intensity = values.mean(axis=2)
+    colored = np.zeros(intensity.shape, dtype=bool)
+    for mask in _marker_masks(array).values():
+        colored |= mask
+    dark = (intensity < 175) & ~colored
+    # Colored disks cover the dark ink at every vertex. Restore only the small
+    # visible junction neighborhoods so graph connectivity is measured from
+    # pixels rather than from a latent edge list.
+    for center in centers.values():
+        dark |= _disk(dark.shape, center, 15.0)
+    return dark
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return yes iff green is a vertex on the unique red-blue tree route."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    centers = _marker_centers(array)
+    network = _network_mask(array, centers)
+    labels, sizes = _label_map(network)
+    large = [size for size in sizes if size >= 20]
+    if len(large) != 1:
+        raise ValueError(f"expected one connected dark tree, found {len(large)} components")
+
+    green_disk = _disk(network.shape, centers["green"], 18.0)
+    remaining = network & ~green_disk
+    labels_after, _ = _label_map(remaining)
+    red_y, red_x = (int(round(value)) for value in centers["red"])
+    blue_y, blue_x = (int(round(value)) for value in centers["blue"])
+    red_label = int(labels_after[red_y, red_x])
+    blue_label = int(labels_after[blue_y, blue_x])
+    if red_label < 0 or blue_label < 0:
+        raise ValueError("terminal marker neighborhood disappeared")
+    return "yes" if red_label != blue_label else "no"

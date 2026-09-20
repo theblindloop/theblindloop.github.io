@@ -1,0 +1,158 @@
+"""Independent pixel-only inverse for conditional nose reversal scenes."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 960
+HEIGHT = 700
+PANEL_RECTS = (
+    (35, 100, 455, 375),
+    (505, 100, 925, 375),
+    (35, 400, 455, 675),
+    (505, 400, 925, 675),
+)
+NOSE_OFFSET = 25.0
+TARGET_RADIUS = 18.0
+PUCK_BLUE = np.array([45, 94, 178], dtype=np.uint8)
+NOSE_GOLD = np.array([242, 178, 39], dtype=np.uint8)
+MOVE_GREEN = np.array([26, 117, 91], dtype=np.uint8)
+GATE_VIOLET = np.array([126, 70, 176], dtype=np.uint8)
+TARGET_RED = np.array([196, 55, 76], dtype=np.uint8)
+
+
+def _mask(arr: np.ndarray, color: np.ndarray) -> np.ndarray:
+    return np.all(arr == color, axis=2)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    coords = np.argwhere(mask)
+    pending = {(int(row), int(col)) for row, col in coords}
+    result: list[np.ndarray] = []
+    while pending:
+        start = pending.pop()
+        stack = [start]
+        found = [start]
+        while stack:
+            row, col = stack.pop()
+            for drow in (-1, 0, 1):
+                for dcol in (-1, 0, 1):
+                    if drow == 0 and dcol == 0:
+                        continue
+                    neighbor = (row + drow, col + dcol)
+                    if neighbor in pending:
+                        pending.remove(neighbor)
+                        stack.append(neighbor)
+                        found.append(neighbor)
+        result.append(np.asarray(found, dtype=float))
+    return result
+
+
+def _crop(mask: np.ndarray, rect: tuple[int, int, int, int]) -> np.ndarray:
+    x0, y0, x1, y1 = rect
+    return mask[y0 : y1 + 1, x0 : x1 + 1]
+
+
+def _largest_component(
+    arr: np.ndarray, rect: tuple[int, int, int, int], color: np.ndarray, minimum: int
+) -> np.ndarray:
+    parts = [part for part in _components(_crop(_mask(arr, color), rect)) if len(part) >= minimum]
+    if not parts:
+        raise ValueError("required colored component is missing")
+    part = max(parts, key=len).copy()
+    x0, y0, _, _ = rect
+    part[:, 0] += y0
+    part[:, 1] += x0
+    return part
+
+
+def _centroid(part: np.ndarray) -> tuple[float, float]:
+    return float(part[:, 1].mean()), float(part[:, 0].mean())
+
+
+def _puck_center(arr: np.ndarray, rect: tuple[int, int, int, int]) -> tuple[float, float]:
+    # The union of the blue disk and its gold nose restores the circular extent.
+    blue = _crop(_mask(arr, PUCK_BLUE), rect)
+    gold = _crop(_mask(arr, NOSE_GOLD), rect)
+    union = blue | gold
+    parts = [part for part in _components(union) if len(part) >= 900]
+    if not parts:
+        raise ValueError("puck is missing")
+    part = max(parts, key=len)
+    rows, cols = part[:, 0], part[:, 1]
+    x0, y0, _, _ = rect
+    min_col, max_col = float(cols.min() + x0), float(cols.max() + x0)
+    min_row, max_row = float(rows.min() + y0), float(rows.max() + y0)
+    return (min_col + max_col) / 2.0, (min_row + max_row) / 2.0
+
+
+def _nose_direction(
+    arr: np.ndarray, rect: tuple[int, int, int, int], center: tuple[float, float]
+) -> tuple[float, float]:
+    nose = _largest_component(arr, rect, NOSE_GOLD, 40)
+    x, y = _centroid(nose)
+    dx, dy = x - center[0], y - center[1]
+    length = math.hypot(dx, dy)
+    if length < 5.0:
+        raise ValueError("nose direction is missing")
+    return dx / length, dy / length
+
+
+def _arrow_move(
+    arr: np.ndarray, rect: tuple[int, int, int, int], center: tuple[float, float]
+) -> tuple[float, float]:
+    arrow = _largest_component(arr, rect, MOVE_GREEN, 300)
+    xy = np.column_stack((arrow[:, 1], arrow[:, 0]))
+    relative = xy - np.asarray(center, dtype=float)
+    radii = np.linalg.norm(relative, axis=1)
+    farthest = xy[radii >= float(radii.max()) - 1.5]
+    tip = farthest.mean(axis=0)
+    move = tip - np.asarray(center, dtype=float)
+    if float(np.linalg.norm(move)) < 70.0:
+        raise ValueError("movement arrow is too short")
+    return float(move[0]), float(move[1])
+
+
+def _gate_x(arr: np.ndarray, rect: tuple[int, int, int, int]) -> float:
+    gate = _mask(arr, GATE_VIOLET)
+    points = np.argwhere(_crop(gate, rect))
+    if len(points) < 500:
+        raise ValueError("gate line is missing")
+    return float(np.median(points[:, 1])) + float(rect[0])
+
+
+def _target_center(arr: np.ndarray, rect: tuple[int, int, int, int]) -> tuple[float, float]:
+    target = _largest_component(arr, rect, TARGET_RED, 100)
+    return _centroid(target)
+
+
+def _score(arr: np.ndarray, rect: tuple[int, int, int, int]) -> float:
+    center = _puck_center(arr, rect)
+    move = _arrow_move(arr, rect, center)
+    post = (center[0] + move[0], center[1] + move[1])
+    gate_x = _gate_x(arr, rect)
+    direction = _nose_direction(arr, rect, center)
+    sign = -1.0 if post[0] > gate_x else 1.0
+    final_nose = (post[0] + sign * NOSE_OFFSET * direction[0], post[1] + sign * NOSE_OFFSET * direction[1])
+    target = _target_center(arr, rect)
+    return math.hypot(final_nose[0] - target[0], final_nose[1] - target[1]) - TARGET_RADIUS
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the only panel whose post-gate nose is inside its bullseye."""
+
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        return "ambiguous"
+    arr = np.asarray(rgb)
+    try:
+        scores = [_score(arr, rect) for rect in PANEL_RECTS]
+    except (ValueError, IndexError, FloatingPointError):
+        return "ambiguous"
+    inside = [value < 0.0 for value in scores]
+    if sum(inside) != 1:
+        return "ambiguous"
+    return f"panel-{chr(65 + inside.index(True))}"

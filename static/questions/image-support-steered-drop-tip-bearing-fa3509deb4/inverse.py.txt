@@ -1,0 +1,248 @@
+"""Independent pixel-only arm for ``drop_tip_bearing``.
+
+Input is a rasterised RGB image and nothing else: no scene dictionary, no
+renderer import, no analytic gold, no metadata.  The arm segments the one
+saturated blob, then reads the bearing of its drawn-out tip by *integrating the
+whole silhouette*: the area skew of the blob about its own centroid, that is the
+mean pixel offset weighted by squared distance, points at the drawn-out end.  A
+tapering check on the two end slabs and a fit against the ideal drop implied by
+the blob's own measurements confirm the silhouette is intact.
+
+The arm abstains whenever the picture does not show exactly one solid,
+untouched, drop-shaped blob, or when the reading is too close to a diagonal to
+name a single picture edge.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+ORACLE_VERSION = "drop_tip_bearing-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+
+_NAMES = ("right", "up", "left", "down")
+
+SAT_MIN = 45          # colour ink is saturated; greys and paper are not
+MIN_AREA = 900        # px, below this the blob is not legibly a drop
+MIN_MARGIN_DEG = 6.0  # angular clearance from the nearest 45-degree diagonal
+SLAB = 0.16           # fraction of the axial extent used for the end slabs
+TAPER_MAX = 0.62      # tip slab must be this much narrower than the base slab
+FIT_MIN = 0.93        # agreement with the drop implied by the blob's own size
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    mx = arr.max(axis=2)
+    mn = arr.min(axis=2)
+    return ((mx - mn) >= SAT_MIN) & (mx >= 55)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Row-run union-find labelling; returns per-component boolean masks."""
+    h, w = mask.shape
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs_by_row: list[list[tuple[int, int, int]]] = []
+    prev: list[tuple[int, int, int]] = []
+    for y in range(h):
+        row = mask[y]
+        if not row.any():
+            runs_by_row.append([])
+            prev = []
+            continue
+        idx = np.flatnonzero(np.diff(np.concatenate(([0], row.view(np.int8), [0]))))
+        cur: list[tuple[int, int, int]] = []
+        for s, e in zip(idx[0::2], idx[1::2]):
+            label = len(parent)
+            parent.append(label)
+            for ps, pe, plabel in prev:
+                if ps < e and s < pe:
+                    union(label, plabel)
+            cur.append((int(s), int(e), label))
+        runs_by_row.append(cur)
+        prev = cur
+
+    groups: dict[int, list[tuple[int, int, int]]] = {}
+    for y, runs in enumerate(runs_by_row):
+        for s, e, label in runs:
+            groups.setdefault(find(label), []).append((y, s, e))
+
+    out = []
+    for runs in groups.values():
+        comp = np.zeros_like(mask)
+        for y, s, e in runs:
+            comp[y, s:e] = True
+        out.append(comp)
+    out.sort(key=lambda c: -int(c.sum()))
+    return out
+
+
+def _has_hole(comp: np.ndarray, y0: int, y1: int, x0: int, x1: int) -> bool:
+    """True when the component's interior is punctured."""
+    sub = comp[y0:y1, x0:x1]
+    pad = np.zeros((sub.shape[0] + 2, sub.shape[1] + 2), dtype=bool)
+    pad[1:-1, 1:-1] = sub
+    outside = np.zeros_like(pad)
+    stack = [(0, 0)]
+    outside[0, 0] = True
+    hh, ww = pad.shape
+    while stack:
+        y, x = stack.pop()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < hh and 0 <= nx < ww and not outside[ny, nx] and not pad[ny, nx]:
+                outside[ny, nx] = True
+                stack.append((ny, nx))
+    return bool((~pad & ~outside).any())
+
+
+def _slab_width(comp: np.ndarray, coord: np.ndarray, perp: np.ndarray,
+                lo: float, hi: float) -> float:
+    sel = (coord >= lo) & (coord <= hi)
+    if not sel.any():
+        return 0.0
+    return float(perp[sel].max() - perp[sel].min() + 1.0)
+
+
+def _shape_fit(blob: np.ndarray, cx: float, cy: float, dx: np.ndarray,
+               dy: np.ndarray, angle: float) -> float:
+    """Agreement between the observed silhouette and the ideal drop implied by
+    its own measurements: body radius, tip reach and tip bearing.
+
+    Reported as intersection over union.  A bite taken out of the blob, an added
+    lump, or a body that is not a drop at all drives this down, so the whole
+    connected area -- not just its extremes -- has to be intact.
+    """
+    t = math.radians(angle)
+    ux, uy = math.cos(t), -math.sin(t)     # screen coordinates
+    proj = dx * ux + dy * uy
+    perp = -dx * uy + dy * ux
+    lo, hi = float(proj.min()), float(proj.max())
+    r = float(np.abs(perp).max())
+    reach = (hi - lo) - r
+    if r < 8.0 or reach <= r * 1.4 or reach >= r * 4.0:
+        return 0.0
+    # Body centre sits one radius ahead of the blunt end.
+    bcx = cx + (lo + r) * ux
+    bcy = cy + (lo + r) * uy
+
+    ys, xs = np.nonzero(blob)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    pad = 3
+    w = x1 - x0 + 1 + 2 * pad
+    h = y1 - y0 + 1 + 2 * pad
+    ideal = Image.new("1", (w, h), 0)
+    phi = math.acos(max(-1.0, min(1.0, r / reach)))
+    pts = []
+    n = 96
+    a0 = t + phi
+    sweep = 2.0 * (math.pi - phi)
+    ox, oy = x0 - pad, y0 - pad
+    for i in range(n + 1):
+        a = a0 + sweep * i / n
+        pts.append((bcx + r * math.cos(a) - ox, bcy - r * math.sin(a) - oy))
+    pts.append((bcx + reach * math.cos(t) - ox, bcy - reach * math.sin(t) - oy))
+    ImageDraw.Draw(ideal).polygon(pts, fill=1)
+    model = np.asarray(ideal, dtype=bool)
+    obs = np.zeros_like(model)
+    obs[pad:pad + (y1 - y0 + 1), pad:pad + (x1 - x0 + 1)] = blob[y0:y1 + 1, x0:x1 + 1]
+    inter = int((obs & model).sum())
+    union = int((obs | model).sum())
+    return inter / union if union else 0.0
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return ``right``/``up``/``left``/``down``, or ``abstain``."""
+    mask = _ink_mask(image)
+    if not mask.any():
+        return ABSTAIN
+    comps = _components(mask)
+    blob = comps[0]
+    area = int(blob.sum())
+    if area < MIN_AREA:
+        return ABSTAIN
+    if len(comps) > 1 and int(comps[1].sum()) > 0.20 * area:
+        return ABSTAIN
+
+    ys, xs = np.nonzero(blob)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    h, w = mask.shape
+    if y0 == 0 or x0 == 0 or y1 == h - 1 or x1 == w - 1:
+        return ABSTAIN
+    if _has_hole(blob, y0, y1 + 1, x0, x1 + 1):
+        return ABSTAIN
+
+    ext_x = float(x1 - x0 + 1)
+    ext_y = float(y1 - y0 + 1)
+    if min(ext_x, ext_y) < 20.0:
+        return ABSTAIN
+    aspect = max(ext_x, ext_y) / min(ext_x, ext_y)
+    if aspect > 2.4:
+        return ABSTAIN
+    # A drop fills roughly half its bounding box; anything far off is not one.
+    if not 0.34 <= area / (ext_x * ext_y) <= 0.80:
+        return ABSTAIN
+
+    cx = float(xs.mean())
+    cy = float(ys.mean())
+    # Direction of the silhouette's area skew: the mean of every ink pixel's
+    # offset from the centroid weighted by its squared distance.  It points at
+    # the drawn-out end.  Every ink pixel contributes, so the whole interior is
+    # load-bearing and no single mark can carry the answer.
+    dx = xs.astype(float) - cx
+    dy = ys.astype(float) - cy
+    r2 = dx * dx + dy * dy
+    sx = float((dx * r2).mean())
+    sy = float((dy * r2).mean())
+    scale = float(r2.mean()) ** 1.5
+    if scale <= 0 or math.hypot(sx, sy) / scale < 0.02:
+        return ABSTAIN
+
+    angle = math.degrees(math.atan2(-sy, sx)) % 360.0   # ccw, y up
+    if _shape_fit(blob, cx, cy, dx, dy, angle) < FIT_MIN:
+        return ABSTAIN
+    k = int(math.floor(angle / 90.0 + 0.5)) % 4
+    clearance = min(abs(angle - d) for d in (45.0, 135.0, 225.0, 315.0, 405.0, -45.0))
+    if clearance < MIN_MARGIN_DEG:
+        return ABSTAIN
+
+    # Tapering check: the tip end must be far narrower than the body end.
+    if k in (0, 2):
+        coord, perp = xs.astype(float), ys.astype(float)
+        lo_end, hi_end = float(x0), float(x1)
+    else:
+        coord, perp = ys.astype(float), xs.astype(float)
+        lo_end, hi_end = float(y0), float(y1)
+    span = hi_end - lo_end
+    band = SLAB * span
+    w_lo = _slab_width(blob, coord, perp, lo_end, lo_end + band)
+    w_hi = _slab_width(blob, coord, perp, hi_end - band, hi_end)
+    # ``right`` and ``down`` point toward increasing screen coordinate.
+    tip_high = k == 0 or k == 3
+    tip_w, base_w = (w_hi, w_lo) if tip_high else (w_lo, w_hi)
+    if base_w <= 0 or tip_w > TAPER_MAX * base_w:
+        return ABSTAIN
+
+    return _NAMES[k]
+
+
+def decision_from_path(path: str) -> str:
+    with Image.open(path) as im:
+        return decision_from_image(im.copy())

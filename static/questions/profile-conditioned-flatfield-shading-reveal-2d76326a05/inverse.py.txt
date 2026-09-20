@@ -1,0 +1,152 @@
+"""Image-only inverse arm for the flat-field shading reveal world.
+
+Receives a PIL image and the public question contract only.  It locates the
+blue frame, rebuilds the 6x6 array of cells, finds the orange key mark to put
+the corner reference cell at the top left, executes the declared photometric
+correction (divide every panel cell by the lighting implied by its column
+strip, its row strip and the corner cell), keeps the nine darkest corrected
+tones and matches them against the six named templates.  It imports no
+renderer, prompt, generator, verifier or gold code and never receives latent
+scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "flatfield_shading_reveal-oracle-0.1.0"
+
+ARRAY = 6
+GRID = 5
+DARK_CELLS = 9
+ABSTAIN = "ambiguous"
+ABSTAIN_MARGIN = 6.0
+
+# Independently re-typed from the public question contract.
+_ROWS: dict[str, tuple[str, ...]] = {
+    "eff": ("XXX..", "X....", "XXX..", "X....", "X...."),
+    "ex": ("X...X", ".X.X.", "..X..", ".X.X.", "X...X"),
+    "plus": ("..X..", "..X..", "XXXXX", "..X..", "..X.."),
+    "tee": ("XXXXX", "..X..", "..X..", "..X..", "..X.."),
+    "vee": ("X...X", "X...X", ".X.X.", ".X.X.", "..X.."),
+    "zee": ("XXXXX", "...X.", "..X..", ".X...", "X...."),
+}
+SYMBOL_NAMES: tuple[str, ...] = tuple(sorted(_ROWS))
+_CELLS: dict[str, frozenset] = {
+    name: frozenset(
+        (r, c) for r, row in enumerate(rows) for c, ch in enumerate(row) if ch == "X"
+    )
+    for name, rows in _ROWS.items()
+}
+
+
+class OracleError(RuntimeError):
+    """Raised when the declared fiducials are not present in the raster."""
+
+
+def _channels(image: Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    return arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+
+def _array_interior(image: Image.Image) -> tuple[int, int, int, int]:
+    r, g, b = _channels(image)
+    blue = (b - np.maximum(r, g)) > 40
+    ys, xs = np.nonzero(blue)
+    if ys.size < 500:
+        raise OracleError("no blue frame fiducial found")
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    mid = (y0 + y1) // 2
+    row = blue[mid, x0 : x1 + 1]
+    thickness = 0
+    while thickness < row.size and row[thickness]:
+        thickness += 1
+    if thickness < 2 or thickness > (x1 - x0) // 4:
+        raise OracleError("frame thickness not measurable")
+    top, left = y0 + thickness, x0 + thickness
+    bottom, right = y1 + 1 - thickness, x1 + 1 - thickness
+    if bottom - top < 6 * ARRAY or right - left < 6 * ARRAY:
+        raise OracleError("array interior too small")
+    return top, left, bottom, right
+
+
+def _cell_grid(image: Image.Image) -> tuple[np.ndarray, tuple[int, int]]:
+    """Mean achromatic level per array cell, plus the key mark's cell."""
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float64)
+    top, left, bottom, right = _array_interior(image)
+    r, g, b = _channels(image)
+    orange = ((r - b) > 60) & ((r - g) > 25)
+    grey = rgb.mean(axis=2)
+    chroma = rgb.max(axis=2) - rgb.min(axis=2)
+    achromatic = chroma <= 24.0
+    height, width = bottom - top, right - left
+
+    values = np.zeros((ARRAY, ARRAY), dtype=np.float64)
+    key_hits = np.zeros((ARRAY, ARRAY), dtype=np.int64)
+    for i in range(ARRAY):
+        for j in range(ARRAY):
+            y0 = top + int(round(i * height / ARRAY))
+            y1 = top + int(round((i + 1) * height / ARRAY))
+            x0 = left + int(round(j * width / ARRAY))
+            x1 = left + int(round((j + 1) * width / ARRAY))
+            inset = max(3, min(y1 - y0, x1 - x0) // 10)
+            box = (slice(y0 + inset, y1 - inset), slice(x0 + inset, x1 - inset))
+            mask = achromatic[box]
+            if mask.sum() < 40:
+                raise OracleError("array cell has no readable flat tone")
+            values[i, j] = float(grey[box][mask].mean())
+            key_hits[i, j] = int(orange[box].sum())
+
+    flat = int(key_hits.argmax())
+    ki, kj = flat // ARRAY, flat % ARRAY
+    if key_hits[ki, kj] < 20:
+        raise OracleError("no orange key mark found")
+    if (ki, kj) not in {(0, 0), (0, ARRAY - 1), (ARRAY - 1, 0), (ARRAY - 1, ARRAY - 1)}:
+        raise OracleError("key mark is not in a corner cell")
+    return values, (ki, kj)
+
+
+def corrected_tones(image: Image.Image) -> np.ndarray:
+    """Declared transform: divide out the lighting recorded by the blank strips."""
+    values, (ki, kj) = _cell_grid(image)
+    turns = {(0, 0): 0, (0, ARRAY - 1): 1, (ARRAY - 1, ARRAY - 1): 2, (ARRAY - 1, 0): 3}
+    values = np.rot90(values, turns[(ki, kj)])
+    corner = float(values[0, 0])
+    if corner <= 1.0:
+        raise OracleError("corner reference cell is black")
+    tones = np.zeros((GRID, GRID), dtype=np.float64)
+    for r in range(1, ARRAY):
+        for c in range(1, ARRAY):
+            lighting = float(values[0, c]) * float(values[r, 0]) / corner
+            if lighting <= 1.0:
+                raise OracleError("blank strip records no light")
+            tones[r - 1, c - 1] = float(values[r, c]) / lighting
+    return tones
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    tones = corrected_tones(image)
+    order = sorted(
+        (float(tones[r, c]), r, c) for r in range(GRID) for c in range(GRID)
+    )
+    dark = frozenset((r, c) for _, r, c in order[:DARK_CELLS])
+    split = float(order[DARK_CELLS][0] - order[DARK_CELLS - 1][0])
+    ranked = sorted((len(dark ^ _CELLS[n]), n) for n in SYMBOL_NAMES)
+    gap = float(ranked[1][0] - ranked[0][0])
+    return str(ranked[0][1]), float(gap * max(0.0, split) * 100.0)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    name, _ = decision_with_margin(image)
+    return name
+
+
+def decision_or_abstain(image: Image.Image) -> str:
+    """Abstaining wrapper used for corruption and erasure probes."""
+    try:
+        name, score = decision_with_margin(image)
+    except OracleError:
+        return ABSTAIN
+    return name if score >= ABSTAIN_MARGIN else ABSTAIN

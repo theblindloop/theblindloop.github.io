@@ -1,0 +1,267 @@
+"""Renderer, analytic gold and margin for undo_history_replay.
+
+A paint pot holds one colour. The leftmost panel of a single drawn row shows the
+pot's starting colour inside a dark ring. Every panel to its right is a card that
+acts once, in drawn left-to-right order. A card holding a coloured circle paints
+the pot that colour. A card holding a dark grey left-pointing triangle is an undo
+card: it cancels the most recent paint card that has acted and has not already
+been cancelled, restoring the colour the pot held just before that paint card.
+An undo card with nothing left to cancel does nothing. The pot's final colour is
+never drawn.
+
+The scene is a plain dict of JSON types. The cards are stored as an unordered bag
+whose drawn position comes from an explicit slot field, so re-orderings of the
+bag are pixel-identical, answer-preserving latent symmetries.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "undo_history_replay-renderer-0.1.0"
+
+# ---------------------------------------------------------------- palette
+BG = (222, 226, 234)
+PANEL_BG = (252, 246, 228)
+PANEL_EDGE = (90, 90, 90)
+RING = (25, 25, 30)
+UNDO_GREY = (70, 70, 70)
+ARROW = (60, 60, 60)
+
+COLOURS = {
+    "red": (214, 38, 38),
+    "blue": (40, 84, 204),
+    "green": (26, 150, 72),
+    "amber": (232, 150, 20),
+    "violet": (140, 58, 180),
+}
+COLOUR_NAMES = tuple(COLOURS)
+COUNT_WORDS = ("zero", "one", "two", "three", "four")
+
+# the drawn saturation boundary between a coloured glyph and the grey undo glyph
+SAT_BOUNDARY = 45.0
+
+# ---------------------------------------------------------------- geometry
+CANVAS = (1360, 300)
+PANEL = 100
+ROW_Y = 74
+SWATCH = 60
+DISK = 64
+QUARANTINE_THRESHOLD = 6.0
+MAX_SURVIVORS = 4
+
+
+def _dist(c1, c2) -> float:
+    """Drawn colour separation in rescaled units (L1 over the channels / 8)."""
+    return (abs(c1[0] - c2[0]) + abs(c1[1] - c2[1]) + abs(c1[2] - c2[2])) / 8.0
+
+
+def _sat(rgb) -> float:
+    return float(max(rgb) - min(rgb))
+
+
+def _colour_clearance(rgb, name: str) -> float:
+    """Half the drawn margin by which this glyph reads as its own palette name."""
+    own = _dist(rgb, COLOURS[name])
+    other = min(_dist(rgb, COLOURS[n]) for n in COLOUR_NAMES if n != name)
+    return (other - own) / 2.0
+
+
+def _nearest_other(name: str) -> str:
+    own = COLOURS[name]
+    return min((n for n in COLOUR_NAMES if n != name), key=lambda n: _dist(own, COLOURS[n]))
+
+
+def drawn_rgb(scene: dict, op: dict) -> tuple:
+    """The RGB actually drawn for one card, derived from its label inputs.
+
+    Nothing about a glyph's colour is stored beside its name: the name selects
+    the palette entry, and tight mode only interpolates that entry toward its
+    nearest palette neighbour, so any change to a label input changes the raster.
+    """
+    if op["kind"] != "paint":
+        return UNDO_GREY
+    own = COLOURS[op["colour"]]
+    if op["slot"] != scene.get("tight_slot", -1):
+        return own
+    near = COLOURS[_nearest_other(op["colour"])]
+    t = float(scene.get("tight_t", 0.0))
+    return tuple(int(round(own[k] + t * (near[k] - own[k]))) for k in range(3))
+
+
+# ---------------------------------------------------------------- sampling
+def _replay_ops(start: str, ops: list) -> tuple[str, int]:
+    """Return the pot's final colour and how many paint cards survive."""
+    stack = [start]
+    for op in sorted(ops, key=lambda o: o["slot"]):
+        if op["kind"] == "paint":
+            stack.append(op["colour"])
+        elif len(stack) > 1:
+            stack.pop()
+    return stack[-1], len(stack) - 1
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    target = rng.choice(COLOUR_NAMES)
+    # the naive "last painted colour" reading is forced to agree with the answer
+    # only at the rate a blind guess over the five names would already achieve
+    want_last_paint = rng.random() < (1.0 / len(COLOUR_NAMES))
+    # the drawn starting colour is likewise allowed to coincide with the answer
+    # only at the blind-guess rate, so ignoring the cards never pays
+    want_start = rng.random() < (1.0 / len(COLOUR_NAMES))
+    tight = rng.random() < 0.12
+
+    chosen = None
+    for attempt in range(6000):
+        relaxed = attempt >= 3000
+        n_cards = rng.randint(6, 9)
+        kinds = []
+        for _ in range(n_cards):
+            kinds.append("undo" if rng.random() < 0.36 else "paint")
+        ops = []
+        for i, kind in enumerate(kinds):
+            op = {"slot": i, "kind": kind}
+            op["colour"] = rng.choice(COLOUR_NAMES) if kind == "paint" else None
+            ops.append(op)
+        start = rng.choice(COLOUR_NAMES)
+
+        paints = [o for o in ops if o["kind"] == "paint"]
+        if len(paints) < 3 or len({o["colour"] for o in paints}) < 2:
+            continue
+        final, survivors = _replay_ops(start, ops)
+        if final != target or survivors > MAX_SURVIVORS:
+            continue
+        if not relaxed and (start == final) != want_start:
+            continue
+        # at least one undo card must actually cancel something, so the undo
+        # semantics are load bearing in every shipped scene
+        plain, _ = _replay_ops(start, paints)
+        effective = any(o["kind"] == "undo" for o in ops) and plain != final
+        if not effective and not relaxed:
+            continue
+        last_paint = max(paints, key=lambda o: o["slot"])["colour"]
+        if not relaxed and (last_paint == final) != want_last_paint:
+            continue
+        chosen = (start, ops)
+        break
+
+    if chosen is None:  # deterministic fallback: a minimal well posed sequence
+        others = [n for n in COLOUR_NAMES if n != target]
+        start = others[0]
+        ops = [
+            {"slot": 0, "kind": "paint", "colour": others[1]},
+            {"slot": 1, "kind": "paint", "colour": target},
+            {"slot": 2, "kind": "paint", "colour": others[2]},
+            {"slot": 3, "kind": "undo", "colour": None},
+            {"slot": 4, "kind": "paint", "colour": others[3]},
+            {"slot": 5, "kind": "undo", "colour": None},
+        ]
+        chosen = (start, ops)
+
+    start, ops = chosen
+    tight_slot, tight_t = -1, 0.0
+    if tight:
+        paints = [o for o in ops if o["kind"] == "paint"]
+        victim = paints[rng.randrange(len(paints))]
+        span = _dist(COLOURS[victim["colour"]], COLOURS[_nearest_other(victim["colour"])])
+        wanted = 2.0 + rng.random() * 1.5
+        tight_slot = victim["slot"]
+        tight_t = round(max(0.0, min(0.5, (1.0 - 2.0 * wanted / span) / 2.0)), 6)
+
+    rng.shuffle(ops)  # drawn position lives in the slot field, not in list order
+    return {
+        "seed": seed,
+        "start": start,
+        "ops": ops,
+        "gap": rng.randint(20, 28),
+        "row_jitter": rng.randint(-6, 6),
+        "tight_slot": tight_slot,
+        "tight_t": tight_t,
+    }
+
+
+# ---------------------------------------------------------------- gold
+def analytic_gold(scene: dict) -> str:
+    final, survivors = _replay_ops(scene["start"], scene["ops"])
+    return f"{final}|{COUNT_WORDS[survivors]}"
+
+
+def margin(scene: dict) -> float:
+    """Smallest drawn clearance any single reading of the picture offers."""
+    start_rgb = COLOURS[scene["start"]]
+    scores = [scene["gap"] / 2.0]
+    scores.append(_colour_clearance(start_rgb, scene["start"]))
+    scores.append(abs(_sat(start_rgb) - SAT_BOUNDARY) / 2.0)
+    for op in scene["ops"]:
+        rgb = drawn_rgb(scene, op)
+        scores.append(abs(_sat(rgb) - SAT_BOUNDARY) / 2.0)
+        if op["kind"] == "paint":
+            scores.append(_colour_clearance(rgb, op["colour"]))
+    return round(min(scores), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_THRESHOLD
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Re-orderings of the unordered card bag: pixel-identical, answer-fixed."""
+    out = []
+    rev = dict(scene)
+    rev["ops"] = list(reversed(scene["ops"]))
+    out.append(("ops_bag_reversed", rev))
+    rot = dict(scene)
+    k = len(scene["ops"]) // 2
+    rot["ops"] = scene["ops"][k:] + scene["ops"][:k]
+    out.append(("ops_bag_rotated", rot))
+    srt = dict(scene)
+    srt["ops"] = sorted(scene["ops"], key=lambda o: (o["kind"], str(o["colour"])))
+    out.append(("ops_bag_sorted_by_kind", srt))
+    return out
+
+
+# ---------------------------------------------------------------- rendering
+def _panel(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
+    draw.rectangle([x, y, x + PANEL, y + PANEL], fill=PANEL_BG, outline=PANEL_EDGE, width=2)
+
+
+def render(scene: dict) -> Image.Image:
+    ops = sorted(scene["ops"], key=lambda o: o["slot"])
+    n = len(ops) + 1
+    gap = scene["gap"]
+    total = n * PANEL + (n - 1) * gap
+    x0 = (CANVAS[0] - total) // 2
+    y = ROW_Y + scene["row_jitter"]
+
+    img = Image.new("RGB", CANVAS, BG)
+    d = ImageDraw.Draw(img)
+
+    # leftmost panel: the pot's starting colour, marked by a dark ring
+    d.rectangle([x0 - 9, y - 9, x0 + PANEL + 9, y + PANEL + 9], outline=RING, width=5)
+    _panel(d, x0, y)
+    cx, cy = x0 + PANEL // 2, y + PANEL // 2
+    h = SWATCH // 2
+    d.rectangle([cx - h, cy - h, cx + h, cy + h], fill=COLOURS[scene["start"]])
+
+    for i, op in enumerate(ops):
+        px = x0 + (i + 1) * (PANEL + gap)
+        _panel(d, px, y)
+        cx, cy = px + PANEL // 2, y + PANEL // 2
+        rgb = drawn_rgb(scene, op)
+        if op["kind"] == "paint":
+            r = DISK // 2
+            d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb)
+        else:
+            d.polygon([(cx - 30, cy), (cx + 24, cy - 30), (cx + 24, cy + 30)], fill=rgb)
+
+    # the drawn reading order
+    ay = y + PANEL + 34
+    d.line([x0, ay, x0 + total, ay], fill=ARROW, width=4)
+    d.polygon(
+        [(x0 + total, ay), (x0 + total - 22, ay - 11), (x0 + total - 22, ay + 11)],
+        fill=ARROW,
+    )
+    return img

@@ -1,0 +1,141 @@
+"""Independent raster-only inverse arm for balanced-symbol trays."""
+
+from __future__ import annotations
+
+import itertools
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+INK = (25, 29, 35)
+NAVY = (42, 68, 102)
+MAGENTA = (194, 45, 133)
+COLOR_RGB = {
+    "red": (210, 65, 62),
+    "green": (45, 151, 91),
+    "blue": (55, 106, 190),
+}
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    """Return 4-connected components as (x0,y0,x1,y1,area)."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[tuple[int, int, int, int, int]] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(x, y)])
+        seen[y, x] = True
+        x0 = x1 = x
+        y0 = y1 = y
+        area = 0
+        while queue:
+            px, py = queue.popleft()
+            area += 1
+            x0, x1 = min(x0, px), max(x1, px)
+            y0, y1 = min(y0, py), max(y1, py)
+            for nx, ny in ((px - 1, py), (px + 1, py), (px, py - 1), (px, py + 1)):
+                if 0 <= nx < width and 0 <= ny < height and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((nx, ny))
+        output.append((x0, y0, x1, y1, area))
+    return output
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int], tolerance: int = 0) -> np.ndarray:
+    delta = np.abs(arr.astype(np.int16) - np.asarray(rgb, dtype=np.int16))
+    return np.max(delta, axis=2) <= tolerance
+
+
+def _frames(arr: np.ndarray, rgb: tuple[int, int, int]) -> list[tuple[int, int, int, int]]:
+    found = []
+    for x0, y0, x1, y1, area in _components(_mask(arr, rgb)):
+        if x1 - x0 > 170 and y1 - y0 > 75 and area > 900:
+            found.append((x0, y0, x1, y1))
+    return sorted(found, key=lambda box: ((box[1] + box[3]) / 2, (box[0] + box[2]) / 2))
+
+
+def _count_group(arr: np.ndarray, box: tuple[int, int, int, int]) -> list[int]:
+    x0, y0, x1, y1 = box
+    crop = _mask(arr[y0 + 9 : y1 - 8, x0 + 9 : x1 - 8], INK)
+    counts = [0, 0, 0]
+    for gx0, gy0, gx1, gy1, area in _components(crop):
+        width, height = gx1 - gx0 + 1, gy1 - gy0 + 1
+        if width < 30 or height < 30 or area < 500:
+            continue
+        fill = area / float(width * height)
+        if fill > 0.90:
+            glyph = 1
+        elif fill > 0.66:
+            glyph = 0
+        elif 0.40 < fill < 0.64:
+            glyph = 2
+        else:
+            raise ValueError(f"unrecognized glyph fill ratio {fill:.3f}")
+        counts[glyph] += 1
+    if sum(counts) == 0:
+        raise ValueError("framed group contains no recognized glyphs")
+    return counts
+
+
+def _primitive_weights(equations: list[dict]) -> tuple[int, int, int]:
+    solutions: set[tuple[int, int, int]] = set()
+    for weights in itertools.product(range(1, 7), repeat=3):
+        if all(
+            sum(a * w for a, w in zip(row["left"], weights))
+            == sum(a * w for a, w in zip(row["right"], weights))
+            for row in equations
+        ):
+            divisor = math.gcd(math.gcd(weights[0], weights[1]), weights[2])
+            solutions.add(tuple(value // divisor for value in weights))
+    if len(solutions) != 1:
+        raise ValueError(f"raster balances yield {len(solutions)} weight ratios")
+    return next(iter(solutions))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover equations, trays, and the answer from final pixels only."""
+    arr = np.asarray(image.convert("RGB"))
+    navy_frames = _frames(arr, NAVY)
+    if len(navy_frames) != 4:
+        raise ValueError(f"expected four blue balance-side frames, found {len(navy_frames)}")
+    rows: list[list[tuple[int, int, int, int]]] = []
+    for index in (0, 2):
+        pair = sorted(navy_frames[index : index + 2], key=lambda box: box[0])
+        if abs((pair[0][1] + pair[0][3]) - (pair[1][1] + pair[1][3])) > 8:
+            raise ValueError("blue frames do not form two horizontal balance rows")
+        rows.append(pair)
+    equations = [
+        {"left": _count_group(arr, pair[0]), "right": _count_group(arr, pair[1])}
+        for pair in rows
+    ]
+
+    references = _frames(arr, MAGENTA)
+    if len(references) != 1:
+        raise ValueError(f"expected one magenta reference frame, found {len(references)}")
+    reference = _count_group(arr, references[0])
+
+    candidate_groups: list[list[int]] = []
+    candidate_colors: list[str] = []
+    located = []
+    for color, rgb in COLOR_RGB.items():
+        boxes = _frames(arr, rgb)
+        if len(boxes) != 1:
+            raise ValueError(f"expected one {color} candidate frame, found {len(boxes)}")
+        located.append((boxes[0][0], color, boxes[0]))
+    for _, color, box in sorted(located):
+        candidate_colors.append(color)
+        candidate_groups.append(_count_group(arr, box))
+
+    weights = _primitive_weights(equations)
+    target = sum(a * b for a, b in zip(reference, weights))
+    totals = [sum(a * b for a, b in zip(group, weights)) for group in candidate_groups]
+    matches = [index for index, total in enumerate(totals) if total == target]
+    if len(matches) != 1:
+        raise ValueError(f"pixels imply {len(matches)} matching candidates")
+    return candidate_colors[matches[0]]
+

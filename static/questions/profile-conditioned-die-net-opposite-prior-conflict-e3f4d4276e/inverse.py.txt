@@ -1,0 +1,135 @@
+"""Independent inverse arm: infer fold-opposite pip values from RGB pixels only."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class PixelOracleError(ValueError):
+    """The raster does not expose six panels, six pip values, or a valid net."""
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    output: list[dict] = []
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        area = 0
+        sum_x = 0.0
+        sum_y = 0.0
+        min_x = max_x = start_x
+        min_y = max_y = start_y
+        while stack:
+            y, x = stack.pop()
+            area += 1
+            sum_x += x
+            sum_y += y
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        output.append(
+            {
+                "area": area,
+                "cx": sum_x / area,
+                "cy": sum_y / area,
+                "bbox": (min_x, min_y, max_x, max_y),
+            }
+        )
+    return output
+
+
+def _measure(image: Image.Image) -> tuple[list[dict], list[int], dict[int, int]]:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    channel_span = rgb.max(axis=2) - rgb.min(axis=2)
+    mean = rgb.mean(axis=2)
+
+    panel_mask = (channel_span > 30) & (mean > 80)
+    panels = [component for component in _components(panel_mask) if component["area"] > 1800]
+    if len(panels) != 6:
+        raise PixelOracleError(f"expected six colored panels, found {len(panels)}")
+    panels.sort(key=lambda item: (item["cy"], item["cx"]))
+
+    pip_mask = mean < 82
+    pips = [
+        component
+        for component in _components(pip_mask)
+        if 30 <= component["area"] <= 600
+    ]
+    counts = [0] * 6
+    for pip in pips:
+        owners = []
+        for index, panel in enumerate(panels):
+            x0, y0, x1, y1 = panel["bbox"]
+            if x0 < pip["cx"] < x1 and y0 < pip["cy"] < y1:
+                owners.append(index)
+        if len(owners) == 1:
+            counts[owners[0]] += 1
+    if sorted(counts) != [1, 2, 3, 4, 5, 6]:
+        raise PixelOracleError(f"visible panel pip counts are invalid: {sorted(counts)}")
+
+    distances: dict[tuple[int, int], float] = {}
+    for left in range(6):
+        for right in range(left + 1, 6):
+            distances[(left, right)] = math.hypot(
+                panels[left]["cx"] - panels[right]["cx"],
+                panels[left]["cy"] - panels[right]["cy"],
+            )
+    step = min(distances.values())
+    adjacency = {index: set() for index in range(6)}
+    for (left, right), distance in distances.items():
+        if distance < 1.20 * step:
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+    degrees = sorted(len(neighbors) for neighbors in adjacency.values())
+    if degrees != [1, 1, 1, 1, 2, 4]:
+        raise PixelOracleError(f"panel hinge topology is invalid: degrees={degrees}")
+
+    center = next(index for index, neighbors in adjacency.items() if len(neighbors) == 4)
+    branch = next(index for index in adjacency[center] if len(adjacency[index]) == 2)
+    far = next(index for index in adjacency[branch] if index != center)
+    opposites = {center: far, far: center}
+
+    vx = panels[branch]["cx"] - panels[center]["cx"]
+    vy = panels[branch]["cy"] - panels[center]["cy"]
+    direct_opposites = []
+    for neighbor in adjacency[center]:
+        if neighbor == branch:
+            continue
+        wx = panels[neighbor]["cx"] - panels[center]["cx"]
+        wy = panels[neighbor]["cy"] - panels[center]["cy"]
+        if vx * wx + vy * wy < -0.75 * step * step:
+            direct_opposites.append(neighbor)
+    if len(direct_opposites) != 1:
+        raise PixelOracleError("cannot identify the collinear panel opposite the branch")
+    across = direct_opposites[0]
+    opposites[branch] = across
+    opposites[across] = branch
+    arms = [
+        index
+        for index in adjacency[center]
+        if index not in {branch, across}
+    ]
+    if len(arms) != 2:
+        raise PixelOracleError("cannot identify the two transverse arm panels")
+    opposites[arms[0]] = arms[1]
+    opposites[arms[1]] = arms[0]
+    return panels, counts, opposites
+
+
+def decision_from_image(image: Image.Image) -> str:
+    _, counts, opposites = _measure(image)
+    one_panel = counts.index(1)
+    return "yes" if counts[opposites[one_panel]] == 6 else "no"

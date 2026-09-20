@@ -1,0 +1,280 @@
+"""Scene sampling, rendering, analytic gold and margin for die_center_pip.
+
+The world draws one die face. Pips sit on a 3x3 lattice of the face, except in
+deliberate near-boundary scenes where a single pip is drawn slightly off the
+face centre. Four short grey ticks are drawn inward from the midpoint of each
+face edge; the two lines joining opposite ticks meet at the face centre, so the
+queried location is visible without any ink being drawn on it.
+
+Gold is always measured from the drawing: the centre is COVERED when some pip
+disk contains the face centre point, and EMPTY otherwise. The canonical die
+prior (odd faces carry a centre pip, even faces do not) is recorded for analysis
+only and never used as gold.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "die_center_pip-renderer-0.1.0"
+
+# Mutually well separated palettes; every colour is an exact rendered value.
+BG_COLORS = [(238, 236, 228), (214, 224, 236), (232, 226, 214), (222, 232, 222)]
+FACE_COLORS = [(250, 250, 250), (247, 240, 210), (236, 246, 250), (245, 235, 240)]
+PIP_COLORS = [(28, 44, 132), (150, 24, 32), (18, 96, 60), (96, 32, 120)]
+TICK_COLORS = [(96, 96, 96), (110, 104, 96), (88, 96, 104), (104, 92, 92)]
+
+# Canonical die faces on the row-major 3x3 lattice (index 4 is the centre),
+# including the rotations a real die can present.
+CANONICAL_FACES: dict[int, list[list[int]]] = {
+    1: [[4]],
+    2: [[0, 8], [2, 6]],
+    3: [[0, 4, 8], [2, 4, 6]],
+    4: [[0, 2, 6, 8]],
+    5: [[0, 2, 4, 6, 8]],
+    6: [[0, 2, 3, 5, 6, 8], [0, 1, 2, 6, 7, 8]],
+}
+
+NON_CENTRE = [0, 1, 2, 3, 5, 6, 7, 8]
+QUARANTINE_FRAC = 0.20  # of the pip radius
+MIN_CLEARANCE_PX = 4.0  # sampled scenes never sit closer than this to the boundary
+
+
+def _canonical_sets() -> set[tuple[int, ...]]:
+    out = set()
+    for faces in CANONICAL_FACES.values():
+        for f in faces:
+            out.add(tuple(sorted(f)))
+    return out
+
+
+CANONICAL_SETS = _canonical_sets()
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    size = rng.choice([512, 544])
+    half = rng.randint(150, 178)
+    cx = rng.randint(half + 24, size - half - 24)
+    cy = rng.randint(half + 24, size - half - 24)
+    pitch_frac = round(rng.uniform(0.50, 0.58), 4)
+    pip_frac = round(rng.uniform(0.135, 0.160), 4)
+    r = pip_frac * half
+
+    cells = [0] * 9
+    boundary_pip = None
+    if rng.random() < 0.28:
+        # Near-boundary scene: one pip is drawn just inside or just outside the
+        # centre, so the covering event is decided by a small visible clearance.
+        k_extra = rng.choice([0, 2, 2, 4])
+        for c in rng.sample(NON_CENTRE, k_extra):
+            cells[c] = 1
+        covered = rng.random() < 0.5
+        clearance = round(rng.uniform(MIN_CLEARANCE_PX, max(MIN_CLEARANCE_PX + 1.0, 0.55 * r)), 3)
+        dist = r - clearance if covered else r + clearance
+        boundary_pip = [round(rng.uniform(0.0, 360.0), 3), round(dist, 3)]
+    else:
+        covered = rng.random() < 0.5
+        canonical = rng.random() < 0.5
+        odd, even = [1, 3, 5], [2, 4, 6]
+        if canonical:
+            k = rng.choice(odd if covered else even)
+            for c in rng.choice(CANONICAL_FACES[k]):
+                cells[c] = 1
+        else:
+            k = rng.choice(even if covered else odd)
+            chosen = rng.sample(NON_CENTRE, k - 1 if covered else k)
+            for c in chosen:
+                cells[c] = 1
+            if covered:
+                cells[4] = 1
+            if tuple(sorted(i for i, v in enumerate(cells) if v)) in CANONICAL_SETS:
+                # Fall back to a pattern that cannot be a canonical face.
+                cells = [0] * 9
+                cells[4] = 1 if covered else 0
+                for c in rng.sample(NON_CENTRE[:6], 3 if covered else 1):
+                    cells[c] = 1
+
+    scene = {
+        "width": size,
+        "height": size,
+        "face_cx": cx,
+        "face_cy": cy,
+        "face_half": half,
+        "pitch_frac": pitch_frac,
+        "pip_frac": pip_frac,
+        "corner_frac": round(rng.uniform(0.08, 0.18), 4),
+        "tick_frac": round(rng.uniform(0.12, 0.17), 4),
+        "bg_color": list(rng.choice(BG_COLORS)),
+        "face_color": list(rng.choice(FACE_COLORS)),
+        "pip_color": list(rng.choice(PIP_COLORS)),
+        "tick_color": list(rng.choice(TICK_COLORS)),
+        "cells": cells,
+        "boundary_pip": boundary_pip,
+        "distractors": [],
+    }
+    scene["distractors"] = _sample_distractors(scene, rng)
+    return scene
+
+
+def _sample_distractors(scene: dict, rng: random.Random) -> list[list[int]]:
+    """Pip-coloured decoys drawn on the background, never on the die face."""
+    size = scene["width"]
+    half = scene["face_half"]
+    r = int(round(scene["pip_frac"] * half))
+    out: list[list[int]] = []
+    for _ in range(rng.choice([0, 1, 2, 3])):
+        for _try in range(40):
+            x = rng.randint(r + 8, size - r - 8)
+            y = rng.randint(r + 8, size - r - 8)
+            if (abs(x - scene["face_cx"]) <= half + r + 14
+                    and abs(y - scene["face_cy"]) <= half + r + 14):
+                continue
+            if any(math.hypot(x - px, y - py) < 3 * r for px, py in out):
+                continue
+            out.append([x, y])
+            break
+    return out
+
+
+def _geometry(scene: dict) -> dict:
+    half = float(scene["face_half"])
+    return {
+        "cx": float(scene["face_cx"]),
+        "cy": float(scene["face_cy"]),
+        "half": half,
+        "pitch": scene["pitch_frac"] * half,
+        "r": scene["pip_frac"] * half,
+        "corner": scene["corner_frac"] * half,
+        "tick": scene["tick_frac"] * half,
+    }
+
+
+def pip_offsets(scene: dict) -> list[tuple[float, float]]:
+    """Pip centres relative to the face centre.
+
+    Reads only the label inputs declared in candidate.json: cells,
+    boundary_pip, pitch_frac, pip_frac and face_half. Gold, margin and
+    quarantine are computed from this translation-invariant view alone.
+    """
+    half = float(scene["face_half"])
+    pitch = scene["pitch_frac"] * half
+    pts: list[tuple[float, float]] = []
+    for idx, on in enumerate(scene["cells"]):
+        if not on:
+            continue
+        row, col = divmod(idx, 3)
+        pts.append(((col - 1) * pitch, (row - 1) * pitch))
+    bp = scene["boundary_pip"]
+    if bp is not None:
+        ang = math.radians(float(bp[0]))
+        dist = float(bp[1])
+        pts.append((dist * math.cos(ang), dist * math.sin(ang)))
+    return pts
+
+
+def pip_centres(scene: dict) -> list[tuple[float, float]]:
+    cx, cy = float(scene["face_cx"]), float(scene["face_cy"])
+    return [(cx + dx, cy + dy) for dx, dy in pip_offsets(scene)]
+
+
+def _pip_radius(scene: dict) -> float:
+    return scene["pip_frac"] * float(scene["face_half"])
+
+
+def _centre_distance(scene: dict) -> float:
+    pts = pip_offsets(scene)
+    if not pts:
+        return float(scene["face_half"])
+    return min(math.hypot(dx, dy) for dx, dy in pts)
+
+
+def analytic_gold(scene: dict) -> str:
+    """COVERED when some pip disk contains the face centre point."""
+    return "covered" if _centre_distance(scene) <= _pip_radius(scene) else "empty"
+
+
+def margin(scene: dict) -> float:
+    """Pixels the nearest pip edge sits away from the face centre point."""
+    return round(abs(_centre_distance(scene) - _pip_radius(scene)), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_FRAC * _pip_radius(scene)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Latent-alias mode is `not_applicable`: no declared pixel-identical alias."""
+    return []
+
+
+def render(scene: dict) -> Image.Image:
+    g = _geometry(scene)
+    img = Image.new("RGB", (int(scene["width"]), int(scene["height"])),
+                    tuple(scene["bg_color"]))
+    d = ImageDraw.Draw(img)
+    x0, y0 = g["cx"] - g["half"], g["cy"] - g["half"]
+    x1, y1 = g["cx"] + g["half"], g["cy"] + g["half"]
+    d.rounded_rectangle([x0, y0, x1, y1], radius=int(round(g["corner"])),
+                        fill=tuple(scene["face_color"]))
+
+    # Four centre ticks: short bars inward from the midpoint of each face edge.
+    t, w = g["tick"], 3
+    d.rectangle([g["cx"] - w, y0, g["cx"] + w, y0 + t], fill=tuple(scene["tick_color"]))
+    d.rectangle([g["cx"] - w, y1 - t, g["cx"] + w, y1], fill=tuple(scene["tick_color"]))
+    d.rectangle([x0, g["cy"] - w, x0 + t, g["cy"] + w], fill=tuple(scene["tick_color"]))
+    d.rectangle([x1 - t, g["cy"] - w, x1, g["cy"] + w], fill=tuple(scene["tick_color"]))
+
+    for x, y in scene["distractors"]:
+        d.ellipse([x - g["r"], y - g["r"], x + g["r"], y + g["r"]],
+                  fill=tuple(scene["pip_color"]))
+    for x, y in pip_centres(scene):
+        d.ellipse([x - g["r"], y - g["r"], x + g["r"], y + g["r"]],
+                  fill=tuple(scene["pip_color"]))
+    return img
+
+
+# ---------------------------------------------------------------- nuisances --
+def repalette(scene: dict, k: int) -> dict:
+    """Gold-preserving colour rotation."""
+    out = dict(scene)
+    out["bg_color"] = list(BG_COLORS[(BG_COLORS.index(tuple(scene["bg_color"])) + k) % len(BG_COLORS)])
+    out["face_color"] = list(FACE_COLORS[(FACE_COLORS.index(tuple(scene["face_color"])) + k) % len(FACE_COLORS)])
+    out["pip_color"] = list(PIP_COLORS[(PIP_COLORS.index(tuple(scene["pip_color"])) + k) % len(PIP_COLORS)])
+    out["tick_color"] = list(TICK_COLORS[(TICK_COLORS.index(tuple(scene["tick_color"])) + k) % len(TICK_COLORS)])
+    return out
+
+
+def permute_pips(scene: dict, seed: int) -> dict:
+    """Gold-preserving permutation: reshuffle the occupied non-centre cells."""
+    rng = random.Random(seed ^ 0x5EED)
+    out = dict(scene)
+    cells = list(scene["cells"])
+    occupied = [c for c in NON_CENTRE if cells[c]]
+    fresh = rng.sample(NON_CENTRE, len(occupied))
+    new = [0] * 9
+    new[4] = cells[4]
+    for c in fresh:
+        new[c] = 1
+    out["cells"] = new
+    return out
+
+
+def translate(scene: dict, dx: int, dy: int) -> dict:
+    """Gold-preserving translation of the whole die face."""
+    out = dict(scene)
+    half = scene["face_half"]
+    out["face_cx"] = int(min(max(scene["face_cx"] + dx, half + 6), scene["width"] - half - 6))
+    out["face_cy"] = int(min(max(scene["face_cy"] + dy, half + 6), scene["height"] - half - 6))
+    out["distractors"] = []
+    return out
+
+
+def move_distractors(scene: dict, seed: int) -> dict:
+    """Gold-preserving resampling of the background decoys."""
+    out = dict(scene)
+    out["distractors"] = _sample_distractors(scene, random.Random(seed ^ 0xD15))
+    return out

@@ -1,0 +1,180 @@
+"""Pixel-only inverse arm for the rotor_window_dial world.
+
+Receives the final PNG and nothing else: no scene, no renderer, no gold. It
+locates the rotor disc from colour alone, orders the eight stations around the
+ring, reads the fixed window bracket, reads the ordered turn glyphs out of the
+hub, replays them, and names the tile that lands under the window.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "rotor_window_dial-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+STATIONS = 8
+
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (214, 38, 38),
+    "orange": (232, 120, 20),
+    "yellow": (222, 196, 20),
+    "green": (34, 150, 54),
+    "teal": (18, 158, 158),
+    "blue": (36, 72, 204),
+    "purple": (128, 44, 180),
+    "pink": (226, 86, 158),
+}
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Four-connected components of a boolean mask, as index arrays."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        out.append(np.array(pixels, dtype=np.int32))
+    return out
+
+
+def _tile_stations(array: np.ndarray) -> list[tuple[str, float, float]] | None:
+    stations: list[tuple[str, float, float]] = []
+    for name, rgb in PALETTE.items():
+        mask = np.all(array == np.array(rgb, dtype=np.uint8), axis=2)
+        if int(mask.sum()) < 100:
+            return None
+        blobs = _components(mask)
+        blobs = [b for b in blobs if b.shape[0] >= 40]
+        if len(blobs) != 1:
+            return None
+        blob = blobs[0]
+        stations.append((name, float(blob[:, 1].mean()), float(blob[:, 0].mean())))
+    return stations
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+    stations = _tile_stations(array)
+    if stations is None or len(stations) != STATIONS:
+        return ABSTAIN
+
+    cx = sum(s[1] for s in stations) / STATIONS
+    cy = sum(s[2] for s in stations) / STATIONS
+    radii = [math.hypot(s[1] - cx, s[2] - cy) for s in stations]
+    ring_r = sum(radii) / STATIONS
+    if max(abs(r - ring_r) for r in radii) > 3.0:
+        return ABSTAIN
+
+    ordered = sorted(stations, key=lambda s: math.atan2(s[2] - cy, s[1] - cx))
+    angles = [math.atan2(s[2] - cy, s[1] - cx) for s in ordered]
+    for i in range(STATIONS):
+        gap = math.degrees((angles[(i + 1) % STATIONS] - angles[i]) % (2 * math.pi))
+        if abs(gap - 360.0 / STATIONS) > 6.0:
+            return ABSTAIN
+
+    black = np.all(array <= 40, axis=2)
+    if not black.any():
+        return ABSTAIN
+    ys, xs = np.nonzero(black)
+    dist = np.hypot(xs - cx, ys - cy)
+
+    outer = dist > ring_r + 9.0
+    inner = dist < ring_r - 13.0
+    if int(outer.sum()) < 40 or int(inner.sum()) < 30:
+        return ABSTAIN
+    if int((~outer & ~inner).sum()) > 0:
+        return ABSTAIN
+
+    window_angle = math.atan2(
+        float(np.mean(np.sin(np.arctan2(ys[outer] - cy, xs[outer] - cx)))),
+        float(np.mean(np.cos(np.arctan2(ys[outer] - cy, xs[outer] - cx)))),
+    )
+    deltas = sorted(
+        (abs(math.degrees(_wrap(a - window_angle))), i) for i, a in enumerate(angles)
+    )
+    if deltas[0][0] > 12.0 or deltas[1][0] - deltas[0][0] < 15.0:
+        return ABSTAIN
+    window_index = deltas[0][1]
+
+    turns = _read_turns(black, inner, ys, xs)
+    if turns is None:
+        return ABSTAIN
+
+    net = sum(turns)
+    landing = (window_index - net) % STATIONS
+    return ordered[landing][0]
+
+
+def _wrap(angle: float) -> float:
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def _read_turns(black: np.ndarray, inner: np.ndarray, ys: np.ndarray, xs: np.ndarray):
+    """Read the hub stack top to bottom as a list of signed station counts."""
+    hub = np.zeros_like(black)
+    hub[ys[inner], xs[inner]] = True
+    blobs = _components(hub)
+    if not 4 <= len(blobs) <= 16:
+        return None
+
+    marks = []
+    for blob in blobs:
+        y0, y1 = int(blob[:, 0].min()), int(blob[:, 0].max())
+        x0, x1 = int(blob[:, 1].min()), int(blob[:, 1].max())
+        marks.append(
+            {
+                "cy": float(blob[:, 0].mean()),
+                "cx": float(blob[:, 1].mean()),
+                "w": x1 - x0 + 1,
+                "h": y1 - y0 + 1,
+                "x0": x0,
+                "x1": x1,
+                "pixels": blob,
+            }
+        )
+
+    marks.sort(key=lambda m: m["cy"])
+    rows: list[list[dict]] = []
+    for mark in marks:
+        if rows and abs(mark["cy"] - rows[-1][0]["cy"]) <= 5.0:
+            rows[-1].append(mark)
+        else:
+            rows.append([mark])
+    if not 2 <= len(rows) <= 5:
+        return None
+
+    turns: list[int] = []
+    for row in rows:
+        row.sort(key=lambda m: m["cx"])
+        head, tail = row[0], row[1:]
+        if head["w"] < 8 or head["h"] < 8:
+            return None
+        if not 1 <= len(tail) <= 3:
+            return None
+        for pip in tail:
+            if pip["w"] > 6 or pip["h"] > 6:
+                return None
+        mid = (head["x0"] + head["x1"]) / 2.0
+        left = int((head["pixels"][:, 1] < mid).sum())
+        right = int((head["pixels"][:, 1] > mid).sum())
+        if abs(left - right) < 4:
+            return None
+        turns.append(len(tail) if left > right else -len(tail))
+    return turns

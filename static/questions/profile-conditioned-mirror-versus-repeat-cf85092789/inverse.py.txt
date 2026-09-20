@@ -1,0 +1,126 @@
+"""Pixel-only inverse arm for mirror_versus_repeat.
+
+Receives one rendered PNG and the public question contract.  It imports no
+renderer, prompt, generator, verifier or gold code and never sees a scene.
+
+Pipeline: recover the grey rule, segment the dark dots into intensity-weighted
+centroids, split them at the rule, then reconstruct the two declared global
+correspondences -- reflection across the rule and the centroid-matched
+translation -- and score each with an order-free assignment residual.  The
+smaller residual names the class; if neither map fits, the structure is absent
+and the arm abstains.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+DOT_LUM_MAX = 150.0      # dark ink
+AXIS_LUM_RANGE = (145.0, 215.0)
+MIN_DOT_AREA = 40
+FIT_TOL_PX = 20.0        # above this, a map does not describe the picture
+
+
+def _luminance(image: Image.Image) -> np.ndarray:
+    a = np.asarray(image.convert("RGB"), dtype=np.float64)
+    return 0.299 * a[:, :, 0] + 0.587 * a[:, :, 1] + 0.114 * a[:, :, 2]
+
+
+def _axis_x(lum: np.ndarray) -> float:
+    h, w = lum.shape
+    band = (lum >= AXIS_LUM_RANGE[0]) & (lum <= AXIS_LUM_RANGE[1])
+    counts = band.sum(axis=0).astype(np.float64)
+    cols = np.flatnonzero(counts > 0.5 * h)
+    if cols.size == 0:
+        raise ValueError("no grey rule found")
+    weight = counts[cols]
+    return float((cols * weight).sum() / weight.sum())
+
+
+def _components(lum: np.ndarray) -> list[tuple[float, float]]:
+    """Intensity-weighted centroids of the dark connected components."""
+    mask = lum < DOT_LUM_MAX
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    weight = np.where(mask, 255.0 - lum, 0.0)
+    out: list[tuple[float, float]] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pix) < MIN_DOT_AREA:
+            continue
+        wsum = sum(weight[y, x] for y, x in pix)
+        cx = sum(weight[y, x] * x for y, x in pix) / wsum
+        cy = sum(weight[y, x] * y for y, x in pix) / wsum
+        out.append((float(cx), float(cy)))
+    return out
+
+
+def _assignment_residual(src, dst) -> float:
+    if len(src) != len(dst) or not src:
+        return float("inf")
+    pairs = []
+    for i, (ax, ay) in enumerate(src):
+        for j, (bx, by) in enumerate(dst):
+            pairs.append((math.hypot(ax - bx, ay - by), i, j))
+    pairs.sort()
+    used_i, used_j = set(), set()
+    worst = 0.0
+    for d, i, j in pairs:
+        if i in used_i or j in used_j:
+            continue
+        used_i.add(i)
+        used_j.add(j)
+        worst = max(worst, d)
+        if len(used_i) == len(src):
+            break
+    return worst
+
+
+def analyse(image: Image.Image) -> dict:
+    lum = _luminance(image)
+    axis = _axis_x(lum)
+    dots = _components(lum)
+    left = [p for p in dots if p[0] < axis]
+    right = [p for p in dots if p[0] > axis]
+    if not left or len(left) != len(right):
+        return {"decision": "unresolved", "mirror": float("inf"), "copy": float("inf"),
+                "axis_x": axis, "n_left": len(left), "n_right": len(right)}
+    reflected = [(2.0 * axis - x, y) for x, y in left]
+    mean_l = sum(x for x, _ in left) / len(left)
+    tx = 2.0 * (axis - mean_l)
+    shifted = [(x + tx, y) for x, y in left]
+    r_mirror = _assignment_residual(reflected, right)
+    r_copy = _assignment_residual(shifted, right)
+    if min(r_mirror, r_copy) > FIT_TOL_PX:
+        decision = "unresolved"
+    else:
+        decision = "mirror" if r_mirror < r_copy else "copy"
+    return {"decision": decision, "mirror": r_mirror, "copy": r_copy,
+            "axis_x": axis, "n_left": len(left), "n_right": len(right)}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return analyse(image)["decision"]
+
+
+def margin_from_image(image: Image.Image) -> float:
+    a = analyse(image)
+    if a["decision"] == "unresolved":
+        return 0.0
+    return abs(a["copy"] - a["mirror"])

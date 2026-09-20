@@ -1,0 +1,192 @@
+"""Renderer and analytic side of the parallel-rail constellation world.
+
+The scene contains three unordered colored point fields. One base geometry is a
+pair of parallel four-point rails; the other two are matched converging and bowed
+geometries. The analytic side searches all 4+4 partitions, while ``oracle.py``
+recovers point centers from the final PNG without importing this module.
+"""
+
+from __future__ import annotations
+
+import copy
+import itertools
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "parallel_rail_constellation-0.1.0"
+CANVAS = (768, 512)
+COLORS = {
+    "red": (214, 64, 72),
+    "blue": (55, 101, 220),
+    "green": (48, 166, 103),
+}
+COLOR_NAMES = ("red", "blue", "green")
+SUPERSAMPLE = 4
+
+
+def _templates() -> tuple[list[tuple[float, float]], ...]:
+    xs = (-96.0, -32.0, 32.0, 96.0)
+    parallel = [(x, -38.0) for x in xs] + [(x, 38.0) for x in xs]
+    converging = [
+        (-96.0, -50.0), (-32.0, -30.0), (32.0, -10.0), (96.0, 10.0),
+        (-96.0, 50.0), (-32.0, 30.0), (32.0, 10.0), (96.0, -10.0),
+    ]
+    bowed = [
+        (-96.0, -48.0), (-32.0, -23.0), (32.0, -23.0), (96.0, -48.0),
+        (-96.0, 48.0), (-32.0, 23.0), (32.0, 23.0), (96.0, 48.0),
+    ]
+    return parallel, converging, bowed
+
+
+def _transform_template(
+    template: Iterable[tuple[float, float]],
+    *,
+    center: tuple[float, float],
+    angle: float,
+    scale: float,
+    jitter: float,
+    rng: random.Random,
+) -> list[list[float]]:
+    ca, sa = math.cos(angle), math.sin(angle)
+    cx, cy = center
+    points: list[list[float]] = []
+    for x, y in template:
+        x += rng.gauss(0.0, jitter)
+        y += rng.gauss(0.0, jitter)
+        tx = scale * (ca * x - sa * y) + cx
+        ty = scale * (sa * x + ca * y) + cy
+        points.append([round(tx, 4), round(ty, 4)])
+    return points
+
+
+def sample_scene(seed: int) -> dict:
+    """Create one balanced, nuisance-randomized scene from an integer seed."""
+
+    rng = random.Random(int(seed))
+    target_color = COLOR_NAMES[int(seed) % 3]
+    parallel, converging, bowed = _templates()
+    decoys = [converging, bowed]
+    rng.shuffle(decoys)
+    template_by_color: dict[str, list[tuple[float, float]]] = {target_color: parallel}
+    other_colors = [name for name in COLOR_NAMES if name != target_color]
+    template_by_color[other_colors[0]] = decoys[0]
+    template_by_color[other_colors[1]] = decoys[1]
+
+    panel_centers = [(128.0, 256.0), (384.0, 256.0), (640.0, 256.0)]
+    rng.shuffle(panel_centers)
+    scale = rng.uniform(0.94, 1.02)
+    radius = round(rng.uniform(5.8, 7.2), 4)
+    jitter = rng.uniform(0.45, 1.05)
+    fields = []
+    for color, center in zip(COLOR_NAMES, panel_centers):
+        cx = center[0] + rng.uniform(-5.0, 5.0)
+        cy = center[1] + rng.uniform(-22.0, 22.0)
+        points = _transform_template(
+            template_by_color[color],
+            center=(cx, cy),
+            angle=rng.uniform(0.0, 2.0 * math.pi),
+            scale=scale,
+            jitter=jitter,
+            rng=rng,
+        )
+        fields.append({"color": color, "points": points, "radius": radius})
+    return {"fields": fields}
+
+
+def _line_stats(points: list[list[float]]) -> tuple[float, float, float, float, float]:
+    """Return center, direction angle, mean normal error, gap CV, and center coordinates."""
+
+    cx = sum(p[0] for p in points) / len(points)
+    cy = sum(p[1] for p in points) / len(points)
+    xx = sum((p[0] - cx) ** 2 for p in points)
+    yy = sum((p[1] - cy) ** 2 for p in points)
+    xy = sum((p[0] - cx) * (p[1] - cy) for p in points)
+    theta = 0.5 * math.atan2(2.0 * xy, xx - yy)
+    ux, uy = math.cos(theta), math.sin(theta)
+    nx, ny = -uy, ux
+    residual = sum(abs((p[0] - cx) * nx + (p[1] - cy) * ny) for p in points) / len(points)
+    projections = sorted((p[0] - cx) * ux + (p[1] - cy) * uy for p in points)
+    gaps = [projections[i + 1] - projections[i] for i in range(len(projections) - 1)]
+    mean_gap = sum(gaps) / len(gaps)
+    gap_cv = math.sqrt(sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)) / max(mean_gap, 1e-6)
+    return cx, cy, theta, residual, gap_cv
+
+
+def _angle_difference(first: float, second: float) -> float:
+    dot = abs(math.cos(first) * math.cos(second) + math.sin(first) * math.sin(second))
+    return math.degrees(math.acos(max(-1.0, min(1.0, dot))))
+
+
+def _split_score(points: list[list[float]], first_indices: tuple[int, ...]) -> float:
+    first_set = set(first_indices)
+    group_a = [points[i] for i in first_indices]
+    group_b = [points[i] for i in range(len(points)) if i not in first_set]
+    ax, ay, at, ar, ac = _line_stats(group_a)
+    bx, by, bt, br, bc = _line_stats(group_b)
+    angle = _angle_difference(at, bt)
+    separation = abs((bx - ax) * (-math.sin(at)) + (by - ay) * math.cos(at))
+    residual = max(ar, br)
+    gap_cv = max(ac, bc)
+    return math.exp(-residual / 5.5 - angle / 14.0 - gap_cv / 0.40) * min(1.0, separation / 28.0)
+
+
+def rail_score(points: list[list[float]]) -> float:
+    """Best score over the 35 distinct ways to split eight points into two fours."""
+
+    if len(points) != 8:
+        return 0.0
+    best = 0.0
+    for indices in itertools.combinations(range(8), 4):
+        if 0 not in indices:
+            continue
+        best = max(best, _split_score(points, indices))
+    return best
+
+
+def _scores(scene: dict) -> list[tuple[str, float]]:
+    return sorted(
+        ((field["color"], rail_score(field["points"])) for field in scene["fields"]),
+        key=lambda item: (-item[1], item[0]),
+    )
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return only the visible color selected by the complete-field rail score."""
+
+    return _scores(scene)[0][0]
+
+
+def margin(scene: dict) -> float:
+    scores = _scores(scene)
+    return scores[0][1] - scores[1][1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = _scores(scene)
+    return scores[0][1] < 0.45 or (scores[0][1] - scores[1][1]) < 0.18
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the three fields; point-list order has no visual meaning."""
+
+    image = Image.new("RGB", (CANVAS[0] * SUPERSAMPLE, CANVAS[1] * SUPERSAMPLE), "white")
+    draw = ImageDraw.Draw(image)
+    for field in scene["fields"]:
+        fill = COLORS[field["color"]]
+        radius = float(field["radius"]) * SUPERSAMPLE
+        for x, y in field["points"]:
+            px, py = float(x) * SUPERSAMPLE, float(y) * SUPERSAMPLE
+            draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=fill)
+    return image.resize(CANVAS, Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """The unordered point-set serialization admits a tested order permutation."""
+
+    twin = copy.deepcopy(scene)
+    for field in twin["fields"]:
+        field["points"] = list(reversed(field["points"]))
+    return [("reverse_unordered_point_serialization", twin)]

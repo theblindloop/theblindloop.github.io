@@ -1,0 +1,214 @@
+"""Independent pixel inverse for colored-pair relation-set matching.
+
+This module deliberately duplicates only the public visual vocabulary.  It does
+not import the renderer, prompt layer, generator, verifier, or any latent state.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+LABELS = ("A", "B", "C", "D")
+VISIBLE_COLORS = (
+    (204, 62, 72),
+    (47, 105, 190),
+    (35, 145, 91),
+    (229, 160, 30),
+    (139, 78, 172),
+)
+
+
+class OracleAbstention(ValueError):
+    """The final raster does not expose a complete unique relation-set match."""
+
+
+@dataclass(frozen=True)
+class Dot:
+    color_id: int
+    cx: float
+    cy: float
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    area: int
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0 + 1
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0 + 1
+
+
+def _components(mask: np.ndarray, color_id: int) -> list[Dot]:
+    """Four-connected components over only the thresholded colored-dot pixels."""
+    height, width = mask.shape
+    ys, xs = np.nonzero(mask)
+    unseen = set((ys * width + xs).tolist())
+    found: list[Dot] = []
+    while unseen:
+        start = unseen.pop()
+        stack = [start]
+        pixels = [start]
+        while stack:
+            value = stack.pop()
+            y, x = divmod(value, width)
+            for neighbor in (value - 1, value + 1, value - width, value + width):
+                if neighbor not in unseen:
+                    continue
+                ny, nx = divmod(neighbor, width)
+                if not (0 <= ny < height and 0 <= nx < width):
+                    continue
+                if abs(nx - x) + abs(ny - y) != 1:
+                    continue
+                unseen.remove(neighbor)
+                stack.append(neighbor)
+                pixels.append(neighbor)
+        if len(pixels) < 150:
+            continue
+        py = np.fromiter((item // width for item in pixels), dtype=np.int32)
+        px = np.fromiter((item % width for item in pixels), dtype=np.int32)
+        found.append(
+            Dot(
+                color_id=color_id,
+                cx=float(px.mean()),
+                cy=float(py.mean()),
+                x0=int(px.min()),
+                y0=int(py.min()),
+                x1=int(px.max()),
+                y1=int(py.max()),
+                area=len(pixels),
+            )
+        )
+    return found
+
+
+def _split_by_gaps(items: list[Dot], axis: str, parts: int) -> list[list[Dot]]:
+    if len(items) < parts:
+        raise OracleAbstention("too few colored nodes to enumerate visible regions")
+    ordered = sorted(items, key=lambda item: getattr(item, axis))
+    gaps = [
+        (getattr(ordered[index + 1], axis) - getattr(ordered[index], axis), index + 1)
+        for index in range(len(ordered) - 1)
+    ]
+    cuts = sorted(index for _, index in sorted(gaps, reverse=True)[: parts - 1])
+    groups: list[list[Dot]] = []
+    start = 0
+    for cut in cuts + [len(ordered)]:
+        groups.append(ordered[start:cut])
+        start = cut
+    groups.sort(key=lambda group: sum(getattr(item, axis) for item in group) / len(group))
+    return groups
+
+
+def _canonical_signature(edges: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    if len(edges) != 5:
+        raise OracleAbstention(f"a region must expose five joined pairs; measured {len(edges)}")
+    canonical = [tuple(sorted(edge)) for edge in edges]
+    if any(left == right for left, right in canonical):
+        raise OracleAbstention("a joined token repeats one color")
+    if len(set(canonical)) != 5:
+        raise OracleAbstention("a region repeats a pair identity")
+    degrees = [0] * 5
+    for left, right in canonical:
+        degrees[left] += 1
+        degrees[right] += 1
+    if degrees != [2, 2, 2, 2, 2]:
+        raise OracleAbstention("a region violates the common two-of-each-color inventory")
+    return tuple(sorted(canonical))
+
+
+def _read_region(group: list[Dot], arr: np.ndarray) -> tuple[tuple[int, int], ...]:
+    if len(group) != 10:
+        raise OracleAbstention(f"each region must contain ten colored nodes; measured {len(group)}")
+    counts = [sum(dot.color_id == color_id for dot in group) for color_id in range(5)]
+    if counts != [2, 2, 2, 2, 2]:
+        raise OracleAbstention(f"unbalanced visible color inventory {counts}")
+
+    rows = _split_by_gaps(group, "cy", 5)
+    if any(len(row) != 2 for row in rows):
+        raise OracleAbstention("colored nodes do not form five visible pair rows")
+    edges: list[tuple[int, int]] = []
+    for row in rows:
+        left, right = sorted(row, key=lambda dot: dot.cx)
+        separation = right.cx - left.cx
+        if not 55.0 <= separation <= 90.0 or abs(left.cy - right.cy) > 2.5:
+            raise OracleAbstention("one pair row has incompatible endpoint geometry")
+
+        # Require the declared visual relation itself: a dark continuous bar in
+        # the open interval between the two colored nodes.  Position grouping
+        # alone is therefore insufficient and erased evidence causes abstention.
+        x0, x1 = left.x1 + 4, right.x0 - 3
+        center_y = int(round((left.cy + right.cy) / 2.0))
+        y0, y1 = center_y - 2, center_y + 3
+        if x1 <= x0 or y0 < 0 or y1 > arr.shape[0]:
+            raise OracleAbstention("a joining-bar corridor is not measurable")
+        corridor = arr[y0:y1, x0:x1]
+        dark = corridor.max(axis=2) < 100
+        if dark.size == 0 or float(dark.mean()) < 0.78:
+            raise OracleAbstention("a visible joining bar is incomplete or erased")
+        # Each sampled x-column must contain dark ink, ruling out a split bar.
+        if not np.all(dark.any(axis=0)):
+            raise OracleAbstention("a visible joining bar contains a gap")
+        edges.append((left.color_id, right.color_id))
+    return _canonical_signature(edges)
+
+
+def analyze_image(image: Image.Image) -> dict:
+    """Enumerate regions and relations, then return all candidate match scores."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int32)
+    palette = np.asarray(VISIBLE_COLORS, dtype=np.int32)
+    squared = ((arr[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=3)
+    nearest = squared.argmin(axis=2)
+    distance = squared.min(axis=2)
+
+    dots: list[Dot] = []
+    for color_id in range(5):
+        dots.extend(_components((nearest == color_id) & (distance <= 32 ** 2), color_id))
+    if len(dots) != 50:
+        raise OracleAbstention(f"expected fifty visible colored nodes, measured {len(dots)}")
+    global_counts = [sum(dot.color_id == color_id for dot in dots) for color_id in range(5)]
+    if global_counts != [10, 10, 10, 10, 10]:
+        raise OracleAbstention(f"global color counts are not balanced: {global_counts}")
+
+    extents = [0.5 * (dot.width + dot.height) for dot in dots]
+    if not 19.0 <= float(np.median(extents)) <= 27.0:
+        raise OracleAbstention("colored nodes are outside the readable size range")
+    if max(extents) - min(extents) > 3.5:
+        raise OracleAbstention("colored node sizes are not uniform")
+    if max(dot.area for dot in dots) / min(dot.area for dot in dots) > 1.30:
+        raise OracleAbstention("colored node ink areas are not uniform")
+
+    vertical = _split_by_gaps(dots, "cy", 2)
+    if [len(group) for group in vertical] != [10, 40]:
+        raise OracleAbstention("could not separate the reference from the candidate row")
+    candidates = _split_by_gaps(vertical[1], "cx", 4)
+    if any(len(group) != 10 for group in candidates):
+        raise OracleAbstention("could not enumerate four candidate cards")
+
+    reference_signature = _read_region(vertical[0], arr)
+    candidate_signatures = [_read_region(group, arr) for group in candidates]
+    wanted = set(reference_signature)
+    scores = [len(wanted & set(signature)) for signature in candidate_signatures]
+    ranking = sorted(range(4), key=lambda index: scores[index], reverse=True)
+    top_gap = scores[ranking[0]] - scores[ranking[1]]
+    if scores[ranking[0]] != 5 or top_gap < 2:
+        raise OracleAbstention("no unique exact relation-set match with margin at least two")
+    return {
+        "decision": LABELS[ranking[0]],
+        "scores": scores,
+        "runner_up_margin": float(top_gap),
+        "reference_signature": [list(edge) for edge in reference_signature],
+        "candidate_signatures": [
+            [list(edge) for edge in signature] for signature in candidate_signatures
+        ],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

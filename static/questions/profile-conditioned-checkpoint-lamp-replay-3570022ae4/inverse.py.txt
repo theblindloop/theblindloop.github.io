@@ -1,0 +1,165 @@
+"""Independent pixel-only inverse for the checkpoint-lamp program.
+
+The inverse segments saturated symbol ink, discovers top and bottom symbol
+groups from relative image halves, classifies shape by measured fill ratio,
+counts isolated pip runs, binds logical lamp identities, and independently
+replays the decoded checkpoint program.  It receives no scene information.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _runs(active: np.ndarray, *, minimum: int) -> list[tuple[int, int]]:
+    padded = np.pad(active.astype(np.int8), (1, 1))
+    edges = np.diff(padded)
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    return [
+        (int(start), int(end))
+        for start, end in zip(starts, ends, strict=True)
+        if end - start >= minimum
+    ]
+
+
+def _symbol_spans(mask: np.ndarray, expected: int) -> list[tuple[int, int]]:
+    spans = _runs(mask.sum(axis=0) >= 4, minimum=28)
+    if len(spans) != expected:
+        raise PixelParseError(f"expected {expected} separated symbols, found {len(spans)}")
+    if any(spans[index + 1][0] - spans[index][1] < 25 for index in range(len(spans) - 1)):
+        raise PixelParseError("symbol order lacks visible separation")
+    return spans
+
+
+def _parts(mask: np.ndarray, span: tuple[int, int]) -> tuple[float, int, float]:
+    x0, x1 = span
+    crop = mask[:, x0:x1]
+    row_spans = _runs(crop.sum(axis=1) >= 3, minimum=5)
+    if not row_spans:
+        raise PixelParseError("symbol has no measurable ink")
+
+    # The large icon is the first tall band.  Optional pips form one much
+    # shorter, separated band below it; no absolute image coordinate is used.
+    tall = [item for item in row_spans if item[1] - item[0] >= 24]
+    if len(tall) != 1:
+        raise PixelParseError("symbol does not contain one unambiguous main icon")
+    main_y0, main_y1 = tall[0]
+    main = crop[main_y0:main_y1]
+    occupied_x = np.flatnonzero(main.any(axis=0))
+    occupied_y = np.flatnonzero(main.any(axis=1))
+    if len(occupied_x) < 28 or len(occupied_y) < 24:
+        raise PixelParseError("main icon is too small")
+    tight = main[
+        occupied_y[0] : occupied_y[-1] + 1,
+        occupied_x[0] : occupied_x[-1] + 1,
+    ]
+    fill_ratio = float(tight.mean())
+
+    pip_bands = [item for item in row_spans if item[0] > main_y1 + 5 and 5 <= item[1] - item[0] <= 13]
+    if len(pip_bands) > 1:
+        raise PixelParseError("multiple rival pip bands")
+    pip_count = 0
+    pip_lead = 1.0
+    if pip_bands:
+        py0, py1 = pip_bands[0]
+        pip_spans = _runs(crop[py0:py1].sum(axis=0) >= 3, minimum=5)
+        if not 1 <= len(pip_spans) <= 4:
+            raise PixelParseError("pip label is outside 1-4")
+        widths = [right - left for left, right in pip_spans]
+        gaps = [pip_spans[i + 1][0] - pip_spans[i][1] for i in range(len(pip_spans) - 1)]
+        if min(widths) < 6 or (gaps and min(gaps) < 4):
+            raise PixelParseError("pip label is merged or undersized")
+        pip_count = len(pip_spans)
+        pip_lead = float(min(widths + gaps))
+    return fill_ratio, pip_count, pip_lead
+
+
+def _decode(image: Image.Image) -> tuple[list[bool], list[str], float]:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if rgb.ndim != 3 or rgb.shape[0] < 300 or rgb.shape[1] < 700:
+        raise PixelParseError("unexpected raster dimensions")
+    high = rgb.max(axis=2)
+    low = rgb.min(axis=2)
+    saturated = (high - low >= 70) & (high >= 95)
+
+    split = saturated.shape[0] // 2
+    top = saturated[:split]
+    bottom = saturated[split:]
+    lamp_spans = _symbol_spans(top, 4)
+    card_spans = _symbol_spans(bottom, 8)
+
+    initial_by_label: dict[int, bool] = {}
+    leads: list[float] = []
+    for span in lamp_spans:
+        ratio, pips, pip_lead = _parts(top, span)
+        if pips in initial_by_label or not 1 <= pips <= 4:
+            raise PixelParseError("lamp pip identities are missing or repeated")
+        if ratio <= 0.52:
+            state = False
+            leads.append(100.0 * (0.52 - ratio))
+        elif ratio >= 0.66:
+            state = True
+            leads.append(100.0 * (ratio - 0.66))
+        else:
+            raise PixelParseError("lamp is ambiguous between ring and filled disk")
+        initial_by_label[pips] = state
+        leads.append(pip_lead)
+    if set(initial_by_label) != {1, 2, 3, 4}:
+        raise PixelParseError("lamp identities do not cover 1-4")
+    initial = [initial_by_label[index] for index in range(1, 5)]
+
+    operations: list[str] = []
+    for span in card_spans:
+        ratio, pips, pip_lead = _parts(bottom, span)
+        if ratio <= 0.61:
+            if not 1 <= pips <= 4:
+                raise PixelParseError("triangular FLIP lacks a 1-4 pip target")
+            operations.append(f"flip_{pips}")
+            leads.extend((100.0 * (0.61 - ratio), pip_lead))
+        elif 0.68 <= ratio <= 0.87:
+            if pips:
+                raise PixelParseError("circular RESTORE has an undeclared pip target")
+            operations.append("restore")
+            leads.append(100.0 * min(ratio - 0.68, 0.87 - ratio))
+        elif ratio >= 0.91:
+            if pips:
+                raise PixelParseError("square SAVE has an undeclared pip target")
+            operations.append("save")
+            leads.append(100.0 * (ratio - 0.91))
+        else:
+            raise PixelParseError("card icon is ambiguous among FLIP, SAVE, and RESTORE")
+
+    if sorted(operations) != [
+        "flip_1",
+        "flip_2",
+        "flip_3",
+        "flip_4",
+        "restore",
+        "restore",
+        "save",
+        "save",
+    ]:
+        raise PixelParseError("decoded program does not have the declared balanced vocabulary")
+    return initial, operations, min(leads)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    initial, operations, _runner_up_margin = _decode(image)
+    state = list(initial)
+    saved = list(initial)
+    for operation in operations:
+        if operation.startswith("flip_"):
+            state[int(operation.split("_", 1)[1]) - 1] ^= True
+        elif operation == "save":
+            saved = list(state)
+        elif operation == "restore":
+            state = list(saved)
+        else:  # pragma: no cover - guarded by the pixel parser
+            raise PixelParseError(f"unrecognized operation {operation!r}")
+    return str(sum(state))

@@ -1,0 +1,501 @@
+"""Renderer for the traced-wire-port world.
+
+A pale panel carries four dark wires of identical colour and thickness. Every
+wire runs from a coloured square port on the panel rim along an axis-aligned
+lattice route into the panel interior and stops at a free end. Exactly one wire
+carries a filled dark dot at its free end. The answer is the colour of the port
+that sits at the other end of *that* wire, so the decision is carried by the
+whole connected route rather than by either of its endpoints alone.
+
+Wire routes occupy pairwise distinct lattice cells, which guarantees a floor of
+25 px of empty background between any two wires. A scene may additionally carry
+one short spur that grows sideways off the marked wire towards a straight run of
+a neighbouring wire, leaving a controlled gap. That spur is the visible decision
+boundary: as the gap closes the marked route stops being separable from its
+neighbour and the reading becomes unclear.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "traced_wire_port-renderer-0.1.0"
+
+WIDTH = 480
+HEIGHT = 480
+GRID = 10
+CELL = 30
+BOARD = GRID * CELL
+PANEL_PAD = 8
+
+WIRE_WIDTH = 5
+WIRE_HALF = 2.5
+DISK_R = 10
+PORT_HALF = 10
+
+# Decision threshold: two wire widths of clear background.
+UNCLEAR_TOLERANCE = 10.0
+QUARANTINE_LOW = 6.0
+QUARANTINE_HIGH = 14.0
+STRUCTURAL_FLOOR = 17.0
+
+BG = (246, 244, 236)
+PANEL = (223, 221, 212)
+INK = (34, 34, 40)
+
+PORT_COLORS: dict[str, tuple[int, int, int]] = {
+    "red": (214, 62, 48),
+    "green": (34, 132, 70),
+    "blue": (40, 86, 190),
+    "orange": (232, 152, 26),
+}
+COLOR_ORDER = ("red", "green", "blue", "orange")
+
+# mode schedule; one full cycle per sixteen consecutive scene seeds. Most scenes
+# are cleanly answerable so that the decisive support is the whole route; the
+# three boundary modes keep the 'unclear' class and the quarantine band populated.
+MODES = (
+    "clear",
+    "clear",
+    "near",
+    "clear",
+    "clear",
+    "clear",
+    "clear_pinch",
+    "clear",
+    "clear",
+    "merged",
+    "clear",
+    "clear",
+    "clear_pinch",
+    "clear",
+    "quarantine",
+    "clear",
+)
+
+_DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+
+
+def _point_segment(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    vx, vy = bx - ax, by - ay
+    denom = vx * vx + vy * vy
+    if denom <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * vx + (py - ay) * vy) / denom
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _orient(ax, ay, bx, by, cx, cy) -> float:
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+
+def _segments_cross(a, b, c, d) -> bool:
+    d1 = _orient(c[0], c[1], d[0], d[1], a[0], a[1])
+    d2 = _orient(c[0], c[1], d[0], d[1], b[0], b[1])
+    d3 = _orient(a[0], a[1], b[0], b[1], c[0], c[1])
+    d4 = _orient(a[0], a[1], b[0], b[1], d[0], d[1])
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _segment_distance(a, b, c, d) -> float:
+    if _segments_cross(a, b, c, d):
+        return 0.0
+    return min(
+        _point_segment(a[0], a[1], c[0], c[1], d[0], d[1]),
+        _point_segment(b[0], b[1], c[0], c[1], d[0], d[1]),
+        _point_segment(c[0], c[1], a[0], a[1], b[0], b[1]),
+        _point_segment(d[0], d[1], a[0], a[1], b[0], b[1]),
+    )
+
+
+# --------------------------------------------------------------------------
+# scene layout in lattice coordinates
+# --------------------------------------------------------------------------
+
+
+def _centre(origin, cell) -> tuple[float, float]:
+    return float(cell[0]), float(cell[1])
+
+
+def _cell_centre(origin, col, row) -> tuple[float, float]:
+    return (
+        float(origin[0] + col * CELL + CELL // 2),
+        float(origin[1] + row * CELL + CELL // 2),
+    )
+
+
+def _border_cells() -> list[tuple[int, int]]:
+    out = []
+    for col in range(GRID):
+        for row in range(GRID):
+            if col in (0, GRID - 1) or row in (0, GRID - 1):
+                out.append((col, row))
+    return out
+
+
+def _cheb(a, b) -> int:
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
+def _walk(rng, start, occupied, target) -> list[tuple[int, int]] | None:
+    path = [start]
+    occupied.add(start)
+    while len(path) < target:
+        col, row = path[-1]
+        options = []
+        for dcol, drow in _DIRS:
+            nxt = (col + dcol, row + drow)
+            if not (0 <= nxt[0] < GRID and 0 <= nxt[1] < GRID):
+                continue
+            if nxt in occupied:
+                continue
+            options.append(nxt)
+        if not options:
+            break
+        nxt = options[rng.randrange(len(options))]
+        occupied.add(nxt)
+        path.append(nxt)
+    if len(path) < 9:
+        return None
+    return path
+
+
+def _layout(rng) -> dict | None:
+    border = _border_cells()
+    ports: list[tuple[int, int]] = []
+    for _ in range(400):
+        if len(ports) == 4:
+            break
+        cand = border[rng.randrange(len(border))]
+        if all(_cheb(cand, other) >= 3 for other in ports):
+            ports.append(cand)
+    if len(ports) != 4:
+        return None
+
+    occupied = set(ports)
+    order = list(range(4))
+    rng.shuffle(order)
+    routes: dict[int, list[tuple[int, int]]] = {}
+    for idx in order:
+        path = _walk(rng, ports[idx], occupied, rng.randint(10, 15))
+        if path is None:
+            return None
+        routes[idx] = path
+    return {"ports": ports, "routes": [routes[i] for i in range(4)]}
+
+
+def _bbox_span(cells) -> tuple[int, int]:
+    cols = [c for c, _ in cells]
+    rows = [r for _, r in cells]
+    across = max(cols) - min(cols)
+    down = max(rows) - min(rows)
+    return max(across, down), min(across, down)
+
+
+def _pick_entry(rng, layout) -> int | None:
+    ports = layout["ports"]
+    order = list(range(4))
+    rng.shuffle(order)
+    for idx in order:
+        cells = layout["routes"][idx]
+        free = cells[-1]
+        long_span, short_span = _bbox_span(cells)
+        # the marked route must be a corridor: long enough to span a substantial
+        # region of the panel, and narrow enough that it stays an elongated
+        # trace rather than a blob that happens to be connected
+        if not 6 <= long_span <= 8:
+            continue
+        if short_span > 3:
+            continue
+        if any(_cheb(free, port) < 2 for port in ports):
+            continue
+        # the marked end must not sit closest to its own port: the answer has to
+        # come from following the route, never from nearest-anchor reading
+        dists = [
+            (abs(free[0] - port[0]) ** 2 + abs(free[1] - port[1]) ** 2, other)
+            for other, port in enumerate(ports)
+        ]
+        dists.sort()
+        if dists[0][1] == idx:
+            continue
+        return idx
+    return None
+
+
+def _spur_options(layout, entry_idx) -> list[dict]:
+    cells = layout["routes"][entry_idx]
+    owner: dict[tuple[int, int], int] = {}
+    for widx, route in enumerate(layout["routes"]):
+        for cell in route:
+            owner[cell] = widx
+    neighbours_in_wire: dict[tuple[int, int], set[tuple[int, int]]] = {}
+    for route in layout["routes"]:
+        for pos, cell in enumerate(route):
+            near = set()
+            if pos > 0:
+                near.add(route[pos - 1])
+            if pos + 1 < len(route):
+                near.add(route[pos + 1])
+            neighbours_in_wire[cell] = near
+
+    options: list[dict] = []
+    for cell in cells[1:-1]:
+        for dcol, drow in _DIRS:
+            target = (cell[0] + dcol, cell[1] + drow)
+            widx = owner.get(target)
+            if widx is None or widx == entry_idx:
+                continue
+            perp = (-drow, dcol)
+            straight = {
+                (target[0] + perp[0], target[1] + perp[1]),
+                (target[0] - perp[0], target[1] - perp[1]),
+            }
+            if not (straight & neighbours_in_wire[target]):
+                continue
+            options.append(
+                {"cell": [cell[0], cell[1]], "dir": [dcol, drow], "target_wire": widx}
+            )
+    return options
+
+
+def _build_primitives(scene, index):
+    """Return (segment, radius) primitives for one wire plus its port."""
+    origin = scene["origin"]
+    wire = scene["wires"][index]
+    prims = []
+    pts = [_cell_centre(origin, c, r) for c, r in wire["cells"]]
+    for a, b in zip(pts, pts[1:]):
+        prims.append((a, b, WIRE_HALF))
+    px, py = _cell_centre(origin, wire["port_cell"][0], wire["port_cell"][1])
+    corners = [
+        (px - PORT_HALF, py - PORT_HALF),
+        (px + PORT_HALF, py - PORT_HALF),
+        (px + PORT_HALF, py + PORT_HALF),
+        (px - PORT_HALF, py + PORT_HALF),
+    ]
+    for a, b in zip(corners, corners[1:] + corners[:1]):
+        prims.append((a, b, 0.0))
+    if wire["entry"]:
+        ex, ey = _cell_centre(origin, wire["cells"][-1][0], wire["cells"][-1][1])
+        prims.append(((ex, ey), (ex, ey), float(DISK_R)))
+        spur = scene.get("spur")
+        if spur is not None:
+            sx, sy = _cell_centre(origin, spur["cell"][0], spur["cell"][1])
+            length = float(spur["length"])
+            prims.append(
+                (
+                    (sx, sy),
+                    (sx + spur["dir"][0] * length, sy + spur["dir"][1] * length),
+                    WIRE_HALF,
+                )
+            )
+    return prims
+
+
+def _clearance(scene) -> float:
+    entry = _entry_index(scene)
+    mine = _build_primitives(scene, entry)
+    theirs = []
+    for index in range(len(scene["wires"])):
+        if index != entry:
+            theirs.extend(_build_primitives(scene, index))
+    best = float("inf")
+    for a0, a1, ra in mine:
+        for b0, b1, rb in theirs:
+            gap = _segment_distance(a0, a1, b0, b1) - ra - rb
+            if gap < best:
+                best = gap
+    return best
+
+
+def _entry_index(scene) -> int:
+    for index, wire in enumerate(scene["wires"]):
+        if wire["entry"]:
+            return index
+    raise ValueError("scene has no marked wire")
+
+
+# --------------------------------------------------------------------------
+# public interface
+# --------------------------------------------------------------------------
+
+
+def sample_scene(seed: int) -> dict:
+    key = int(seed) & 0x7FFFFFFF
+    rng = random.Random(key * 6364136223846793 % 2147483647 + 17)
+    mode = MODES[key % len(MODES)]
+    want = COLOR_ORDER[(key // len(MODES) + key) % 4]
+
+    for _ in range(600):
+        layout = _layout(rng)
+        if layout is None:
+            continue
+        entry_idx = _pick_entry(rng, layout)
+        if entry_idx is None:
+            continue
+
+        others = [c for c in COLOR_ORDER if c != want]
+        rng.shuffle(others)
+        colors = []
+        pos = 0
+        for index in range(4):
+            if index == entry_idx:
+                colors.append(want)
+            else:
+                colors.append(others[pos])
+                pos += 1
+
+        origin = (
+            45 + rng.randrange(0, 91),
+            45 + rng.randrange(0, 91),
+        )
+        wires = [
+            {
+                "cells": [[c, r] for c, r in layout["routes"][index]],
+                "port_cell": [layout["ports"][index][0], layout["ports"][index][1]],
+                "port_color": colors[index],
+                "entry": index == entry_idx,
+            }
+            for index in range(4)
+        ]
+        scene = {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "origin": [origin[0], origin[1]],
+            "cell": CELL,
+            "grid": GRID,
+            "wires": wires,
+            "spur": None,
+        }
+
+        if mode != "clear":
+            gaps = {
+                "clear_pinch": (17.5,),
+                "near": (2.0, 3.0, 4.0),
+                "quarantine": (7.0, 8.0),
+                "merged": (-4.0,),
+            }[mode]
+            gap = gaps[rng.randrange(len(gaps))]
+            options = _spur_options(layout, entry_idx)
+            if not options:
+                continue
+            choice = options[rng.randrange(len(options))]
+            scene["spur"] = {
+                "cell": choice["cell"],
+                "dir": choice["dir"],
+                "target_wire": choice["target_wire"],
+                "gap": gap,
+                # tip stops gap px short of the neighbour's painted edge:
+                # cell pitch minus both stroke half-widths minus the gap
+                "length": float(CELL) - 2.0 * WIRE_HALF - gap,
+            }
+
+        gap_value = _clearance(scene)
+        band = {
+            "clear": (STRUCTURAL_FLOOR, 60.0),
+            "clear_pinch": (STRUCTURAL_FLOOR, 60.0),
+            "near": (1.5, 4.5),
+            "quarantine": (6.5, 9.0),
+            "merged": (-60.0, -1.0),
+        }[mode]
+        if not band[0] <= gap_value <= band[1]:
+            continue
+        return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BG)
+    draw = ImageDraw.Draw(image)
+    origin = scene["origin"]
+    draw.rectangle(
+        [
+            origin[0] - PANEL_PAD,
+            origin[1] - PANEL_PAD,
+            origin[0] + BOARD + PANEL_PAD - 1,
+            origin[1] + BOARD + PANEL_PAD - 1,
+        ],
+        fill=PANEL,
+    )
+    for wire in scene["wires"]:
+        pts = [_cell_centre(origin, c, r) for c, r in wire["cells"]]
+        draw.line(pts, fill=INK, width=WIRE_WIDTH, joint="curve")
+    spur = scene.get("spur")
+    if spur is not None:
+        sx, sy = _cell_centre(origin, spur["cell"][0], spur["cell"][1])
+        length = float(spur["length"])
+        draw.line(
+            [(sx, sy), (sx + spur["dir"][0] * length, sy + spur["dir"][1] * length)],
+            fill=INK,
+            width=WIRE_WIDTH,
+        )
+    for wire in scene["wires"]:
+        px, py = _cell_centre(origin, wire["port_cell"][0], wire["port_cell"][1])
+        draw.rectangle(
+            [px - PORT_HALF, py - PORT_HALF, px + PORT_HALF, py + PORT_HALF],
+            fill=PORT_COLORS[wire["port_color"]],
+        )
+    for wire in scene["wires"]:
+        if wire["entry"]:
+            ex, ey = _cell_centre(origin, wire["cells"][-1][0], wire["cells"][-1][1])
+            draw.ellipse(
+                [ex - DISK_R, ey - DISK_R, ex + DISK_R, ey + DISK_R], fill=INK
+            )
+    return image
+
+
+def margin(scene: dict) -> float:
+    return round(max(0.0, _clearance(scene)), 6)
+
+
+def analytic_gold(scene: dict) -> str:
+    if margin(scene) < UNCLEAR_TOLERANCE:
+        return "unclear"
+    return scene["wires"][_entry_index(scene)]["port_color"]
+
+
+def is_quarantined(scene: dict) -> bool:
+    return QUARANTINE_LOW <= margin(scene) <= QUARANTINE_HIGH
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabellings of the scene description.
+
+    All four wires are painted in one flat ink colour and occupy disjoint cells,
+    and the port squares never overlap, so the order in which the wires are
+    listed cannot change a single pixel. Analytic gold reads the marked wire's
+    own port colour, which travels with the wire, so both permutations preserve
+    the decision and the margin exactly.
+    """
+    import copy
+
+    out: list[tuple[str, dict]] = []
+
+    reversed_scene = copy.deepcopy(scene)
+    order = list(range(len(scene["wires"])))[::-1]
+    reversed_scene["wires"] = [copy.deepcopy(scene["wires"][i]) for i in order]
+    if reversed_scene.get("spur") is not None:
+        reversed_scene["spur"] = dict(scene["spur"])
+        reversed_scene["spur"]["target_wire"] = order.index(
+            scene["spur"]["target_wire"]
+        )
+    out.append(("wire_list_reversed", reversed_scene))
+
+    rotated = copy.deepcopy(scene)
+    order = list(range(1, len(scene["wires"]))) + [0]
+    rotated["wires"] = [copy.deepcopy(scene["wires"][i]) for i in order]
+    if rotated.get("spur") is not None:
+        rotated["spur"] = dict(scene["spur"])
+        rotated["spur"]["target_wire"] = order.index(scene["spur"]["target_wire"])
+    out.append(("wire_list_rotated", rotated))
+
+    return out

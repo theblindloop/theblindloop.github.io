@@ -1,0 +1,153 @@
+"""Independent pixel-only inverse arm for wall_hop_nearest.
+
+The image path receives only the rendered PNG.  It segments the black ink into
+closed ring components, locates the four coloured dots by hue, decides which
+rings enclose each dot by parity of ring crossings along four axis rays, and
+ranks the candidate dots by the size of the symmetric difference of their
+enclosing ring sets.  It imports no renderer, prompt, generator, verifier or
+analytic-gold code and never sees latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+INK_LEVEL = 100
+MIN_COMPONENT_PIXELS = 150
+CANDIDATE_COLORS = ("red", "blue", "orange")
+HUE_TARGETS = {"red": 0.0, "orange": 36.0, "green": 130.0, "blue": 227.0}
+HUE_TOLERANCE = 18.0
+
+
+def _hue_saturation(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    arr = rgb.astype(np.float64)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    mx = arr.max(axis=2)
+    mn = arr.min(axis=2)
+    delta = mx - mn
+    safe = np.where(delta == 0, 1.0, delta)
+    hue = np.zeros_like(mx)
+    is_r = (mx == r) & (delta > 0)
+    is_g = (mx == g) & (delta > 0) & ~is_r
+    is_b = (mx == b) & (delta > 0) & ~is_r & ~is_g
+    hue[is_r] = (60.0 * ((g - b) / safe))[is_r] % 360.0
+    hue[is_g] = (60.0 * ((b - r) / safe) + 120.0)[is_g]
+    hue[is_b] = (60.0 * ((r - g) / safe) + 240.0)[is_b]
+    saturation = np.where(mx == 0, 0.0, delta / np.where(mx == 0, 1.0, mx))
+    return hue, saturation, mx
+
+
+def _label_ink(ink: np.ndarray) -> tuple[np.ndarray, list[int]]:
+    """Run-based union-find labelling of the 8-connected ink mask."""
+
+    height, width = ink.shape
+    parent: list[int] = []
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> None:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+
+    rows: list[list[tuple[int, int, int]]] = []
+    previous: list[tuple[int, int, int]] = []
+    for y in range(height):
+        row = ink[y]
+        if not row.any():
+            rows.append([])
+            previous = []
+            continue
+        padded = np.concatenate(([False], row, [False]))
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        current: list[tuple[int, int, int]] = []
+        for index in range(0, len(edges), 2):
+            start, stop = int(edges[index]), int(edges[index + 1]) - 1
+            run_id = len(parent)
+            parent.append(run_id)
+            for other_start, other_stop, other_id in previous:
+                if other_start - 1 <= stop and start - 1 <= other_stop:
+                    union(run_id, other_id)
+            current.append((start, stop, run_id))
+        rows.append(current)
+        previous = current
+
+    labels = np.zeros((height, width), dtype=np.int32)
+    roots: dict[int, int] = {}
+    sizes: dict[int, int] = {}
+    for y, row_runs in enumerate(rows):
+        for start, stop, run_id in row_runs:
+            root = find(run_id)
+            label = roots.setdefault(root, len(roots) + 1)
+            labels[y, start : stop + 1] = label
+            sizes[label] = sizes.get(label, 0) + (stop - start + 1)
+    keep = [label for label, size in sorted(sizes.items()) if size >= MIN_COMPONENT_PIXELS]
+    drop = np.isin(labels, [label for label in sizes if label not in set(keep)])
+    labels[drop] = 0
+    return labels, keep
+
+
+def _dot_centres(rgb: np.ndarray) -> dict[str, tuple[int, int]]:
+    hue, saturation, value = _hue_saturation(rgb)
+    coloured = (saturation > 0.35) & (value > 70)
+    centres: dict[str, tuple[int, int]] = {}
+    for name, target in HUE_TARGETS.items():
+        delta = np.abs((hue - target + 180.0) % 360.0 - 180.0)
+        mask = coloured & (delta <= HUE_TOLERANCE)
+        if int(mask.sum()) < 40:
+            raise ValueError(f"cannot locate the {name} dot")
+        ys, xs = np.nonzero(mask)
+        centres[name] = (int(round(float(ys.mean()))), int(round(float(xs.mean()))))
+    return centres
+
+
+def _crossing_counts(sequence: np.ndarray, count: int) -> np.ndarray:
+    if sequence.size == 0:
+        return np.zeros(count + 1, dtype=np.int64)
+    starts = np.concatenate(([sequence[0] != 0], sequence[1:] != sequence[:-1]))
+    hits = sequence[starts & (sequence != 0)]
+    return np.bincount(hits, minlength=count + 1)
+
+
+def _enclosing(labels: np.ndarray, keep: list[int], centre: tuple[int, int]) -> frozenset[int]:
+    y, x = centre
+    rays = [
+        labels[y, x:],
+        labels[y, : x + 1][::-1],
+        labels[y:, x],
+        labels[: y + 1, x][::-1],
+    ]
+    votes = [set() for _ in rays]
+    high = int(labels.max()) if labels.size else 0
+    for index, ray in enumerate(rays):
+        counts = _crossing_counts(np.ascontiguousarray(ray), high)
+        for label in keep:
+            if counts[label] % 2 == 1:
+                votes[index].add(label)
+    if any(vote != votes[0] for vote in votes[1:]):
+        raise ValueError("ring enclosure is ambiguous along the axis rays")
+    return frozenset(votes[0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Rank red, blue and orange by their ring-crossing cost from the green dot."""
+
+    rgb = np.asarray(image.convert("RGB"))
+    ink = rgb.max(axis=2) < INK_LEVEL
+    labels, keep = _label_ink(ink)
+    if len(keep) < 2:
+        raise ValueError("fewer than two ring components were segmented")
+    centres = _dot_centres(rgb)
+    green = _enclosing(labels, keep, centres["green"])
+    costs = {
+        color: len(green ^ _enclosing(labels, keep, centres[color]))
+        for color in CANDIDATE_COLORS
+    }
+    if len(set(costs.values())) != len(costs):
+        raise ValueError("two candidate dots have the same crossing cost")
+    return "|".join(sorted(CANDIDATE_COLORS, key=lambda color: (costs[color], color)))

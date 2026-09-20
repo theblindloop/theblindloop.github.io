@@ -1,0 +1,111 @@
+"""Independent pixel-only inverse for straight-continuation search.
+
+This module knows only the public visual contract: orange frames delimit the
+four labeled panels, and each panel contains two navy fragments.  It discovers
+those objects from raster colors, fits both fragments by PCA, and ranks all
+panels.  It receives no latent scene and imports no forward-world module.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+FRAME_RGB = np.array((224, 111, 45), dtype=np.int32)
+INK_RGB = np.array((35, 51, 70), dtype=np.int32)
+LABELS = ("A", "B", "C", "D")
+
+
+def _mask_near(array: np.ndarray, color: np.ndarray, radius: float) -> np.ndarray:
+    # int32 avoids overflow when three squared 8-bit channel deltas are summed.
+    delta = array.astype(np.int32) - color
+    return np.sum(delta * delta, axis=2) <= radius * radius
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return component coordinates as (y,x) arrays under 8-connectivity."""
+    work = mask.copy()
+    height, width = work.shape
+    found: list[np.ndarray] = []
+    for start_y, start_x in zip(*np.nonzero(work), strict=True):
+        if not work[start_y, start_x]:
+            continue
+        work[start_y, start_x] = False
+        queue = deque([(int(start_y), int(start_x))])
+        pixels = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    yy, xx = y + dy, x + dx
+                    if 0 <= yy < height and 0 <= xx < width and work[yy, xx]:
+                        work[yy, xx] = False
+                        queue.append((yy, xx))
+        found.append(np.asarray(pixels, dtype=np.float64))
+    return found
+
+
+def _line_fit(component: np.ndarray, x_offset: int, y_offset: int) -> tuple[float, float]:
+    points = np.column_stack(
+        (component[:, 1] + float(x_offset), component[:, 0] + float(y_offset))
+    )
+    center = points.mean(axis=0)
+    covariance = np.cov(points - center, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    if direction[0] < 0:
+        direction = -direction
+    if abs(direction[0]) < 0.25:
+        raise ValueError("fragment is too close to vertical for the public path contract")
+    angle = math.degrees(math.atan2(float(direction[1]), float(direction[0]))) % 180.0
+    slope = float(direction[1] / direction[0])
+    return angle, float(center[1] - slope * center[0])
+
+
+def _panel_score(array: np.ndarray, bounds: tuple[int, int, int, int]) -> float:
+    x0, y0, x1, y1 = bounds
+    inset = 7
+    crop = array[y0 + inset : y1 - inset + 1, x0 + inset : x1 - inset + 1]
+    ink = _mask_near(crop, INK_RGB, 68.0)
+    fragments = [component for component in _components(ink) if len(component) >= 120]
+    if len(fragments) != 2:
+        raise ValueError(f"expected two segment components, found {len(fragments)}")
+    fragments.sort(key=lambda component: float(component[:, 1].mean()))
+    fits = [
+        _line_fit(component, x0 + inset, y0 + inset)
+        for component in fragments
+    ]
+    (left_angle, left_intercept), (right_angle, right_intercept) = fits
+    angle_gap = abs(left_angle - right_angle)
+    angle_gap = min(angle_gap, 180.0 - angle_gap)
+    center_x = (x0 + x1) / 2.0
+    left_y = math.tan(math.radians(left_angle)) * center_x + left_intercept
+    right_y = math.tan(math.radians(right_angle)) * center_x + right_intercept
+    return angle_gap + abs(left_y - right_y)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    frame_mask = _mask_near(array, FRAME_RGB, 58.0)
+    frame_components = []
+    for component in _components(frame_mask):
+        if len(component) < 500:
+            continue
+        y0, x0 = component.min(axis=0).astype(int)
+        y1, x1 = component.max(axis=0).astype(int)
+        if x1 - x0 > 180 and y1 - y0 > 105:
+            frame_components.append((x0, y0, x1, y1))
+    if len(frame_components) != 4:
+        raise ValueError(f"expected four visible panel frames, found {len(frame_components)}")
+    frame_components.sort(key=lambda box: ((box[1] + box[3]) // 80, box[0]))
+    scores = [_panel_score(array, bounds) for bounds in frame_components]
+    order = sorted(range(4), key=scores.__getitem__)
+    if scores[order[1]] - scores[order[0]] < 4.0:
+        raise ValueError("pixel decision is ambiguous: insufficient runner-up gap")
+    return LABELS[order[0]]

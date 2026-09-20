@@ -1,0 +1,131 @@
+"""Independent image-only inverse for the polar annulus question world."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+GRID_N = 8
+MIN_MARGIN = 4
+
+
+class OracleAbstention(ValueError):
+    """Raised when visible fiducials or transformed evidence are ambiguous."""
+
+
+def _luminance(pixels: np.ndarray) -> np.ndarray:
+    values = pixels.astype(np.float32)
+    return 0.2126 * values[..., 0] + 0.7152 * values[..., 1] + 0.0722 * values[..., 2]
+
+
+def _sample_patch(luma: np.ndarray, x: float, y: float, radius: int = 2) -> float:
+    ix, iy = int(round(x)), int(round(y))
+    if ix - radius < 0 or iy - radius < 0 or ix + radius >= luma.shape[1] or iy + radius >= luma.shape[0]:
+        raise OracleAbstention("sample point lies outside the raster")
+    return float(np.median(luma[iy - radius : iy + radius + 1, ix - radius : ix + radius + 1]))
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    if len(values) == 0:
+        return []
+    groups = []
+    start = previous = int(values[0])
+    for value in values[1:]:
+        value = int(value)
+        if value != previous + 1:
+            groups.append((start, previous))
+            start = value
+        previous = value
+    groups.append((start, previous))
+    return groups
+
+
+def _reference_masks(arr: np.ndarray, luma: np.ndarray) -> list[np.ndarray]:
+    # Coral frames are invariant fiducials. Detect their x-runs rather than use
+    # canvas coordinates, then infer each enclosed 8-by-8 sampling lattice.
+    coral = (arr[..., 0] > 190) & (arr[..., 1] < 105) & (arr[..., 2] > 95) & (arr[..., 2] < 165)
+    x_runs = [(a, b) for a, b in _runs(np.flatnonzero(coral.any(axis=0))) if b - a > 80]
+    if len(x_runs) != 4:
+        raise OracleAbstention(f"expected four visible reference frames, found {len(x_runs)}")
+    masks = []
+    for xmin, xmax in sorted(x_runs):
+        ys = np.flatnonzero(coral[:, xmin : xmax + 1].any(axis=1))
+        if len(ys) == 0:
+            raise OracleAbstention("reference frame has no vertical extent")
+        ymin, ymax = int(ys.min()), int(ys.max())
+        inner_left, inner_right = xmin + 4.0, xmax - 4.0
+        inner_top, inner_bottom = ymin + 4.0, ymax - 4.0
+        if min(inner_right - inner_left, inner_bottom - inner_top) < 80:
+            raise OracleAbstention("reference frame is too small")
+        mask = np.zeros((GRID_N, GRID_N), dtype=bool)
+        for row in range(GRID_N):
+            for column in range(GRID_N):
+                x = inner_left + (column + 0.5) * (inner_right - inner_left) / GRID_N
+                y = inner_top + (row + 0.5) * (inner_bottom - inner_top) / GRID_N
+                mask[row, column] = _sample_patch(luma, x, y, 1) < 145.0
+        if int(mask.sum()) != 16 or not np.all(mask.sum(axis=0) == 2) or not np.all(mask.sum(axis=1) == 2):
+            raise OracleAbstention("a reference pattern violates the visible balanced-grid construction")
+        masks.append(mask)
+    if len({mask.tobytes() for mask in masks}) != 4:
+        raise OracleAbstention("reference patterns are not distinct")
+    return masks
+
+
+def _polar_mask(arr: np.ndarray, luma: np.ndarray) -> np.ndarray:
+    cyan = (arr[..., 0] < 80) & (arr[..., 1] > 130) & (arr[..., 2] > 160)
+    cy_pixels, cx_pixels = np.nonzero(cyan)
+    if len(cx_pixels) < 80:
+        raise OracleAbstention("cyan center fiducial is missing")
+    cx, cy = float(cx_pixels.mean()), float(cy_pixels.mean())
+
+    gold = (arr[..., 0] > 195) & (arr[..., 1] > 125) & (arr[..., 1] < 205) & (arr[..., 2] < 95)
+    gy, gx = np.nonzero(gold)
+    if len(gx) < 300:
+        raise OracleAbstention("gold cut spoke is missing")
+    dx = gx.astype(np.float64) - cx
+    dy = gy.astype(np.float64) - cy
+    radii = np.hypot(dx, dy)
+    keep = radii > 25.0
+    if int(keep.sum()) < 250:
+        raise OracleAbstention("gold spoke has insufficient radial support")
+    dx, dy, radii = dx[keep], dy[keep], radii[keep]
+    seam = math.atan2(float(dy.mean()), float(dx.mean()))
+    inner, outer = float(radii.min()), float(radii.max())
+    if outer - inner < 120.0:
+        raise OracleAbstention("inferred annulus is too narrow")
+
+    recovered = np.zeros((GRID_N, GRID_N), dtype=bool)
+    for row in range(GRID_N):
+        radius = outer - (row + 0.5) * (outer - inner) / GRID_N
+        for column in range(GRID_N):
+            angle = seam + (column + 0.5) * 2.0 * math.pi / GRID_N
+            x = cx + radius * math.cos(angle)
+            y = cy + radius * math.sin(angle)
+            recovered[row, column] = _sample_patch(luma, x, y) < 145.0
+    return recovered
+
+
+def analyze_image(image: Image.Image) -> tuple[str, float, tuple[int, ...]]:
+    """Return (A-D decision, runner-up margin, four Hamming scores)."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or min(arr.shape[:2]) < 128:
+        raise OracleAbstention("unsupported raster")
+    luma = _luminance(arr)
+    references = _reference_masks(arr, luma)
+    recovered = _polar_mask(arr, luma)
+    scores = tuple(int(np.count_nonzero(recovered != reference)) for reference in references)
+    order = sorted(range(4), key=lambda index: (scores[index], index))
+    margin = float(scores[order[1]] - scores[order[0]])
+    if scores[order[0]] > 4 or margin < MIN_MARGIN:
+        raise OracleAbstention(
+            f"ambiguous transformed pattern: best={scores[order[0]]}, margin={margin:g}"
+        )
+    return "ABCD"[order[0]], margin, scores
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the answer from raster pixels and the visible/public rules only."""
+    return analyze_image(image)[0]
+

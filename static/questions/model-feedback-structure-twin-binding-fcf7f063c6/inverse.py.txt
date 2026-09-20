@@ -1,0 +1,205 @@
+"""Image-only inverse arm for the structure-twin binding world.
+
+Receives a rendered PNG and nothing else.  It segments the flat dot fills and
+the flat link ink in each panel, decides adjacency by testing whether the whole
+sight line between two dot centres is inked, recovers the correspondence
+between the two drawn networks by structural search, and reports the colour of
+the dot that the black-ringed dot maps onto.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_DIVIDER_X = 800
+
+_NODE = (152, 160, 172)
+_EDGE = (58, 62, 72)
+_RING = (12, 12, 14)
+_PALETTE = {
+    "red": (206, 46, 40),
+    "blue": (34, 78, 200),
+    "green": (26, 136, 60),
+    "orange": (232, 142, 16),
+}
+
+_BLOB_RADIUS = 45.0
+_MIN_BLOB_AREA = 700
+_MIN_RING_AREA = 900
+_EXCLUDE_R = 46.0
+_PROBE = 4
+_SAMPLE_STEP = 3.0
+
+
+class OracleAbstention(ValueError):
+    """Raised when the raster does not legibly express the decision."""
+
+
+def _mask(array: np.ndarray, colour) -> np.ndarray:
+    return (
+        (array[:, :, 0] == colour[0])
+        & (array[:, :, 1] == colour[1])
+        & (array[:, :, 2] == colour[2])
+    )
+
+
+def _blobs(mask: np.ndarray, min_area: int) -> list[tuple[float, float, int]]:
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return []
+    points = np.stack([xs.astype(float), ys.astype(float)], axis=1)
+    alive = np.ones(points.shape[0], dtype=bool)
+    found: list[tuple[float, float, int]] = []
+    while alive.any():
+        index = int(np.argmax(alive))
+        centre = points[index]
+        selection = alive.copy()
+        for _ in range(3):
+            distance = np.hypot(points[:, 0] - centre[0], points[:, 1] - centre[1])
+            selection = alive & (distance <= _BLOB_RADIUS)
+            if not selection.any():
+                break
+            centre = points[selection].mean(axis=0)
+        if not selection.any():
+            alive[index] = False
+            continue
+        count = int(selection.sum())
+        if count >= min_area:
+            found.append((float(centre[0]), float(centre[1]), count))
+        alive &= ~selection
+    found.sort(key=lambda item: (round(item[1]), round(item[0])))
+    return found
+
+
+def _covered(ink: np.ndarray, x: float, y: float) -> bool:
+    height, width = ink.shape
+    x0 = max(0, int(round(x)) - _PROBE)
+    x1 = min(width, int(round(x)) + _PROBE + 1)
+    y0 = max(0, int(round(y)) - _PROBE)
+    y1 = min(height, int(round(y)) + _PROBE + 1)
+    if x0 >= x1 or y0 >= y1:
+        return False
+    return bool(ink[y0:y1, x0:x1].any())
+
+
+def _adjacent(ink: np.ndarray, a, b) -> bool:
+    ax, ay = a
+    bx, by = b
+    length = float(np.hypot(bx - ax, by - ay))
+    if length <= 2.0 * _EXCLUDE_R + 4.0:
+        raise OracleAbstention("dot centres are too close to test for a link")
+    lo = _EXCLUDE_R / length
+    hi = 1.0 - lo
+    steps = max(6, int((hi - lo) * length / _SAMPLE_STEP))
+    misses = 0
+    for k in range(steps + 1):
+        t = lo + (hi - lo) * k / steps
+        if not _covered(ink, ax + t * (bx - ax), ay + t * (by - ay)):
+            misses += 1
+            if misses >= 2:
+                return False
+    return True
+
+
+def _panel_graph(array: np.ndarray, x_lo: int, x_hi: int):
+    view = array[:, x_lo:x_hi]
+    ink = _mask(view, _EDGE)
+    nodes: list[tuple[float, float]] = []
+    labels: list[str | None] = []
+    for centre in _blobs(_mask(view, _NODE), _MIN_BLOB_AREA):
+        nodes.append((centre[0], centre[1]))
+        labels.append(None)
+    for name, rgb in sorted(_PALETTE.items()):
+        for centre in _blobs(_mask(view, rgb), _MIN_BLOB_AREA):
+            nodes.append((centre[0], centre[1]))
+            labels.append(name)
+    order = sorted(range(len(nodes)), key=lambda i: (round(nodes[i][1]), round(nodes[i][0])))
+    nodes = [nodes[i] for i in order]
+    labels = [labels[i] for i in order]
+    n = len(nodes)
+    adjacency = [set() for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _adjacent(ink, nodes[i], nodes[j]):
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+    ring_index = None
+    ring_mask = _mask(view, _RING)
+    if int(ring_mask.sum()) >= _MIN_RING_AREA:
+        ys, xs = np.nonzero(ring_mask)
+        centre = ((float(xs.min()) + float(xs.max())) / 2.0, (float(ys.min()) + float(ys.max())) / 2.0)
+        best = min(
+            range(n),
+            key=lambda i: (nodes[i][0] - centre[0]) ** 2 + (nodes[i][1] - centre[1]) ** 2,
+        )
+        if (nodes[best][0] - centre[0]) ** 2 + (nodes[best][1] - centre[1]) ** 2 <= 144.0:
+            ring_index = best
+    return nodes, labels, adjacency, ring_index
+
+
+def _all_isomorphisms(adj_a, adj_b, limit: int = 8) -> list[dict[int, int]]:
+    n = len(adj_a)
+    if len(adj_b) != n:
+        return []
+    deg_a = [len(adj_a[i]) for i in range(n)]
+    deg_b = [len(adj_b[i]) for i in range(n)]
+    if sorted(deg_a) != sorted(deg_b):
+        return []
+    order = sorted(range(n), key=lambda i: -deg_a[i])
+    mapping: dict[int, int] = {}
+    used = [False] * n
+    solutions: list[dict[int, int]] = []
+
+    def backtrack(pos: int) -> None:
+        if len(solutions) >= limit:
+            return
+        if pos == n:
+            solutions.append(dict(mapping))
+            return
+        u = order[pos]
+        for w in range(n):
+            if used[w] or deg_b[w] != deg_a[u]:
+                continue
+            ok = True
+            for x, y in mapping.items():
+                if (x in adj_a[u]) != (y in adj_b[w]):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            mapping[u] = w
+            used[w] = True
+            backtrack(pos + 1)
+            del mapping[u]
+            used[w] = False
+            if len(solutions) >= limit:
+                return
+
+    backtrack(0)
+    return solutions
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+    width = array.shape[1]
+    left = _panel_graph(array, 0, _DIVIDER_X - 4)
+    right = _panel_graph(array, _DIVIDER_X + 4, width)
+    left_nodes, _, left_adj, ring = left
+    right_nodes, right_labels, right_adj, _ = right
+    if len(left_nodes) != len(right_nodes):
+        raise OracleAbstention("panels hold different dot counts")
+    if ring is None:
+        raise OracleAbstention("no ringed dot found in the left panel")
+    solutions = _all_isomorphisms(left_adj, right_adj)
+    if not solutions:
+        raise OracleAbstention("no structural correspondence between the panels")
+    answers = set()
+    for mapping in solutions:
+        label = right_labels[mapping[ring]]
+        if label is None:
+            raise OracleAbstention("correspondence lands on an uncoloured dot")
+        answers.add(label)
+    if len(answers) != 1:
+        raise OracleAbstention(f"correspondence is ambiguous: {sorted(answers)}")
+    return answers.pop()

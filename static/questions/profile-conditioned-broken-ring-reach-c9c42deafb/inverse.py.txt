@@ -1,0 +1,111 @@
+"""Independent pixel-only inverse arm for the broken-ring reachability world.
+
+This module never sees the latent scene. It receives one rasterised PNG and
+reconstructs the decision by segmenting the fixed world palette, labelling the
+4-connected components of the ink, locating the two dark markers, and asking
+whether the ink surrounding the two markers carries the same component label.
+
+It shares no geometry code with the renderer: there is no curve model, no arc
+length, no gap parameter here - only pixels, colour distance, and a union-find
+over the ink mask.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "broken_ring_reach-oracle-0.1.0"
+
+# The world palette is public (declared in the question contract): white paper,
+# one ink colour, near-black markers.
+PALETTE = ((255, 255, 255), (28, 82, 196), (17, 17, 17))
+NEIGHBOURHOOD_PX = 11.0
+MIN_COMPONENT_PX = 60
+MIN_MARKER_PX = 25
+
+
+def _label_nearest(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    stack = [
+        ((array - np.array(colour, dtype=np.float32)) ** 2).sum(axis=-1) for colour in PALETTE
+    ]
+    return np.stack(stack, axis=-1).argmin(axis=-1)
+
+
+def _components(mask: np.ndarray) -> np.ndarray:
+    """Two-pass 4-connected labelling with union-find (0 means background)."""
+    height, width = mask.shape
+    flat = [0] * (height * width)
+    parent = [0]
+
+    def find(node: int) -> int:
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left != right:
+            parent[max(left, right)] = min(left, right)
+
+    rows, columns = np.nonzero(mask)
+    for row, column in zip(rows.tolist(), columns.tolist()):
+        offset = row * width + column
+        up = flat[offset - width] if row else 0
+        left = flat[offset - 1] if column else 0
+        if up and left:
+            flat[offset] = min(up, left)
+            union(up, left)
+        elif up or left:
+            flat[offset] = up or left
+        else:
+            parent.append(len(parent))
+            flat[offset] = len(parent) - 1
+    lookup = np.array([find(index) for index in range(len(parent))], dtype=np.int32)
+    return lookup[np.array(flat, dtype=np.int32)].reshape(height, width)
+
+
+def _marker_centroids(marker_mask: np.ndarray) -> list[tuple[float, float]]:
+    labelled = _components(marker_mask)
+    centroids = []
+    for value in np.unique(labelled):
+        if value == 0:
+            continue
+        rows, columns = np.nonzero(labelled == value)
+        if rows.size < MIN_MARKER_PX:
+            continue
+        centroids.append((float(columns.mean()), float(rows.mean())))
+    return sorted(centroids)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return "same" or "different" from the final pixels alone."""
+    labels = _label_nearest(image)
+    ink_mask = labels == 1
+    marker_mask = labels == 2
+    centroids = _marker_centroids(marker_mask)
+    if len(centroids) != 2:
+        raise ValueError(f"expected exactly two markers, measured {len(centroids)}")
+
+    ink_labels = _components(ink_mask)
+    sizes = np.bincount(ink_labels.reshape(-1))
+    height, width = ink_mask.shape
+    rows = np.arange(height, dtype=np.float64)[:, None]
+    columns = np.arange(width, dtype=np.float64)[None, :]
+
+    owners = []
+    for centre_x, centre_y in centroids:
+        near = (columns - centre_x) ** 2 + (rows - centre_y) ** 2 <= NEIGHBOURHOOD_PX**2
+        candidates = ink_labels[near & ink_mask]
+        candidates = candidates[[sizes[value] >= MIN_COMPONENT_PX for value in candidates]]
+        if candidates.size == 0:
+            raise ValueError("marker has no ink in its neighbourhood")
+        values, counts = np.unique(candidates, return_counts=True)
+        if values.size > 1 and counts.max() < 0.9 * counts.sum():
+            raise ValueError("marker neighbourhood touches several ink pieces")
+        owners.append(int(values[counts.argmax()]))
+    return "same" if owners[0] == owners[1] else "different"

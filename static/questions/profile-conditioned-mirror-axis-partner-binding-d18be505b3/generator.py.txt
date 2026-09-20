@@ -1,0 +1,283 @@
+"""Mirror-axis partner binding: latent scene sampling, rendering, analytic gold.
+
+A single black straight line crosses the canvas. On one side of it sit five
+coloured disks; on the other side sit five identical gray squares. Four of the
+squares are centred exactly on the mirror image of a disk across the line. The
+fifth square is displaced, so exactly one disk has no square on its mirror
+image. The decision is that disk's colour.
+
+The correspondence is purely geometric (reflection across a drawn oblique axis)
+and carries no colour information: every square looks the same, so the colour
+can only be read after the reflection assignment is solved.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "mirror_axis_partner_binding-0.1.0"
+
+WIDTH = 640
+HEIGHT = 480
+BACKGROUND = (255, 255, 255)
+
+COLOR_NAMES = ("red", "blue", "green", "orange", "purple")
+COLOR_RGB = {
+    "red": (214, 38, 38),
+    "blue": (36, 68, 214),
+    "green": (26, 146, 58),
+    "orange": (242, 148, 16),
+    "purple": (138, 46, 190),
+}
+
+DISK_RADIUS = 15
+SQUARE_HALF = 13
+LINE_RGB = (0, 0, 0)
+LINE_WIDTH = 3
+SQUARE_RGB = (110, 110, 110)
+SUPERSAMPLE = 3
+
+# Sampling / validity constants.
+N_PAIRS = 5
+MIN_LINE_CLEARANCE = 30.0  # centre-to-axis distance for every drawn shape
+MIN_SHAPE_SPACING = 66.0  # centre-to-centre spacing inside one side
+MIN_SQUARE_SPACING = 40.0  # centre-to-centre spacing between gray squares
+CANVAS_MARGIN = 26.0
+DISPLACEMENT_RANGE = (16.0, 46.0)
+MIN_DECOY_CLEARANCE = 16.0  # displaced square must stay clear of every mirror image
+QUARANTINE_MARGIN = 14.0
+QUARANTINE_CLEARANCE = 22.0
+
+
+# --------------------------------------------------------------------------
+# geometry helpers (operate on plain floats so scenes survive a JSON round-trip)
+# --------------------------------------------------------------------------
+def _axis(scene: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return (point, unit normal) of the mirror axis."""
+    px, py = scene["line_point"]
+    angle = float(scene["line_angle"])
+    normal = (-math.sin(angle), math.cos(angle))
+    return (float(px), float(py)), normal
+
+
+def _side(scene: dict, point) -> float:
+    (px, py), (nx, ny) = _axis(scene)
+    return (float(point[0]) - px) * nx + (float(point[1]) - py) * ny
+
+
+def _mirror(scene: dict, point) -> tuple[float, float]:
+    (_, _), (nx, ny) = _axis(scene)
+    s = _side(scene, point)
+    return (float(point[0]) - 2.0 * s * nx, float(point[1]) - 2.0 * s * ny)
+
+
+def _dist(a, b) -> float:
+    return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+def _nearest_square_distance(scene: dict, disk) -> float:
+    image = _mirror(scene, disk)
+    return min(_dist(image, square) for square in scene["squares"])
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _try_sample(rng: random.Random) -> dict | None:
+    angle = rng.uniform(0.0, math.pi)
+    point = (
+        round(WIDTH / 2 + rng.uniform(-40.0, 40.0), 2),
+        round(HEIGHT / 2 + rng.uniform(-30.0, 30.0), 2),
+    )
+    probe = {"line_point": list(point), "line_angle": angle}
+
+    disks: list[tuple[float, float]] = []
+    for _ in range(4000):
+        if len(disks) == N_PAIRS:
+            break
+        cand = (
+            round(rng.uniform(CANVAS_MARGIN, WIDTH - CANVAS_MARGIN), 2),
+            round(rng.uniform(CANVAS_MARGIN, HEIGHT - CANVAS_MARGIN), 2),
+        )
+        if _side(probe, cand) < MIN_LINE_CLEARANCE:
+            continue
+        image = _mirror(probe, cand)
+        if not (CANVAS_MARGIN <= image[0] <= WIDTH - CANVAS_MARGIN):
+            continue
+        if not (CANVAS_MARGIN <= image[1] <= HEIGHT - CANVAS_MARGIN):
+            continue
+        if any(_dist(cand, other) < MIN_SHAPE_SPACING for other in disks):
+            continue
+        images = [_mirror(probe, other) for other in disks]
+        if any(_dist(image, other) < MIN_SHAPE_SPACING for other in images):
+            continue
+        disks.append(cand)
+    if len(disks) != N_PAIRS:
+        return None
+
+    mirrors = [_mirror(probe, disk) for disk in disks]
+    odd = rng.randrange(N_PAIRS)
+    squares: list[tuple[float, float]] | None = None
+    for _ in range(600):
+        theta = rng.uniform(0.0, 2.0 * math.pi)
+        radius = rng.uniform(*DISPLACEMENT_RANGE)
+        moved = (
+            round(mirrors[odd][0] + radius * math.cos(theta), 2),
+            round(mirrors[odd][1] + radius * math.sin(theta), 2),
+        )
+        if not (CANVAS_MARGIN <= moved[0] <= WIDTH - CANVAS_MARGIN):
+            continue
+        if not (CANVAS_MARGIN <= moved[1] <= HEIGHT - CANVAS_MARGIN):
+            continue
+        if _side(probe, moved) > -MIN_LINE_CLEARANCE:
+            continue
+        others = [image for index, image in enumerate(mirrors) if index != odd]
+        if any(_dist(moved, other) < MIN_SQUARE_SPACING for other in others):
+            continue
+        if min(_dist(moved, image) for image in mirrors) < MIN_DECOY_CLEARANCE:
+            continue
+        squares = [
+            (round(image[0], 2), round(image[1], 2)) if index != odd else moved
+            for index, image in enumerate(mirrors)
+        ]
+        break
+    if squares is None:
+        return None
+
+    palette = list(COLOR_NAMES)
+    rng.shuffle(palette)
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "line_point": [point[0], point[1]],
+        "line_angle": angle,
+        "disks": [[disk[0], disk[1], name] for disk, name in zip(disks, palette)],
+        "squares": [[square[0], square[1]] for square in squares],
+    }
+    if is_quarantined(scene):
+        return None
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one latent scene."""
+    rng = random.Random(seed)
+    for _ in range(400):
+        scene = _try_sample(rng)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"could not sample a valid scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    """Render I = R(z). Shapes are supersampled; the axis is drawn aliased at 1x
+    so that no neutral-gray edge ramp can be confused with the gray squares."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    ss = SUPERSAMPLE
+    image = Image.new("RGB", (width * ss, height * ss), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for cx, cy in scene["squares"]:
+        box = [
+            (float(cx) - SQUARE_HALF) * ss,
+            (float(cy) - SQUARE_HALF) * ss,
+            (float(cx) + SQUARE_HALF) * ss,
+            (float(cy) + SQUARE_HALF) * ss,
+        ]
+        draw.rectangle(box, fill=SQUARE_RGB)
+    for cx, cy, name in scene["disks"]:
+        box = [
+            (float(cx) - DISK_RADIUS) * ss,
+            (float(cy) - DISK_RADIUS) * ss,
+            (float(cx) + DISK_RADIUS) * ss,
+            (float(cy) + DISK_RADIUS) * ss,
+        ]
+        draw.ellipse(box, fill=COLOR_RGB[name])
+    image = image.resize((width, height), Image.LANCZOS)
+
+    (px, py), _ = _axis(scene)
+    angle = float(scene["line_angle"])
+    reach = float(width + height)
+    dx, dy = math.cos(angle), math.sin(angle)
+    ImageDraw.Draw(image).line(
+        [
+            (round(px - reach * dx), round(py - reach * dy)),
+            (round(px + reach * dx), round(py + reach * dy)),
+        ],
+        fill=LINE_RGB,
+        width=LINE_WIDTH,
+    )
+    return image
+
+
+# --------------------------------------------------------------------------
+# analytic gold, margin, quarantine, symmetries
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    """Colour of the unique disk whose mirror image carries no gray square."""
+    ranked = sorted(
+        ((_nearest_square_distance(scene, disk[:2]), disk[2]) for disk in scene["disks"]),
+        key=lambda item: -item[0],
+    )
+    return ranked[0][1]
+
+
+def margin(scene: dict) -> float:
+    """One-sided decision margin in pixels: how far the unmatched disk's mirror
+    image sits from the nearest gray square, minus the worst matched residual."""
+    distances = sorted(
+        (_nearest_square_distance(scene, disk[:2]) for disk in scene["disks"]), reverse=True
+    )
+    return float(distances[0] - distances[1])
+
+
+def clearance(scene: dict) -> float:
+    """Smallest centre-to-axis distance over every drawn shape."""
+    points = [disk[:2] for disk in scene["disks"]] + [list(sq) for sq in scene["squares"]]
+    return float(min(abs(_side(scene, point)) for point in points))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Finite-resolution boundary cases excluded from headline claims."""
+    if margin(scene) < QUARANTINE_MARGIN:
+        return True
+    if clearance(scene) < QUARANTINE_CLEARANCE:
+        return True
+    squares = [tuple(square) for square in scene["squares"]]
+    for i in range(len(squares)):
+        for j in range(i + 1, len(squares)):
+            if _dist(squares[i], squares[j]) < MIN_SQUARE_SPACING - 6.0:
+                return True
+    disks = [tuple(disk[:2]) for disk in scene["disks"]]
+    for i in range(len(disks)):
+        for j in range(i + 1, len(disks)):
+            if _dist(disks[i], disks[j]) < MIN_SHAPE_SPACING - 6.0:
+                return True
+    return False
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Declared pixel-identical latent aliases.
+
+    The disks and the squares are unordered sets carried as lists. Because no two
+    drawn shapes overlap, draw order is invisible, so rotating either list yields
+    a different latent scene with a byte-identical raster and the same gold.
+    """
+    aliases: list[tuple[str, dict]] = []
+    disks = list(scene["disks"])
+    if len(disks) > 1:
+        rotated = dict(scene)
+        rotated["disks"] = disks[1:] + disks[:1]
+        aliases.append(("rotate_disk_list", rotated))
+    squares = list(scene["squares"])
+    if len(squares) > 1:
+        rotated = dict(scene)
+        rotated["squares"] = squares[1:] + squares[:1]
+        aliases.append(("rotate_square_list", rotated))
+    return aliases

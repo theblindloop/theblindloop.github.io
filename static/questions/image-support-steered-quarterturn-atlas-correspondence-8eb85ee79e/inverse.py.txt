@@ -1,0 +1,153 @@
+"""Independent image-only inverse arm for quarter-turn landmark atlases."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+_WHITE = np.array((255, 255, 255), dtype=np.uint8)
+_LANDMARK = np.array((35, 38, 43), dtype=np.uint8)
+_TAG_COLORS = {
+    (105, 119, 132): "reference",
+    (242, 177, 40): "amber",
+    (25, 174, 190): "cyan",
+    (146, 82, 184): "violet",
+}
+_SHAPES = ("circle", "square", "triangle", "plus")
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for start_y, start_x in np.argwhere(mask):
+        sy, sx = int(start_y), int(start_x)
+        if visited[sy, sx]:
+            continue
+        visited[sy, sx] = True
+        stack = [(sy, sx)]
+        points = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _box(component: np.ndarray) -> tuple[int, int, int, int, int, float, float]:
+    ys = component[:, 0]
+    xs = component[:, 1]
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    return x0, y0, width, height, len(component), (x0 + x1) / 2.0, (y0 + y1) / 2.0
+
+
+def _tag_anchors(array: np.ndarray) -> list[tuple[str, float, float]]:
+    anchors = []
+    for rgb, name in _TAG_COLORS.items():
+        mask = np.all(array == np.asarray(rgb, dtype=np.uint8), axis=2)
+        components = _components(mask)
+        if len(components) != 1:
+            raise ValueError(f"missing or fragmented {name} tag")
+        _, _, width, height, area, cx, cy = _box(components[0])
+        if (width, height, area) != (31, 17, 527):
+            raise ValueError(f"malformed {name} tag")
+        anchors.append((name, cx, cy))
+    if {name for name, _, _ in anchors} != {"reference", "amber", "cyan", "violet"}:
+        raise ValueError("tag inventory is incomplete")
+    return anchors
+
+
+def _shape_name(component: np.ndarray) -> tuple[str, float, float]:
+    _, _, width, height, area, cx, cy = _box(component)
+    if not (15 <= width <= 23 and 15 <= height <= 23 and 180 <= area <= 360):
+        raise ValueError("malformed landmark component")
+    fill = area / float(width * height)
+    if fill > 0.92:
+        name = "square"
+    elif fill > 0.70:
+        name = "circle"
+    elif fill > 0.58:
+        name = "plus"
+    elif fill > 0.44:
+        name = "triangle"
+    else:
+        raise ValueError("unrecognized landmark shape")
+    return name, cx, cy
+
+
+def _extract_layouts(array: np.ndarray, anchors: list[tuple[str, float, float]]) -> dict[str, dict[str, tuple[float, float]]]:
+    mask = np.all(array == _LANDMARK, axis=2)
+    components = _components(mask)
+    if len(components) != 16:
+        raise ValueError("expected sixteen separated landmark components")
+    groups: dict[str, dict[str, tuple[float, float]]] = {name: {} for name, _, _ in anchors}
+    anchor_rows = [(name, x, y + 70.0) for name, x, y in anchors]
+    for component in components:
+        shape, cx, cy = _shape_name(component)
+        distances = [((cx - ax) ** 2 + (cy - ay) ** 2, name) for name, ax, ay in anchor_rows]
+        distance, group = min(distances)
+        if distance > 75.0**2:
+            raise ValueError("landmark is not visibly associated with a tag")
+        if shape in groups[group]:
+            raise ValueError("cluster repeats a landmark identity")
+        groups[group][shape] = (cx, cy)
+    if any(set(layout) != set(_SHAPES) for layout in groups.values()):
+        raise ValueError("cluster shape inventory is incomplete")
+    return groups
+
+
+def _centered(layout: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
+    mean_x = sum(layout[shape][0] for shape in _SHAPES) / len(_SHAPES)
+    mean_y = sum(layout[shape][1] for shape in _SHAPES) / len(_SHAPES)
+    return {shape: (layout[shape][0] - mean_x, layout[shape][1] - mean_y) for shape in _SHAPES}
+
+
+def _rotate(point: tuple[float, float], turns: int) -> tuple[float, float]:
+    x, y = point
+    for _ in range(turns % 4):
+        x, y = -y, x
+    return x, y
+
+
+def _distance(reference: dict[str, tuple[float, float]], candidate: dict[str, tuple[float, float]]) -> float:
+    ref = _centered(reference)
+    cand = _centered(candidate)
+    scores = []
+    for turns in range(4):
+        total = 0.0
+        for shape in _SHAPES:
+            rx, ry = _rotate(ref[shape], turns)
+            cx, cy = cand[shape]
+            total += math.hypot(rx - cx, ry - cy)
+        scores.append(total)
+    return min(scores)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the matching candidate tag from final RGB pixels alone."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected an RGB raster")
+    if not np.all(array[0] == _WHITE) or not np.all(array[-1] == _WHITE):
+        raise ValueError("atlas touches the image boundary")
+    anchors = _tag_anchors(array)
+    layouts = _extract_layouts(array, anchors)
+    reference = layouts["reference"]
+    candidates = [(name, layouts[name]) for name in ("amber", "cyan", "violet")]
+    scores = [(name, _distance(reference, layout)) for name, layout in candidates]
+    scores.sort(key=lambda item: item[1])
+    if scores[0][1] > 1e-6:
+        raise ValueError("no exact quarter-turn correspondence")
+    if scores[1][1] - scores[0][1] < 12.0:
+        raise ValueError("correspondence is non-unique or inside quarantine")
+    return scores[0][0]

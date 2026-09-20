@@ -1,0 +1,445 @@
+"""Scene sampling, rendering, analytic gold and margin for `cut_link_partition`.
+
+A wiring harness is drawn as grey strokes on white paper. Exactly one link of
+the harness is painted violet. Three coloured dots sit on junctions of the
+harness. The decision is which dots stay mutually connected once the violet
+link is deleted from the harness.
+
+Geometry is sampled on a jittered lattice so that two strokes touch if and only
+if they share a junction; the smallest white clearance between strokes that
+must stay apart is the reported margin.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "cut_link_partition-renderer-0.1.0"
+
+CANVAS = (640, 540)
+SUPERSAMPLE = 3
+GRID_COLS = 6
+GRID_ROWS = 5
+SPACING = 100.0
+ORIGIN = (70.0, 70.0)
+JITTER = 22.0
+
+BACKGROUND = (255, 255, 255)
+WIRE_COLOR = (60, 64, 72)
+CUT_COLOR = (150, 40, 190)
+MARKER_RGB = {
+    "red": (208, 32, 44),
+    "blue": (36, 72, 200),
+    "green": (24, 132, 64),
+}
+MARKER_ORDER = ("red", "blue", "green")
+
+STROKE_WIDTH = 10
+NODE_RADIUS = 7
+MARKER_RADIUS = 15
+
+QUARANTINE_PX = 26.0
+MIN_CLEARANCE_PX = 11.0
+MIN_MARKER_SEPARATION_PX = 140.0
+
+DECISIONS = ("red_blue", "red_green", "blue_green", "all_three")
+
+
+# --------------------------------------------------------------------------
+# geometry helpers (pure functions of coordinates, never of a scene dict)
+# --------------------------------------------------------------------------
+def _segment_distance(p, q, r, s) -> float:
+    """Minimum Euclidean distance between segments pq and rs."""
+
+    def point_segment(px, py, ax, ay, bx, by) -> float:
+        dx, dy = bx - ax, by - ay
+        length = dx * dx + dy * dy
+        if length <= 1e-12:
+            return math.hypot(px - ax, py - ay)
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length))
+        return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+    (px, py), (qx, qy), (rx, ry), (sx, sy) = p, q, r, s
+    d1 = (qx - px, qy - py)
+    d2 = (sx - rx, sy - ry)
+    denominator = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(denominator) > 1e-12:
+        t = ((rx - px) * d2[1] - (ry - py) * d2[0]) / denominator
+        u = ((rx - px) * d1[1] - (ry - py) * d1[0]) / denominator
+        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+            return 0.0
+    return min(
+        point_segment(px, py, rx, ry, sx, sy),
+        point_segment(qx, qy, rx, ry, sx, sy),
+        point_segment(rx, ry, px, py, qx, qy),
+        point_segment(sx, sy, px, py, qx, qy),
+    )
+
+
+def _point_segment_distance(point, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = point
+    dx, dy = bx - ax, by - ay
+    length = dx * dx + dy * dy
+    if length <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _lattice_pairs() -> list[tuple[int, int, object]]:
+    """Candidate links between lattice neighbours; diagonals carry a cell key."""
+
+    def index(column: int, row: int) -> int:
+        return row * GRID_COLS + column
+
+    pairs: list[tuple[int, int, object]] = []
+    for row in range(GRID_ROWS):
+        for column in range(GRID_COLS):
+            if column + 1 < GRID_COLS:
+                pairs.append((index(column, row), index(column + 1, row), None))
+            if row + 1 < GRID_ROWS:
+                pairs.append((index(column, row), index(column, row + 1), None))
+            if column + 1 < GRID_COLS and row + 1 < GRID_ROWS:
+                pairs.append((index(column, row), index(column + 1, row + 1), (column, row)))
+                pairs.append((index(column + 1, row), index(column, row + 1), (column, row)))
+    return pairs
+
+
+def _components(node_count: int, links) -> list[int]:
+    parent = list(range(node_count))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for a, b in links:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    return [find(node) for node in range(node_count)]
+
+
+def _link_clearance(nodes, links) -> float:
+    """Smallest white separation between links and junction blobs that must stay apart."""
+    half = STROKE_WIDTH / 2.0
+    smallest = float("inf")
+    for i in range(len(links)):
+        a, b = links[i]
+        for j in range(i + 1, len(links)):
+            c, d = links[j]
+            if {a, b} & {c, d}:
+                continue
+            gap = _segment_distance(nodes[a], nodes[b], nodes[c], nodes[d]) - 2.0 * half
+            smallest = min(smallest, gap)
+    used = sorted({node for pair in links for node in pair})
+    for node in used:
+        for a, b in links:
+            if node in (a, b):
+                continue
+            gap = (
+                _point_segment_distance(nodes[node], nodes[a], nodes[b]) - half - NODE_RADIUS
+            )
+            smallest = min(smallest, gap)
+    return float(smallest)
+
+
+def _clearances(nodes, links, cut, markers) -> float:
+    """Smallest white separation that must survive rasterisation."""
+    half = STROKE_WIDTH / 2.0
+    smallest = _link_clearance(nodes, links)
+    for marker in markers:
+        node = marker["node"]
+        for a, b in links:
+            if node in (a, b):
+                continue
+            gap = (
+                _point_segment_distance(nodes[node], nodes[a], nodes[b])
+                - half
+                - MARKER_RADIUS
+            )
+            smallest = min(smallest, gap)
+    for i, first in enumerate(markers):
+        for second in markers[i + 1 :]:
+            gap = (
+                math.dist(nodes[first["node"]], nodes[second["node"]])
+                - 2.0 * MARKER_RADIUS
+            )
+            smallest = min(smallest, gap)
+    # The violet link must keep a visible violet span between the grey junctions.
+    a, b = cut
+    smallest = min(smallest, math.dist(nodes[a], nodes[b]) - 2.0 * (NODE_RADIUS + MARKER_RADIUS))
+    return float(smallest)
+
+
+def _sample_harness(rng: random.Random):
+    """Sample jittered node positions and a connected set of links."""
+    nodes = []
+    for row in range(GRID_ROWS):
+        for column in range(GRID_COLS):
+            nodes.append(
+                (
+                    ORIGIN[0] + column * SPACING + rng.uniform(-JITTER, JITTER),
+                    ORIGIN[1] + row * SPACING + rng.uniform(-JITTER, JITTER),
+                )
+            )
+    pairs = _lattice_pairs()
+    rng.shuffle(pairs)
+    keep = []
+    taken_cells = set()
+    for a, b, cell in pairs:
+        if cell is None:
+            if rng.random() < 0.8:
+                keep.append((a, b, cell))
+        elif cell not in taken_cells and rng.random() < 0.3:
+            taken_cells.add(cell)
+            keep.append((a, b, cell))
+    links: list[tuple[int, int]] = []
+    roots = list(range(len(nodes)))
+
+    def find(node: int) -> int:
+        while roots[node] != node:
+            roots[node] = roots[roots[node]]
+            node = roots[node]
+        return node
+
+    # spanning forest first, then a few extra links that close cycles
+    extras = []
+    for a, b, _diagonal in keep:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            roots[max(ra, rb)] = min(ra, rb)
+            links.append((a, b))
+        else:
+            extras.append((a, b))
+    rng.shuffle(extras)
+    links.extend(extras[: rng.randint(3, 6)])
+    labels = _components(len(nodes), links)
+    biggest = max(set(labels), key=lambda value: labels.count(value))
+    kept = [pair for pair in links if labels[pair[0]] == biggest]
+    return nodes, kept
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one wiring-harness scene."""
+    target = DECISIONS[int(seed) % len(DECISIONS)]
+    rng = random.Random((int(seed) * 6364136223846793005 + 1442695040888963407) % (2**63))
+    for _attempt in range(400):
+        nodes, links = _sample_harness(rng)
+        nodes = [(round(x, 3), round(y, 3)) for x, y in nodes]
+        node_ids = sorted({node for pair in links for node in pair})
+        if len(node_ids) < 18:
+            continue
+        if _link_clearance(nodes, links) < MIN_CLEARANCE_PX:
+            continue
+        degree = {node: 0 for node in node_ids}
+        for a, b in links:
+            degree[a] += 1
+            degree[b] += 1
+
+        # classify every link as bridge or cycle link
+        bridges = []
+        cyclic = []
+        for pair in links:
+            rest = [other for other in links if other != pair]
+            labels = _components(GRID_COLS * GRID_ROWS, rest)
+            (bridges if labels[pair[0]] != labels[pair[1]] else cyclic).append(pair)
+
+        pool = cyclic if target == "all_three" else bridges
+        rng.shuffle(pool)
+        for cut in pool:
+            rest = [other for other in links if other != cut]
+            labels = _components(GRID_COLS * GRID_ROWS, rest)
+            eligible = [node for node in node_ids if node not in cut]
+            rng.shuffle(eligible)
+            if target == "all_three":
+                chosen = _pick_spread(nodes, eligible, 3)
+                if chosen is None:
+                    continue
+                assignment = list(MARKER_ORDER)
+                slots = chosen
+            else:
+                pair_colors = target.split("_")
+                lone_color = next(
+                    colour for colour in MARKER_ORDER if colour not in pair_colors
+                )
+                side_a = [node for node in eligible if labels[node] == labels[cut[0]]]
+                side_b = [node for node in eligible if labels[node] == labels[cut[1]]]
+                if rng.random() < 0.5:
+                    side_a, side_b = side_b, side_a
+                duo = _pick_spread(nodes, side_a, 2)
+                solo = _pick_spread(nodes, side_b, 1)
+                if duo is None or solo is None:
+                    continue
+                slots = duo + solo
+                assignment = [pair_colors[0], pair_colors[1], lone_color]
+            markers = [
+                {"color": colour, "node": node}
+                for colour, node in sorted(zip(assignment, slots))
+            ]
+            if not _markers_spread(nodes, [m["node"] for m in markers]):
+                continue
+            scene = {
+                "canvas": list(CANVAS),
+                "supersample": SUPERSAMPLE,
+                "background": list(BACKGROUND),
+                "wire_color": list(WIRE_COLOR),
+                "cut_color": list(CUT_COLOR),
+                "stroke_width": STROKE_WIDTH,
+                "node_radius": NODE_RADIUS,
+                "marker_radius": MARKER_RADIUS,
+                "nodes": [[round(x, 3), round(y, 3)] for x, y in nodes],
+                "edges": [list(pair) for pair in links],
+                "cut_edge": list(cut),
+                "markers": markers,
+            }
+            if _clearances(scene["nodes"], links, cut, markers) < MIN_CLEARANCE_PX:
+                continue
+            if analytic_gold(scene) != target:
+                continue
+            return scene
+    raise RuntimeError(f"failed to sample a scene for seed {seed}")
+
+
+def _pick_spread(nodes, pool, count):
+    chosen: list[int] = []
+    for node in pool:
+        if all(
+            math.dist(nodes[node], nodes[other]) >= MIN_MARKER_SEPARATION_PX
+            for other in chosen
+        ):
+            chosen.append(node)
+        if len(chosen) == count:
+            return chosen
+    return None
+
+
+def _markers_spread(nodes, slots) -> bool:
+    return all(
+        math.dist(nodes[a], nodes[b]) >= MIN_MARKER_SEPARATION_PX
+        for i, a in enumerate(slots)
+        for b in slots[i + 1 :]
+    )
+
+
+# --------------------------------------------------------------------------
+# contract surface
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    """Rasterise one scene; draw order is grey links, violet link, junctions, dots."""
+    width, height = scene["canvas"]
+    scale = int(scene["supersample"])
+    background = tuple(scene["background"])
+    wire = tuple(scene["wire_color"])
+    cut_color = tuple(scene["cut_color"])
+    stroke = int(scene["stroke_width"]) * scale
+    node_radius = float(scene["node_radius"]) * scale
+    marker_radius = float(scene["marker_radius"]) * scale
+    nodes = scene["nodes"]
+    edges = scene["edges"]
+    cut_edge = scene["cut_edge"]
+    markers = scene["markers"]
+
+    canvas = Image.new("RGB", (width * scale, height * scale), background)
+    draw = ImageDraw.Draw(canvas)
+    cut_key = tuple(sorted(cut_edge))
+    points = [(x * scale, y * scale) for x, y in nodes]
+
+    for a, b in edges:
+        if tuple(sorted((a, b))) == cut_key:
+            continue
+        draw.line([points[a], points[b]], fill=wire, width=stroke)
+    a, b = cut_edge
+    draw.line([points[a], points[b]], fill=cut_color, width=stroke)
+    used = sorted({node for pair in edges for node in pair})
+    for node in used:
+        x, y = points[node]
+        draw.ellipse(
+            [x - node_radius, y - node_radius, x + node_radius, y + node_radius], fill=wire
+        )
+    for marker in markers:
+        x, y = points[marker["node"]]
+        draw.ellipse(
+            [x - marker_radius, y - marker_radius, x + marker_radius, y + marker_radius],
+            fill=MARKER_RGB[marker["color"]],
+        )
+    return canvas.resize((width, height), Image.BOX)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Which dots stay mutually connected after the violet link is deleted."""
+    edges = scene["edges"]
+    cut_edge = scene["cut_edge"]
+    markers = scene["markers"]
+
+    cut_key = tuple(sorted(cut_edge))
+    adjacency: dict[int, list[int]] = {}
+    for pair in edges:
+        a, b = pair[0], pair[1]
+        if tuple(sorted((a, b))) == cut_key:
+            continue
+        adjacency.setdefault(a, []).append(b)
+        adjacency.setdefault(b, []).append(a)
+
+    seats: dict[str, int] = {}
+    reachable: dict[str, set[int]] = {}
+    for marker in markers:
+        start = marker["node"]
+        seats[marker["color"]] = start
+        seen = {start}
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for other in adjacency.get(node, ()):
+                if other not in seen:
+                    seen.add(other)
+                    stack.append(other)
+        reachable[marker["color"]] = seen
+    if sorted(seats) != sorted(MARKER_ORDER):
+        raise ValueError("expected exactly one red, one blue and one green dot")
+
+    together = [
+        (first, second)
+        for index, first in enumerate(MARKER_ORDER)
+        for second in MARKER_ORDER[index + 1 :]
+        if seats[second] in reachable[first]
+    ]
+    if len(together) == 3:
+        return "all_three"
+    if len(together) != 1:
+        raise ValueError("deleting one link cannot separate all three dots")
+    first, second = together[0]
+    return f"{first}_{second}"
+
+
+def margin(scene: dict) -> float:
+    """Smallest white clearance, in pixels, between elements that must stay apart."""
+    nodes = scene["nodes"]
+    links = [tuple(pair) for pair in scene["edges"]]
+    return round(_clearances(nodes, links, tuple(scene["cut_edge"]), scene["markers"]), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Flag scenes whose smallest visible clearance is below the declared bound."""
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Relabelings that are pixel-identical and gold-preserving by construction."""
+    reversed_links = dict(scene)
+    reversed_links["edges"] = list(reversed(scene["edges"]))
+    rotated_markers = dict(scene)
+    rotated_markers["markers"] = scene["markers"][1:] + scene["markers"][:1]
+    both = dict(reversed_links)
+    both["markers"] = rotated_markers["markers"]
+    return [
+        ("link_draw_order_reversed", reversed_links),
+        ("marker_slot_rotation", rotated_markers),
+        ("link_and_marker_relabel", both),
+    ]

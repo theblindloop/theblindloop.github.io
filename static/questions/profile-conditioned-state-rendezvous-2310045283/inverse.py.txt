@@ -1,0 +1,113 @@
+"""Independent pixel-only inverse arm for the state-rendezvous world.
+
+Receives only the final PNG and returns the panel (P2/P3/P4) at which the red
+and green tokens first occupy the same slot. It:
+  1. labels pixels against the public color palette;
+  2. locates the horizontal track boundaries and every vertical slot delimiter
+     from the gray border pixels alone;
+  3. groups the delimiters into the four ordered panels (left to right) and
+     derives each panel's slot-column centers;
+  4. within each panel reads the red and green token columns from their pixel
+     centroids;
+  5. returns the earliest panel index where the two columns agree.
+
+No latent scene, renderer, prompt, generate, verify, or gold code is read.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+BORDER = (120, 120, 120)
+RED = (210, 40, 40)
+GREEN = (40, 170, 40)
+
+PALETTE = [BG, BORDER, RED, GREEN]
+_BG, _BRD, _RED, _GRN = range(4)
+
+NPANELS = 4
+NSLOT = 6
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected panel structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _cluster(sorted_vals: list[int], tol: int) -> list[int]:
+    if not sorted_vals:
+        return []
+    out = [[sorted_vals[0]]]
+    for v in sorted_vals[1:]:
+        if v - out[-1][-1] > tol:
+            out.append([v])
+        else:
+            out[-1].append(v)
+    return [r[len(r) // 2] for r in out]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+    h, w = labels.shape
+
+    border_ys, border_xs = np.nonzero(labels == _BRD)
+    if len(border_xs) == 0:
+        raise UnreadableImageError("no panel borders found")
+
+    row_counts = np.bincount(border_ys, minlength=h)
+    row_hits = [int(y) for y in range(h) if row_counts[y] > 400]
+    if len(row_hits) < 2:
+        raise UnreadableImageError("could not locate horizontal track boundaries")
+    top_y = min(row_hits)
+    bottom_y = max(row_hits)
+
+    band = (border_ys >= top_y) & (border_ys <= bottom_y)
+    col_counts = np.bincount(border_xs[band], minlength=w)
+    threshold = max(0.5 * (bottom_y - top_y + 1), 20)
+    line_xs = [int(x) for x in range(w) if col_counts[x] > threshold]
+    lines = _cluster(sorted(set(line_xs)), 5)
+    if len(lines) != NPANELS * (NSLOT + 1):
+        raise UnreadableImageError(
+            f"expected {NPANELS * (NSLOT + 1)} slot delimiters, found {len(lines)}"
+        )
+
+    def slot_centers(p: int) -> list[int]:
+        base = p * (NSLOT + 1)
+        return [
+            (lines[base + i] + lines[base + i + 1]) // 2 for i in range(NSLOT)
+        ]
+
+    red_ys, red_xs = np.nonzero(labels == _RED)
+    grn_ys, grn_xs = np.nonzero(labels == _GRN)
+    if len(red_xs) == 0 or len(grn_xs) == 0:
+        raise UnreadableImageError("red or green token missing from the raster")
+
+    A = [0] * NPANELS
+    B = [0] * NPANELS
+    for p in range(NPANELS):
+        centers = slot_centers(p)
+        x_lo = lines[p * (NSLOT + 1)]
+        x_hi = lines[(p + 1) * (NSLOT + 1) - 1]
+        in_panel = (red_xs >= x_lo) & (red_xs <= x_hi)
+        g_in = (grn_xs >= x_lo) & (grn_xs <= x_hi)
+        if not in_panel.any() or not g_in.any():
+            raise UnreadableImageError(f"panel {p + 1} missing a tracked token")
+        rx = int(red_xs[in_panel].mean())
+        gx = int(grn_xs[g_in].mean())
+        A[p] = min(range(NSLOT), key=lambda i: abs(centers[i] - rx))
+        B[p] = min(range(NSLOT), key=lambda i: abs(centers[i] - gx))
+
+    for k in range(NPANELS):
+        if A[k] == B[k]:
+            return f"panel {k + 1}"
+    raise UnreadableImageError("no coincidence panel found")

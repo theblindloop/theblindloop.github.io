@@ -1,0 +1,156 @@
+"""Independent pixel-only inverse for paired ordered turn words.
+
+The oracle segments the two distant route drawings, extracts endpoint and
+corner-marker centroids, reconstructs each five-node centerline chain by
+testing visible axis-aligned ink between nodes, directs it from blue to orange,
+and compares the three ordered cross-product signs.  It receives only a PNG.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    remaining = {tuple(map(int, point)) for point in np.argwhere(mask)}
+    output: list[np.ndarray] = []
+    while remaining:
+        origin = remaining.pop()
+        stack = [origin]
+        component = [origin]
+        while stack:
+            y, x = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    neighbor = (y + dy, x + dx)
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+                        component.append(neighbor)
+        if len(component) >= minimum:
+            output.append(np.asarray(component, dtype=np.float64))
+    return output
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    y, x = component.mean(axis=0)
+    return float(x), float(y)
+
+
+def _link_fraction(mask: np.ndarray, first: tuple[float, float], second: tuple[float, float]) -> float:
+    x1, y1 = first
+    x2, y2 = second
+    height, width = mask.shape
+    if abs(y1 - y2) <= 2.5:
+        lo, hi = sorted((int(round(x1)), int(round(x2))))
+        lo += 9
+        hi -= 9
+        y = int(round((y1 + y2) / 2.0))
+        if hi <= lo or not (3 <= y < height - 3):
+            return 0.0
+        return float(mask[y - 3:y + 4, lo:hi + 1].mean())
+    if abs(x1 - x2) <= 2.5:
+        lo, hi = sorted((int(round(y1)), int(round(y2))))
+        lo += 9
+        hi -= 9
+        x = int(round((x1 + x2) / 2.0))
+        if hi <= lo or not (3 <= x < width - 3):
+            return 0.0
+        return float(mask[lo:hi + 1, x - 3:x + 4].mean())
+    return 0.0
+
+
+def _between(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> bool:
+    """Whether c is collinear with and strictly between a and b."""
+    if abs(a[1] - b[1]) <= 2.5 and abs(c[1] - a[1]) <= 2.5:
+        return min(a[0], b[0]) + 5 < c[0] < max(a[0], b[0]) - 5
+    if abs(a[0] - b[0]) <= 2.5 and abs(c[0] - a[0]) <= 2.5:
+        return min(a[1], b[1]) + 5 < c[1] < max(a[1], b[1]) - 5
+    return False
+
+
+def _turn_word(nodes: list[tuple[float, float]], route_mask: np.ndarray) -> tuple[int, int, int]:
+    adjacency: dict[int, set[int]] = {index: set() for index in range(5)}
+    for left in range(5):
+        for right in range(left + 1, 5):
+            if any(_between(nodes[left], nodes[right], nodes[other])
+                   for other in range(5) if other not in (left, right)):
+                continue
+            fraction = _link_fraction(route_mask, nodes[left], nodes[right])
+            if fraction >= 0.30:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+    if len(adjacency[0]) != 1 or len(adjacency[4]) != 1:
+        raise OracleAbstention("a route endpoint lacks one unique visible continuation")
+    if sorted(len(adjacency[index]) for index in range(1, 4)) != [2, 2, 2]:
+        raise OracleAbstention("gold corners do not form one unambiguous centerline chain")
+    ordered = [0]
+    previous = -1
+    current = 0
+    while current != 4 and len(ordered) <= 5:
+        options = adjacency[current] - ({previous} if previous >= 0 else set())
+        if len(options) != 1:
+            raise OracleAbstention("centerline traversal branches or terminates early")
+        following = options.pop()
+        ordered.append(following)
+        previous, current = current, following
+    if ordered[-1] != 4 or len(ordered) != 5 or len(set(ordered)) != 5:
+        raise OracleAbstention("blue-to-orange traversal does not visit three corners")
+    points = [nodes[index] for index in ordered]
+    signs: list[int] = []
+    for a, b, c in zip(points, points[1:], points[2:]):
+        ux, uy = b[0] - a[0], b[1] - a[1]
+        vx, vy = c[0] - b[0], c[1] - b[1]
+        cross = ux * vy - uy * vx
+        dot = ux * vx + uy * vy
+        lengths = math.hypot(ux, uy) * math.hypot(vx, vy)
+        if lengths < 1200 or abs(cross) / lengths < 0.93 or abs(dot) / lengths > 0.12:
+            raise OracleAbstention("a declared corner is not a stable visible 90-degree turn")
+        signs.append(1 if cross > 0 else -1)
+    return tuple(signs)  # type: ignore[return-value]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.ndim != 3 or array.shape[0] < 200 or array.shape[1] < 400:
+        raise OracleAbstention("image is too small")
+    red, green, blue = array[:, :, 0], array[:, :, 1], array[:, :, 2]
+    route_mask = (red < 95) & (green < 205) & (blue < 215) & ((blue - red) > 12)
+    # Remove endpoint colors from route mask while retaining navy and cyan ink.
+    route_mask &= ~((blue > 150) & (red < 70) & (green < 150))
+    route_mask &= ~((red > 170) & (green < 145) & (blue < 105))
+    start_mask = (red < 90) & (green > 75) & (green < 155) & (blue > 155) & ((blue - green) > 35)
+    finish_mask = (red > 175) & (green > 65) & (green < 145) & (blue < 100) & ((red - green) > 65)
+    gold_mask = (red > 185) & (green > 125) & (green < 215) & (blue < 100) & ((red - blue) > 110)
+
+    starts = _components(start_mask, 70)
+    finishes = _components(finish_mask, 70)
+    corners = _components(gold_mask, 70)
+    if (len(starts), len(finishes), len(corners)) != (2, 2, 6):
+        raise OracleAbstention(
+            f"expected two starts, two finishes, and six square corners; found "
+            f"{(len(starts), len(finishes), len(corners))}"
+        )
+    start_points = sorted((_centroid(item) for item in starts), key=lambda point: point[0])
+    finish_points = [_centroid(item) for item in finishes]
+    corner_points = [_centroid(item) for item in corners]
+    split = (start_points[0][0] + start_points[1][0]) / 2.0
+    words: list[tuple[int, int, int]] = []
+    for index, start in enumerate(start_points):
+        side = (lambda point: point[0] < split) if index == 0 else (lambda point: point[0] > split)
+        side_finishes = [point for point in finish_points if side(point)]
+        side_corners = [point for point in corner_points if side(point)]
+        if len(side_finishes) != 1 or len(side_corners) != 3:
+            raise OracleAbstention("distant route-marker ownership is ambiguous")
+        words.append(_turn_word([start, *side_corners, side_finishes[0]], route_mask))
+    return "same_word" if words[0] == words[1] else "different_word"
+

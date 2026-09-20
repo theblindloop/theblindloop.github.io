@@ -1,0 +1,164 @@
+"""Independent pixel-only inverse arm for landmark-board correspondence.
+
+This module deliberately duplicates the public visual vocabulary and transform
+rules. It imports no world module and receives only a raster image. Grid bounds,
+panel roles, glyph identities, query location, and color locations are all
+recovered from pixels.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import numpy as np
+from PIL import Image
+
+_GRID = np.array((48, 63, 83), dtype=np.int16)
+_GLYPH = np.array((17, 24, 39), dtype=np.int16)
+_MAGENTA = np.array((202, 38, 145), dtype=np.int16)
+_COLORS = {
+    "red": np.array((222, 61, 69), dtype=np.int16),
+    "green": np.array((38, 166, 101), dtype=np.int16),
+    "blue": np.array((43, 111, 214), dtype=np.int16),
+}
+_TRANSFORMS = (
+    "identity",
+    "rot90",
+    "rot180",
+    "rot270",
+    "mirror_lr",
+    "mirror_lr_rot90",
+    "mirror_lr_rot180",
+    "mirror_lr_rot270",
+)
+
+
+def _near(arr: np.ndarray, rgb: np.ndarray, tolerance: int) -> np.ndarray:
+    return np.max(np.abs(arr.astype(np.int16) - rgb), axis=2) <= tolerance
+
+
+def _runs(values: Iterable[int]) -> list[list[int]]:
+    groups: list[list[int]] = []
+    for value in values:
+        value = int(value)
+        if not groups or value > groups[-1][-1] + 1:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return groups
+
+
+def _line_centres(arr: np.ndarray) -> tuple[list[list[float]], list[float]]:
+    """Recover the two 4x4 board lattices from long grid-color runs."""
+    grid = _near(arr, _GRID, 3)
+    x_runs = _runs(np.flatnonzero(grid.sum(axis=0) > 220))
+    y_runs = _runs(np.flatnonzero(grid.sum(axis=1) > 440))
+    if len(x_runs) != 10 or len(y_runs) != 5:
+        raise ValueError(
+            f"abstain: expected two five-line grids, found {len(x_runs)}x/{len(y_runs)}y runs"
+        )
+    xs = [sum(run) / len(run) for run in x_runs]
+    ys = [sum(run) / len(run) for run in y_runs]
+    panels = [xs[:5], xs[5:]]
+    for lines in [*panels, ys]:
+        gaps = np.diff(lines)
+        if len(lines) != 5 or float(gaps.max() - gaps.min()) > 2.0 or float(gaps.min()) < 40:
+            raise ValueError("abstain: malformed or nonuniform board lattice")
+    return panels, ys
+
+
+def _cell_bounds(xlines: list[float], ylines: list[float], r: int, c: int) -> tuple[int, int, int, int]:
+    inset = 7
+    return (
+        int(round(xlines[c])) + inset,
+        int(round(ylines[r])) + inset,
+        int(round(xlines[c + 1])) - inset,
+        int(round(ylines[r + 1])) - inset,
+    )
+
+
+def _glyph_code(arr: np.ndarray, bounds: tuple[int, int, int, int]) -> int:
+    x0, y0, x1, y1 = bounds
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    mask = _near(arr, _GLYPH, 12)
+    code = 0
+    for rr in range(3):
+        for cc in range(3):
+            sx = int(round(cx + (cc - 1) * 15))
+            sy = int(round(cy + (rr - 1) * 15))
+            patch = mask[sy - 6 : sy + 7, sx - 6 : sx + 7]
+            code = (code << 1) | int(patch.sum() >= 35)
+    return code
+
+
+def _decode_panel(
+    arr: np.ndarray, xlines: list[float], ylines: list[float]
+) -> tuple[dict[int, tuple[int, int]], list[tuple[int, int]], dict[str, tuple[int, int]]]:
+    magenta = _near(arr, _MAGENTA, 14)
+    color_masks = {name: _near(arr, rgb, 14) for name, rgb in _COLORS.items()}
+    glyphs: dict[int, tuple[int, int]] = {}
+    queries: list[tuple[int, int]] = []
+    colors: dict[str, tuple[int, int]] = {}
+    for r in range(4):
+        for c in range(4):
+            bounds = _cell_bounds(xlines, ylines, r, c)
+            x0, y0, x1, y1 = bounds
+            code = _glyph_code(arr, bounds)
+            if code:
+                if code in glyphs:
+                    raise ValueError("abstain: repeated landmark glyph")
+                glyphs[code] = (r, c)
+            if int(magenta[y0:y1, x0:x1].sum()) >= 80:
+                queries.append((r, c))
+            for name, mask in color_masks.items():
+                if int(mask[y0:y1, x0:x1].sum()) >= 300:
+                    if name in colors:
+                        raise ValueError(f"abstain: repeated {name} target disk")
+                    colors[name] = (r, c)
+    return glyphs, queries, colors
+
+
+def _map(pos: tuple[int, int], name: str, n: int = 4) -> tuple[int, int]:
+    r, c = pos
+    if name.startswith("mirror_lr"):
+        c = n - 1 - c
+        suffix = name[len("mirror_lr") :]
+        turns = {"": 0, "_rot90": 1, "_rot180": 2, "_rot270": 3}[suffix]
+    else:
+        turns = {"identity": 0, "rot90": 1, "rot180": 2, "rot270": 3}[name]
+    for _ in range(turns):
+        r, c = c, n - 1 - r
+    return r, c
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return red/green/blue, or raise ValueError to explicitly abstain."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 300 or arr.shape[1] < 600:
+        raise ValueError("abstain: raster is too small")
+    panels, ylines = _line_centres(arr)
+    decoded = [_decode_panel(arr, xlines, ylines) for xlines in panels]
+
+    reference_ids = [i for i, (_, queries, colors) in enumerate(decoded) if len(queries) == 1 and not colors]
+    target_ids = [i for i, (_, queries, colors) in enumerate(decoded) if not queries and len(colors) == 3]
+    if len(reference_ids) != 1 or len(target_ids) != 1 or reference_ids[0] == target_ids[0]:
+        raise ValueError("abstain: panel roles are not uniquely visible")
+    ref_glyphs, queries, _ = decoded[reference_ids[0]]
+    target_glyphs, _, colors = decoded[target_ids[0]]
+    if len(ref_glyphs) != 4 or set(ref_glyphs) != set(target_glyphs):
+        raise ValueError("abstain: need four unique landmark correspondences")
+
+    scored = []
+    for name in _TRANSFORMS:
+        score = sum(_map(ref_glyphs[code], name) == target_glyphs[code] for code in ref_glyphs)
+        scored.append((score, name))
+    scored.sort(reverse=True)
+    if scored[0][0] != 4 or scored[0][0] - scored[1][0] < 2:
+        raise ValueError("abstain: landmark mapping is ambiguous")
+
+    mapped_query = _map(queries[0], scored[0][1])
+    answers = [name for name, pos in colors.items() if pos == mapped_query]
+    if len(answers) != 1:
+        raise ValueError("abstain: mapped target cell has no unique color")
+    return answers[0]

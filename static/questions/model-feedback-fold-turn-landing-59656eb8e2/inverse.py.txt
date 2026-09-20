@@ -1,0 +1,149 @@
+"""Independent PNG-only inverse arm for fold-turn landing panels."""
+
+from __future__ import annotations
+
+import itertools
+import math
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 1000
+HEIGHT = 1030
+GRID_N = 9
+CELL = 38
+PANEL_X = (35, 515)
+PANEL_Y = (85, 555)
+GRID_OFFSET_X = 54
+GRID_OFFSET_Y = 72
+
+BLUE = np.array((37, 99, 235), dtype=np.uint8)
+AMBER = np.array((245, 158, 11), dtype=np.uint8)
+RED = np.array((220, 38, 38), dtype=np.uint8)
+GREEN = np.array((22, 163, 74), dtype=np.uint8)
+
+
+class OracleAbstention(ValueError):
+    """The required visible geometric marks cannot be decoded confidently."""
+
+
+def _origin(index: int) -> tuple[int, int]:
+    return PANEL_X[index % 2], PANEL_Y[index // 2]
+
+
+def _center(index: int, x: int, y: int) -> np.ndarray:
+    panel_x, panel_y = _origin(index)
+    return np.array(
+        (
+            panel_x + GRID_OFFSET_X + (x + 0.5) * CELL,
+            panel_y + GRID_OFFSET_Y + (y + 0.5) * CELL,
+        ),
+        dtype=np.float64,
+    )
+
+
+def _exact_mask(crop: np.ndarray, color: np.ndarray) -> np.ndarray:
+    return np.all(crop == color, axis=2)
+
+
+def _cell_set(arr: np.ndarray, panel_index: int, color: np.ndarray) -> list[np.ndarray]:
+    found: list[np.ndarray] = []
+    for y in range(GRID_N):
+        for x in range(GRID_N):
+            center = _center(panel_index, x, y)
+            cx, cy = int(round(center[0])), int(round(center[1]))
+            patch = arr[cy - 7 : cy + 8, cx - 7 : cx + 8]
+            if int(_exact_mask(patch, color).sum()) >= 180:
+                found.append(center)
+    if len(found) != 4:
+        raise OracleAbstention(f"panel {panel_index + 1}: expected four colored cells, found {len(found)}")
+    return found
+
+
+def _fit_axis(arr: np.ndarray, panel_index: int) -> tuple[np.ndarray, np.ndarray]:
+    panel_x, panel_y = _origin(panel_index)
+    gx = panel_x + GRID_OFFSET_X
+    gy = panel_y + GRID_OFFSET_Y
+    size = GRID_N * CELL
+    crop = arr[gy - 4 : gy + size + 5, gx - 4 : gx + size + 5]
+    ys, xs = np.nonzero(_exact_mask(crop, RED))
+    if not 450 <= len(xs) <= 2100:
+        raise OracleAbstention(f"panel {panel_index + 1}: fold line has {len(xs)} red pixels")
+    points = np.column_stack((xs + gx - 4, ys + gy - 4)).astype(np.float64)
+    center = points.mean(axis=0)
+    _, _, vt = np.linalg.svd(points - center, full_matrices=False)
+    direction = vt[0]
+    normal = np.array((-direction[1], direction[0]))
+    residual = np.abs((points - center) @ normal)
+    extent = float(np.ptp((points - center) @ direction))
+    if float(np.quantile(residual, 0.95)) > 4.5 or extent < 210.0:
+        raise OracleAbstention(f"panel {panel_index + 1}: malformed fold line")
+    return center, direction
+
+
+def _fit_pin(arr: np.ndarray, panel_index: int) -> np.ndarray:
+    panel_x, panel_y = _origin(panel_index)
+    gx = panel_x + GRID_OFFSET_X
+    gy = panel_y + GRID_OFFSET_Y
+    size = GRID_N * CELL
+    crop = arr[gy - 18 : gy + size + 19, gx - 18 : gx + size + 19]
+    ys, xs = np.nonzero(_exact_mask(crop, GREEN))
+    if not 300 <= len(xs) <= 390:
+        raise OracleAbstention(f"panel {panel_index + 1}: pin has {len(xs)} green pixels")
+    points = np.column_stack((xs + gx - 18, ys + gy - 18)).astype(np.float64)
+    center = points.mean(axis=0)
+    radius = np.linalg.norm(points - center, axis=1)
+    if float(radius.max()) > 11.2 or float(np.quantile(radius, 0.9)) < 8.0:
+        raise OracleAbstention(f"panel {panel_index + 1}: malformed pin")
+    return center
+
+
+def _set_error(expected: list[np.ndarray], observed: list[np.ndarray]) -> float:
+    best = math.inf
+    for permutation in itertools.permutations(observed):
+        distances = [float(np.linalg.norm(a - b)) for a, b in zip(expected, permutation)]
+        best = min(best, max(distances))
+    return best
+
+
+def _panel_error(arr: np.ndarray, index: int) -> float:
+    source = _cell_set(arr, index, BLUE)
+    target = _cell_set(arr, index, AMBER)
+    panel_x, panel_y = _origin(index)
+    gx = panel_x + GRID_OFFSET_X
+    gy = panel_y + GRID_OFFSET_Y
+    size = GRID_N * CELL
+    crop = arr[gy : gy + size + 1, gx : gx + size + 1]
+    blue_area = int(_exact_mask(crop, BLUE).sum())
+    amber_area = int(_exact_mask(crop, AMBER).sum())
+    if not (4250 <= blue_area <= 4450 and 4250 <= amber_area <= 4450):
+        raise OracleAbstention(
+            f"panel {index + 1}: colored cell areas are {blue_area}/{amber_area}"
+        )
+    axis_center, axis_direction = _fit_axis(arr, index)
+    pivot = _fit_pin(arr, index)
+    reflected: list[np.ndarray] = []
+    for point in source:
+        delta = point - axis_center
+        projection = axis_direction * float(delta @ axis_direction)
+        reflected.append(axis_center + 2.0 * projection - delta)
+    expected = []
+    for point in reflected:
+        dx, dy = point - pivot
+        expected.append(pivot + np.array((-dy, dx)))
+    return _set_error(expected, target)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the selected panel using only visible pixels."""
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        raise OracleAbstention(f"unexpected raster size {rgb.size}")
+    arr = np.asarray(rgb, dtype=np.uint8)
+    errors = [_panel_error(arr, index) for index in range(4)]
+    order = sorted(range(4), key=lambda index: errors[index])
+    if errors[order[0]] > 6.0:
+        raise OracleAbstention(f"no exact fold-turn landing: {errors}")
+    if errors[order[1]] - errors[order[0]] < 18.0:
+        raise OracleAbstention(f"landing is not unique: {errors}")
+    return f"panel-{order[0] + 1}"

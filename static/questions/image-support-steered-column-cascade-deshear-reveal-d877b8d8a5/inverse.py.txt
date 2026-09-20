@@ -1,0 +1,169 @@
+"""Pixel-only inverse arm for the column-cascade de-shear reveal world.
+
+The oracle receives one RGB image and nothing else. It thresholds the image at
+the midpoint of its own darkest and lightest tones, finds the single bordered
+panel as the one ink component large enough and square enough to be a panel,
+measures the panel's border thickness, rectifies its 7x7 cell lattice, reads
+each cell as ink or paper, executes the declared inverse cascade - slide column
+j upward, cyclically, by j cells - and classifies the recovered 7x7 pattern
+against the declared symbol alphabet with a reported runner-up margin. It
+abstains by raising whenever the panel, the lattice, a cell tone, or the symbol
+decision is ambiguous.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "column_cascade_deshear_reveal-oracle-0.1.0"
+
+CELLS = 7
+MIN_PANEL_PX = 100
+MAX_PANEL_PX = 200
+MIN_FRAME_PX = 2
+MAX_FRAME_PX = 9
+MAX_GLYPH_ERRORS = 3
+MIN_GLYPH_GAP = 5
+
+
+def _templates() -> dict[str, np.ndarray]:
+    def build(cells: set[tuple[int, int]]) -> np.ndarray:
+        grid = np.zeros((CELLS, CELLS), dtype=np.uint8)
+        for row, col in cells:
+            grid[row, col] = 1
+        return grid
+
+    bars = {(1, c) for c in range(CELLS)} | {(5, c) for c in range(CELLS)}
+    caret = {(abs(c - 3), c) for c in range(CELLS)} | {(CELLS - 1, c) for c in range(CELLS)}
+    vee = {(CELLS - 1 - abs(c - 3), c) for c in range(CELLS)} | {(0, c) for c in range(CELLS)}
+    zigzag = {(3, c) for c in range(CELLS)} | {(1 if c % 2 == 0 else 5, c) for c in range(CELLS)}
+    return {"bars": build(bars), "caret": build(caret), "vee": build(vee), "zigzag": build(zigzag)}
+
+
+TEMPLATES = _templates()
+
+
+def _ink_mask(array: np.ndarray) -> np.ndarray:
+    luma = 0.299 * array[:, :, 0] + 0.587 * array[:, :, 1] + 0.114 * array[:, :, 2]
+    darkest = float(np.percentile(luma, 0.2))
+    lightest = float(np.percentile(luma, 99.8))
+    if lightest - darkest < 20.0:
+        raise ValueError("image has no usable ink-to-paper contrast")
+    return luma < 0.5 * (darkest + lightest)
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Bounding boxes of 4-connected ink components, largest component first."""
+
+    seen = np.zeros(mask.shape, dtype=bool)
+    boxes: list[tuple[int, int, int, int, int]] = []
+    height, width = mask.shape
+    for start_y, start_x in np.argwhere(mask):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(int(start_y), int(start_x))]
+        seen[start_y, start_x] = True
+        y0 = y1 = int(start_y)
+        x0 = x1 = int(start_x)
+        size = 0
+        while stack:
+            cy, cx = stack.pop()
+            size += 1
+            y0, y1 = min(y0, cy), max(y1, cy)
+            x0, x1 = min(x0, cx), max(x1, cx)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        boxes.append((size, y0, x0, y1, x1))
+    boxes.sort(reverse=True)
+    return [(y0, x0, y1, x1) for _, y0, x0, y1, x1 in boxes]
+
+
+def _panel(mask: np.ndarray) -> tuple[int, int, int, int]:
+    found = []
+    for y0, x0, y1, x1 in _components(mask):
+        height = y1 - y0 + 1
+        width = x1 - x0 + 1
+        if not (MIN_PANEL_PX <= height <= MAX_PANEL_PX):
+            continue
+        if not (MIN_PANEL_PX <= width <= MAX_PANEL_PX):
+            continue
+        if height != width:
+            continue
+        found.append((y0, x0, y1, x1))
+    if len(found) != 1:
+        raise ValueError(f"expected exactly one bordered panel, found {len(found)}")
+    return found[0]
+
+
+def _frame_thickness(mask: np.ndarray, box: tuple[int, int, int, int]) -> int:
+    y0, x0, y1, x1 = box
+    window = mask[y0:y1 + 1, x0:x1 + 1]
+    runs = []
+    for lines in (window, window[:, ::-1], window.T, window.T[:, ::-1]):
+        for line in lines:
+            run = 0
+            while run < line.size and line[run]:
+                run += 1
+            if run:
+                runs.append(int(run))
+    if not runs:
+        raise ValueError("panel has no measurable border")
+    thickness = min(runs)
+    if not (MIN_FRAME_PX <= thickness <= MAX_FRAME_PX):
+        raise ValueError("panel border thickness is out of range")
+    side = y1 - y0 + 1
+    if (side - 2 * thickness) % CELLS != 0:
+        raise ValueError("panel interior does not divide into a 7x7 lattice")
+    return thickness
+
+
+def _read_cells(mask: np.ndarray, box: tuple[int, int, int, int], frame: int) -> np.ndarray:
+    y0, x0, y1, x1 = box
+    cell = ((y1 - y0 + 1) - 2 * frame) // CELLS
+    if cell < 10:
+        raise ValueError("panel cells are too small to read")
+    grid = np.zeros((CELLS, CELLS), dtype=np.uint8)
+    for row in range(CELLS):
+        for col in range(CELLS):
+            cy0 = y0 + frame + row * cell
+            cx0 = x0 + frame + col * cell
+            patch = mask[cy0 + 2:cy0 + cell - 2, cx0 + 2:cx0 + cell - 2]
+            if patch.size == 0:
+                raise ValueError("panel cell patch is empty")
+            share = float(patch.mean())
+            if 0.2 < share < 0.8:
+                raise ValueError("panel cell tone is ambiguous")
+            grid[row, col] = 1 if share >= 0.8 else 0
+    return grid
+
+
+def _uncascade(grid: np.ndarray) -> np.ndarray:
+    """Slide column j upward, cyclically, by j cells: the declared operation."""
+
+    out = np.zeros_like(grid)
+    for col in range(CELLS):
+        out[:, col] = np.roll(grid[:, col], -col)
+    return out
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the revealed symbol from the final pixels alone."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    mask = _ink_mask(array)
+    box = _panel(mask)
+    frame = _frame_thickness(mask, box)
+    drawn = _read_cells(mask, box, frame)
+    recovered = _uncascade(drawn)
+    scores = sorted(
+        (int(np.abs(recovered.astype(int) - template.astype(int)).sum()), name)
+        for name, template in TEMPLATES.items()
+    )
+    if scores[0][0] > MAX_GLYPH_ERRORS:
+        raise ValueError("recovered pattern matches no declared symbol")
+    if scores[1][0] - scores[0][0] < MIN_GLYPH_GAP:
+        raise ValueError("recovered pattern is ambiguous between two symbols")
+    return scores[0][1]

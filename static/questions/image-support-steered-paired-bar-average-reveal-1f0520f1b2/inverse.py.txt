@@ -1,0 +1,210 @@
+"""Independent final-PNG inverse for Paired Bar Average Reveal.
+
+Only public palette values, rack geometry, and answer templates are duplicated
+here. No renderer, latent scene, manifest, filename, or analytic gold is read.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import Iterable
+
+import numpy as np
+from PIL import Image
+
+DARK = np.array((31, 38, 51), dtype=np.int16)
+FRAME_COLORS = tuple(
+    np.array(color, dtype=np.int16)
+    for color in (
+        (20, 170, 190),
+        (230, 165, 30),
+        (126, 82, 188),
+        (42, 157, 91),
+        (210, 72, 82),
+        (54, 108, 210),
+    )
+)
+REFERENCE_PROFILES: dict[str, tuple[int, ...]] = {
+    "arrow": (2, 4, 6, 8, 4, 4, 4),
+    "diamond": (2, 4, 6, 8, 6, 4, 2),
+    "funnel": (8, 6, 4, 2, 2, 4, 6),
+}
+
+
+class PixelEvidenceError(ValueError):
+    """The declared transform cannot be recovered from visible pixels."""
+
+
+def _near(array: np.ndarray, color: np.ndarray, tolerance: float = 28.0) -> np.ndarray:
+    delta = array.astype(np.int32) - color.astype(np.int32)
+    return np.sqrt(np.sum(delta * delta, axis=2, dtype=np.int64)) <= tolerance
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _validate_card(mask: np.ndarray, points: np.ndarray) -> dict[str, int | bool]:
+    ymin, xmin = points.min(axis=0)
+    ymax, xmax = points.max(axis=0)
+    width = int(xmax - xmin)
+    scale = int(round(width / 11.0))
+    if scale not in (9, 10) or abs(width - 11 * scale) > 1:
+        raise PixelEvidenceError("a colored rack has an invalid width")
+
+    top_count = int(mask[int(ymin), int(xmin) : int(xmax) + 1].sum())
+    bottom_count = int(mask[int(ymax), int(xmin) : int(xmax) + 1].sum())
+    if top_count <= 5 and bottom_count >= int(0.75 * (width + 1)):
+        flipped = False
+        y0 = int(ymax - 9 * scale)
+    elif bottom_count <= 5 and top_count >= int(0.75 * (width + 1)):
+        flipped = True
+        y0 = int(ymin)
+    else:
+        raise PixelEvidenceError("a rack triangular orientation notch is unreadable")
+    y1 = y0 + 9 * scale
+    if not (0 <= y0 < y1 < mask.shape[0]):
+        raise PixelEvidenceError("a rack frame lies outside the image")
+
+    top = mask[y0 : y0 + 3, int(xmin) : int(xmax) + 1]
+    bottom = mask[y1 - 2 : y1 + 1, int(xmin) : int(xmax) + 1]
+    left = mask[y0 : y1 + 1, int(xmin) : int(xmin) + 3]
+    right = mask[y0 : y1 + 1, int(xmax) - 2 : int(xmax) + 1]
+    if min(float(side.mean()) for side in (top, bottom, left, right)) < 0.82:
+        raise PixelEvidenceError("a colored rack frame is incomplete")
+    if flipped:
+        notch = mask[y1 : min(mask.shape[0], y1 + 9), int(xmin) + width // 2 - 7 : int(xmin) + width // 2 + 8]
+    else:
+        notch = mask[max(0, y0 - 8) : y0 + 1, int(xmin) + width // 2 - 7 : int(xmin) + width // 2 + 8]
+    if notch.size == 0 or int(notch.sum()) < 45:
+        raise PixelEvidenceError("a rack notch is incomplete")
+    return {
+        "x0": int(xmin),
+        "x1": int(xmax),
+        "y0": y0,
+        "y1": y1,
+        "scale": scale,
+        "flipped": flipped,
+    }
+
+
+def _locate_cards(array: np.ndarray) -> list[dict[str, int | bool]]:
+    cards: list[dict[str, int | bool]] = []
+    for color in FRAME_COLORS:
+        mask = _near(array, color)
+        for component in _components(mask):
+            if len(component) < 350:
+                continue
+            cards.append(_validate_card(mask, component))
+    if len(cards) != 2:
+        raise PixelEvidenceError(f"expected exactly two complete colored racks, found {len(cards)}")
+    cards.sort(key=lambda card: int(card["x0"]))
+    if int(cards[1]["x0"]) - int(cards[0]["x1"]) < 180:
+        raise PixelEvidenceError("the two racks are not visibly detached")
+    return cards
+
+
+def _read_lengths(dark_mask: np.ndarray, card: dict[str, int | bool]) -> list[int]:
+    x0 = int(card["x0"])
+    y0 = int(card["y0"])
+    scale = int(card["scale"])
+    flipped = bool(card["flipped"])
+    lengths = []
+    for logical_row in range(7):
+        physical_row = 6 - logical_row if flipped else logical_row
+        cy = y0 + (1 + physical_row) * scale
+        occupied = []
+        for column in range(9):
+            cx = x0 + (1 + column) * scale
+            patch = dark_mask[cy - 2 : cy + 3, cx - 2 : cx + 3]
+            if patch.shape != (5, 5):
+                raise PixelEvidenceError("a rack cell falls outside the raster")
+            fraction = float(patch.mean())
+            if 0.20 < fraction < 0.80:
+                raise PixelEvidenceError("a bar cell is partially erased")
+            occupied.append(fraction >= 0.80)
+        length = int(sum(occupied))
+        if not 1 <= length <= 9:
+            raise PixelEvidenceError("a bar row has an invalid visible length")
+        expected = ([False] * (9 - length) + [True] * length) if flipped else ([True] * length + [False] * (9 - length))
+        if occupied != expected:
+            raise PixelEvidenceError("a bar row is not contiguous from its oriented edge")
+        lengths.append(length)
+    return lengths
+
+
+def _centered_row(length: int) -> tuple[int, ...]:
+    start = (9 - int(length)) // 2
+    return tuple(int(start <= column < start + int(length)) for column in range(9))
+
+
+def _classify(lengths_a: Iterable[int], lengths_b: Iterable[int]) -> dict:
+    left = tuple(int(value) for value in lengths_a)
+    right = tuple(int(value) for value in lengths_b)
+    if len(left) != 7 or len(right) != 7:
+        raise PixelEvidenceError("each rack must expose seven bars")
+    profile = []
+    for first, second in zip(left, right, strict=True):
+        if (first + second) % 2:
+            raise PixelEvidenceError("a visible pair does not have a whole-cell average")
+        profile.append((first + second) // 2)
+    observed = tuple(_centered_row(length) for length in profile)
+    distances: dict[str, int] = {}
+    for name, reference_profile in REFERENCE_PROFILES.items():
+        reference = tuple(_centered_row(length) for length in reference_profile)
+        distances[name] = sum(
+            int(a != b)
+            for observed_row, reference_row in zip(observed, reference, strict=True)
+            for a, b in zip(observed_row, reference_row, strict=True)
+        )
+    ranked = sorted((distance, name) for name, distance in distances.items())
+    if ranked[0][0] == ranked[1][0]:
+        decision = "ambiguous"
+        margin = 0.0
+    else:
+        decision = ranked[0][1]
+        margin = float(ranked[1][0] - ranked[0][0])
+    return {
+        "decision": decision,
+        "margin": margin,
+        "distances": distances,
+        "averaged_profile": profile,
+    }
+
+
+def classify_from_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape != (512, 768, 3):
+        raise PixelEvidenceError("unexpected raster dimensions")
+    cards = _locate_cards(array)
+    dark_mask = _near(array, DARK, 24.0)
+    first = _read_lengths(dark_mask, cards[0])
+    second = _read_lengths(dark_mask, cards[1])
+    return _classify(first, second)
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    result = classify_from_image(image)
+    return str(result["decision"]), float(result["margin"])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(classify_from_image(image)["decision"])

@@ -1,0 +1,279 @@
+"""Mirror-defect crossbar world.
+
+One dark, thick, connected structure is drawn: a wide vertical column crossed by
+four long horizontal crossbars. Square bumps are attached to the top or bottom
+edge of every crossbar on both sides of a dashed vertical mirror axis. Every
+crossbar carries the same number of identically sized bumps, so per-crossbar
+ink, bump count, bump size, colour and crossbar extent are all constant. The
+only thing that varies is how well each crossbar's bumps agree with their own
+reflection across the dashed axis.
+
+The decision variable is the crossbar whose bumps deviate most from mirror
+symmetry. Because bump offsets are stored as distances from the axis, the mirror
+mismatch of a crossbar is the size of the symmetric difference between its
+left-side and right-side occupied offset sets, taken separately for the top edge
+and the bottom edge, scaled by the bump height. That number is exactly the
+left/right XOR pixel count of that crossbar's band in the rendered raster, so
+the analytic gold and the pixel-only inverse arm measure the same quantity by
+independent routes.
+"""
+
+from __future__ import annotations
+
+import copy
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "mirror_defect_rung-renderer-0.1.0"
+
+# Crossbars are named by vertical rank from the top; the name is never the
+# position of the crossbar inside the latent list (see latent_symmetries).
+LABELS = ("first", "second", "third", "fourth")
+
+CANVAS = 720
+RUNG_COUNT = 4
+SPINE_HALF = 58
+RUNG_HALF_LEN = 300
+RUNG_HALF_THICK = 34
+BUMP_W = 34
+BUMP_H = 34
+BASE_OFFSETS = (70, 142, 214)
+MIN_OFFSET = 68
+AXIS_DASH = 16
+AXIS_WIDTH = 3
+
+# A crossbar's mismatch is BUMP_H * |left_offsets XOR right_offsets|, so one
+# pixel of relative shift is worth 2 * BUMP_H = 68 mismatch pixels. Two
+# crossbars whose mismatch differs by less than three shift pixels are treated
+# as a finite-resolution boundary case and quarantined.
+QUARANTINE_MARGIN = 200.0
+
+PALETTES = (
+    {"bg": "#f5f3ec", "ink": "#22304d", "axis": "#c2571f"},
+    {"bg": "#f2f4f2", "ink": "#33324a", "axis": "#1f7a63"},
+    {"bg": "#f6f1f1", "ink": "#3d2a33", "axis": "#2f5aa8"},
+)
+
+_DELTAS = (2, 3, 4, 6, 9, 14, 20, 26)
+
+
+# --------------------------------------------------------------------------
+# analytic side
+# --------------------------------------------------------------------------
+def _scores(scene: dict) -> list[int]:
+    """Mirror-mismatch pixel count of every crossbar, ordered top to bottom."""
+
+    bump = scene["bump"]
+    rungs = scene["rungs"]
+    bump_w = int(bump["w"])
+    bump_h = int(bump["h"])
+    ordered = sorted(rungs, key=lambda item: int(item["y"]))
+    out: list[int] = []
+    for rung in ordered:
+        total = 0
+        for edge in ("above", "below"):
+            left: set[int] = set()
+            right: set[int] = set()
+            for spec in rung["bumps"]:
+                if spec["edge"] != edge:
+                    continue
+                start = int(spec["d"])
+                span = set(range(start, start + bump_w))
+                if spec["side"] == "left":
+                    left |= span
+                else:
+                    right |= span
+            total += len(left ^ right)
+        out.append(total * bump_h)
+    return out
+
+
+def analytic_gold(scene: dict) -> str:
+    """Name of the crossbar with the largest mirror mismatch."""
+
+    scores = _scores(scene)
+    best = max(range(len(scores)), key=lambda index: (scores[index], -index))
+    return LABELS[best]
+
+
+def margin(scene: dict) -> float:
+    """Winner-minus-runner-up mirror mismatch, in raster pixels."""
+
+    ranked = sorted(_scores(scene), reverse=True)
+    return float(ranked[0] - ranked[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _bumps_for(rng: random.Random, offsets: list[int], defect: dict) -> list[dict]:
+    edges = [rng.choice(("above", "below")) for _ in offsets]
+    bumps: list[dict] = []
+    for index, offset in enumerate(offsets):
+        bumps.append({"side": "left", "d": offset, "edge": edges[index]})
+        bumps.append({"side": "right", "d": offset, "edge": edges[index]})
+    if defect["kind"] == "none":
+        return bumps
+    slot = defect["slot"]
+    target = None
+    for spec in bumps:
+        if spec["side"] == "right" and spec["d"] == offsets[slot]:
+            target = spec
+    if defect["kind"] == "shift":
+        target["d"] = offsets[slot] + defect["shift"]
+    else:  # edge flip: the right bump moves to the opposite edge
+        target["edge"] = "below" if target["edge"] == "above" else "above"
+    return bumps
+
+
+def _shift_is_legal(offsets: list[int], slot: int, shift: int) -> bool:
+    new = offsets[slot] + shift
+    if new < MIN_OFFSET or new + BUMP_W - 1 > RUNG_HALF_LEN:
+        return False
+    lo, hi = new, new + BUMP_W - 1
+    for index, other in enumerate(offsets):
+        if index == slot:
+            continue
+        if not (hi < other or lo > other + BUMP_W - 1):
+            return False
+    return True
+
+
+def _pick_defect(rng: random.Random, offsets: list[int], magnitude: int) -> dict:
+    slots = list(range(len(offsets)))
+    rng.shuffle(slots)
+    for slot in slots:
+        for sign in rng.sample((1, -1), 2):
+            if _shift_is_legal(offsets, slot, sign * magnitude):
+                return {"kind": "shift", "slot": slot, "shift": sign * magnitude}
+    return {"kind": "flip", "slot": slots[0]}
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(0xC0FFEE ^ (seed * 2654435761 % (1 << 61)))
+    target = seed % RUNG_COUNT
+    delta = _DELTAS[(seed // RUNG_COUNT) % len(_DELTAS)]
+    base = rng.randint(0, 8)
+    clear_target = delta >= 20 and rng.random() < 0.5
+
+    axis_x = CANVAS // 2 + rng.randint(-20, 20)
+    spacing = 175
+    first_y = 105 + rng.randint(-6, 6)
+    rungs: list[dict] = []
+    for index in range(RUNG_COUNT):
+        centre = first_y + index * spacing + rng.randint(-8, 8)
+        jitter = rng.randint(0, 20)
+        offsets = [value + jitter for value in BASE_OFFSETS]
+        if index == target:
+            if clear_target:
+                defect = {"kind": "flip", "slot": rng.randrange(len(offsets))}
+            else:
+                defect = _pick_defect(rng, offsets, base + delta)
+        elif base == 0 or rng.random() < 0.25:
+            defect = {"kind": "none"}
+        else:
+            defect = _pick_defect(rng, offsets, rng.randint(1, base))
+        rungs.append({"y": centre, "bumps": _bumps_for(rng, offsets, defect)})
+
+    scene = {
+        "width": CANVAS,
+        "height": CANVAS,
+        "axis_x": axis_x,
+        "spine_half": SPINE_HALF,
+        "rung_half_len": RUNG_HALF_LEN,
+        "rung_half_thick": RUNG_HALF_THICK,
+        "bump": {"w": BUMP_W, "h": BUMP_H},
+        "rungs": rungs,
+        "palette": dict(PALETTES[seed % len(PALETTES)]),
+        "axis_dash": AXIS_DASH,
+        "axis_width": AXIS_WIDTH,
+    }
+    return scene
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    width = int(scene["width"])
+    height = int(scene["height"])
+    palette = scene["palette"]
+    axis_x = int(scene["axis_x"])
+    spine_half = int(scene["spine_half"])
+    rung_half_len = int(scene["rung_half_len"])
+    rung_half_thick = int(scene["rung_half_thick"])
+    bump = scene["bump"]
+    bump_w = int(bump["w"])
+    bump_h = int(bump["h"])
+    rungs = scene["rungs"]
+    dash = int(scene["axis_dash"])
+    axis_w = int(scene["axis_width"])
+
+    image = Image.new("RGB", (width, height), palette["bg"])
+    draw = ImageDraw.Draw(image)
+    ink = palette["ink"]
+
+    centres = [int(rung["y"]) for rung in rungs]
+    top = min(centres) - rung_half_thick - bump_h
+    bottom = max(centres) + rung_half_thick + bump_h
+    draw.rectangle([axis_x - spine_half, top, axis_x + spine_half, bottom], fill=ink)
+
+    for rung in rungs:
+        centre = int(rung["y"])
+        draw.rectangle(
+            [axis_x - rung_half_len, centre - rung_half_thick,
+             axis_x + rung_half_len, centre + rung_half_thick],
+            fill=ink,
+        )
+        for spec in rung["bumps"]:
+            offset = int(spec["d"])
+            if spec["side"] == "left":
+                x0, x1 = axis_x - offset - bump_w + 1, axis_x - offset
+            else:
+                x0, x1 = axis_x + offset, axis_x + offset + bump_w - 1
+            if spec["edge"] == "above":
+                y0, y1 = centre - rung_half_thick - bump_h, centre - rung_half_thick - 1
+            else:
+                y0, y1 = centre + rung_half_thick + 1, centre + rung_half_thick + bump_h
+            draw.rectangle([x0, y0, x1, y1], fill=ink)
+
+    half = axis_w // 2
+    lo = max(0, top - 14)
+    hi = min(height - 1, bottom + 14)
+    row = lo
+    while row <= hi:
+        draw.rectangle([axis_x - half, row, axis_x + half, min(row + dash - 1, hi)],
+                       fill=palette["axis"])
+        row += 2 * dash
+    return image
+
+
+# --------------------------------------------------------------------------
+# latent aliases
+# --------------------------------------------------------------------------
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Render-invariant relabelings of the latent scene.
+
+    Both transforms are genuine aliases: the crossbar list and each crossbar's
+    bump list are unordered collections of same-coloured axis-aligned
+    rectangles, so permuting them cannot change a single pixel. The analytic
+    gold is stated in terms of vertical rank and offset sets rather than list
+    position, so it is invariant too.
+    """
+
+    reversed_rungs = copy.deepcopy(scene)
+    reversed_rungs["rungs"] = list(reversed(reversed_rungs["rungs"]))
+
+    reversed_bumps = copy.deepcopy(scene)
+    for rung in reversed_bumps["rungs"]:
+        rung["bumps"] = list(reversed(rung["bumps"]))
+
+    return [
+        ("crossbar_list_reversal", reversed_rungs),
+        ("bump_list_reversal", reversed_bumps),
+    ]

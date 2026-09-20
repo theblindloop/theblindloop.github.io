@@ -1,0 +1,343 @@
+"""Renderer and analytic gold for the switch-lane descent world.
+
+One connected thin ladder spans the whole board: five tall rails joined by a
+handful of short horizontal switches.  A black pointer names the rail where the
+descent starts.  The walker only ever moves downwards and is forced across
+every switch it meets, so the rail it finishes on is the composition of the
+visible adjacent transpositions in height order.  The answer is the colour of
+the square bead parked at the foot of the finishing rail.
+
+The analytic gold is recomputed from the drawn geometry only (switch heights and
+their rail pairs, the pointer rail, the bead colours), never from list order.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "switchlane_descent_bind-renderer-0.1.0"
+
+WIDTH = 720
+HEIGHT = 520
+
+BOARD = (243, 238, 228)
+RAIL_INK = (92, 100, 112)
+POINTER_INK = (18, 18, 18)
+
+PALETTE = {
+    "red": (206, 42, 42),
+    "orange": (232, 124, 28),
+    "green": (46, 150, 62),
+    "teal": (26, 158, 168),
+    "blue": (48, 86, 208),
+    "purple": (140, 58, 180),
+}
+COLOR_NAMES = ("red", "orange", "green", "teal", "blue", "purple")
+
+N_RAILS = 5
+RAIL_X = (100, 230, 360, 490, 620)
+RAIL_TOP = 110
+RAIL_BOTTOM = 430
+HALF_INK = 2                     # rails and switches are five pixels thick
+BEAD_HALF = 15
+BEAD_CY = 445                    # the bead touches the foot of its rail
+POINTER_HALF_W = 14
+POINTER_TOP = 84
+POINTER_TIP = RAIL_TOP           # the pointer tip touches the top of its rail
+
+SWITCH_Y_LO = 152
+SWITCH_Y_HI = 394
+DECOR_SIDE = 12
+DECOR_CLEAR = 22                 # decoration keeps this far from every structure
+
+QUARANTINE_MARGIN = 16.0
+MARGIN_CAP = 40.0
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def _mode_for(seed: int) -> str:
+    if seed % 11 == 0:
+        return "quarantine"
+    if seed % 5 == 0:
+        return "tight"
+    return "normal"
+
+
+BASE_GAP = 26                    # comfortable vertical spacing between switches
+
+
+def _target_gap(rng: random.Random, mode: str) -> int | None:
+    """Vertical gap forced onto one order-sensitive switch pair."""
+    if mode == "quarantine":
+        return rng.randint(10, 15)
+    if mode == "tight":
+        return rng.randint(17, 22)
+    return None
+
+
+def _descend(switches: list[dict], start: int) -> tuple[int, list[int], int]:
+    """Walk down from ``start``; every switch met flips the walker to its twin."""
+    ordered = sorted(switches, key=lambda s: s["y"])
+    lane = start
+    visited = [lane]
+    taken = 0
+    for sw in ordered:
+        left = sw["lane"]
+        if lane == left:
+            lane = left + 1
+            taken += 1
+            visited.append(lane)
+        elif lane == left + 1:
+            lane = left
+            taken += 1
+            visited.append(lane)
+    return lane, visited, taken
+
+
+def _order_sensitive_gaps(switches: list[dict]) -> list[float]:
+    gaps = []
+    for i, a in enumerate(switches):
+        for b in switches[i + 1:]:
+            rails_a = {a["lane"], a["lane"] + 1}
+            rails_b = {b["lane"], b["lane"] + 1}
+            if rails_a & rails_b and a["lane"] != b["lane"]:
+                gaps.append(abs(a["y"] - b["y"]))
+    return gaps
+
+
+def _all_gaps(switches: list[dict]) -> list[float]:
+    return [
+        abs(a["y"] - b["y"])
+        for i, a in enumerate(switches)
+        for b in switches[i + 1:]
+    ]
+
+
+def _structure_boxes(scene: dict) -> list[tuple[int, int, int, int]]:
+    boxes = [
+        (RAIL_X[i] - HALF_INK, RAIL_TOP, RAIL_X[i] + HALF_INK, RAIL_BOTTOM)
+        for i in range(N_RAILS)
+    ]
+    for sw in scene["switches"]:
+        boxes.append(
+            (
+                RAIL_X[sw["lane"]],
+                sw["y"] - HALF_INK,
+                RAIL_X[sw["lane"] + 1],
+                sw["y"] + HALF_INK,
+            )
+        )
+    for i in range(N_RAILS):
+        boxes.append(
+            (
+                RAIL_X[i] - BEAD_HALF,
+                BEAD_CY - BEAD_HALF,
+                RAIL_X[i] + BEAD_HALF,
+                BEAD_CY + BEAD_HALF,
+            )
+        )
+    px = RAIL_X[scene["start_lane"]]
+    boxes.append((px - POINTER_HALF_W, POINTER_TOP, px + POINTER_HALF_W, POINTER_TIP))
+    return boxes
+
+
+def _box_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    dx = max(a[0] - b[2], b[0] - a[2], 0)
+    dy = max(a[1] - b[3], b[1] - a[3], 0)
+    if dx == 0 and dy == 0:
+        return 0.0
+    return float(max(dx, dy))
+
+
+def _spread_heights(rng: random.Random, n: int) -> list[int]:
+    """``n`` increasing heights whose consecutive gaps are all at least BASE_GAP."""
+    free = (SWITCH_Y_HI - SWITCH_Y_LO) - (n - 1) * BASE_GAP
+    offsets = sorted(rng.randrange(free + 1) for _ in range(n))
+    return [SWITCH_Y_LO + offsets[i] + i * BASE_GAP for i in range(n)]
+
+
+def _sample_switches(rng: random.Random, mode: str, want_end) -> dict | None:
+    n = rng.randint(7, 9)
+    for attempt in range(900):
+        heights = _spread_heights(rng, n)
+        lanes = [rng.randrange(N_RAILS - 1) for _ in range(n)]
+        switches = [{"lane": lanes[i], "y": heights[i]} for i in range(n)]
+
+        pairs = [
+            i
+            for i in range(n - 1)
+            if ({lanes[i], lanes[i] + 1} & {lanes[i + 1], lanes[i + 1] + 1})
+            and lanes[i] != lanes[i + 1]
+        ]
+        if not pairs:
+            continue
+        target = _target_gap(rng, mode)
+        if target is not None:
+            i = pairs[rng.randrange(len(pairs))]
+            switches[i + 1]["y"] = switches[i]["y"] + target
+        sensitive = _order_sensitive_gaps(switches)
+        if not sensitive:
+            continue
+        if target is not None and min(sensitive) != target:
+            continue
+        start = rng.randrange(N_RAILS)
+        end, visited, taken = _descend(switches, start)
+        if min(visited) != 0 or max(visited) != N_RAILS - 1:
+            continue
+        if taken < max(5, n - 3):
+            continue
+        if want_end is not None and end != want_end and attempt < 700:
+            continue
+        return {
+            "switches": switches,
+            "start_lane": start,
+            "end_lane": end,
+            "visited": visited,
+            "taken": taken,
+        }
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic latent scene for ``seed``."""
+    rng = random.Random(seed * 7919 + 13)
+    mode = _mode_for(seed)
+    want_colour = COLOR_NAMES[seed % len(COLOR_NAMES)]
+    want_end = (seed // len(COLOR_NAMES)) % N_RAILS
+
+    core = _sample_switches(rng, mode, want_end)
+    if core is None:
+        core = _sample_switches(rng, "normal", None)
+    if core is None:                                    # pragma: no cover
+        raise RuntimeError(f"switch sampling failed for seed {seed}")
+
+    others = [c for c in COLOR_NAMES if c != want_colour]
+    rng.shuffle(others)
+    beads = [None] * N_RAILS
+    beads[core["end_lane"]] = want_colour
+    pool = others[: N_RAILS - 1]
+    k = 0
+    for lane in range(N_RAILS):
+        if beads[lane] is None:
+            beads[lane] = pool[k]
+            k += 1
+
+    scene = {
+        "seed": int(seed),
+        "mode": mode,
+        "switches": core["switches"],
+        "start_lane": core["start_lane"],
+        "beads": beads,
+        "decor": [],
+    }
+
+    boxes = _structure_boxes(scene)
+    decor: list[dict] = []
+    n_decor = rng.randint(12, 16)
+    guard = 0
+    while len(decor) < n_decor and guard < 4000:
+        guard += 1
+        cx = rng.randrange(24, WIDTH - 24)
+        cy = rng.randrange(24, HEIGHT - 24)
+        box = (cx - DECOR_SIDE // 2, cy - DECOR_SIDE // 2,
+               cx + DECOR_SIDE // 2, cy + DECOR_SIDE // 2)
+        if any(_box_gap(box, b) < DECOR_CLEAR for b in boxes):
+            continue
+        if any(_box_gap(box, d["box"]) < 8 for d in decor):
+            continue
+        decor.append({"box": box, "colour": COLOR_NAMES[len(decor) % len(COLOR_NAMES)]})
+    scene["decor"] = [
+        {"cx": (d["box"][0] + d["box"][2]) // 2,
+         "cy": (d["box"][1] + d["box"][3]) // 2,
+         "colour": d["colour"]}
+        for d in decor
+    ]
+    return scene
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BOARD)
+    draw = ImageDraw.Draw(image)
+
+    for spot in scene["decor"]:
+        h = DECOR_SIDE // 2
+        draw.rectangle(
+            [spot["cx"] - h, spot["cy"] - h, spot["cx"] + h, spot["cy"] + h],
+            fill=PALETTE[spot["colour"]],
+        )
+
+    for x in RAIL_X:
+        draw.rectangle([x - HALF_INK, RAIL_TOP, x + HALF_INK, RAIL_BOTTOM], fill=RAIL_INK)
+    for sw in scene["switches"]:
+        draw.rectangle(
+            [RAIL_X[sw["lane"]], sw["y"] - HALF_INK,
+             RAIL_X[sw["lane"] + 1], sw["y"] + HALF_INK],
+            fill=RAIL_INK,
+        )
+
+    for lane, colour in enumerate(scene["beads"]):
+        x = RAIL_X[lane]
+        draw.rectangle(
+            [x - BEAD_HALF, BEAD_CY - BEAD_HALF, x + BEAD_HALF, BEAD_CY + BEAD_HALF],
+            fill=PALETTE[colour],
+        )
+
+    px = RAIL_X[scene["start_lane"]]
+    draw.polygon(
+        [(px - POINTER_HALF_W, POINTER_TOP), (px + POINTER_HALF_W, POINTER_TOP),
+         (px, POINTER_TIP)],
+        fill=POINTER_INK,
+    )
+    return image
+
+
+# --------------------------------------------------------------------------- #
+# gold, margin, quarantine, aliases
+# --------------------------------------------------------------------------- #
+def analytic_gold(scene: dict) -> str:
+    """Colour of the bead at the foot of the rail the descent ends on."""
+    end, _, _ = _descend(scene["switches"], scene["start_lane"])
+    return scene["beads"][end]
+
+
+def margin(scene: dict) -> float:
+    """Smallest visible clearance in pixels that the reading depends on."""
+    values = [MARGIN_CAP]
+    values.extend(_order_sensitive_gaps(scene["switches"]))
+    values.extend(_all_gaps(scene["switches"]))
+    boxes = _structure_boxes(scene)
+    h = DECOR_SIDE // 2
+    for spot in scene["decor"]:
+        box = (spot["cx"] - h, spot["cy"] - h, spot["cx"] + h, spot["cy"] + h)
+        values.extend(_box_gap(box, b) for b in boxes)
+    return round(float(min(values)), 3)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical latent aliases: description order of drawn elements."""
+    out: list[tuple[str, dict]] = []
+
+    reversed_switches = dict(scene)
+    reversed_switches["switches"] = list(reversed(scene["switches"]))
+    out.append(("switch_list_reversed", reversed_switches))
+
+    rotated = dict(scene)
+    sw = list(scene["switches"])
+    rotated["switches"] = sw[3:] + sw[:3]
+    out.append(("switch_list_rotated", rotated))
+
+    decor_rev = dict(scene)
+    decor_rev["decor"] = list(reversed(scene["decor"]))
+    out.append(("decor_list_reversed", decor_rev))
+    return out

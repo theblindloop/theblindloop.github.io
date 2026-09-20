@@ -1,0 +1,168 @@
+"""Pixel-only inverse arm for the ribbon-stack reveal world.
+
+Receives one rendered PNG and the public question contract only: the decisive
+ribbon is orange, its dots are near-black, the start arrow is black, panels are
+square and joined edge to edge by narrower necks, each panel carries a 5x5 dot
+field in the ribbon's travel frame, and the answer is the glyph spelled by the
+cells that carry a dot in every panel.  It imports no renderer, prompt,
+generator, verifier or gold code and never sees a scene.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "ribbon_stack_reveal-oracle-0.1.0"
+
+TAPE_RGB = (206, 122, 58)
+DOT_RGB = (38, 40, 46)
+ARROW_RGB = (0, 0, 0)
+
+GRID = 5
+CELL_RATIO = 5.0 / 30.0
+ERODE_R = 6
+ABSTAIN = "abstain"
+
+GLYPHS = ("ell", "ex", "plus", "tee")
+
+
+def _glyph(name: str) -> frozenset:
+    if name == "plus":
+        return frozenset({(2, c) for c in range(5)} | {(r, 2) for r in range(5)})
+    if name == "ex":
+        return frozenset({(i, i) for i in range(5)} | {(i, 4 - i) for i in range(5)})
+    if name == "tee":
+        return frozenset({(0, c) for c in range(5)} | {(r, 2) for r in range(1, 5)})
+    return frozenset({(r, 0) for r in range(5)} | {(4, c) for c in range(1, 5)})
+
+
+TEMPLATES = {name: _glyph(name) for name in GLYPHS}
+
+
+def _exact(arr: np.ndarray, rgb) -> np.ndarray:
+    return np.all(arr == np.array(rgb, dtype=np.int16), axis=-1)
+
+
+def _erode(mask: np.ndarray, radius: int) -> np.ndarray:
+    out = mask.copy()
+    for axis in (0, 1):
+        acc = out.copy()
+        for shift in range(1, radius + 1):
+            acc &= np.roll(out, shift, axis=axis)
+            acc &= np.roll(out, -shift, axis=axis)
+        out = acc
+    return out
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    seen = np.zeros_like(mask, dtype=bool)
+    blobs = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        pixels = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1]:
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        blobs.append(np.array(pixels))
+    return blobs
+
+
+def _decide(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    body = _exact(arr, TAPE_RGB) | _exact(arr, DOT_RGB)
+    dots = _exact(arr, DOT_RGB)
+    cores = _components(_erode(body, ERODE_R))
+    cores = [blob for blob in cores if len(blob) >= 80]
+    if len(cores) < 3:
+        return ABSTAIN, 0.0
+    centers = [(float(blob[:, 1].mean()), float(blob[:, 0].mean())) for blob in cores]
+
+    dists = [
+        (abs(a[0] - b[0]) + abs(a[1] - b[1]), i, j)
+        for i, a in enumerate(centers)
+        for j, b in enumerate(centers)
+        if i < j
+    ]
+    if not dists:
+        return ABSTAIN, 0.0
+    pitch = min(d[0] for d in dists)
+    adj: dict[int, list[int]] = {i: [] for i in range(len(centers))}
+    for dist, i, j in dists:
+        if dist > pitch * 1.4:
+            continue
+        mx = int(round((centers[i][0] + centers[j][0]) / 2.0))
+        my = int(round((centers[i][1] + centers[j][1]) / 2.0))
+        if not body[my, mx]:
+            continue
+        adj[i].append(j)
+        adj[j].append(i)
+    ends = [i for i in adj if len(adj[i]) == 1]
+    if len(ends) != 2 or any(len(v) > 2 for v in adj.values()):
+        return ABSTAIN, 0.0
+
+    black = np.argwhere(_exact(arr, ARROW_RGB))
+    if black.size == 0:
+        return ABSTAIN, 0.0
+    ax, ay = float(black[:, 1].mean()), float(black[:, 0].mean())
+    start = min(ends, key=lambda i: (centers[i][0] - ax) ** 2 + (centers[i][1] - ay) ** 2)
+
+    order = [start]
+    prev = -1
+    while True:
+        nxt = [k for k in adj[order[-1]] if k != prev]
+        if not nxt:
+            break
+        prev = order[-1]
+        order.append(nxt[0])
+        if len(order) > len(centers):
+            return ABSTAIN, 0.0
+    if len(order) != len(centers):
+        return ABSTAIN, 0.0
+
+    cell = pitch * CELL_RATIO
+    keep = {(r, c) for r in range(GRID) for c in range(GRID)}
+    for step, node in enumerate(order):
+        a = order[step] if step + 1 < len(order) else order[step - 1]
+        b = order[step + 1] if step + 1 < len(order) else order[step]
+        ux = centers[b][0] - centers[a][0]
+        uy = centers[b][1] - centers[a][1]
+        norm = max(abs(ux), abs(uy))
+        ux, uy = round(ux / norm), round(uy / norm)
+        vx, vy = -uy, ux
+        cx, cy = centers[node]
+        marks = set()
+        for r in range(GRID):
+            for c in range(GRID):
+                px = int(round(cx + (c - 2) * cell * ux + (r - 2) * cell * vx))
+                py = int(round(cy + (c - 2) * cell * uy + (r - 2) * cell * vy))
+                patch = dots[py - 1 : py + 2, px - 1 : px + 2]
+                if patch.size and patch.sum() >= 5:
+                    marks.add((r, c))
+        keep &= marks
+
+    scores = sorted((len(keep ^ TEMPLATES[name]), name) for name in GLYPHS)
+    if scores[0][0] != 0:
+        return ABSTAIN, float(scores[1][0] - scores[0][0])
+    return scores[0][1], float(scores[1][0] - scores[0][0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the stacked glyph from pixels alone, or abstain."""
+    return _decide(image)[0]
+
+
+def margin_from_image(image: Image.Image) -> float:
+    """Runner-up cell separation between the recovered stack and the next glyph."""
+    return _decide(image)[1]

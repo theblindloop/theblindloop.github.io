@@ -1,0 +1,178 @@
+"""Independent PNG-only inverse arm for Prefix Flip Stack.
+
+This module deliberately duplicates the public palette and visual grammar.  It
+does not import scene generation, rendering, prompts, verification, or gold code.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_DARK = np.array((30, 35, 44), dtype=np.int16)
+_BLUE = np.array((38, 108, 218), dtype=np.int16)
+_GRAY = np.array((205, 211, 220), dtype=np.int16)
+_CYAN = np.array((0, 156, 184), dtype=np.int16)
+_MAGENTA = np.array((207, 45, 132), dtype=np.int16)
+_PASTELS = tuple(
+    np.array(rgb, dtype=np.int16)
+    for rgb in ((255, 211, 188), (190, 234, 214), (218, 204, 244), (241, 224, 169))
+)
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _near(arr: np.ndarray, color: np.ndarray, tolerance: int = 8) -> np.ndarray:
+    # int32 avoids wraparound when two 8-bit channels differ by more than 181.
+    delta = arr.astype(np.int32) - color.astype(np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[dict[str, float | int]]:
+    """Return 4-connected component measurements without external CV libraries."""
+    work = mask.copy()
+    found: list[dict[str, float | int]] = []
+    height, width = work.shape
+    while work.any():
+        y, x = np.argwhere(work)[0]
+        queue: deque[tuple[int, int]] = deque([(int(y), int(x))])
+        work[y, x] = False
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and work[ny, nx]:
+                    work[ny, nx] = False
+                    queue.append((ny, nx))
+        if len(xs) >= minimum:
+            found.append(
+                {
+                    "area": len(xs),
+                    "x0": min(xs),
+                    "x1": max(xs),
+                    "y0": min(ys),
+                    "y1": max(ys),
+                    "cx": float(sum(xs)) / len(xs),
+                    "cy": float(sum(ys)) / len(ys),
+                }
+            )
+    return found
+
+
+def _shape_from_crop(arr: np.ndarray, box: dict[str, float | int]) -> str:
+    x0, x1 = int(box["x0"]), int(box["x1"])
+    y0, y1 = int(box["y0"]), int(box["y1"])
+    tile_w = x1 - x0 + 1
+    tile_h = y1 - y0 + 1
+    crop = arr[y0 : y1 + 1, x0 : x0 + int(tile_w * 0.58)]
+    comps = _components(_near(crop, _DARK), minimum=300)
+    if len(comps) != 1:
+        raise PixelParseError(f"expected one identity glyph, found {len(comps)}")
+    comp = comps[0]
+    width = int(comp["x1"]) - int(comp["x0"]) + 1
+    height = int(comp["y1"]) - int(comp["y0"]) + 1
+    fill = int(comp["area"]) / float(width * height)
+    rel_y = (float(comp["cy"]) - float(comp["y0"])) / max(height - 1, 1)
+    if width < 34 or height < 34 or width > tile_w * 0.4 or height > tile_h * 0.75:
+        raise PixelParseError("identity glyph dimensions are ambiguous")
+    if fill > 0.93:
+        return "square"
+    if fill > 0.68:
+        return "circle"
+    if rel_y > 0.57:
+        return "triangle"
+    return "diamond"
+
+
+def _face_from_crop(arr: np.ndarray, box: dict[str, float | int]) -> bool:
+    x0, x1 = int(box["x0"]), int(box["x1"])
+    y0, y1 = int(box["y0"]), int(box["y1"])
+    tile_w = x1 - x0 + 1
+    crop = arr[y0 : y1 + 1, x0 + int(tile_w * 0.60) : x1 + 1]
+    count = int(_near(crop, _CYAN).sum())
+    if count >= 350:
+        return True
+    if 180 <= count <= 300:
+        return False
+    raise PixelParseError(f"face marker ink {count} is neither solid nor hollow")
+
+
+def _read_cards(arr: np.ndarray) -> list[int]:
+    bars: list[dict[str, float | int | str]] = []
+    for name, color in (("blue", _BLUE), ("gray", _GRAY)):
+        for comp in _components(_near(arr, color), minimum=900):
+            width = int(comp["x1"]) - int(comp["x0"]) + 1
+            height = int(comp["y1"]) - int(comp["y0"]) + 1
+            if 68 <= width <= 84 and 15 <= height <= 23:
+                comp["kind"] = name
+                bars.append(comp)
+    if len(bars) != 16:
+        raise PixelParseError(f"expected 16 operation bars, found {len(bars)}")
+    bars.sort(key=lambda item: float(item["cx"]))
+    groups: list[list[dict[str, float | int | str]]] = []
+    for bar in bars:
+        if not groups or abs(float(bar["cx"]) - np.mean([float(x["cx"]) for x in groups[-1]])) > 20:
+            groups.append([bar])
+        else:
+            groups[-1].append(bar)
+    if len(groups) != 4 or any(len(group) != 4 for group in groups):
+        raise PixelParseError("operation bars do not form four unambiguous cards")
+    flips: list[int] = []
+    for group in groups:
+        ordered = sorted(group, key=lambda item: float(item["cy"]))
+        kinds = [str(item["kind"]) for item in ordered]
+        k = sum(kind == "blue" for kind in kinds)
+        if k not in (1, 2, 3, 4) or kinds != ["blue"] * k + ["gray"] * (4 - k):
+            raise PixelParseError(f"card is not one contiguous blue prefix: {kinds}")
+        flips.append(k)
+    return flips
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3 or arr.shape[0] < 200 or arr.shape[1] < 500:
+        raise PixelParseError("canvas is missing or too small")
+
+    pastel_mask = np.zeros(arr.shape[:2], dtype=bool)
+    for color in _PASTELS:
+        pastel_mask |= _near(arr, color)
+    tiles = []
+    for comp in _components(pastel_mask, minimum=7000):
+        width = int(comp["x1"]) - int(comp["x0"]) + 1
+        height = int(comp["y1"]) - int(comp["y0"]) + 1
+        if 160 <= width <= 185 and 66 <= height <= 78:
+            tiles.append(comp)
+    tiles.sort(key=lambda item: float(item["cy"]))
+    if len(tiles) != 4:
+        raise PixelParseError(f"expected four start-stack tiles, found {len(tiles)}")
+    if min(float(tiles[i + 1]["cy"]) - float(tiles[i]["cy"]) for i in range(3)) < 70:
+        raise PixelParseError("stack slot order is ambiguous")
+
+    order = [_shape_from_crop(arr, tile) for tile in tiles]
+    if sorted(order) != ["circle", "diamond", "square", "triangle"]:
+        raise PixelParseError(f"shape identities are not unique: {order}")
+    faces = [_face_from_crop(arr, tile) for tile in tiles]
+
+    targets = _components(_near(arr, _MAGENTA), minimum=300)
+    targets = [comp for comp in targets if int(comp["area"]) >= 400]
+    if len(targets) != 1:
+        raise PixelParseError(f"expected one target pointer, found {len(targets)}")
+    distances = sorted(
+        (abs(float(targets[0]["cy"]) - float(tile["cy"])), index)
+        for index, tile in enumerate(tiles)
+    )
+    if distances[0][0] > 8 or distances[1][0] - distances[0][0] < 45:
+        raise PixelParseError("target slot is not uniquely selected")
+    target_slot = distances[0][1]
+
+    for k in _read_cards(arr):
+        order[:k] = reversed(order[:k])
+        faces[:k] = [not value for value in reversed(faces[:k])]
+    return f"{order[target_slot]} {'up' if faces[target_slot] else 'down'}"

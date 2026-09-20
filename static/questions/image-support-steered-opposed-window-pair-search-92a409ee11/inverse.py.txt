@@ -1,0 +1,123 @@
+"""Independent RGB-only inverse for the opposed-window pair search."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """Return inclusive runs of true entries without using scene metadata."""
+
+    positions = np.flatnonzero(flags)
+    if not len(positions):
+        return []
+    runs: list[tuple[int, int]] = []
+    start = previous = int(positions[0])
+    for value in positions[1:]:
+        current = int(value)
+        if current != previous + 1:
+            runs.append((start, previous))
+            start = current
+        previous = current
+    runs.append((start, previous))
+    return runs
+
+
+def _badge_info(
+    foreground: np.ndarray, background_mask: np.ndarray, bbox: tuple[int, int, int, int]
+) -> tuple[float, float, int] | None:
+    x0, y0, x1, y1 = bbox
+    box_width = x1 - x0 + 1
+    box_height = y1 - y0 + 1
+    if not (150 <= box_width <= 185 and 110 <= box_height <= 145):
+        return None
+    filled = foreground[y0 : y1 + 1, x0 : x1 + 1]
+    if float(np.mean(filled)) < 0.72:
+        return None
+    center_x = (x0 + x1) / 2.0
+    center_y = (y0 + y1) / 2.0
+
+    # The middle of an octagon is entirely inside its ink except for the
+    # enclosed window. A bounded crop therefore recovers the window without
+    # flood-filling the million-pixel exterior background.
+    ix0, ix1 = x0 + 10, x1 - 10
+    iy0, iy1 = y0 + 30, y1 - 30
+    interior = background_mask[iy0 : iy1 + 1, ix0 : ix1 + 1]
+    window_pixels = np.argwhere(interior)
+    if not (900 <= len(window_pixels) <= 1900):
+        return None
+    hole_y = float(window_pixels[:, 0].mean() + iy0)
+    hole_x = float(window_pixels[:, 1].mean() + ix0)
+    if abs(hole_y - center_y) > 30.0:
+        return None
+    offset = int(round(hole_x - center_x))
+    if abs(offset) < 15 or abs(offset) > 65:
+        return None
+    return center_x, center_y, offset
+
+
+def _side_infos(
+    foreground: np.ndarray, background_mask: np.ndarray, x_start: int, x_end: int
+) -> list[tuple[float, float, int]]:
+    side = foreground[:, x_start:x_end]
+    infos: list[tuple[float, float, int]] = []
+    for row_start, row_end in _runs(side.any(axis=1)):
+        row_slice = side[row_start : row_end + 1]
+        for col_start, col_end in _runs(row_slice.any(axis=0)):
+            bbox = (x_start + col_start, row_start, x_start + col_end, row_end)
+            info = _badge_info(foreground, background_mask, bbox)
+            if info is not None:
+                infos.append(info)
+    return infos
+
+
+def _infos(image: Image.Image) -> list[tuple[float, float, int]]:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if pixels.ndim != 3 or pixels.shape[2] != 3 or pixels.shape[0] < 200 or pixels.shape[1] < 300:
+        raise ValueError("unexpected image shape")
+    height, width = pixels.shape[:2]
+    background = pixels[0, 0]
+    foreground = np.max(np.abs(pixels - background), axis=2) > 24
+    background_mask = np.max(np.abs(pixels - background), axis=2) <= 8
+    midpoint = width // 2
+    infos = _side_infos(foreground, background_mask, 0, midpoint)
+    infos.extend(_side_infos(foreground, background_mask, midpoint, width))
+    if not infos:
+        raise ValueError("no complete badge remains")
+    return infos
+
+
+def _pair_scores(infos: list[tuple[float, float, int]]) -> list[tuple[float, float]]:
+    left = sorted((info for info in infos if info[0] < 600.0), key=lambda item: item[1])
+    right = sorted((info for info in infos if info[0] >= 600.0), key=lambda item: item[1])
+    pairs: list[tuple[float, float]] = []
+    unused = set(range(len(right)))
+    for left_info in left:
+        if not unused:
+            break
+        index = min(unused, key=lambda candidate: abs(right[candidate][1] - left_info[1]))
+        right_info = right[index]
+        if abs(right_info[1] - left_info[1]) <= 70.0:
+            unused.remove(index)
+            pairs.append((abs(left_info[2] + right_info[2]), left_info[1]))
+    return pairs
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the unique complete row whose signed window offsets cancel."""
+
+    infos = _infos(image)
+    scores = _pair_scores(infos)
+    if not scores:
+        raise ValueError("no complete remote badge pair remains")
+    scores.sort(key=lambda item: item[1])
+    good = [item for item in scores if item[0] <= 3.0]
+    if len(good) != 1:
+        raise ValueError("raster has no unique balanced-window pair")
+    best = good[0]
+    other_scores = [item[0] for item in scores if item is not best]
+    if other_scores and min(other_scores) - best[0] < 8.0:
+        raise ValueError("balanced-window decision margin is too small")
+    row_index = min(3, max(0, int(round((best[1] - 110.0) / 200.0))))
+    return str(row_index + 1)

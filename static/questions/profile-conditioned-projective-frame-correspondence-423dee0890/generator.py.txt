@@ -1,0 +1,246 @@
+"""Deterministic sampler, analytic projective solver, and Pillow renderer."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH, HEIGHT = 1100, 700
+PAPER = (255, 255, 255)
+INK = (31, 36, 43)
+GRAY = (102, 112, 124)
+LIGHT = (218, 224, 231)
+FAINT = (239, 242, 246)
+MAGENTA = (204, 38, 151)
+COLORS = ("red", "green", "blue", "orange")
+RGB = {
+    "red": (218, 55, 65),
+    "green": (42, 150, 88),
+    "blue": (45, 98, 210),
+    "orange": (236, 137, 32),
+}
+ANCHOR_RGBS = (
+    (12, 158, 179),
+    (226, 181, 25),
+    (132, 76, 184),
+    (76, 142, 112),
+)
+_CANONICAL_CORNERS = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+_D4_ORDERS = (
+    (0, 1, 2, 3),
+    (3, 0, 1, 2),
+    (2, 3, 0, 1),
+    (1, 2, 3, 0),
+    (0, 3, 2, 1),
+    (3, 2, 1, 0),
+    (2, 1, 0, 3),
+    (1, 0, 3, 2),
+)
+_BASE_POINTS = (
+    (0.18, 0.20),
+    (0.46, 0.16),
+    (0.77, 0.25),
+    (0.25, 0.47),
+    (0.58, 0.42),
+    (0.82, 0.57),
+    (0.39, 0.76),
+    (0.70, 0.81),
+)
+
+
+def _homography(source: list[list[float]] | tuple, destination: list[list[float]] | tuple) -> np.ndarray:
+    rows: list[list[float]] = []
+    values: list[float] = []
+    for (u, v), (x, y) in zip(source, destination, strict=True):
+        rows.append([u, v, 1.0, 0.0, 0.0, 0.0, -u * x, -v * x])
+        rows.append([0.0, 0.0, 0.0, u, v, 1.0, -u * y, -v * y])
+        values.extend([x, y])
+    solution = np.linalg.solve(np.asarray(rows, dtype=float), np.asarray(values, dtype=float))
+    return np.asarray(
+        [[solution[0], solution[1], solution[2]],
+         [solution[3], solution[4], solution[5]],
+         [solution[6], solution[7], 1.0]],
+        dtype=float,
+    )
+
+
+def _project(matrix: np.ndarray, point: tuple[float, float] | list[float]) -> tuple[float, float]:
+    value = matrix @ np.asarray([point[0], point[1], 1.0], dtype=float)
+    if abs(float(value[2])) < 1e-9:
+        raise ValueError("projective point is at infinity")
+    return float(value[0] / value[2]), float(value[1] / value[2])
+
+
+def _anchors_by_identity(corners: list, order: list[int]) -> list[list[float]]:
+    if sorted(order) != [0, 1, 2, 3]:
+        raise ValueError("anchor order is not a permutation")
+    return [list(corners[order.index(identity)]) for identity in range(4)]
+
+
+def _panel_homography(corners: list, order: list[int]) -> np.ndarray:
+    return _homography(_CANONICAL_CORNERS, _anchors_by_identity(corners, order))
+
+
+def _ranked(scene: dict) -> list[tuple[float, int]]:
+    reference_corners = scene["reference_corners"]
+    target_corners = scene["target_corners"]
+    reference_order = scene["reference_anchor_order"]
+    target_order = scene["target_anchor_order"]
+    points = scene["point_uvs"]
+    query_index = int(scene["query_index"])
+    reference_anchors = _anchors_by_identity(reference_corners, reference_order)
+    target_anchors = _anchors_by_identity(target_corners, target_order)
+    reference_to_target = _homography(reference_anchors, target_anchors)
+    reference_map = _panel_homography(reference_corners, reference_order)
+    target_map = _panel_homography(target_corners, target_order)
+    marked_xy = _project(reference_map, points[query_index])
+    predicted_xy = _project(reference_to_target, marked_xy)
+    target_points = [_project(target_map, point) for point in points]
+    ranked = [
+        (math.hypot(point[0] - predicted_xy[0], point[1] - predicted_xy[1]), index)
+        for index, point in enumerate(target_points)
+    ]
+    return sorted(ranked, key=lambda item: (item[0], item[1]))
+
+
+def analytic_gold(scene: dict) -> str:
+    winner = _ranked(scene)[0][1]
+    return str(scene["point_colors"][winner])
+
+
+def margin(scene: dict) -> float:
+    ranked = _ranked(scene)
+    return float(ranked[1][0] - ranked[0][0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    ranked = _ranked(scene)
+    return ranked[0][0] > 3.0 or ranked[1][0] - ranked[0][0] < 38.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    count = len(twin["point_uvs"])
+    twin["point_uvs"] = list(reversed(twin["point_uvs"]))
+    twin["point_colors"] = list(reversed(twin["point_colors"]))
+    twin["query_index"] = count - 1 - int(twin["query_index"])
+    return [("reverse_parallel_point_records", twin)]
+
+
+def sample_scene(seed: int) -> dict:
+    seed = int(seed)
+    rng = random.Random(seed ^ 0x4F2A9D)
+    left_base = ((105, 164), (492, 132), (463, 571), (126, 548))
+    right_base = ((648, 142), (1012, 172), (1031, 552), (671, 584))
+    for _attempt in range(100):
+        reference_corners = [
+            [x + rng.randint(-12, 12), y + rng.randint(-12, 12)] for x, y in left_base
+        ]
+        target_corners = [
+            [x + rng.randint(-12, 12), y + rng.randint(-12, 12)] for x, y in right_base
+        ]
+        reference_choice = rng.randrange(8)
+        target_choice = (reference_choice + 1 + rng.randrange(7)) % 8
+        point_uvs = [
+            [round(u + rng.uniform(-0.018, 0.018), 4), round(v + rng.uniform(-0.018, 0.018), 4)]
+            for u, v in _BASE_POINTS
+        ]
+        anchor_palette = [list(value) for value in ANCHOR_RGBS]
+        rng.shuffle(anchor_palette)
+        phase = (seed // 8) % 4
+        point_colors = [COLORS[(index * 3 + phase) % 4] for index in range(8)]
+        scene = {
+            "reference_corners": reference_corners,
+            "target_corners": target_corners,
+            "reference_anchor_order": list(_D4_ORDERS[reference_choice]),
+            "target_anchor_order": list(_D4_ORDERS[target_choice]),
+            "anchor_palette": anchor_palette,
+            "point_uvs": point_uvs,
+            "query_index": seed % 8,
+            "point_colors": point_colors,
+        }
+        if not is_quarantined(scene):
+            return scene
+    raise RuntimeError("could not sample a separated projective scene")
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    paths = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    )
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def _centered(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font, fill) -> None:
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.text(
+        (xy[0] - (box[2] - box[0]) / 2, xy[1] - (box[3] - box[1]) / 2),
+        text,
+        font=font,
+        fill=fill,
+    )
+
+
+def _pixel(point: tuple[float, float]) -> tuple[int, int]:
+    return int(round(point[0])), int(round(point[1]))
+
+
+def _draw_frame(draw: ImageDraw.ImageDraw, corners: list, order: list[int], palette: list) -> None:
+    polygon = [tuple(point) for point in corners]
+    draw.polygon(polygon, fill=FAINT)
+    draw.line(polygon + [polygon[0]], fill=GRAY, width=5, joint="curve")
+    draw.line((polygon[0], polygon[2]), fill=LIGHT, width=2)
+    draw.line((polygon[1], polygon[3]), fill=LIGHT, width=2)
+    for physical_index, (x, y) in enumerate(corners):
+        identity = order[physical_index]
+        color = tuple(palette[identity])
+        draw.ellipse((x - 19, y - 19, x + 19, y + 19), fill=color, outline=PAPER, width=5)
+        draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=PAPER)
+
+
+def render(scene: dict) -> Image.Image:
+    reference_corners = scene["reference_corners"]
+    target_corners = scene["target_corners"]
+    reference_order = scene["reference_anchor_order"]
+    target_order = scene["target_anchor_order"]
+    palette = scene["anchor_palette"]
+    points = scene["point_uvs"]
+    query_index = int(scene["query_index"])
+    point_colors = scene["point_colors"]
+    image = Image.new("RGB", (WIDTH, HEIGHT), PAPER)
+    draw = ImageDraw.Draw(image)
+    title = _font(27, bold=True)
+    body = _font(17)
+    small = _font(15, bold=True)
+    _centered(draw, (300, 56), "REFERENCE", title, INK)
+    _centered(draw, (820, 56), "TARGET", title, INK)
+    _centered(draw, (550, 95), "MATCH THE FOUR CORNER COLORS  •  ONE PERSPECTIVE WARP", body, GRAY)
+    draw.line((550, 120, 550, 628), fill=LIGHT, width=3)
+    _draw_frame(draw, reference_corners, reference_order, palette)
+    _draw_frame(draw, target_corners, target_order, palette)
+    reference_map = _panel_homography(reference_corners, reference_order)
+    target_map = _panel_homography(target_corners, target_order)
+    reference_points = [_pixel(_project(reference_map, point)) for point in points]
+    target_points = [_pixel(_project(target_map, point)) for point in points]
+    for x, y in reference_points:
+        draw.ellipse((x - 9, y - 9, x + 9, y + 9), fill=PAPER, outline=GRAY, width=4)
+    qx, qy = reference_points[query_index]
+    draw.ellipse((qx - 18, qy - 18, qx + 18, qy + 18), outline=MAGENTA, width=7)
+    draw.ellipse((qx - 4, qy - 4, qx + 4, qy + 4), fill=MAGENTA)
+    for (x, y), color_name in zip(target_points, point_colors, strict=True):
+        draw.ellipse((x - 16, y - 16, x + 16, y + 16), fill=RGB[color_name], outline=PAPER, width=4)
+    _centered(draw, (300, 635), "MAGENTA RING = POINT TO TRANSPORT", small, GRAY)
+    _centered(draw, (820, 635), "EACH ANSWER COLOR APPEARS TWICE", small, GRAY)
+    return image

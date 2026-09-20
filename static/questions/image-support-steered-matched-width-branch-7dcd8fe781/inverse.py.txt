@@ -1,0 +1,143 @@
+"""Independent image-only inverse arm for the width-matched fork.
+
+The arm segments the four public marker colors and navy corridor ink, treats the
+markers as graph nodes, verifies ink coverage on all three node-to-node edges,
+measures each edge cross-section in its middle third, and binds the outgoing
+edge closest in width to the incoming edge to its red or gold endpoint.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+_NAVY = (24, 45, 69)
+_MARKERS = {
+    "blue": (31, 119, 207),
+    "junction": (139, 68, 181),
+    "red": (215, 55, 58),
+    "gold": (225, 164, 31),
+}
+_COLOR_RADIUS = 52.0
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _mask(array: np.ndarray, color: tuple[int, int, int], radius: float = _COLOR_RADIUS) -> np.ndarray:
+    target = np.asarray(color, dtype=np.float32)
+    delta = array.astype(np.float32) - target
+    return np.sqrt(np.sum(delta * delta, axis=2)) <= radius
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= 12:
+            components.append(np.asarray(pixels, dtype=np.float64))
+    return components
+
+
+def _marker_center(array: np.ndarray, name: str) -> tuple[float, float]:
+    components = _components(_mask(array, _MARKERS[name]))
+    if len(components) != 1:
+        raise OracleAbstention(f"expected one {name} marker, found {len(components)}")
+    component = components[0]
+    area = len(component)
+    if not 64 <= area <= 190:
+        raise OracleAbstention(f"{name} marker area {area} is outside calibration")
+    ys, xs = component[:, 0], component[:, 1]
+    height = float(ys.max() - ys.min() + 1.0)
+    width = float(xs.max() - xs.min() + 1.0)
+    if not 0.72 <= width / height <= 1.38:
+        raise OracleAbstention(f"{name} marker is not compact")
+    return float(xs.mean() + 0.5), float(ys.mean() + 0.5)
+
+
+def _corridor_width(
+    navy_yx: np.ndarray,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[float, float]:
+    sx, sy = start
+    ex, ey = end
+    vx, vy = ex - sx, ey - sy
+    length = math.hypot(vx, vy)
+    if not 22.0 <= length <= 43.0:
+        raise OracleAbstention(f"edge length {length:.2f} is outside calibration")
+    ux, uy = vx / length, vy / length
+    xs = navy_yx[:, 1] + 0.5
+    ys = navy_yx[:, 0] + 0.5
+    dx, dy = xs - sx, ys - sy
+    axial = dx * ux + dy * uy
+    perpendicular = -dx * uy + dy * ux
+    lo, hi = 0.34 * length, 0.66 * length
+    selected = (axial >= lo) & (axial <= hi) & (np.abs(perpendicular) <= 14.0)
+    if int(selected.sum()) < 35:
+        raise OracleAbstention("corridor middle has too little navy ink")
+    local_axial = axial[selected]
+    local_perp = perpendicular[selected]
+    if abs(float(np.mean(local_perp))) > 1.4:
+        raise OracleAbstention("corridor ink is not centered on its node edge")
+    # Area divided by axial probe length is a rotation-stable cross-section estimate.
+    width = float(selected.sum()) / (hi - lo)
+    bins = np.linspace(lo, hi, 7)
+    occupied = [int(np.sum((local_axial >= a) & (local_axial < b))) for a, b in zip(bins[:-1], bins[1:])]
+    if min(occupied) < 3:
+        raise OracleAbstention("corridor edge is visibly broken")
+    return width, float(min(occupied))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 256 or array.shape[1] < 256:
+        raise OracleAbstention("unexpected raster size")
+
+    centers = {name: _marker_center(array, name) for name in _MARKERS}
+    junction = centers["junction"]
+    terminal_vectors = []
+    for name in ("red", "gold"):
+        dx = centers[name][0] - junction[0]
+        dy = centers[name][1] - junction[1]
+        terminal_vectors.append((name, math.atan2(dy, dx), math.hypot(dx, dy)))
+    angular_gap = abs((terminal_vectors[0][1] - terminal_vectors[1][1] + math.pi) % (2 * math.pi) - math.pi)
+    if not math.radians(58.0) <= angular_gap <= math.radians(92.0):
+        raise OracleAbstention("outgoing markers do not form a valid fork")
+
+    navy_components = _components(_mask(array, _NAVY, radius=58.0))
+    navy_yx = np.concatenate([item for item in navy_components if len(item) >= 20], axis=0) if navy_components else np.empty((0, 2))
+    if len(navy_yx) < 120:
+        raise OracleAbstention("insufficient corridor ink")
+
+    trunk_width, trunk_coverage = _corridor_width(navy_yx, junction, centers["blue"])
+    red_width, red_coverage = _corridor_width(navy_yx, junction, centers["red"])
+    gold_width, gold_coverage = _corridor_width(navy_yx, junction, centers["gold"])
+    if min(trunk_coverage, red_coverage, gold_coverage) < 3.0:
+        raise OracleAbstention("one graph edge lacks continuous pixel coverage")
+
+    red_gap = abs(red_width - trunk_width)
+    gold_gap = abs(gold_width - trunk_width)
+    decision_margin = abs(red_gap - gold_gap)
+    if min(red_gap, gold_gap) > 2.35 or decision_margin < 1.5:
+        raise OracleAbstention(
+            f"width match is ambiguous (red gap={red_gap:.2f}, gold gap={gold_gap:.2f})"
+        )
+    return "red" if red_gap < gold_gap else "gold"

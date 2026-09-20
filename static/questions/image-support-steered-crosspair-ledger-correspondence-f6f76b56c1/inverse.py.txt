@@ -1,0 +1,189 @@
+"""Independent RGB-only inverse for Cross-Pair Ledger.
+
+The module intentionally defines its own palette measurements, connected-component
+extractor, and glyph templates.  It receives one final image and no latent data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+_TAG_COLORS = {
+    "amber": (239, 166, 35),
+    "cyan": (26, 164, 190),
+    "violet": (126, 87, 194),
+}
+_NAMES = ("circle", "square", "triangle", "diamond", "plus", "x")
+
+
+@dataclass(frozen=True)
+class _Component:
+    mask: np.ndarray
+    cx: float
+    cy: float
+    area: int
+
+
+def _components(mask: np.ndarray) -> list[_Component]:
+    visited = np.zeros(mask.shape, dtype=bool)
+    output: list[_Component] = []
+    height, width = mask.shape
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if visited[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        visited[sy, sx] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) < 55:
+            continue
+        ys = np.fromiter((point[0] for point in pixels), dtype=np.int32)
+        xs = np.fromiter((point[1] for point in pixels), dtype=np.int32)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        crop = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+        crop[ys - y0, xs - x0] = True
+        output.append(
+            _Component(crop, float(xs.mean()), float(ys.mean()), int(len(pixels)))
+        )
+    return output
+
+
+def _tight_normalize(mask: np.ndarray) -> np.ndarray:
+    image = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8), mode="L")
+    return np.asarray(image.resize((41, 41), Image.Resampling.NEAREST), dtype=np.uint8) > 127
+
+
+def _prototype(name: str) -> np.ndarray:
+    image = Image.new("L", (25, 25), 0)
+    pen = ImageDraw.Draw(image)
+    cx = cy = 12
+    r = 10
+    if name == "circle":
+        pen.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+    elif name == "square":
+        pen.rectangle((cx - r, cy - r, cx + r, cy + r), fill=255)
+    elif name == "triangle":
+        pen.polygon(((cx, cy - r), (cx + r, cy + r), (cx - r, cy + r)), fill=255)
+    elif name == "diamond":
+        pen.polygon(((cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)), fill=255)
+    elif name == "plus":
+        pen.rectangle((cx - 4, cy - r, cx + 4, cy + r), fill=255)
+        pen.rectangle((cx - r, cy - 4, cx + r, cy + 4), fill=255)
+    elif name == "x":
+        pen.line((cx - r + 1, cy - r + 1, cx + r - 1, cy + r - 1), fill=255, width=5)
+        pen.line((cx - r + 1, cy + r - 1, cx + r - 1, cy - r + 1), fill=255, width=5)
+    else:
+        raise AssertionError(name)
+    array = np.asarray(image, dtype=np.uint8) > 127
+    ys, xs = np.nonzero(array)
+    return _tight_normalize(array[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1])
+
+
+_TEMPLATES = {name: _prototype(name) for name in _NAMES}
+
+
+def _classify(component: _Component) -> str:
+    if not 90 <= component.area <= 520:
+        raise ValueError("glyph component has implausible ink area")
+    observed = _tight_normalize(component.mask)
+    scores = sorted(
+        (float(np.mean(observed != template)), name) for name, template in _TEMPLATES.items()
+    )
+    if scores[0][0] > 0.075 or scores[1][0] - scores[0][0] < 0.055:
+        raise ValueError(f"ambiguous glyph template scores {scores[:2]!r}")
+    return scores[0][1]
+
+
+def _pair(a: str, b: str) -> tuple[str, str]:
+    return tuple(sorted((a, b)))
+
+
+def _tags(array: np.ndarray) -> list[tuple[str, float, float]]:
+    values = array.astype(np.int32)
+    found: list[tuple[str, float, float]] = []
+    for name, rgb in _TAG_COLORS.items():
+        target = np.asarray(rgb, dtype=np.int32)
+        distance2 = np.sum((values - target) ** 2, axis=2)
+        ys, xs = np.nonzero(distance2 < 30**2)
+        if len(xs) < 650:
+            raise ValueError(f"missing or damaged {name} tag")
+        found.append((name, float(xs.mean()), float(ys.mean())))
+    return found
+
+
+def _decode(image: Image.Image) -> tuple[list[str], list[str], list[list[tuple[str, str]]], list[str]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    dark = np.max(array, axis=2) < 78
+    components = _components(dark)
+    if len(components) != 24:
+        raise ValueError(f"expected 24 intact glyph components, found {len(components)}")
+    labeled = [(part, _classify(part)) for part in components]
+
+    by_x = sorted(labeled, key=lambda item: item[0].cx)
+    gaps = [by_x[index + 1][0].cx - by_x[index][0].cx for index in range(len(by_x) - 1)]
+    split_index = int(np.argmax(gaps)) + 1
+    reference = by_x[:split_index]
+    candidates = by_x[split_index:]
+    if len(reference) != 6 or len(candidates) != 18 or max(gaps) < 120:
+        raise ValueError("could not recover the separated reference and ledger evidence islands")
+
+    reference_y = sorted(reference, key=lambda item: item[0].cy)
+    ref_top_items, ref_bottom_items = reference_y[:3], reference_y[3:]
+    if max(item[0].cy for item in ref_top_items) + 35 >= min(
+        item[0].cy for item in ref_bottom_items
+    ):
+        raise ValueError("reference rows are not cleanly separated")
+    ref_top = [name for _, name in sorted(ref_top_items, key=lambda item: item[0].cx)]
+    ref_bottom = [name for _, name in sorted(ref_bottom_items, key=lambda item: item[0].cx)]
+    if len(set(ref_top + ref_bottom)) != 6 or set(ref_top + ref_bottom) != set(_NAMES):
+        raise ValueError("the two reference rows must jointly use every symbol exactly once")
+
+    candidate_y = sorted(candidates, key=lambda item: item[0].cy)
+    rows = [candidate_y[index : index + 6] for index in (0, 6, 12)]
+    row_centers = [float(np.mean([item[0].cy for item in row])) for row in rows]
+    if any(max(item[0].cy for item in row) - min(item[0].cy for item in row) > 8 for row in rows):
+        raise ValueError("candidate glyphs do not form three clean rows")
+    if min(np.diff(sorted(row_centers))) < 55:
+        raise ValueError("candidate rows are not cleanly separated")
+
+    decoded_rows: list[list[tuple[str, str]]] = []
+    for row in rows:
+        ordered = sorted(row, key=lambda item: item[0].cx)
+        names = [name for _, name in ordered]
+        if set(names) != set(_NAMES):
+            raise ValueError("each candidate row must use every symbol once")
+        decoded_rows.append([_pair(names[0], names[1]), _pair(names[2], names[3]), _pair(names[4], names[5])])
+
+    tag_marks = _tags(array)
+    tag_names: list[str] = []
+    used: set[str] = set()
+    for row_y in row_centers:
+        name, _, tag_y = min(tag_marks, key=lambda item: abs(item[2] - row_y))
+        if abs(tag_y - row_y) > 12 or name in used:
+            raise ValueError("tag-to-row binding is ambiguous")
+        used.add(name)
+        tag_names.append(name)
+    return ref_top, ref_bottom, decoded_rows, tag_names
+
+
+def decision_from_image(image: Image.Image) -> str:
+    ref_top, ref_bottom, candidate_rows, tag_names = _decode(image)
+    target = frozenset(_pair(a, b) for a, b in zip(ref_top, reversed(ref_bottom)))
+    matches = [
+        index for index, row in enumerate(candidate_rows) if frozenset(row) == target
+    ]
+    if len(matches) != 1:
+        raise ValueError("pixels do not expose a unique exact pair ledger")
+    return tag_names[matches[0]]

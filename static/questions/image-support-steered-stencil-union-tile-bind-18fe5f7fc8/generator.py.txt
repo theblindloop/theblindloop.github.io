@@ -1,0 +1,275 @@
+"""Renderer for stencil_union_tile_bind.
+
+Two slate-framed STENCIL grids sit at two opposite corners of the board.  Their
+cell-wise union is the KEY pattern.  Four colour-framed TILE grids are spread
+around the board and exactly one of them carries the key pattern.  The decision
+is the frame colour of that tile.
+
+Both stencils are jointly necessary: every distractor tile is a superset of one
+stencil, so neither stencil alone eliminates all three distractors.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "stencil_union_tile_bind-0.1.0"
+
+CANVAS = 960
+GRID = 4
+CELL = 34
+FRAME = 4
+OUTER = GRID * CELL + 2 * FRAME  # 144
+CLUTTER = 10
+QUARANTINE_MARGIN = 3.0
+
+BG = (247, 243, 232)
+SLATE = (54, 66, 84)
+INK = (18, 18, 18)
+
+TILE_COLORS = {
+    "red": (196, 52, 44),
+    "blue": (38, 92, 184),
+    "green": (36, 140, 74),
+    "purple": (128, 58, 168),
+}
+COLOR_ORDER = ("red", "blue", "green", "purple")
+
+CLUTTER_COLORS = (
+    (196, 52, 44),
+    (38, 92, 184),
+    (36, 140, 74),
+    (128, 58, 168),
+    (222, 150, 40),
+    (30, 150, 150),
+    (18, 18, 18),
+    (54, 66, 84),
+)
+
+# Two diagonals of stencil anchors; the tiles use the four mid-edge slots.
+DIAGONALS = (
+    ((28, 28), (CANVAS - 28 - OUTER, CANVAS - 28 - OUTER)),
+    ((CANVAS - 28 - OUTER, 28), (28, CANVAS - 28 - OUTER)),
+)
+TILE_SLOTS = (
+    (408, 46),
+    (46, 408),
+    (770, 408),
+    (408, 770),
+)
+
+
+def _cells(pattern: int) -> frozenset:
+    return frozenset(i for i in range(16) if pattern >> i & 1)
+
+
+def _mask(cells) -> int:
+    value = 0
+    for index in cells:
+        value |= 1 << index
+    return value
+
+
+def _sample_patterns(rng: random.Random) -> dict:
+    """Sample stencils A, B and three distractor tiles."""
+    while True:
+        a_only = rng.sample(range(16), rng.randint(1, 3))
+        rest = [i for i in range(16) if i not in a_only]
+        b_only = rng.sample(rest, rng.randint(1, 3))
+        rest2 = [i for i in rest if i not in b_only]
+        shared = rng.sample(rest2, rng.randint(1, 3))
+        key = sorted(set(a_only) | set(b_only) | set(shared))
+        if not 4 <= len(key) <= 11:
+            continue
+        outside = [i for i in range(16) if i not in key]
+        if len(outside) < 3:
+            continue
+
+        stencil_a = sorted(set(a_only) | set(shared))
+        stencil_b = sorted(set(b_only) | set(shared))
+        key_mask = _mask(key)
+
+        # Distractor alpha drops one A-only cell (so it still covers B);
+        # beta drops one B-only cell (so it still covers A); gamma edits a
+        # shared cell.  Each may also gain spare cells so that the ink rank of
+        # the true tile is not informative.
+        drops = (rng.choice(a_only), rng.choice(b_only), rng.choice(shared))
+        spare = outside[:]
+        rng.shuffle(spare)
+        pool = iter(spare)
+        tiles = []
+        ok = True
+        for drop in drops:
+            gained = [next(pool) for _ in range(rng.randint(0, 2))]
+            cells = (set(key) - {drop}) | set(gained)
+            value = _mask(cells)
+            if value == key_mask or value in tiles:
+                ok = False
+                break
+            tiles.append(value)
+        if not ok:
+            continue
+        return {
+            "stencil_a": _mask(stencil_a),
+            "stencil_b": _mask(stencil_b),
+            "key": key_mask,
+            "distractors": tiles,
+        }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    pats = _sample_patterns(rng)
+
+    answer_color = COLOR_ORDER[seed % 4]
+    answer_slot = (seed // 4) % 4
+
+    palette = list(COLOR_ORDER)
+    palette.remove(answer_color)
+    rng.shuffle(palette)
+    slot_order = [s for s in range(4) if s != answer_slot]
+    rng.shuffle(slot_order)
+
+    tiles = [{"slot": answer_slot, "color": answer_color, "pattern": pats["key"], "key": True}]
+    for slot, color, pattern in zip(slot_order, palette, pats["distractors"]):
+        tiles.append({"slot": slot, "color": color, "pattern": pattern, "key": False})
+
+    diag = DIAGONALS[rng.randrange(2)]
+    if rng.random() < 0.5:
+        anchor_a, anchor_b = diag
+    else:
+        anchor_b, anchor_a = diag
+
+    stencils = [
+        {"x": anchor_a[0], "y": anchor_a[1], "pattern": pats["stencil_a"], "role": "a"},
+        {"x": anchor_b[0], "y": anchor_b[1], "pattern": pats["stencil_b"], "role": "b"},
+    ]
+
+    placed = []
+    for tile in tiles:
+        sx, sy = TILE_SLOTS[tile["slot"]]
+        tile["x"] = sx + rng.randint(-14, 14)
+        tile["y"] = sy + rng.randint(-14, 14)
+        placed.append(tile)
+
+    rects = [(g["x"], g["y"], OUTER, OUTER) for g in stencils + placed]
+
+    tight = rng.random() < 0.25
+    clutter = []
+    attempts = 0
+    want = rng.randint(10, 18)
+    if tight:
+        # place one decorative mark at a controlled near-boundary clearance so
+        # that finite-resolution cases appear explicitly in the gallery
+        host = rects[rng.randrange(len(rects))]
+        gap = rng.randint(1, 4)
+        clutter.append(
+            {
+                "x": host[0] - CLUTTER - gap,
+                "y": host[1] + rng.randint(0, OUTER - CLUTTER),
+                "color_index": rng.randrange(len(CLUTTER_COLORS)),
+            }
+        )
+    while len(clutter) < want and attempts < 600:
+        attempts += 1
+        cx = rng.randint(6, CANVAS - CLUTTER - 6)
+        cy = rng.randint(6, CANVAS - CLUTTER - 6)
+        gap = _min_gap((cx, cy, CLUTTER, CLUTTER), rects)
+        gap = min(gap, _min_gap((cx, cy, CLUTTER, CLUTTER), [(c["x"], c["y"], CLUTTER, CLUTTER) for c in clutter]))
+        target = 2 if (tight and not clutter) else 18
+        if gap < target:
+            continue
+        clutter.append({"x": cx, "y": cy, "color_index": rng.randrange(len(CLUTTER_COLORS))})
+
+    return {
+        "canvas": CANVAS,
+        "stencils": stencils,
+        "tiles": placed,
+        "clutter": clutter,
+        "tight": tight,
+    }
+
+
+def _min_gap(rect, others) -> float:
+    ax, ay, aw, ah = rect
+    best = float(CANVAS)
+    for bx, by, bw, bh in others:
+        dx = max(bx - (ax + aw), ax - (bx + bw))
+        dy = max(by - (ay + ah), ay - (by + bh))
+        best = min(best, float(max(dx, dy)))
+    return best
+
+
+def _draw_grid(draw: ImageDraw.ImageDraw, x: int, y: int, pattern: int, frame_rgb) -> None:
+    draw.rectangle([x, y, x + OUTER - 1, y + OUTER - 1], fill=frame_rgb)
+    inner = x + FRAME, y + FRAME
+    draw.rectangle(
+        [inner[0], inner[1], inner[0] + GRID * CELL - 1, inner[1] + GRID * CELL - 1],
+        fill=BG,
+    )
+    for index in range(16):
+        if not pattern >> index & 1:
+            continue
+        col, row = index % GRID, index // GRID
+        cx = inner[0] + col * CELL
+        cy = inner[1] + row * CELL
+        draw.rectangle([cx, cy, cx + CELL - 1, cy + CELL - 1], fill=INK)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (scene["canvas"], scene["canvas"]), BG)
+    draw = ImageDraw.Draw(image)
+
+    for item in sorted(scene["clutter"], key=lambda c: (c["y"], c["x"], c["color_index"])):
+        draw.rectangle(
+            [item["x"], item["y"], item["x"] + CLUTTER - 1, item["y"] + CLUTTER - 1],
+            fill=CLUTTER_COLORS[item["color_index"]],
+        )
+    for stencil in sorted(scene["stencils"], key=lambda g: (g["y"], g["x"])):
+        _draw_grid(draw, stencil["x"], stencil["y"], stencil["pattern"], SLATE)
+    for tile in sorted(scene["tiles"], key=lambda g: (g["y"], g["x"])):
+        _draw_grid(draw, tile["x"], tile["y"], tile["pattern"], TILE_COLORS[tile["color"]])
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    union = 0
+    for stencil in scene["stencils"]:
+        union |= stencil["pattern"]
+    hits = [t["color"] for t in scene["tiles"] if t["pattern"] == union]
+    if len(hits) != 1:
+        raise ValueError("scene does not have a unique union tile")
+    return hits[0]
+
+
+def margin(scene: dict) -> float:
+    rects = [(g["x"], g["y"], OUTER, OUTER) for g in scene["stencils"] + scene["tiles"]]
+    values = []
+    for index, rect in enumerate(rects):
+        values.append(_min_gap(rect, rects[index + 1 :]))
+        values.append(float(min(rect[0], rect[1], CANVAS - rect[0] - OUTER, CANVAS - rect[1] - OUTER)))
+    clutter_rects = [(c["x"], c["y"], CLUTTER, CLUTTER) for c in scene["clutter"]]
+    for index, rect in enumerate(clutter_rects):
+        values.append(_min_gap(rect, rects))
+        values.append(_min_gap(rect, clutter_rects[index + 1 :]))
+    return float(min(values))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Stored stencil, tile and clutter lists are consumed as sets.
+
+    `render` sorts each list into a canonical drawing order and every painted
+    shape is pairwise disjoint, so reversing any stored order re-paints a
+    byte-identical raster and cannot move the analytic gold.
+    """
+    return [
+        ("clutter_order", {**scene, "clutter": list(reversed(scene["clutter"]))}),
+        ("stencil_order", {**scene, "stencils": list(reversed(scene["stencils"]))}),
+        ("tile_order", {**scene, "tiles": list(reversed(scene["tiles"]))}),
+    ]

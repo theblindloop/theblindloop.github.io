@@ -1,0 +1,136 @@
+"""Independent raster-only inverse arm for Bent Route Interval Comparison.
+
+The oracle receives only a final PIL raster. It segments the one dark stroke,
+orders its centerline along the dominant axis, locates the three colored rings,
+and integrates the two adjacent centerline lengths.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ROUTE_RGB = np.array((24, 38, 58), dtype=np.int16)
+MARKER_RGB = {
+    "red": np.array((218, 62, 70), dtype=np.int16),
+    "gold": np.array((238, 174, 24), dtype=np.int16),
+    "green": np.array((38, 157, 91), dtype=np.int16),
+}
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: int = 2) -> np.ndarray:
+    return np.max(np.abs(array.astype(np.int16) - color), axis=2) <= tolerance
+
+
+def _component_sizes(mask: np.ndarray) -> list[int]:
+    visited = np.zeros(mask.shape, dtype=np.bool_)
+    sizes: list[int] = []
+    height, width = mask.shape
+    for y_raw, x_raw in np.argwhere(mask):
+        y, x = int(y_raw), int(x_raw)
+        if visited[y, x]:
+            continue
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        size = 0
+        while queue:
+            cy, cx = queue.popleft()
+            size += 1
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        sizes.append(size)
+    return sorted(sizes, reverse=True)
+
+
+def _ring_center(mask: np.ndarray) -> tuple[float, float]:
+    points = np.argwhere(mask)
+    if not 120 <= len(points) <= 300:
+        raise ValueError("a colored ring is missing or corrupted")
+    low = points.min(axis=0)
+    high = points.max(axis=0)
+    spread = high - low
+    if np.any(spread < 18) or np.any(spread > 22):
+        raise ValueError("colored marker geometry is malformed")
+    # The dark centerline is painted over the ring and can remove one extreme
+    # color pixel.  The color centroid is used only to recover station order;
+    # exact equal station coordinates are recovered from the route extent.
+    center = points.mean(axis=0)
+    return float(center[0]), float(center[1])
+
+
+def _centerline(route: np.ndarray, horizontal: bool) -> tuple[np.ndarray, np.ndarray]:
+    points = np.argwhere(route)
+    if not len(points):
+        raise ValueError("dark route is missing")
+    primary_values = points[:, 1] if horizontal else points[:, 0]
+    secondary_values = points[:, 0] if horizontal else points[:, 1]
+    first, last = int(primary_values.min()), int(primary_values.max())
+    primary = np.arange(first, last + 1, dtype=np.int32)
+    secondary = []
+    for value in primary:
+        column = secondary_values[primary_values == value]
+        if not len(column):
+            raise ValueError("the route has a broken centerline")
+        secondary.append(float(np.median(column)))
+    return primary.astype(np.float64), np.asarray(secondary, dtype=np.float64)
+
+
+def _arc_between(primary: np.ndarray, secondary: np.ndarray, a: float, b: float) -> float:
+    lo, hi = sorted((int(round(a)), int(round(b))))
+    start = lo - int(primary[0])
+    stop = hi - int(primary[0])
+    if start < 0 or stop >= len(primary) or stop - start < 25:
+        raise ValueError("marker is not securely owned by the route")
+    delta = np.diff(secondary[start : stop + 1])
+    return float(np.sum(np.sqrt(1.0 + delta * delta)))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape != (512, 512, 3):
+        raise ValueError("unexpected raster size")
+
+    route = _mask(array, ROUTE_RGB)
+    sizes = _component_sizes(route)
+    if len(sizes) != 1 or not 420 <= sizes[0] <= 900:
+        raise ValueError("the dark route is broken, clipped, or malformed")
+    route_points = np.argwhere(route)
+    y_span = int(np.ptp(route_points[:, 0]))
+    x_span = int(np.ptp(route_points[:, 1]))
+    horizontal = x_span > y_span
+    primary_span = x_span if horizontal else y_span
+    secondary_span = y_span if horizontal else x_span
+    if not 70 <= primary_span <= 74 or not 18 <= secondary_span <= 25:
+        raise ValueError("route geometry is outside the declared local vocabulary")
+
+    centers = {name: _ring_center(_mask(array, rgb)) for name, rgb in MARKER_RGB.items()}
+    primary_centers = {
+        name: (center[1] if horizontal else center[0]) for name, center in centers.items()
+    }
+    ordered = sorted(primary_centers, key=primary_centers.get)
+    if ordered[1] != "gold" or {ordered[0], ordered[2]} != {"red", "green"}:
+        raise ValueError("gold is not visibly between the endpoint rings")
+    direct_gaps = [primary_centers[ordered[1]] - primary_centers[ordered[0]], primary_centers[ordered[2]] - primary_centers[ordered[1]]]
+    if min(direct_gaps) < 30 or max(direct_gaps) > 42 or abs(direct_gaps[0] - direct_gaps[1]) > 6:
+        raise ValueError("the visible straight marker gaps are not equal")
+
+    primary, secondary = _centerline(route, horizontal)
+    endpoint_a = float(primary[0] + 2.0)
+    endpoint_b = float(primary[-1] - 2.0)
+    middle = (endpoint_a + endpoint_b) / 2.0
+    first_length = _arc_between(primary, secondary, endpoint_a, middle)
+    second_length = _arc_between(primary, secondary, middle, endpoint_b)
+    lengths = {}
+    if ordered[0] == "red":
+        lengths = {"red-gold": first_length, "gold-green": second_length}
+    else:
+        lengths = {"red-gold": second_length, "gold-green": first_length}
+    pixel_margin = abs(lengths["red-gold"] - lengths["gold-green"])
+    if pixel_margin < 18.0:
+        raise ValueError("centerline length comparison is ambiguous")
+    return max(lengths, key=lengths.get)

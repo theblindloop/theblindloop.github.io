@@ -1,0 +1,198 @@
+"""Pixel-only inverse arm for the half-turn shade-rank reveal world.
+
+Receives a PIL image and the public question contract only.  It locates the
+panel interior from its own pixels, recovers the 12x12 lattice, clusters the
+cell shades into the three rendered levels, executes the declared half-turn
+comparison, and classifies the resulting 12x6 figure with a reported margin.
+It raises ValueError (abstains) whenever the panel, the lattice, the shade
+levels or the figure are ambiguous.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "halfturn_shade_rank_reveal-oracle-0.1.0"
+
+GRID = 12
+HALF = 6
+
+# Public answer alphabet (part of the question contract, not renderer state).
+_ART = {
+    "arrow": (
+        ".##......##.",
+        "..##....##..",
+        "...##..##...",
+        "....####....",
+        ".....##.....",
+        ".....##.....",
+    ),
+    "cross": (
+        ".....##.....",
+        ".....##.....",
+        "############",
+        "############",
+        ".....##.....",
+        ".....##.....",
+    ),
+    "ell": (
+        "###.........",
+        "###.........",
+        "###.........",
+        "###.........",
+        "############",
+        "############",
+    ),
+    "ex": (
+        "##........##",
+        ".##......##.",
+        "..##....##..",
+        "..##....##..",
+        ".##......##.",
+        "##........##",
+    ),
+    "ring": (
+        "############",
+        "#..........#",
+        "#..........#",
+        "#..........#",
+        "#..........#",
+        "############",
+    ),
+    "tee": (
+        "############",
+        "############",
+        ".....##.....",
+        ".....##.....",
+        ".....##.....",
+        ".....##.....",
+    ),
+}
+_BITS = {
+    name: np.array([[1 if ch == "#" else 0 for ch in row] for row in art], dtype=int)
+    for name, art in _ART.items()
+}
+
+_NEUTRAL_TOL = 26
+_MIN_CELL_LUMA = 40.0
+_MIN_LEVEL_GAP = 20.0
+_MAX_LEVEL_SPREAD = 10.0
+_MIN_FIGURE_MARGIN = 6
+
+
+def _luma(rgb: np.ndarray) -> np.ndarray:
+    return 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+
+
+def _interior_box(rgb: np.ndarray) -> tuple[int, int, int, int]:
+    spread = rgb.max(axis=2).astype(int) - rgb.min(axis=2).astype(int)
+    mask = (spread <= _NEUTRAL_TOL) & (_luma(rgb.astype(float)) >= _MIN_CELL_LUMA)
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    if rows.size < GRID or cols.size < GRID:
+        raise ValueError("no panel interior found in the image")
+    y0, y1 = int(rows[0]), int(rows[-1]) + 1
+    x0, x1 = int(cols[0]), int(cols[-1]) + 1
+    height, width = y1 - y0, x1 - x0
+    if height != width:
+        raise ValueError(f"panel interior is not square ({width}x{height})")
+    if width % GRID != 0 or width // GRID < 12:
+        raise ValueError("panel interior does not split into a clean 12x12 lattice")
+    coverage = float(mask[y0:y1, x0:x1].mean())
+    if coverage < 0.75:
+        raise ValueError("panel interior is not fully tiled by shade cells")
+    return x0, y0, x1, y1
+
+
+def _cell_lumas(rgb: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    x0, y0, x1, _y1 = box
+    cell = (x1 - x0) // GRID
+    inset = max(3, cell // 4)
+    luma = _luma(rgb.astype(float))
+    spread = rgb.max(axis=2).astype(int) - rgb.min(axis=2).astype(int)
+    out = np.zeros((GRID, GRID), dtype=float)
+    for r in range(GRID):
+        for c in range(GRID):
+            ys = slice(y0 + r * cell + inset, y0 + (r + 1) * cell - inset)
+            xs = slice(x0 + c * cell + inset, x0 + (c + 1) * cell - inset)
+            patch = luma[ys, xs]
+            sat = spread[ys, xs]
+            if patch.size == 0:
+                raise ValueError("degenerate cell sampling window")
+            if float(sat.mean()) > _NEUTRAL_TOL:
+                raise ValueError(f"cell ({r},{c}) is not a flat neutral shade")
+            if float(patch.max() - patch.min()) > _MAX_LEVEL_SPREAD:
+                raise ValueError(f"cell ({r},{c}) is not a single flat tone")
+            out[r, c] = float(patch.mean())
+    return out
+
+
+def _levels(lumas: np.ndarray) -> np.ndarray:
+    flat = np.sort(lumas.reshape(-1))
+    gaps = np.diff(flat)
+    if gaps.size < 2:
+        raise ValueError("too few cells to recover shade levels")
+    order = np.argsort(gaps)[::-1]
+    cut_idx = sorted(int(i) for i in order[:2])
+    if gaps[cut_idx[0]] < _MIN_LEVEL_GAP or gaps[cut_idx[1]] < _MIN_LEVEL_GAP:
+        raise ValueError("the three rendered shades are not separable")
+    thresholds = [
+        (flat[i] + flat[i + 1]) / 2.0 for i in cut_idx
+    ]  # rendered midpoints, not code constants
+    groups = [
+        flat[: cut_idx[0] + 1],
+        flat[cut_idx[0] + 1 : cut_idx[1] + 1],
+        flat[cut_idx[1] + 1 :],
+    ]
+    for group in groups:
+        if group.size == 0:
+            raise ValueError("a rendered shade level is empty")
+        if float(group.max() - group.min()) > _MAX_LEVEL_SPREAD:
+            raise ValueError("a rendered shade level is not tight")
+    # level 0 = lightest ... level 2 = darkest, matching the declared ordering
+    lo, hi = thresholds
+    levels = np.zeros_like(lumas, dtype=int)
+    levels[lumas <= lo] = 2
+    levels[(lumas > lo) & (lumas <= hi)] = 1
+    levels[lumas > hi] = 0
+    return levels
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Pixel-only decision: the figure formed by the declared half-turn marks."""
+
+    rgb = np.asarray(image.convert("RGB"))
+    box = _interior_box(rgb)
+    levels = _levels(_cell_lumas(rgb, box))
+    found = np.zeros((HALF, GRID), dtype=int)
+    for r in range(HALF):
+        for c in range(GRID):
+            upper = levels[r, c]
+            lower = levels[GRID - 1 - r, GRID - 1 - c]
+            found[r, c] = 1 if upper > lower else 0
+    scored = sorted(
+        ((int(np.abs(bits - found).sum()), name) for name, bits in _BITS.items())
+    )
+    best, runner = scored[0], scored[1]
+    if best[0] != 0:
+        raise ValueError("marked positions match no declared figure exactly")
+    if runner[0] - best[0] < _MIN_FIGURE_MARGIN:
+        raise ValueError("figure decision margin is too small")
+    return best[1]
+
+
+def decision_margin_from_image(image: Image.Image) -> int:
+    """Runner-up Hamming margin of the pixel decision, for diagnostics."""
+
+    rgb = np.asarray(image.convert("RGB"))
+    box = _interior_box(rgb)
+    levels = _levels(_cell_lumas(rgb, box))
+    found = np.zeros((HALF, GRID), dtype=int)
+    for r in range(HALF):
+        for c in range(GRID):
+            found[r, c] = 1 if levels[r, c] > levels[GRID - 1 - r, GRID - 1 - c] else 0
+    scored = sorted(
+        ((int(np.abs(bits - found).sum()), name) for name, bits in _BITS.items())
+    )
+    return scored[1][0] - scored[0][0]

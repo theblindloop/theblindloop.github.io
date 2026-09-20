@@ -1,0 +1,112 @@
+"""Independent image-only inverse arm for alternating-turn routing."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_PALETTE = {
+    "green": (22, 163, 74),
+    "orange": (249, 115, 22),
+    "purple": (139, 92, 246),
+    "blue": (37, 99, 235),
+}
+_UNDERLAY = (71, 85, 105)
+_JUNCTION = (156, 163, 175)
+_ANSWERS = ("orange", "purple", "blue")
+
+
+def _mask_near(arr: np.ndarray, rgb: tuple[int, int, int], radius: int = 20) -> np.ndarray:
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2) <= radius * radius
+
+
+def _centroid(arr: np.ndarray, rgb: tuple[int, int, int]) -> tuple[int, int]:
+    ys, xs = np.nonzero(_mask_near(arr, rgb))
+    if len(xs) < 40:
+        raise ValueError("required colored marker is missing")
+    return int(round(float(xs.mean()))), int(round(float(ys.mean())))
+
+
+def _junction_centers(arr: np.ndarray) -> list[tuple[int, int]]:
+    ys, xs = np.nonzero(_mask_near(arr, _JUNCTION, 12))
+    if len(xs) < 120:
+        raise ValueError("gray junction markers are missing")
+    points = np.column_stack((xs, ys)).astype(np.float64)
+    first = points[0]
+    second = points[int(np.argmax(np.sum((points - first) ** 2, axis=1)))]
+    centers = np.vstack((first, second))
+    for _ in range(12):
+        distances = np.sum((points[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        labels = np.argmin(distances, axis=1)
+        if len(set(labels.tolist())) != 2:
+            raise ValueError("junction markers cannot be separated")
+        centers = np.vstack([points[labels == index].mean(axis=0) for index in range(2)])
+    separation = float(np.linalg.norm(centers[0] - centers[1]))
+    if separation < 60:
+        raise ValueError("junction markers are too close")
+    return [(int(round(x)), int(round(y))) for x, y in centers]
+
+
+def _nearest(mask: np.ndarray, point: tuple[int, int]) -> tuple[int, int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise ValueError("route pixels are missing")
+    px, py = point
+    index = int(np.argmin((xs - px) ** 2 + (ys - py) ** 2))
+    return int(xs[index]), int(ys[index])
+
+
+def _distances(mask: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = mask.shape
+    distance = np.full((height, width), -1, dtype=np.int32)
+    distance[start[1], start[0]] = 0
+    pending = deque([start[1] * width + start[0]])
+    while pending:
+        flat = pending.popleft()
+        y, x = divmod(flat, width)
+        value = int(distance[y, x]) + 1
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < width and 0 <= ny < height and mask[ny, nx] and distance[ny, nx] < 0:
+                distance[ny, nx] = value
+                pending.append(ny * width + nx)
+    return distance
+
+
+def _cross(a: tuple[int, int], b: tuple[int, int], c: tuple[int, int]) -> int:
+    return (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    markers = {name: _centroid(arr, rgb) for name, rgb in _PALETTE.items()}
+    junctions = _junction_centers(arr)
+    route = _mask_near(arr, _UNDERLAY, 15) | _mask_near(arr, _JUNCTION, 15) | (np.max(arr, axis=2) < 50)
+    anchors = {name: _nearest(route, point) for name, point in markers.items()}
+    junction_anchors = [_nearest(route, point) for point in junctions]
+    root_dist = _distances(route, anchors["green"])
+    if any(root_dist[y, x] < 0 for x, y in [*junction_anchors, *(anchors[c] for c in _ANSWERS)]):
+        raise ValueError("route network is disconnected")
+    ordered = sorted(zip(junctions, junction_anchors), key=lambda item: root_dist[item[1][1], item[1][0]])
+    selected = []
+    for color in _ANSWERS:
+        tx, ty = anchors[color]
+        total = int(root_dist[ty, tx])
+        on_path = []
+        for center, anchor in ordered:
+            jx, jy = anchor
+            from_junction = _distances(route, anchor)
+            detour = int(root_dist[jy, jx]) + int(from_junction[ty, tx]) - total
+            if 0 <= detour <= 24:
+                on_path.append(center)
+        if len(on_path) != 2:
+            continue
+        first_turn = _cross(markers["green"], on_path[0], on_path[1])
+        second_turn = _cross(on_path[0], on_path[1], markers[color])
+        if first_turn < -5000 and second_turn > 5000:
+            selected.append(color)
+    if len(selected) != 1:
+        raise ValueError(f"ambiguous alternating-turn destination: {selected}")
+    return selected[0]

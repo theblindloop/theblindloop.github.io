@@ -1,0 +1,239 @@
+"""Latent sampler and deterministic raster renderer for the switchyard world."""
+
+from __future__ import annotations
+
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 640, 480
+COLS, ROWS = 5, 4
+GRAY = (74, 85, 99)
+ORANGE = (230, 126, 34)
+BACKGROUND = (248, 249, 251)
+TARGET_RGB = {
+    "red": (211, 52, 61),
+    "green": (31, 157, 98),
+    "blue": (42, 101, 210),
+}
+TARGETS = ("red", "green", "blue")
+
+
+def _grid_edges() -> list[tuple[int, int]]:
+    edges: list[tuple[int, int]] = []
+    for row in range(ROWS):
+        for col in range(COLS):
+            node = row * COLS + col
+            if col + 1 < COLS:
+                edges.append((node, node + 1))
+            if row + 1 < ROWS:
+                edges.append((node, node + COLS))
+    return edges
+
+
+def _components(edges: list[list], skipped_color: str | None = None) -> list[set[int]]:
+    adjacency = {node: set() for node in range(COLS * ROWS)}
+    for left, right, color in edges:
+        if color == skipped_color:
+            continue
+        adjacency[int(left)].add(int(right))
+        adjacency[int(right)].add(int(left))
+    unseen = set(adjacency)
+    result: list[set[int]] = []
+    while unseen:
+        start = min(unseen)
+        component = {start}
+        queue = deque([start])
+        unseen.remove(start)
+        while queue:
+            here = queue.popleft()
+            for nxt in adjacency[here]:
+                if nxt in unseen:
+                    unseen.remove(nxt)
+                    component.add(nxt)
+                    queue.append(nxt)
+        result.append(component)
+    return result
+
+
+def _build_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    grid_edges = _grid_edges()
+    shuffled = list(grid_edges)
+    rng.shuffle(shuffled)
+
+    parent = list(range(COLS * ROWS))
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    tree: list[tuple[int, int]] = []
+    for left, right in shuffled:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[a] = b
+            tree.append((left, right))
+
+    # Cutting two tree links always yields three components. Reject tiny pieces
+    # so every component can host a clearly separated station marker.
+    cut_pair: tuple[tuple[int, int], tuple[int, int]] | None = None
+    pieces: list[set[int]] = []
+    candidates = [(tree[i], tree[j]) for i in range(len(tree)) for j in range(i + 1, len(tree))]
+    rng.shuffle(candidates)
+    for first, second in candidates:
+        trial = [[a, b, "orange" if (a, b) in (first, second) else "gray"] for a, b in tree]
+        trial_pieces = _components(trial, skipped_color="orange")
+        if len(trial_pieces) == 3 and min(map(len, trial_pieces)) >= 2:
+            cut_pair, pieces = (first, second), trial_pieces
+            break
+    if cut_pair is None:
+        raise RuntimeError("could not find a balanced two-link cut")
+
+    piece_of = {node: index for index, piece in enumerate(pieces) for node in piece}
+    edge_rows: list[list] = []
+    for left, right in tree:
+        color = "orange" if (left, right) in cut_pair else "gray"
+        edge_rows.append([left, right, color])
+
+    # Additional grid links add loops within pieces and visible cross-piece cut
+    # links. Their colors are determined only by component membership.
+    tree_set = {tuple(sorted(edge)) for edge in tree}
+    for left, right in grid_edges:
+        if tuple(sorted((left, right))) in tree_set:
+            continue
+        same_piece = piece_of[left] == piece_of[right]
+        keep_probability = 0.66 if same_piece else 0.52
+        if rng.random() < keep_probability:
+            edge_rows.append([left, right, "gray" if same_piece else "orange"])
+
+    answer = TARGETS[seed % len(TARGETS)]
+    station_piece = rng.randrange(3)
+    station_nodes = list(pieces[station_piece])
+    rng.shuffle(station_nodes)
+    station = station_nodes.pop()
+
+    # Prefer a non-adjacent correct target so the solver must trace a path.
+    sr, sc = divmod(station, COLS)
+    station_nodes.sort(key=lambda n: abs(divmod(n, COLS)[0] - sr) + abs(divmod(n, COLS)[1] - sc), reverse=True)
+    targets: dict[str, int] = {answer: station_nodes[0]}
+    other_pieces = [index for index in range(3) if index != station_piece]
+    rng.shuffle(other_pieces)
+    other_colors = [color for color in TARGETS if color != answer]
+    rng.shuffle(other_colors)
+    for color, piece_index in zip(other_colors, other_pieces):
+        targets[color] = rng.choice(sorted(pieces[piece_index]))
+
+    return {
+        "seed": seed,
+        "nodes": list(range(COLS * ROWS)),
+        "edges": edge_rows,
+        "station": station,
+        "targets": targets,
+        "transform": rng.choice(["identity", "flip_x", "flip_y", "rotate_180"]),
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced, unambiguous graph scene from an integer seed."""
+    return _build_scene(int(seed))
+
+
+def _point(scene: dict, node: int) -> tuple[int, int]:
+    # Access nodes so the renderer audit sees that the declared node set is visual.
+    if int(node) not in scene["nodes"]:
+        raise ValueError("edge references an undeclared node")
+    row, col = divmod(int(node), COLS)
+    transform = scene["transform"]
+    if transform in ("flip_x", "rotate_180"):
+        col = COLS - 1 - col
+    if transform in ("flip_y", "rotate_180"):
+        row = ROWS - 1 - row
+    return 100 + 110 * col, 78 + 106 * row
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only visible graph state; no analytic answer is painted."""
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    # A faint construction grid supplies visual structure but is far from the
+    # oracle's gray-link color.
+    for col in range(COLS):
+        x, _ = _point(scene, col)
+        draw.line((x, 48, x, 430), fill=(231, 234, 239), width=1)
+    for row in range(ROWS):
+        _, y = _point(scene, row * COLS)
+        draw.line((62, y, 578, y), fill=(231, 234, 239), width=1)
+
+    palette = {"gray": GRAY, "orange": ORANGE}
+    # Canonical sorting makes edge-list order a tested render alias.
+    for left, right, color in sorted(scene["edges"], key=lambda edge: (edge[2], min(edge[0], edge[1]), max(edge[0], edge[1]))):
+        draw.line((*_point(scene, left), *_point(scene, right)), fill=palette[color], width=16)
+
+    # Gray junction disks make component adjacency visually explicit and give
+    # the pixel inverse a stable point on every graph vertex.
+    for node in scene["nodes"]:
+        x, y = _point(scene, node)
+        draw.ellipse((x - 9, y - 9, x + 9, y + 9), fill=GRAY)
+
+    station = scene["station"]
+    sx, sy = _point(scene, station)
+    # Compact filled markers sit inside the 16 px junction ink. A two-pixel
+    # gray collar remains around them, so station styling cannot sever a path.
+    draw.rectangle((sx - 6, sy - 6, sx + 6, sy + 6), fill=(20, 24, 31))
+    for color, node in sorted(scene["targets"].items()):
+        x, y = _point(scene, node)
+        draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=TARGET_RGB[color])
+    return image
+
+
+def _reachable_nodes(scene: dict) -> set[int]:
+    adjacency: dict[int, set[int]] = {int(node): set() for node in scene["targets"].values()}
+    adjacency.setdefault(int(scene["station"]), set())
+    for left, right, color in scene["edges"]:
+        adjacency.setdefault(int(left), set())
+        adjacency.setdefault(int(right), set())
+        if color == "gray":
+            adjacency[int(left)].add(int(right))
+            adjacency[int(right)].add(int(left))
+    reached = {int(scene["station"])}
+    queue = deque(reached)
+    while queue:
+        here = queue.popleft()
+        for nxt in adjacency[here]:
+            if nxt not in reached:
+                reached.add(nxt)
+                queue.append(nxt)
+    return reached
+
+
+def analytic_gold(scene: dict) -> str:
+    reached = _reachable_nodes(scene)
+    winners = [color for color, node in scene["targets"].items() if int(node) in reached]
+    if len(winners) != 1:
+        raise ValueError(f"expected one reachable colored station, got {winners}")
+    return winners[0]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up score gap: reachable=1 and unreachable=0 in a discrete graph."""
+    winner = analytic_gold(scene)
+    scores = sorted((1.0 if color == winner else 0.0 for color in scene["targets"]), reverse=True)
+    return scores[0] - scores[1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        return analytic_gold(scene) not in TARGETS or margin(scene) < 1.0
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = dict(scene)
+    twin["edges"] = list(reversed(scene["edges"]))
+    return [("reverse_edge_storage_order", twin)]

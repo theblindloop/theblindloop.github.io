@@ -1,0 +1,421 @@
+"""Chain-reflow reveal world.
+
+One teal tape winds through a medium-sized window of the canvas as a single
+unbranching chain of 25 square tiles joined edge to edge. Each tile carries one
+round dot in one of exactly two rendered grays. The declared raster transform is
+a traversal, not a lookup: start at the tile whose corners carry black brackets,
+walk the chain to its far end, and write the 25 dots into a 5x5 grid row by row.
+The dark dots then spell one abstract glyph.
+
+Nothing in canvas space carries the glyph. The chain's shape is an independent
+random self-avoiding route, so the glyph lives in the *order* the route imposes
+on the tiles; every glyph marks exactly 9 of the 25 positions, so dot counts,
+ink, colour, size and placement are uninformative.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "chain_reflow_reveal-renderer-0.1.0"
+
+CANVAS = 640
+LATTICE = 7
+PITCH = 44
+TILE_PX = 30
+NECK_PX = 8
+DOT_R = 11
+BRACKET_ARM = 6
+BRACKET_THICK = 2
+GRID = 5
+
+BACKGROUND = (246, 246, 242)
+TAPE_RGB = (34, 128, 141)
+DECOY_RGB = (176, 166, 210)
+BRACKET_RGB = (0, 0, 0)
+KEY_EDGE = (60, 60, 60)
+
+TONE_MID = 148
+MIN_TONE_GAP = 28
+MAX_TONE_GAP = 88
+QUARANTINE_CLEARANCE = 17.0
+
+GLYPHS: dict[str, tuple[str, ...]] = {
+    "plus": ("..#..", "..#..", "#####", "..#..", "..#.."),
+    "ex": ("#...#", ".#.#.", "..#..", ".#.#.", "#...#"),
+    "tee": ("#####", "..#..", "..#..", "..#..", "..#.."),
+    "ell": ("#....", "#....", "#....", "#....", "#####"),
+}
+GLYPH_NAMES = tuple(sorted(GLYPHS))
+CHAIN_LEN = GRID * GRID
+
+
+def _bitmap(name: str) -> tuple[int, ...]:
+    return tuple(1 if ch == "#" else 0 for row in GLYPHS[name] for ch in row)
+
+
+BITMAPS = {name: _bitmap(name) for name in GLYPH_NAMES}
+
+
+def glyph_from_bits(bits: list[int] | tuple[int, ...]) -> str | None:
+    """Row-major 25-bit pattern -> declared glyph name, else None."""
+    key = tuple(int(b) for b in bits)
+    for name in GLYPH_NAMES:
+        if BITMAPS[name] == key:
+            return name
+    return None
+
+
+# ---------------------------------------------------------------- route sampling
+
+
+def _neighbours(cell: tuple[int, int]) -> list[tuple[int, int]]:
+    r, c = cell
+    out = []
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < LATTICE and 0 <= nc < LATTICE:
+            out.append((nr, nc))
+    return out
+
+
+def _sample_route(rng: random.Random) -> list[tuple[int, int]] | None:
+    """Randomised depth-first self-avoiding route of exactly CHAIN_LEN cells."""
+    start = (rng.randrange(LATTICE), rng.randrange(LATTICE))
+    path = [start]
+    used = {start}
+    frontier = [iter(_shuffled(rng, _neighbours(start)))]
+    steps = 0
+    while path:
+        steps += 1
+        if steps > 60000:
+            return None
+        if len(path) == CHAIN_LEN:
+            return list(path)
+        nxt = next(frontier[-1], None)
+        if nxt is None:
+            used.discard(path.pop())
+            frontier.pop()
+            continue
+        if nxt in used:
+            continue
+        path.append(nxt)
+        used.add(nxt)
+        frontier.append(iter(_shuffled(rng, _neighbours(nxt))))
+    return None
+
+
+def _shuffled(rng: random.Random, items: list[Any]) -> list[Any]:
+    out = list(items)
+    rng.shuffle(out)
+    return out
+
+
+def _short_route(rng: random.Random, length: int, span: int) -> list[tuple[int, int]]:
+    """Short self-avoiding route inside a span x span lattice, for decoy tapes."""
+    while True:
+        cur = (rng.randrange(span), rng.randrange(span))
+        path = [cur]
+        used = {cur}
+        for _ in range(length - 1):
+            options = [
+                n
+                for n in _neighbours(cur)
+                if n not in used and n[0] < span and n[1] < span
+            ]
+            if not options:
+                break
+            cur = rng.choice(options)
+            path.append(cur)
+            used.add(cur)
+        if len(path) == length:
+            return path
+
+
+def _route_span(route: list[tuple[int, int]]) -> tuple[int, int]:
+    rows = [r for r, _ in route]
+    cols = [c for _, c in route]
+    return max(rows) - min(rows) + 1, max(cols) - min(cols) + 1
+
+
+def _positional_leak(route: list[tuple[int, int]], bits: list[int]) -> bool:
+    """True if a purely positional reading order already spells a glyph."""
+    pairs = list(zip(route, bits))
+    for key in (lambda item: (item[0][0], item[0][1]), lambda item: (item[0][1], item[0][0])):
+        ordered = [bit for _, bit in sorted(pairs, key=key)]
+        if glyph_from_bits(ordered) is not None:
+            return True
+    return False
+
+
+def _tile_boxes(origin: tuple[int, int], route: list[tuple[int, int]]) -> list[tuple[int, int, int, int]]:
+    half = TILE_PX // 2
+    boxes = []
+    for r, c in route:
+        cx = origin[0] + c * PITCH
+        cy = origin[1] + r * PITCH
+        boxes.append((cx - half, cy - half, cx + half, cy + half))
+    return boxes
+
+
+def _bbox_of(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    return (
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    )
+
+
+def _inflate(box: tuple[int, int, int, int], pad: int) -> tuple[int, int, int, int]:
+    return (box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad)
+
+
+def _overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+# --------------------------------------------------------------- scene sampling
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one scene from an integer seed."""
+    rng = random.Random(f"chain_reflow_reveal|{int(seed)}")
+
+    while True:
+        route = _sample_route(rng)
+        if route is None:
+            continue
+        rows, cols = _route_span(route)
+        if min(rows, cols) < GRID or max(rows, cols) < GRID + 1:
+            continue
+        glyph = rng.choice(GLYPH_NAMES)
+        bits = list(BITMAPS[glyph])
+        if _positional_leak(route, bits):
+            continue
+        break
+
+    span_px = (LATTICE - 1) * PITCH + TILE_PX
+    lo = 50
+    hi = CANVAS - span_px - lo
+    origin = (
+        lo + TILE_PX // 2 + rng.randrange(0, hi - lo + 1),
+        lo + TILE_PX // 2 + rng.randrange(0, hi - lo + 1),
+    )
+
+    tone_gap = rng.randrange(MIN_TONE_GAP, MAX_TONE_GAP + 1, 2)
+    dark_value = TONE_MID - tone_gap // 2
+    light_value = TONE_MID + tone_gap // 2
+
+    route_box = _inflate(_bbox_of(_tile_boxes(origin, route)), 26)
+
+    key_w, key_h = 3 * 34 + 16, 50
+    key_origin = None
+    for corner in _shuffled(
+        rng,
+        [
+            (24, 24),
+            (CANVAS - key_w - 24, 24),
+            (24, CANVAS - key_h - 24),
+            (CANVAS - key_w - 24, CANVAS - key_h - 24),
+        ],
+    ):
+        box = (corner[0], corner[1], corner[0] + key_w, corner[1] + key_h)
+        if not _overlaps(_inflate(box, 14), route_box):
+            key_origin = corner
+            break
+    if key_origin is None:
+        key_origin = (24, CANVAS - key_h - 24)
+    key_box = _inflate((key_origin[0], key_origin[1], key_origin[0] + key_w, key_origin[1] + key_h), 14)
+
+    decoys: list[dict] = []
+    blocked = [route_box, key_box]
+    for _ in range(400):
+        if len(decoys) == 3:
+            break
+        span = rng.randint(2, 3)
+        length = rng.randint(4, 7)
+        if length > span * span:
+            continue
+        d_route = _short_route(rng, length, span)
+        extent = (span - 1) * PITCH + TILE_PX
+        d_origin = (
+            rng.randint(20 + TILE_PX // 2, CANVAS - extent - 20 + TILE_PX // 2),
+            rng.randint(20 + TILE_PX // 2, CANVAS - extent - 20 + TILE_PX // 2),
+        )
+        box = _inflate(_bbox_of(_tile_boxes(d_origin, d_route)), 22)
+        if any(_overlaps(box, other) for other in blocked):
+            continue
+        blocked.append(box)
+        decoys.append(
+            {
+                "origin": list(d_origin),
+                "route": [list(cell) for cell in d_route],
+                "bits": [rng.randint(0, 1) for _ in range(length)],
+            }
+        )
+
+    return {
+        "canvas": CANVAS,
+        "lattice": LATTICE,
+        "pitch": PITCH,
+        "tile_px": TILE_PX,
+        "neck_px": NECK_PX,
+        "dot_r": DOT_R,
+        "grid": GRID,
+        "origin": list(origin),
+        "route": [list(cell) for cell in route],
+        "bits": bits,
+        "dark_value": dark_value,
+        "light_value": light_value,
+        "key_origin": list(key_origin),
+        "decoys": decoys,
+    }
+
+
+# ------------------------------------------------------------------- rendering
+
+
+def _draw_tape(
+    draw: ImageDraw.ImageDraw,
+    origin: tuple[int, int],
+    route: list[tuple[int, int]],
+    colour: tuple[int, int, int],
+) -> list[tuple[int, int]]:
+    half = TILE_PX // 2
+    nhalf = NECK_PX // 2
+    centres = [(origin[0] + c * PITCH, origin[1] + r * PITCH) for r, c in route]
+    for (x0, y0), (x1, y1) in zip(centres, centres[1:]):
+        draw.rectangle(
+            (min(x0, x1) - nhalf, min(y0, y1) - nhalf, max(x0, x1) + nhalf, max(y0, y1) + nhalf),
+            fill=colour,
+        )
+    for cx, cy in centres:
+        draw.rectangle((cx - half, cy - half, cx + half, cy + half), fill=colour)
+    return centres
+
+
+def _draw_dots(
+    draw: ImageDraw.ImageDraw,
+    centres: list[tuple[int, int]],
+    bits: list[int],
+    dark_value: int,
+    light_value: int,
+) -> None:
+    for (cx, cy), bit in zip(centres, bits):
+        value = dark_value if bit else light_value
+        draw.ellipse((cx - DOT_R, cy - DOT_R, cx + DOT_R, cy + DOT_R), fill=(value, value, value))
+
+
+def _draw_brackets(draw: ImageDraw.ImageDraw, centre: tuple[int, int]) -> None:
+    cx, cy = centre
+    half = TILE_PX // 2
+    arm = BRACKET_ARM
+    th = BRACKET_THICK
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            ex = cx + sx * half
+            ey = cy + sy * half
+            x0, x1 = sorted((ex, ex - sx * (arm - 1)))
+            y0, y1 = sorted((ey, ey - sy * (th - 1)))
+            draw.rectangle((x0, y0, x1, y1), fill=BRACKET_RGB)
+            x0, x1 = sorted((ex, ex - sx * (th - 1)))
+            y0, y1 = sorted((ey, ey - sy * (arm - 1)))
+            draw.rectangle((x0, y0, x1, y1), fill=BRACKET_RGB)
+
+
+def _draw_key(draw: ImageDraw.ImageDraw, scene: dict) -> None:
+    kx, ky = scene["key_origin"]
+    dark = int(scene["dark_value"])
+    light = int(scene["light_value"])
+    mid = (dark + light) // 2
+    for index, value in enumerate((dark, mid, light)):
+        x0 = kx + 8 + index * 34
+        y0 = ky + 8
+        draw.rectangle((x0, y0, x0 + 30, y0 + 30), fill=(value, value, value), outline=KEY_EDGE)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one scene to a flat-fill, antialiasing-free RGB raster."""
+    image = Image.new("RGB", (int(scene["canvas"]), int(scene["canvas"])), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    for decoy in scene["decoys"]:
+        centres = _draw_tape(
+            draw,
+            (int(decoy["origin"][0]), int(decoy["origin"][1])),
+            [(int(r), int(c)) for r, c in decoy["route"]],
+            DECOY_RGB,
+        )
+        _draw_dots(
+            draw,
+            centres,
+            [int(b) for b in decoy["bits"]],
+            int(scene["dark_value"]),
+            int(scene["light_value"]),
+        )
+
+    route = [(int(r), int(c)) for r, c in scene["route"]]
+    centres = _draw_tape(draw, (int(scene["origin"][0]), int(scene["origin"][1])), route, TAPE_RGB)
+    _draw_dots(
+        draw,
+        centres,
+        [int(b) for b in scene["bits"]],
+        int(scene["dark_value"]),
+        int(scene["light_value"]),
+    )
+    _draw_brackets(draw, centres[0])
+    _draw_key(draw, scene)
+    return image
+
+
+# ------------------------------------------------------------ analytic gold API
+
+
+def analytic_gold(scene: dict) -> str:
+    """Glyph spelled by the route-ordered dots reflowed row-major into 5x5."""
+    name = glyph_from_bits([int(b) for b in scene["bits"]])
+    if name is None:
+        raise ValueError("scene bits do not reflow to a declared glyph")
+    return name
+
+
+def margin(scene: dict) -> float:
+    """Per-dot tone clearance in luma units: half the rendered tone gap."""
+    return float(int(scene["light_value"]) - int(scene["dark_value"])) / 2.0
+
+
+def hamming_margin(scene: dict) -> int:
+    """Dot misreads required before another declared glyph could win."""
+    bits = BITMAPS[analytic_gold(scene)]
+    best = min(
+        sum(1 for a, b in zip(bits, BITMAPS[other]) if a != b)
+        for other in GLYPH_NAMES
+        if BITMAPS[other] != bits
+    )
+    return best // 2
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Scenes whose two dot tones are too close to separate reliably by eye."""
+    return margin(scene) < QUARANTINE_CLEARANCE
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: the scene->raster map is injective on all fields."""
+    return []
+
+
+def support_mask(scene: dict) -> np.ndarray:
+    """Diagnostic: the decisive support, i.e. the teal chain's own pixels."""
+    array = np.asarray(render(scene), dtype=np.int16)
+    target = np.array(TAPE_RGB, dtype=np.int16)
+    return bool_tape(array, target)
+
+
+def bool_tape(array: np.ndarray, target: np.ndarray) -> np.ndarray:
+    return np.all(np.abs(array - target) <= 12, axis=2)

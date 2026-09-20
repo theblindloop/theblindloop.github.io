@@ -1,0 +1,227 @@
+"""Renderer for a marked three-channel exposure-registration world.
+
+The latent scene contains one canonical square raster, but the three RGB
+channels are painted at different offsets.  The colored corner marks are part
+of the observable image and are the only way to recover those offsets.  Each
+channel carries the same broad glyph plus a phase-shifted six-state carrier;
+the carrier cancels when the three channel rasters are cropped and averaged in
+registration.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+WIDTH = 512
+HEIGHT = 512
+TILE_SIZE = 240
+FIDUCIAL_OFFSET = 16
+FIDUCIAL_HALF = 5
+SYMBOLS = ("arch", "kite", "coil", "trident")
+
+# The three entries in every offset set are deliberately well separated, so
+# the four marker components for different channels cannot touch.
+OFFSET_SETS: tuple[tuple[tuple[int, int], ...], ...] = (
+    ((-24, -16), (20, -10), (-4, 24)),
+    ((-20, 18), (24, 10), (0, -24)),
+    ((-26, 8), (16, -20), (8, 24)),
+    ((-18, -22), (24, 0), (-2, 24)),
+    ((-24, 14), (18, 22), (4, -24)),
+)
+
+# Marker palettes vary intensity and hue while retaining one clear dominant
+# RGB component per channel.  The inverse detects dominance, not palette ID.
+MARKER_PALETTES: tuple[tuple[tuple[int, int, int], ...], ...] = (
+    ((245, 52, 52), (48, 205, 66), (55, 86, 238)),
+    ((250, 92, 40), (42, 190, 142), (112, 55, 228)),
+    ((228, 58, 124), (70, 214, 60), (48, 122, 242)),
+    ((242, 74, 34), (44, 224, 110), (116, 56, 238)),
+)
+
+# For phases 0, 2, and 4, the entries sum to zero for every six-state phase.
+# This makes phase cancellation a property of the aligned raster, not of a
+# particular symbol or position.
+_PHASE_LUT = np.asarray((1.0, 0.0, -1.0, 1.0, 0.0, -1.0), dtype=np.float32)
+_CHANNEL_BIAS = (-6.0, 0.0, 6.0)
+_STROKE_WIDTH = 11
+
+
+def _symbol_paths(symbol: str, cx: float, cy: float) -> list[list[tuple[float, float]]]:
+    """Return balanced, broad line paths around a symbol center."""
+
+    paths: dict[str, list[list[tuple[float, float]]]] = {
+        "arch": [
+            [(-54, 48), (-54, -42), (54, -42), (54, 48)],
+        ],
+        "kite": [
+            [(0, -58), (54, 0), (0, 58), (-54, 0), (0, -58)],
+        ],
+        "coil": [
+            [(-58, -48), (58, -48), (58, 42), (-30, 42), (-30, -15), (28, -15), (28, 15)],
+        ],
+        "trident": [
+            [(0, 56), (0, -30)],
+            [(0, -28), (-54, -56)],
+            [(0, -28), (54, -56)],
+            [(0, -28), (0, -60)],
+        ],
+    }
+    if symbol not in paths:
+        raise ValueError(f"unknown symbol {symbol!r}")
+    return [[(cx + x, cy + y) for x, y in path] for path in paths[symbol]]
+
+
+def _symbol_mask(symbol: str, dx: int, dy: int) -> np.ndarray:
+    """Build an antialiased broad-symbol mask in canonical tile coordinates."""
+
+    supersample = 3
+    canvas = Image.new("L", (TILE_SIZE * supersample, TILE_SIZE * supersample), 0)
+    draw = ImageDraw.Draw(canvas)
+    cx = TILE_SIZE / 2.0 + float(dx)
+    cy = TILE_SIZE / 2.0 + float(dy)
+    for path in _symbol_paths(symbol, cx, cy):
+        draw.line(
+            [(round(x * supersample), round(y * supersample)) for x, y in path],
+            fill=255,
+            width=_STROKE_WIDTH * supersample,
+            joint="curve",
+        )
+    canvas = canvas.resize((TILE_SIZE, TILE_SIZE), Image.Resampling.LANCZOS)
+    return np.asarray(canvas, dtype=np.float32) / 255.0
+
+
+def _channel_tile(
+    *,
+    symbol_mask: np.ndarray,
+    channel: int,
+    phase: int,
+    base_level: int,
+    carrier_amplitude: int,
+    signal_strength: int,
+) -> np.ndarray:
+    yy, xx = np.indices((TILE_SIZE, TILE_SIZE), dtype=np.int32)
+    channel_phase = int(phase) + 2 * int(channel)
+    carrier_x = _PHASE_LUT[(xx + channel_phase) % 6]
+    carrier_y = _PHASE_LUT[(yy + 2 * int(phase) + 2 * int(channel)) % 6]
+    carrier = float(carrier_amplitude) * (carrier_x + 0.8 * carrier_y)
+    values = (
+        float(base_level)
+        + _CHANNEL_BIAS[channel]
+        + carrier
+        - float(signal_strength) * symbol_mask
+    )
+    return np.clip(np.rint(values), 0, 255).astype(np.uint8)
+
+
+def _marker_centers(origin_x: int, origin_y: int) -> list[tuple[int, int]]:
+    edge = FIDUCIAL_OFFSET
+    return [
+        (origin_x - edge, origin_y - edge),
+        (origin_x + TILE_SIZE - 1 + edge, origin_y - edge),
+        (origin_x - edge, origin_y + TILE_SIZE - 1 + edge),
+        (origin_x + TILE_SIZE - 1 + edge, origin_y + TILE_SIZE - 1 + edge),
+    ]
+
+
+def _draw_markers(image: Image.Image, scene: dict) -> None:
+    draw = ImageDraw.Draw(image)
+    palette = MARKER_PALETTES[int(scene["marker_palette_id"]) % len(MARKER_PALETTES)]
+    half = FIDUCIAL_HALF
+    for channel, (dx, dy) in enumerate(scene["offsets"]):
+        origin_x = int(scene["tile_x"]) + int(dx)
+        origin_y = int(scene["tile_y"]) + int(dy)
+        for cx, cy in _marker_centers(origin_x, origin_y):
+            draw.rectangle((cx - half, cy - half, cx + half, cy + half), fill=palette[channel])
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one JSON-friendly scene with independent nuisance variation."""
+
+    rng = random.Random(int(seed))
+    symbol = rng.choice(SYMBOLS)
+    offset_set = list(rng.choice(OFFSET_SETS))
+    rng.shuffle(offset_set)
+    quality_band = "boundary" if rng.random() < 0.25 else "clear"
+    if quality_band == "boundary":
+        carrier_amplitude = rng.randint(46, 54)
+        signal_strength = rng.randint(14, 17)
+    else:
+        carrier_amplitude = rng.randint(42, 50)
+        signal_strength = rng.randint(26, 36)
+    return {
+        "symbol": symbol,
+        "tile_x": rng.randint(116, 168),
+        "tile_y": rng.randint(116, 168),
+        "offsets": [[int(x), int(y)] for x, y in offset_set],
+        "marker_palette_id": rng.randrange(len(MARKER_PALETTES)),
+        "carrier_phase": rng.randrange(6),
+        "carrier_amplitude": int(carrier_amplitude),
+        "signal_strength": int(signal_strength),
+        "base_level": rng.randint(140, 150),
+        "symbol_dx": rng.randint(-14, 14),
+        "symbol_dy": rng.randint(-14, 14),
+        "quality_band": quality_band,
+        "seed": int(seed),
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only from the supplied scene dictionary."""
+
+    image_array = np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8)
+    symbol_mask = _symbol_mask(
+        str(scene["symbol"]), int(scene["symbol_dx"]), int(scene["symbol_dy"])
+    )
+    phase = int(scene["carrier_phase"]) % 6
+    for channel, (dx, dy) in enumerate(scene["offsets"]):
+        origin_x = int(scene["tile_x"]) + int(dx)
+        origin_y = int(scene["tile_y"]) + int(dy)
+        if not (0 <= origin_x and origin_x + TILE_SIZE <= WIDTH):
+            raise ValueError("channel crop is outside the canvas")
+        if not (0 <= origin_y and origin_y + TILE_SIZE <= HEIGHT):
+            raise ValueError("channel crop is outside the canvas")
+        image_array[origin_y : origin_y + TILE_SIZE, origin_x : origin_x + TILE_SIZE, channel] = (
+            _channel_tile(
+                symbol_mask=symbol_mask,
+                channel=channel,
+                phase=phase,
+                base_level=int(scene["base_level"]),
+                carrier_amplitude=int(scene["carrier_amplitude"]),
+                signal_strength=int(scene["signal_strength"]),
+            )
+        )
+    image = Image.fromarray(image_array, mode="RGB")
+    _draw_markers(image, scene)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    """Analytic answer; the label depends on the symbol field only."""
+
+    symbol = str(scene["symbol"])
+    if symbol not in SYMBOLS:
+        raise ValueError(f"unknown symbol {symbol!r}")
+    return symbol
+
+
+def margin(scene: dict) -> float:
+    """Declared registered-average signal margin before template classification."""
+
+    return float(float(scene["signal_strength"]) - 18.0)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 0.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Exercise the six-state carrier phase alias."""
+
+    twin = dict(scene)
+    twin["carrier_phase"] = int(scene["carrier_phase"]) + 6
+    return [("carrier_phase_period", twin)]

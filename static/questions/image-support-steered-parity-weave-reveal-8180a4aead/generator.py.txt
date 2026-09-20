@@ -1,0 +1,285 @@
+"""Renderer for the compact checkerboard-parity reveal world.
+
+The visible patch carries two interleaved parity streams.  One is a random
+carrier and the other is that carrier XOR a binary template.  The declared
+pixel operation therefore has to deinterleave and compare the two streams.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "parity_weave_reveal-0.1.0"
+WIDTH = 512
+HEIGHT = 512
+PANEL_SIDE = 96
+FRAME = 8
+INNER_SIDE = 80
+GRID_SIDE = 16
+CELL = 5
+PAIR_COUNT = GRID_SIDE * GRID_SIDE // 2
+
+_A_ROWS = (
+    "....####....####",
+    "...######...####",
+    "..########..####",
+    ".##########.####",
+    ".##########.####",
+    "..########..####",
+    "...######...####",
+    "....####....####",
+)
+_B_ROWS = (
+    "################",
+    "####........####",
+    "####........####",
+    "################",
+    "####........####",
+    "####........####",
+    "####........####",
+    "################",
+)
+
+
+def _rows_to_template(rows: tuple[str, ...]) -> tuple[tuple[int, ...], ...]:
+    if len(rows) != 8 or any(len(row) != 16 for row in rows):
+        raise AssertionError("templates must be 8 by 16")
+    return tuple(tuple(int(char == "#") for char in row) for row in rows)
+
+
+PETAL = _rows_to_template(_A_ROWS)
+GATE = _rows_to_template(_B_ROWS)
+TEMPLATES = {"A": PETAL, "B": GATE}
+FLAT_TEMPLATES = {
+    key: tuple(value for row in template for value in row)
+    for key, template in TEMPLATES.items()
+}
+DIFF_POSITIONS = tuple(
+    index
+    for index, (left, right) in enumerate(zip(FLAT_TEMPLATES["A"], FLAT_TEMPLATES["B"], strict=True))
+    if left != right
+)
+
+BACKGROUND_PALETTE = (
+    (242, 245, 239),
+    (239, 243, 248),
+    (247, 240, 234),
+    (235, 244, 241),
+)
+FRAME_PALETTE = (
+    (31, 52, 83),
+    (53, 40, 74),
+    (67, 46, 88),
+    (35, 78, 76),
+)
+TONE_PALETTE = (
+    ((225, 190, 71), (67, 117, 166)),
+    ((215, 126, 76), (62, 139, 126)),
+    ((197, 112, 174), (65, 104, 174)),
+    ((221, 177, 78), (117, 83, 156)),
+)
+FIDUCIAL_PALETTE = (
+    (220, 74, 75),
+    (238, 142, 48),
+    (81, 177, 135),
+    (208, 84, 170),
+)
+
+
+def _as_rgb(value: Iterable[int]) -> tuple[int, int, int]:
+    rgb = tuple(int(channel) for channel in value)
+    if len(rgb) != 3 or any(channel < 0 or channel > 255 for channel in rgb):
+        raise ValueError(f"invalid RGB value {value!r}")
+    return rgb
+
+
+def _flatten(template: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    return tuple(value for row in template for value in row)
+
+
+def _template_with_variant(scene: dict) -> tuple[int, ...]:
+    symbol = str(scene["symbol"])
+    if symbol not in FLAT_TEMPLATES:
+        raise ValueError(f"unknown symbol {symbol!r}")
+    values = list(FLAT_TEMPLATES[symbol])
+    variant = int(scene["variant"])
+    if variant not in (0, 1, 2):
+        raise ValueError("variant must be 0, 1, or 2")
+    if variant:
+        flips = 24 if variant == 1 else 28
+        for index in DIFF_POSITIONS[:flips]:
+            values[index] = 1 - values[index]
+    return tuple(values)
+
+
+def _balanced_carrier(scene: dict) -> tuple[int, ...]:
+    """Make the clean two labels have identical total cell ink."""
+
+    rng = random.Random(int(scene["carrier_seed"]))
+    carrier = [rng.randrange(2) for _ in range(PAIR_COUNT)]
+    carrier[0], carrier[1] = 0, 1
+
+    def dark_count(template: tuple[int, ...]) -> int:
+        return sum(value + (value ^ bit) for value, bit in zip(carrier, template, strict=True))
+
+    delta = dark_count(FLAT_TEMPLATES["A"]) - dark_count(FLAT_TEMPLATES["B"])
+    for index in DIFF_POSITIONS:
+        if delta == 0:
+            break
+        old = carrier[index]
+        carrier[index] = 1 - old
+        new_delta = dark_count(FLAT_TEMPLATES["A"]) - dark_count(FLAT_TEMPLATES["B"])
+        if abs(new_delta) >= abs(delta):
+            carrier[index] = old
+        else:
+            delta = new_delta
+    if delta != 0:
+        raise AssertionError("carrier balancing failed")
+    return tuple(carrier)
+
+
+def _parity_coordinates(parity: int) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (row, col)
+        for row in range(GRID_SIDE)
+        for col in range(GRID_SIDE)
+        if (row + col) % 2 == parity
+    )
+
+
+EVEN_COORDINATES = _parity_coordinates(0)
+ODD_COORDINATES = _parity_coordinates(1)
+
+
+def _encoded_bits(scene: dict) -> tuple[int, ...]:
+    target = _template_with_variant(scene)
+    carrier = _balanced_carrier(scene)
+    return tuple(carrier[index] ^ target[index] for index in range(PAIR_COUNT))
+
+
+def _draw_remote_marks(draw: ImageDraw.ImageDraw, scene: dict, side: int) -> None:
+    rng = random.Random(int(scene["distractor_seed"]))
+    panel_x = int(scene["panel_x"])
+    panel_y = int(scene["panel_y"])
+    count = int(scene["distractor_count"])
+    color = _as_rgb(scene["fiducial"])
+    placed = 0
+    attempts = 0
+    while placed < count and attempts < 200:
+        attempts += 1
+        x = rng.randint(18, WIDTH - 19)
+        y = rng.randint(18, HEIGHT - 19)
+        if panel_x - 18 <= x <= panel_x + side + 18 and panel_y - 18 <= y <= panel_y + side + 18:
+            continue
+        if placed % 2:
+            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
+        else:
+            draw.rectangle((x - 3, y - 3, x + 3, y + 3), fill=color)
+        placed += 1
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a translated, palette-balanced, image-answerable scene."""
+
+    rng = random.Random(int(seed))
+    tone_a, tone_b = rng.choice(TONE_PALETTE)
+    return {
+        "symbol": "A" if int(seed) % 2 == 0 else "B",
+        "panel_x": rng.randint(48, WIDTH - PANEL_SIDE - 48),
+        "panel_y": rng.randint(48, HEIGHT - PANEL_SIDE - 48),
+        "panel_side": PANEL_SIDE,
+        "background": list(rng.choice(BACKGROUND_PALETTE)),
+        "frame": list(rng.choice(FRAME_PALETTE)),
+        "tone_a": list(tone_a),
+        "tone_b": list(tone_b),
+        "fiducial": list(rng.choice(FIDUCIAL_PALETTE)),
+        "carrier_seed": rng.randrange(1, 2**31 - 1),
+        "marker_style": rng.randrange(2),
+        "tone_flip": rng.randrange(2),
+        "distractor_seed": rng.randrange(1, 2**31 - 1),
+        "distractor_count": rng.randrange(1, 4),
+        "variant": 2 if int(seed) % 19 == 0 else 1 if int(seed) % 11 == 0 else 0,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one compact connected patch and a few nondiagnostic remote marks."""
+
+    side = int(scene["panel_side"])
+    if side != PANEL_SIDE:
+        raise ValueError("unsupported panel side")
+    x0 = int(scene["panel_x"])
+    y0 = int(scene["panel_y"])
+    if not (48 <= x0 <= WIDTH - side - 48 and 48 <= y0 <= HEIGHT - side - 48):
+        raise ValueError("panel is outside the sampling margin")
+
+    background = _as_rgb(scene["background"])
+    frame = _as_rgb(scene["frame"])
+    fiducial = _as_rgb(scene["fiducial"])
+    tone_a = _as_rgb(scene["tone_a"])
+    tone_b = _as_rgb(scene["tone_b"])
+    if int(scene["tone_flip"]) % 2:
+        tone_a, tone_b = tone_b, tone_a
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw = ImageDraw.Draw(image)
+    _draw_remote_marks(draw, scene, side)
+    draw.rectangle((x0, y0, x0 + side - 1, y0 + side - 1), fill=frame)
+
+    marker = int(scene["marker_style"]) % 2
+    if marker == 0:
+        draw.rectangle((x0 + 2, y0 + 2, x0 + 5, y0 + 5), fill=fiducial)
+    else:
+        draw.rectangle((x0 + 2, y0 + 2, x0 + 7, y0 + 3), fill=fiducial)
+        draw.rectangle((x0 + 2, y0 + 2, x0 + 3, y0 + 7), fill=fiducial)
+
+    inner_x = x0 + FRAME
+    inner_y = y0 + FRAME
+    carrier = _balanced_carrier(scene)
+    target = _template_with_variant(scene)
+    even_colors = tone_a, tone_b
+    odd_colors = tone_a, tone_b
+    for index, ((even_row, even_col), (odd_row, odd_col)) in enumerate(
+        zip(EVEN_COORDINATES, ODD_COORDINATES, strict=True)
+    ):
+        first = carrier[index]
+        second = carrier[index] ^ target[index]
+        even_color = even_colors[first]
+        odd_color = odd_colors[second]
+        for row, col, color in (
+            (even_row, even_col, even_color),
+            (odd_row, odd_col, odd_color),
+        ):
+            left = inner_x + col * CELL
+            top = inner_y + row * CELL
+            draw.rectangle((left, top, left + CELL - 1, top + CELL - 1), fill=color)
+    return image
+
+
+def _hamming(left: Iterable[int], right: Iterable[int]) -> int:
+    return sum(int(a) != int(b) for a, b in zip(left, right, strict=True))
+
+
+def analytic_gold(scene: dict) -> str:
+    symbol = str(scene["symbol"])
+    if symbol not in TEMPLATES:
+        raise ValueError(symbol)
+    return symbol
+
+
+def margin(scene: dict) -> float:
+    code = _template_with_variant(scene)
+    distance_a = _hamming(code, FLAT_TEMPLATES["A"])
+    distance_b = _hamming(code, FLAT_TEMPLATES["B"])
+    return float(abs(distance_a - distance_b))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 8.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

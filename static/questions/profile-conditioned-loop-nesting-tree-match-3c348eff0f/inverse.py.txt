@@ -1,0 +1,135 @@
+"""Independent pixel-only inverse arm for closed-loop containment forests."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """Raised when the raster does not expose a stable closed-loop decision."""
+
+
+PROTOTYPES = {
+    "gray": (112, 118, 124),
+    "blue": (35, 116, 178),
+    "orange": (225, 125, 35),
+    "purple": (137, 86, 171),
+    "dark": (31, 38, 45),
+}
+ANSWER_COLORS = ("blue", "orange", "purple")
+
+
+def _near(arr: np.ndarray, rgb: tuple[int, int, int], radius: float) -> np.ndarray:
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int32) <= radius * radius
+
+
+def _bbox(mask: np.ndarray, name: str) -> list[int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 500:
+        raise OracleAbstention(f"missing or damaged {name} panel frame")
+    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+
+
+def _edge_fraction(mask: np.ndarray, box: list[int], width: int = 5) -> float:
+    x0, y0, x1, y1 = box
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return 0.0
+    strips = (
+        mask[y0 : y0 + width, x0 : x1 + 1],
+        mask[y1 - width + 1 : y1 + 1, x0 : x1 + 1],
+        mask[y0 : y1 + 1, x0 : x0 + width],
+        mask[y0 : y1 + 1, x1 - width + 1 : x1 + 1],
+    )
+    return float(min(strip.mean() for strip in strips))
+
+
+def _rectangles(mask: np.ndarray) -> list[list[int]]:
+    """Recover axis-aligned closed rectangles from their long horizontal stroke bands."""
+    bands_by_span: dict[tuple[int, int], list[list[int]]] = {}
+    active: dict[tuple[int, int], list[int]] = {}
+    for y in range(mask.shape[0]):
+        row = mask[y]
+        changes = np.diff(np.pad(row.astype(np.int8), (1, 1)))
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1) - 1
+        spans = {(int(x0), int(x1)) for x0, x1 in zip(starts, ends) if x1 - x0 + 1 >= 20}
+        for span in list(active):
+            if span not in spans:
+                bands_by_span.setdefault(span, []).append(active.pop(span))
+        for span in spans:
+            if span in active:
+                active[span][1] = y
+            else:
+                active[span] = [y, y]
+    for span, band in active.items():
+        bands_by_span.setdefault(span, []).append(band)
+
+    rectangles: list[list[int]] = []
+    for (x0, x1), bands in bands_by_span.items():
+        bands.sort()
+        if len(bands) % 2:
+            raise OracleAbstention("an open or merged loop has an unmatched horizontal edge")
+        for index in range(0, len(bands), 2):
+            top, bottom = bands[index], bands[index + 1]
+            box = [x0, top[0], x1, bottom[1]]
+            if _edge_fraction(mask, box) < 0.965:
+                raise OracleAbstention("a loop boundary is open or materially erased")
+            rectangles.append(box)
+    if len(rectangles) != 7:
+        raise OracleAbstention(f"expected seven closed loops, recovered {len(rectangles)}")
+    return rectangles
+
+
+def _contains(outer: list[int], inner: list[int]) -> bool:
+    return outer[0] < inner[0] and outer[1] < inner[1] and outer[2] > inner[2] and outer[3] > inner[3]
+
+
+def _signature(boxes: list[list[int]]) -> tuple[str, ...]:
+    parents: list[int | None] = []
+    for i, box in enumerate(boxes):
+        containers = [j for j, other in enumerate(boxes) if i != j and _contains(other, box)]
+        parent = min(containers, key=lambda j: (boxes[j][2] - boxes[j][0]) * (boxes[j][3] - boxes[j][1])) if containers else None
+        parents.append(parent)
+    children = {i: [] for i in range(len(boxes))}
+    roots = []
+    for i, parent in enumerate(parents):
+        if parent is None:
+            roots.append(i)
+        else:
+            children[parent].append(i)
+
+    def encode(node: int) -> str:
+        return "(" + "".join(sorted(encode(child) for child in children[node])) + ")"
+
+    signature = tuple(sorted(encode(root) for root in roots))
+    if len(roots) != 1 or max(value.count("(") for value in signature) != 7:
+        raise OracleAbstention("loop forest is not the declared seven-node rooted tree")
+    return signature
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or min(arr.shape[:2]) < 64:
+        raise OracleAbstention("image is too small")
+
+    frames: dict[str, list[int]] = {}
+    for name in ("gray", *ANSWER_COLORS):
+        mask = _near(arr, PROTOTYPES[name], 38.0)
+        box = _bbox(mask, name)
+        if _edge_fraction(mask, box) < 0.94:
+            raise OracleAbstention(f"{name} frame is not a closed visible rectangle")
+        frames[name] = box
+
+    dark = _near(arr, PROTOTYPES["dark"], 45.0)
+    signatures: dict[str, tuple[str, ...]] = {}
+    for name, (x0, y0, x1, y1) in frames.items():
+        inset = 10
+        panel_mask = dark[y0 + inset : y1 - inset + 1, x0 + inset : x1 - inset + 1]
+        signatures[name] = _signature(_rectangles(panel_mask))
+
+    matches = [name for name in ANSWER_COLORS if signatures[name] == signatures["gray"]]
+    if len(matches) != 1:
+        raise OracleAbstention(f"raster has {len(matches)} matching candidate trees")
+    return matches[0]

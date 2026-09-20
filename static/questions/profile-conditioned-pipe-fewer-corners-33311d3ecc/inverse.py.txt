@@ -1,0 +1,168 @@
+"""Pixel-only oracle for pipe_fewer_corners.
+
+Receives one rendered PNG and nothing else: no scene, no renderer constants, no
+analytic gold. It segments the two gray strokes, splits each stroke into its
+maximal straight horizontal and vertical sections from the run structure of its
+own pixels, counts right-angle turns as (sections - 1), attaches each colored
+square to the stroke it terminates, and reports the color of the stroke with
+fewer turns. Ambiguous rasters abstain.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "pipe_fewer_corners-oracle-0.1.0"
+
+ABSTAIN = "ambiguous"
+_MIN_STROKE_PX = 500
+_MIN_MARK_PX = 200
+
+
+def _runs(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    """Per-row maximal runs of True as (start, end) inclusive."""
+    out = []
+    for row in mask:
+        idx = np.flatnonzero(row)
+        if idx.size == 0:
+            out.append([])
+            continue
+        breaks = np.flatnonzero(np.diff(idx) > 1)
+        starts = np.concatenate(([idx[0]], idx[breaks + 1]))
+        ends = np.concatenate((idx[breaks], [idx[-1]]))
+        out.append(list(zip(starts.tolist(), ends.tolist())))
+    return out
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """8-connected components, returned as boolean masks."""
+    rows = _runs(mask)
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    ids: list[list[int]] = []
+    for y, rr in enumerate(rows):
+        cur = []
+        for run in rr:
+            cur.append(len(parent))
+            parent.append(len(parent))
+        ids.append(cur)
+        if y == 0:
+            continue
+        for i, (s1, e1) in enumerate(rows[y - 1]):
+            for j, (s2, e2) in enumerate(rr):
+                if s1 <= e2 + 1 and s2 <= e1 + 1:
+                    union(ids[y - 1][i], cur[j])
+
+    groups: dict[int, list[tuple[int, int, int]]] = {}
+    for y, rr in enumerate(rows):
+        for j, (s, e) in enumerate(rr):
+            groups.setdefault(find(ids[y][j]), []).append((y, s, e))
+
+    comps = []
+    for runs_of in groups.values():
+        size = sum(e - s + 1 for _, s, e in runs_of)
+        if size < _MIN_STROKE_PX:
+            continue
+        comp = np.zeros_like(mask)
+        for y, s, e in runs_of:
+            comp[y, s : e + 1] = True
+        comps.append(comp)
+    return comps
+
+
+def _long_sections(comp: np.ndarray, thresh: float) -> int:
+    """Count maximal straight sections lying along rows of `comp`."""
+    rows = _runs(comp)
+    clusters = 0
+    prev: list[tuple[int, int]] = []
+    for rr in rows:
+        cur = [(s, e) for s, e in rr if (e - s + 1) >= thresh]
+        for s, e in cur:
+            if not any(s <= pe and ps <= e for ps, pe in prev):
+                clusters += 1
+        prev = cur
+    return clusters
+
+
+def _turns(comp: np.ndarray) -> int | None:
+    lengths = []
+    for rr in _runs(comp):
+        lengths.extend(e - s + 1 for s, e in rr)
+    for rr in _runs(comp.T):
+        lengths.extend(e - s + 1 for s, e in rr)
+    if not lengths:
+        return None
+    width = float(np.percentile(np.asarray(lengths, dtype=float), 15))
+    if width < 2.0:
+        return None
+    thresh = 3.0 * width
+    n_h = _long_sections(comp, thresh)
+    n_v = _long_sections(np.ascontiguousarray(comp.T), thresh)
+    if n_h < 1 or n_v < 1:
+        return None
+    return n_h + n_v - 1
+
+
+def _dist_to_comp(comp: np.ndarray, cy: float, cx: float) -> float:
+    ys, xs = np.nonzero(comp)
+    step = max(1, ys.size // 4000)
+    ys = ys[::step].astype(float)
+    xs = xs[::step].astype(float)
+    return float(np.min((ys - cy) ** 2 + (xs - cx) ** 2)) ** 0.5
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    hi = arr.max(axis=2)
+    lo = arr.min(axis=2)
+    sat = hi - lo
+    mean = arr.mean(axis=2)
+
+    stroke = (sat <= 20) & (mean >= 40) & (mean <= 140)
+    colored = sat >= 60
+
+    comps = _components(stroke)
+    if len(comps) != 2:
+        return ABSTAIN
+    marks = _components(colored)
+    marks = [m for m in marks if int(m.sum()) >= _MIN_MARK_PX]
+    if len(marks) != 2:
+        return ABSTAIN
+
+    turns = [_turns(c) for c in comps]
+    if any(t is None for t in turns):
+        return ABSTAIN
+
+    named: dict[str, int] = {}
+    for m in marks:
+        ys, xs = np.nonzero(m)
+        cy, cx = float(ys.mean()), float(xs.mean())
+        rgb = arr[m]
+        name = "orange" if rgb[:, 0].mean() > rgb[:, 2].mean() else "purple"
+        dists = [_dist_to_comp(c, cy, cx) for c in comps]
+        near = int(np.argmin(dists))
+        if sorted(dists)[1] < 2.0 * sorted(dists)[0] + 1.0:
+            return ABSTAIN
+        if name in named:
+            return ABSTAIN
+        named[name] = near
+    if len(named) != 2 or named["orange"] == named["purple"]:
+        return ABSTAIN
+
+    t_orange = turns[named["orange"]]
+    t_purple = turns[named["purple"]]
+    if t_orange == t_purple:
+        return ABSTAIN
+    return "orange" if t_orange < t_purple else "purple"

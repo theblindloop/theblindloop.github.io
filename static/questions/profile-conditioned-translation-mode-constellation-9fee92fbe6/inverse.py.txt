@@ -1,0 +1,121 @@
+"""Independent pixel-only recovery of the repeated displacement mode."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+GUIDE_RGB = {
+    "red": (211, 55, 48),
+    "blue": (42, 104, 177),
+    "green": (34, 139, 78),
+    "orange": (225, 126, 35),
+}
+DOT_RGB = (27, 32, 43)
+
+
+@dataclass(frozen=True)
+class Measurement:
+    decision: str
+    margin: float
+    supports: dict[str, int]
+    dot_count: int
+    guide_angles: dict[str, float]
+
+
+def _components(mask: np.ndarray) -> list[tuple[float, float, int]]:
+    """Four-connected component centroids, implemented without renderer geometry."""
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[tuple[float, float, int]] = []
+    for start_y, start_x in np.argwhere(mask):
+        sy, sx = int(start_y), int(start_x)
+        if visited[sy, sx]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(sy, sx)])
+        visited[sy, sx] = True
+        total_x = total_y = area = 0
+        while queue:
+            y, x = queue.popleft()
+            total_x += x
+            total_y += y
+            area += 1
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        components.append((total_x / area, total_y / area, area))
+    return components
+
+
+def _axis_angle(coords_xy: np.ndarray) -> float:
+    centered = coords_xy - coords_xy.mean(axis=0)
+    covariance = centered.T @ centered
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    return math.degrees(math.atan2(float(direction[1]), float(direction[0]))) % 180.0
+
+
+def _angle_gap(first: float, second: float) -> float:
+    gap = abs(first - second) % 180.0
+    return min(gap, 180.0 - gap)
+
+
+def _repeated_support(points: list[tuple[float, float]], angle: float) -> int:
+    candidate_lengths: list[float] = []
+    for index, (x1, y1) in enumerate(points):
+        for x2, y2 in points[index + 1 :]:
+            dx, dy = x2 - x1, y2 - y1
+            length = math.hypot(dx, dy)
+            if length < 34.0:
+                continue
+            pair_angle = math.degrees(math.atan2(dy, dx)) % 180.0
+            if _angle_gap(pair_angle, angle) <= 3.2:
+                candidate_lengths.append(length)
+    if not candidate_lengths:
+        return 0
+    return max(
+        sum(abs(other - center) <= 3.5 for other in candidate_lengths)
+        for center in candidate_lengths
+    )
+
+
+def measure(image: Image.Image) -> Measurement:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    dot_mask = np.all(array == np.asarray(DOT_RGB, dtype=np.uint8), axis=2)
+    raw_components = _components(dot_mask)
+    components = [(x, y) for x, y, area in raw_components if 120 <= area <= 300]
+    residual = sum(area for _, _, area in raw_components if not 120 <= area <= 300)
+    if residual:
+        raise ValueError("dark evidence contains a fused, erased, or non-dot component")
+    if not 18 <= len(components) <= 30:
+        raise ValueError(f"expected a populated dot field, recovered {len(components)} dots")
+
+    guide_angles: dict[str, float] = {}
+    for color, rgb in GUIDE_RGB.items():
+        mask = np.all(array == np.asarray(rgb, dtype=np.uint8), axis=2)
+        yx = np.argwhere(mask)
+        if len(yx) < 300:
+            raise ValueError(f"insufficient {color} guide evidence")
+        guide_angles[color] = _axis_angle(yx[:, ::-1].astype(np.float64))
+    angles = list(guide_angles.values())
+    if min(_angle_gap(angles[i], angles[j]) for i in range(4) for j in range(i + 1, 4)) < 15.0:
+        raise ValueError("colored guide directions are not visibly distinct")
+
+    supports = {
+        color: _repeated_support(components, angle) for color, angle in guide_angles.items()
+    }
+    ordered = sorted(supports, key=lambda color: (-supports[color], color))
+    best, runner = ordered[:2]
+    runner_up_margin = supports[best] - supports[runner]
+    if supports[best] < 6 or runner_up_margin < 3:
+        raise ValueError("repeated displacement evidence is erased, weak, or ambiguous")
+    return Measurement(best, float(runner_up_margin), supports, len(components), guide_angles)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure(image).decision

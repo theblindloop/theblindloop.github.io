@@ -1,0 +1,230 @@
+"""Deterministic sampler and renderer for color-anchored affine transfer."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 1000, 680
+BACKGROUND = (249, 247, 241)
+ANCHOR_RGB = {
+    "cyan": (18, 160, 190),
+    "orange": (235, 116, 35),
+    "purple": (132, 79, 184),
+}
+CANDIDATE_RGB = {
+    "red": (210, 51, 58),
+    "blue": (46, 91, 190),
+    "gold": (218, 160, 27),
+}
+RING_RGB = (218, 54, 150)
+TRIANGLE_RGB = (65, 70, 78)
+PANEL_RGB = (186, 188, 190)
+ANCHOR_ORDER = ("cyan", "orange", "purple")
+
+_WEIGHTS = (
+    (0.12, 0.14, 0.74),
+    (0.12, 0.70, 0.18),
+    (0.16, 0.68, 0.16),
+    (0.16, 0.28, 0.56),
+    (0.18, 0.52, 0.30),
+    (0.22, 0.36, 0.42),
+    (0.27, 0.18, 0.55),
+    (0.29, 0.47, 0.24),
+    (0.34, 0.23, 0.43),
+    (0.38, 0.42, 0.20),
+    (0.43, 0.18, 0.39),
+    (0.46, 0.36, 0.18),
+    (0.52, 0.27, 0.21),
+    (0.68, 0.14, 0.18),
+    (0.72, 0.16, 0.12),
+)
+
+
+def _point(weights: tuple[float, float, float], anchors: dict[str, list[int]]) -> list[int]:
+    return [
+        round(sum(weights[i] * anchors[name][0] for i, name in enumerate(ANCHOR_ORDER))),
+        round(sum(weights[i] * anchors[name][1] for i, name in enumerate(ANCHOR_ORDER))),
+    ]
+
+
+def _barycentric(point: list[int], anchors: dict[str, list[int]]) -> tuple[float, float, float]:
+    ax, ay = anchors["cyan"]
+    bx, by = anchors["orange"]
+    cx, cy = anchors["purple"]
+    px, py = point
+    determinant = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    if abs(determinant) < 1000:
+        raise ValueError("anchor triangle is degenerate")
+    wa = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / determinant
+    wb = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / determinant
+    return (wa, wb, 1.0 - wa - wb)
+
+
+def _distance(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def _anchors(rng: random.Random, side: str) -> dict[str, list[int]]:
+    if side == "left":
+        return {
+            "cyan": [rng.randint(72, 142), rng.randint(492, 568)],
+            "orange": [rng.randint(365, 454), rng.randint(474, 564)],
+            "purple": [rng.randint(185, 302), rng.randint(86, 176)],
+        }
+    return {
+        "cyan": [rng.randint(540, 632), rng.randint(468, 568)],
+        "orange": [rng.randint(850, 938), rng.randint(478, 566)],
+        "purple": [rng.randint(670, 824), rng.randint(78, 184)],
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    left_anchors = _anchors(rng, "left")
+    right_anchors = _anchors(rng, "right")
+    reference_weights = _WEIGHTS[rng.randrange(len(_WEIGHTS))]
+    eligible = [weights for weights in _WEIGHTS if _distance(weights, reference_weights) >= 0.24]
+    pairs = [(eligible[i], eligible[j]) for i in range(len(eligible))
+             for j in range(i + 1, len(eligible))
+             if _distance(eligible[i], eligible[j]) >= 0.24]
+    rng.shuffle(pairs)
+    reference_point = _point(reference_weights, right_anchors)
+    distractor_weights = None
+    for pair in pairs:
+        points = [reference_point, _point(pair[0], right_anchors), _point(pair[1], right_anchors)]
+        if min(math.hypot(points[i][0] - points[j][0], points[i][1] - points[j][1])
+               for i in range(3) for j in range(i + 1, 3)) >= 55:
+            distractor_weights = pair
+            break
+    if distractor_weights is None:
+        raise RuntimeError("could not place three separated affine candidates")
+    correct_label = ("red", "blue", "gold")[int(seed) % 3]
+    other_labels = [label for label in ("red", "blue", "gold") if label != correct_label]
+    weight_by_label = {
+        correct_label: reference_weights,
+        other_labels[0]: distractor_weights[0],
+        other_labels[1]: distractor_weights[1],
+    }
+    left = {
+        "side": "left",
+        "anchors": [{"color": name, "center": left_anchors[name]} for name in ANCHOR_ORDER],
+        "markers": [{"kind": "ring", "center": _point(reference_weights, left_anchors)}],
+    }
+    marker_labels = ["red", "blue", "gold"]
+    rng.shuffle(marker_labels)
+    right = {
+        "side": "right",
+        "anchors": [{"color": name, "center": right_anchors[name]} for name in ANCHOR_ORDER],
+        "markers": [
+            {"kind": "candidate", "color": label,
+             "center": _point(weight_by_label[label], right_anchors)}
+            for label in marker_labels
+        ],
+    }
+    return {"panels": [left, right]}
+
+
+def _panel(scene: dict, side: str) -> dict:
+    found = [panel for panel in scene["panels"] if panel["side"] == side]
+    if len(found) != 1:
+        raise ValueError(f"scene must contain exactly one {side} panel")
+    return found[0]
+
+
+def _anchor_map(panel: dict) -> dict[str, list[int]]:
+    anchors = {item["color"]: item["center"] for item in panel["anchors"]}
+    if set(anchors) != set(ANCHOR_ORDER):
+        raise ValueError("panel anchor identities are incomplete")
+    return anchors
+
+
+def _distances(scene: dict) -> dict[str, float]:
+    left, right = _panel(scene, "left"), _panel(scene, "right")
+    # Keep the analytic scene boundary explicit for the protected source audit:
+    # both maps are consequences of the sole top-level ``panels`` field.
+    left_anchors = {item["color"]: item["center"] for item in left["anchors"]}
+    right_anchors = {item["color"]: item["center"] for item in right["anchors"]}
+    if set(left_anchors) != set(ANCHOR_ORDER) or set(right_anchors) != set(ANCHOR_ORDER):
+        raise ValueError("panel anchor identities are incomplete")
+    rings = [item for item in left["markers"] if item["kind"] == "ring"]
+    if len(rings) != 1:
+        raise ValueError("left panel must contain one ring")
+    target = _barycentric(rings[0]["center"], left_anchors)
+    distances = {}
+    for marker in right["markers"]:
+        if marker["kind"] != "candidate" or marker.get("color") not in CANDIDATE_RGB:
+            raise ValueError("right panel marker is invalid")
+        distances[marker["color"]] = _distance(
+            target, _barycentric(marker["center"], right_anchors)
+        )
+    if set(distances) != set(CANDIDATE_RGB):
+        raise ValueError("right panel must contain one candidate of each color")
+    return distances
+
+
+def analytic_gold(scene: dict) -> str:
+    ordered = sorted(_distances(scene).items(), key=lambda item: (item[1], item[0]))
+    if len(ordered) != 3 or abs(ordered[1][1] - ordered[0][1]) < 1e-12:
+        raise ValueError("scene lacks a unique affine-coordinate match")
+    return ordered[0][0]
+
+
+def margin(scene: dict) -> float:
+    values = sorted(_distances(scene).values())
+    return float(values[1] - values[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        for side in ("left", "right"):
+            panel = _panel(scene, side)
+            anchors = _anchor_map(panel)
+            for marker in panel["markers"]:
+                weights = _barycentric(marker["center"], anchors)
+                if min(weights) < 0.10:
+                    return True
+        return margin(scene) < 0.18
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return True
+
+
+def _draw_panel(draw: ImageDraw.ImageDraw, panel: dict) -> None:
+    anchors = _anchor_map(panel)
+    points = [tuple(anchors[name]) for name in ANCHOR_ORDER]
+    draw.line(points + [points[0]], fill=TRIANGLE_RGB, width=7, joint="curve")
+    for name in ANCHOR_ORDER:
+        x, y = anchors[name]
+        draw.ellipse((x - 15, y - 15, x + 15, y + 15),
+                     fill=ANCHOR_RGB[name], outline=(255, 255, 255), width=3)
+        draw.ellipse((x - 16, y - 16, x + 16, y + 16), outline=TRIANGLE_RGB, width=2)
+    for marker in panel["markers"]:
+        x, y = marker["center"]
+        if marker["kind"] == "ring":
+            draw.ellipse((x - 16, y - 16, x + 16, y + 16), outline=RING_RGB, width=7)
+        else:
+            rgb = CANDIDATE_RGB[marker["color"]]
+            draw.ellipse((x - 14, y - 14, x + 14, y + 14),
+                         fill=rgb, outline=(255, 255, 255), width=3)
+            draw.ellipse((x - 15, y - 15, x + 15, y + 15), outline=TRIANGLE_RGB, width=2)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((26, 34, 478, 646), radius=18, outline=PANEL_RGB, width=3)
+    draw.rounded_rectangle((522, 34, 974, 646), radius=18, outline=PANEL_RGB, width=3)
+    draw.text((42, 48), "LEFT: RING", fill=TRIANGLE_RGB)
+    draw.text((538, 48), "RIGHT: CANDIDATES", fill=TRIANGLE_RGB)
+    for panel in sorted(scene["panels"], key=lambda item: item["side"]):
+        _draw_panel(draw, panel)
+    return image
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["panels"] = list(reversed(twin["panels"]))
+    return [("panel_serialization_reversal", twin)]

@@ -1,0 +1,239 @@
+"""Face-mouth bulge world: which side of its own chord does the mouth arc bulge to?
+
+Latent state z = head pose and geometry in the head's own frame. The decision is
+the sign of the mouth arc's sagitta measured against the direction of the eye
+pair, i.e. a relation between two painted parts, evaluated in the head's frame
+rather than in the page frame. The head is drawn at an arbitrary rotation, so the
+page-frame "up" of a smile carries no information.
+
+Canonical prior under test: drawn faces smile, so the mouth is expected to bulge
+away from the eyes. That prior is recorded (``prior_consistent``) for analysis and
+is never used as gold.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "face_mouth_bulge-0.1.0"
+
+CANVAS = 512
+SUPERSAMPLE = 3
+
+# Sagitta magnitude (px) below which the bulge is not certifiable at pixel scale.
+QUARANTINE_SAGITTA_PX = 6.0
+
+# Light backgrounds and light head fills; features are always dark. The oracle
+# only needs "dark marks on a light head", which the question wording declares.
+BACKGROUNDS = [(247, 244, 236), (238, 240, 245), (245, 238, 240), (236, 245, 240), (242, 242, 242)]
+HEAD_FILLS = [(232, 205, 150), (206, 224, 236), (224, 214, 232), (214, 232, 208), (236, 216, 200),
+              (225, 225, 215)]
+FEATURE_COLORS = [(24, 24, 28), (30, 26, 60), (58, 24, 24), (20, 44, 34), (44, 38, 20)]
+DECOR_COLORS = [(168, 168, 168), (176, 172, 160), (160, 170, 178)]
+
+
+def _rot(px: float, py: float, ct: float, st: float) -> tuple[float, float]:
+    return (px * ct - py * st, px * st + py * ct)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene. All style is sampled independently of the answer."""
+    rng = random.Random(seed * 7919 + 13)
+
+    # Answer-bearing latent: sign and magnitude of the mouth sagitta, sampled
+    # independently of each other and of every style field.
+    sign = rng.choice([1, -1])  # +1: bulges away from eyes (smile-like)
+    band = rng.random()
+    if band < 0.14:
+        sag = rng.uniform(1.0, QUARANTINE_SAGITTA_PX)          # quarantine band
+    elif band < 0.34:
+        sag = rng.uniform(QUARANTINE_SAGITTA_PX, 12.0)         # near-boundary
+    else:
+        sag = rng.uniform(12.0, 34.0)                          # clear
+
+    radius = rng.uniform(120.0, 190.0)
+    theta = rng.uniform(0.0, 2.0 * math.pi)  # head rotation: kills page-frame cues
+
+    eye_dx = rng.uniform(0.30, 0.44) * radius
+    eye_dy = rng.uniform(0.26, 0.44) * radius      # above head centre (face frame)
+    eye_r = rng.uniform(0.055, 0.085) * radius
+    mouth_y = rng.uniform(0.26, 0.44) * radius     # below head centre (face frame)
+    half_chord = rng.uniform(0.34, 0.50) * radius
+    # Keep the mouth unambiguously the long stroke and clear of the eyes.
+    half_chord = max(half_chord, 2.0 * eye_r)
+    mouth_w = rng.uniform(0.035, 0.055) * radius
+
+    margin_px = 14.0 + radius
+    cx = rng.uniform(margin_px, CANVAS - margin_px)
+    cy = rng.uniform(margin_px, CANVAS - margin_px)
+
+    scene = {
+        "seed": int(seed),
+        "canvas": CANVAS,
+        "head_center": [round(cx, 3), round(cy, 3)],
+        "head_radius": round(radius, 3),
+        "theta_deg": round(math.degrees(theta), 4),
+        "eye_dx": round(eye_dx, 3),
+        "eye_dy": round(eye_dy, 3),
+        "eye_r": round(eye_r, 3),
+        "mouth_y": round(mouth_y, 3),
+        "half_chord": round(half_chord, 3),
+        "mouth_width": round(mouth_w, 3),
+        "sagitta_signed": round(sign * sag, 4),
+        "background": list(BACKGROUNDS[rng.randrange(len(BACKGROUNDS))]),
+        "head_fill": list(HEAD_FILLS[rng.randrange(len(HEAD_FILLS))]),
+        "feature_color": list(FEATURE_COLORS[rng.randrange(len(FEATURE_COLORS))]),
+        "decor_color": list(DECOR_COLORS[rng.randrange(len(DECOR_COLORS))]),
+        "decor_ticks": rng.randrange(0, 5),
+        "decor_frame": rng.random() < 0.6,
+        "mouth_erased": False,
+    }
+    # Recorded for analysis only; never an input to analytic_gold().
+    scene["prior_consistent"] = bool(scene["sagitta_signed"] > 0)
+    return scene
+
+
+def _mouth_points(scene: dict) -> list[tuple[float, float]]:
+    """Mouth polyline in page coordinates (parabolic arc over its own chord)."""
+    ct = math.cos(math.radians(scene["theta_deg"]))
+    st = math.sin(math.radians(scene["theta_deg"]))
+    cx, cy = scene["head_center"]
+    a = scene["half_chord"]
+    s = scene["sagitta_signed"]
+    pts = []
+    for i in range(81):
+        u = -1.0 + 2.0 * i / 80.0
+        fx = u * a
+        # Face frame: +y is away from the eyes (eyes sit at negative y).
+        fy = scene["mouth_y"] + s * (1.0 - u * u)
+        rx, ry = _rot(fx, fy, ct, st)
+        pts.append((cx + rx, cy + ry))
+    return pts
+
+
+def _eye_centers(scene: dict) -> list[tuple[float, float]]:
+    ct = math.cos(math.radians(scene["theta_deg"]))
+    st = math.sin(math.radians(scene["theta_deg"]))
+    cx, cy = scene["head_center"]
+    out = []
+    for sx in (-1.0, 1.0):
+        rx, ry = _rot(sx * scene["eye_dx"], -scene["eye_dy"], ct, st)
+        out.append((cx + rx, cy + ry))
+    return out
+
+
+def render(scene: dict) -> Image.Image:
+    ss = SUPERSAMPLE
+    n = scene["canvas"]
+    img = Image.new("RGB", (n * ss, n * ss), tuple(scene["background"]))
+    d = ImageDraw.Draw(img)
+    decor = tuple(scene["decor_color"])
+
+    # Decoration: never dark, never inside the head, never answer-bearing.
+    if scene["decor_frame"]:
+        d.rectangle([6 * ss, 6 * ss, (n - 7) * ss, (n - 7) * ss], outline=decor, width=2 * ss)
+    for k in range(scene["decor_ticks"]):
+        x = (26 + 34 * k) * ss
+        d.line([x, 14 * ss, x, 26 * ss], fill=decor, width=2 * ss)
+
+    cx, cy = scene["head_center"]
+    r = scene["head_radius"]
+    d.ellipse([(cx - r) * ss, (cy - r) * ss, (cx + r) * ss, (cy + r) * ss],
+              fill=tuple(scene["head_fill"]), outline=decor, width=2 * ss)
+
+    feat = tuple(scene["feature_color"])
+    er = scene["eye_r"]
+    for ex, ey in _eye_centers(scene):
+        d.ellipse([(ex - er) * ss, (ey - er) * ss, (ex + er) * ss, (ey + er) * ss], fill=feat)
+
+    if not scene["mouth_erased"]:
+        pts = [(x * ss, y * ss) for x, y in _mouth_points(scene)]
+        d.line(pts, fill=feat, width=max(2, int(round(scene["mouth_width"] * ss))), joint="curve")
+
+    return img.resize((n, n), Image.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Bulge direction of the mouth's middle relative to the eyes."""
+    return "away" if scene["sagitta_signed"] > 0 else "toward"
+
+
+def margin(scene: dict) -> float:
+    """Visible decision margin: |sagitta| in pixels (0 = straight mouth)."""
+    return float(abs(scene["sagitta_signed"]))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(scene["mouth_erased"] or margin(scene) < QUARANTINE_SAGITTA_PX)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: declared empty (latent_alias mode ``not_applicable``).
+
+    Every latent field is rendered and visible -- the head disc, its rotation via
+    the eye/mouth placement, both eyes, the mouth chord and its signed sagitta,
+    the three palettes and the decoration. No two distinct latent scenes produce
+    the same raster, so there is no pixel-identical transform that could preserve
+    or change gold. The robustness battery below is deliberately NOT declared
+    here: those transforms change pixels by construction and are exercised by the
+    candidate tests, not by the latent-alias gate.
+    """
+    return []
+
+
+def robustness_variants(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-changing robustness battery used by the tests (not latent aliases).
+
+    Label-preserving: palette swap, whole-scene translation, extra decoration,
+    and head rotation leave the bulge relation (and therefore gold) unchanged.
+    Label-transforming: negating the sagitta flips the answer exactly.
+    Evidence erasure: removing the mouth stroke forces oracle abstention.
+    """
+    out: list[tuple[str, dict]] = []
+
+    pal = dict(scene)
+    bg = BACKGROUNDS[(BACKGROUNDS.index(tuple(scene["background"])) + 1) % len(BACKGROUNDS)]
+    hf = HEAD_FILLS[(HEAD_FILLS.index(tuple(scene["head_fill"])) + 1) % len(HEAD_FILLS)]
+    fc = FEATURE_COLORS[(FEATURE_COLORS.index(tuple(scene["feature_color"])) + 1) % len(FEATURE_COLORS)]
+    pal.update(background=list(bg), head_fill=list(hf), feature_color=list(fc))
+    out.append(("palette_preserving", pal))
+
+    tr = dict(scene)
+    cx, cy = scene["head_center"]
+    lim = scene["canvas"] - 14.0 - scene["head_radius"]
+    dx = min(18.0, max(-18.0, lim - cx)) if cx > 14.0 + scene["head_radius"] else 0.0
+    tr["head_center"] = [round(min(max(cx + dx, 14.0 + scene["head_radius"]), lim), 3), cy]
+    out.append(("translation_preserving", tr))
+
+    dec = dict(scene)
+    dec["decor_ticks"] = (scene["decor_ticks"] + 2) % 5
+    dec["decor_frame"] = not scene["decor_frame"]
+    out.append(("distractor_permutation_preserving", dec))
+
+    rot = dict(scene)
+    rot["theta_deg"] = round((scene["theta_deg"] + 97.0) % 360.0, 4)
+    out.append(("head_rotation_preserving", rot))
+
+    flip = dict(scene)
+    flip["sagitta_signed"] = round(-scene["sagitta_signed"], 4)
+    flip["prior_consistent"] = bool(flip["sagitta_signed"] > 0)
+    out.append(("sagitta_negation_transforming", flip))
+
+    erased = dict(scene)
+    erased["mouth_erased"] = True
+    out.append(("mouth_erasure_evidence_removal", erased))
+
+    return out
+
+
+SYMMETRY_KIND = {
+    "palette_preserving": "preserving",
+    "translation_preserving": "preserving",
+    "distractor_permutation_preserving": "preserving",
+    "head_rotation_preserving": "preserving",
+    "sagitta_negation_transforming": "transforming",
+    "mouth_erasure_evidence_removal": "erasure",
+}

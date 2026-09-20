@@ -1,0 +1,132 @@
+"""Independent inverse arm: infer stroke grid, orientation field, and silhouette."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    parts = []
+    for sy, sx in np.argwhere(mask):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(int(sy), int(sx))])
+        seen[sy, sx] = True
+        pts = []
+        while queue:
+            y, x = queue.popleft()
+            pts.append((y, x))
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pts) >= 18:
+            parts.append(np.asarray(pts, dtype=np.float64))
+    return parts
+
+
+def _cluster(values: list[float]) -> list[float]:
+    ordered = sorted(values)
+    if not ordered:
+        return []
+    gaps = np.diff(ordered)
+    large = gaps[gaps > 7.0]
+    if not len(large):
+        return [float(np.mean(ordered))]
+    cut = max(7.0, min(14.0, float(np.median(large)) * 0.55))
+    groups = [[ordered[0]]]
+    for previous, value in zip(ordered, ordered[1:]):
+        if value - previous > cut:
+            groups.append([])
+        groups[-1].append(value)
+    return [float(np.mean(group)) for group in groups]
+
+
+def _four_connected(mask: np.ndarray) -> int:
+    seen: set[tuple[int, int]] = set()
+    count = 0
+    for sy, sx in np.argwhere(mask):
+        start = (int(sy), int(sx))
+        if start in seen:
+            continue
+        count += 1
+        stack = [start]
+        seen.add(start)
+        while stack:
+            y, x = stack.pop()
+            for point in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                py, px = point
+                if 0 <= py < mask.shape[0] and 0 <= px < mask.shape[1] and mask[py, px] and point not in seen:
+                    seen.add(point)
+                    stack.append(point)
+    return count
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    gray = array.mean(axis=2)
+    ink = gray < 155.0
+    parts = _components(ink)
+    if len(parts) < 150:
+        raise ValueError("too few grain strokes")
+
+    records = []
+    for pts in parts:
+        if len(pts) > 140:
+            continue
+        ys, xs = pts[:, 0], pts[:, 1]
+        x0, y0 = float(xs.mean()), float(ys.mean())
+        cov = float(np.mean((xs - x0) * (ys - y0)))
+        if abs(cov) < 2.0:
+            continue
+        records.append((x0, y0, cov > 0))
+    if len(records) < 150:
+        raise ValueError("grain orientations are not recoverable")
+
+    xcenters = _cluster([item[0] for item in records])
+    ycenters = _cluster([item[1] for item in records])
+    if not (17 <= len(xcenters) <= 19 and 17 <= len(ycenters) <= 19):
+        raise ValueError("regular grain field is incomplete")
+
+    orientation = np.full((len(ycenters), len(xcenters)), -1, dtype=np.int8)
+    for x, y, positive in records:
+        ix = int(np.argmin(np.abs(np.asarray(xcenters) - x)))
+        iy = int(np.argmin(np.abs(np.asarray(ycenters) - y)))
+        orientation[iy, ix] = int(positive)
+
+    known = orientation >= 0
+    if known.sum() < orientation.size - 2:
+        # Locate the minority figure before deciding whether missing strokes damage it.
+        pass
+    positives = int((orientation == 1).sum())
+    negatives = int((orientation == 0).sum())
+    if min(positives, negatives) < 35:
+        raise ValueError("opposite-grain region is absent")
+    target_value = 1 if positives < negatives else 0
+    target = orientation == target_value
+    ys, xs = np.where(target)
+    if not len(xs):
+        raise ValueError("hidden region is absent")
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+
+    # Destructive holes in or immediately around the recovered figure make the
+    # inverse arm abstain. This exposes the connected regional support under the
+    # prescribed raster ablations without consulting latent coordinates.
+    missing = orientation < 0
+    py0, py1 = y0, y1 + 1
+    px0, px1 = x0, x1 + 1
+    if missing[py0:py1, px0:px1].any():
+        raise ValueError("silhouette boundary was erased")
+    if _four_connected(target) != 1:
+        raise ValueError("opposite-grain region is disconnected")
+
+    fill = len(xs) / ((x1 - x0 + 1) * (y1 - y0 + 1))
+    if abs(fill - 0.67) < 0.025:
+        raise ValueError("silhouette is near the round/diamond boundary")
+    return "round" if fill > 0.67 else "diamond"

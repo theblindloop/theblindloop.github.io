@@ -1,0 +1,149 @@
+"""Independent pixel-only inverse arm for the comb-merge world.
+
+Input: the final PNG only.  This module never imports the renderer, the prompt
+module, the generator, the verifier or any analytic-gold code, and it never
+receives latent scene data.  It re-derives everything from pixels:
+
+1. locate the one cream card and work only inside its bounding box;
+2. segment the six coloured beads and split them into two feed rows;
+3. segment the six track slots and find the single filled (marked) slot;
+4. sort the beads by horizontal centre - the sweep order - and read the bead
+   whose sweep rank equals the marked slot's rank in the track.
+
+It raises (abstains) whenever the structure it needs is not unambiguously
+present: no single card, the wrong number of beads or slots, repeated bead
+colours, a track that is not one evenly spaced line, feed rows that do not
+split three-and-three, no unique filled slot, or two beads whose centres are
+too close in x for the sweep order to be decided.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+CREAM = (240, 232, 208)
+SLOT = (70, 76, 96)
+BEAD_COLORS: dict[str, tuple[int, int, int]] = {
+    "red": (206, 58, 54),
+    "orange": (226, 132, 32),
+    "yellow": (222, 198, 44),
+    "green": (58, 150, 80),
+    "blue": (52, 96, 204),
+    "purple": (140, 66, 178),
+}
+
+MIN_BLOB = 16
+MIN_CARD_AREA = 1500
+MIN_CREAM_FRACTION = 0.45
+MIN_SWEEP_GAP = 1.0
+ROW_SPLIT_GAP = 8.0
+
+
+class OracleAbstain(RuntimeError):
+    """Raised when the image does not present the contract structure."""
+
+
+def _mask(arr: np.ndarray, color: tuple[int, int, int], tol: int = 12) -> np.ndarray:
+    diff = np.abs(arr.astype(np.int16) - np.array(color, dtype=np.int16))
+    return diff.max(axis=2) <= tol
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Four-connected components of a boolean mask, as centroid/bbox records."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), dtype=bool)
+    out: list[dict] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        pys = [p[0] for p in pixels]
+        pxs = [p[1] for p in pixels]
+        y0, y1, x0, x1 = min(pys), max(pys), min(pxs), max(pxs)
+        area = len(pixels)
+        box = (y1 - y0 + 1) * (x1 - x0 + 1)
+        out.append(
+            {
+                "area": area,
+                "cy": sum(pys) / area,
+                "cx": sum(pxs) / area,
+                "bbox": (y0, x0, y1, x1),
+                "fill": area / box,
+            }
+        )
+    return out
+
+
+def _card_box(arr: np.ndarray) -> tuple[int, int, int, int]:
+    cream = _mask(arr, CREAM)
+    if not cream.any():
+        raise OracleAbstain("no cream card region")
+    blobs = [c for c in _components(cream) if c["area"] >= MIN_CARD_AREA]
+    if len(blobs) != 1:
+        raise OracleAbstain(f"expected exactly one cream card, found {len(blobs)}")
+    y0, x0, y1, x1 = blobs[0]["bbox"]
+    box_area = (y1 - y0 + 1) * (x1 - x0 + 1)
+    if blobs[0]["area"] / box_area < MIN_CREAM_FRACTION:
+        raise OracleAbstain("cream region does not fill a card-like rectangle")
+    return y0, x0, y1, x1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    y0, x0, y1, x1 = _card_box(arr)
+    card = arr[y0 : y1 + 1, x0 : x1 + 1]
+
+    beads: list[dict] = []
+    for name, rgb in BEAD_COLORS.items():
+        for blob in _components(_mask(card, rgb)):
+            if blob["area"] >= MIN_BLOB:
+                beads.append({**blob, "color": name})
+    if len(beads) != 6:
+        raise OracleAbstain(f"expected six beads on the card, found {len(beads)}")
+    if len({bead["color"] for bead in beads}) != 6:
+        raise OracleAbstain("bead colours are not six distinct colours")
+
+    slots = [b for b in _components(_mask(card, SLOT)) if b["area"] >= MIN_BLOB]
+    if len(slots) != 6:
+        raise OracleAbstain(f"expected six track slots, found {len(slots)}")
+    slots.sort(key=lambda b: b["cx"])
+    filled = [i for i, b in enumerate(slots) if b["fill"] >= 0.85]
+    outlined = [i for i, b in enumerate(slots) if b["fill"] <= 0.75]
+    if len(filled) != 1 or len(outlined) != 5:
+        raise OracleAbstain("track does not show exactly one filled slot")
+    track_ys = [b["cy"] for b in slots]
+    if max(track_ys) - min(track_ys) > 2.0:
+        raise OracleAbstain("track slots are not on one line")
+    pitches = [b["cx"] - a["cx"] for a, b in zip(slots, slots[1:])]
+    if max(pitches) - min(pitches) > 2.0:
+        raise OracleAbstain("track slots are not evenly spaced")
+
+    bead_ys = sorted(bead["cy"] for bead in beads)
+    splits = [
+        i
+        for i in range(1, 6)
+        if bead_ys[i] - bead_ys[i - 1] >= ROW_SPLIT_GAP
+    ]
+    if splits != [3]:
+        raise OracleAbstain("beads do not split into two feed rows of three")
+    row_cut = (bead_ys[2] + bead_ys[3]) / 2.0
+
+    beads.sort(key=lambda b: b["cx"])
+    gaps = [b["cx"] - a["cx"] for a, b in zip(beads, beads[1:])]
+    if min(gaps) < MIN_SWEEP_GAP:
+        raise OracleAbstain("two bead centres are too close to order the sweep")
+
+    picked = beads[filled[0]]
+    row = "upper" if picked["cy"] < row_cut else "lower"
+    return f"{row}_{picked['color']}"

@@ -1,0 +1,118 @@
+"""Independent PNG-only inverse for coupled lever-arm calibration."""
+
+from __future__ import annotations
+
+import itertools
+import math
+
+import numpy as np
+from PIL import Image
+
+PALETTE = ((201, 67, 64), (48, 111, 176), (43, 147, 103), (222, 153, 35))
+INK = (35, 42, 54)
+STEP = 48
+BEAM_Y_OFFSET = 122
+CLUE_RECTS = ((30, 56, 585, 246), (615, 56, 1170, 246), (30, 266, 585, 456), (615, 266, 1170, 456))
+OPTION_RECTS = ((30, 536, 585, 726), (615, 536, 1170, 726), (30, 746, 585, 936), (615, 746, 1170, 936))
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, float, float]]:
+    height, width = mask.shape
+    remaining = set(int(value) for value in np.flatnonzero(mask))
+    found: list[tuple[int, float, float]] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        xs: list[int] = []
+        ys: list[int] = []
+        while stack:
+            value = stack.pop()
+            y, x = divmod(value, width)
+            xs.append(x)
+            ys.append(y)
+            for neighbor in (value - 1, value + 1, value - width, value + width):
+                if neighbor in remaining:
+                    ny, nx = divmod(neighbor, width)
+                    if abs(nx - x) + abs(ny - y) == 1:
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+        found.append((len(xs), sum(xs) / len(xs), sum(ys) / len(ys)))
+    return found
+
+
+def _read_loads(arr: np.ndarray, rect: tuple[int, int, int, int]) -> list[tuple[int, int, int]] | None:
+    x0, y0, x1, y1 = rect
+    crop = arr[y0:y1 + 1, x0:x1 + 1]
+    center = (x1 - x0) / 2
+    loads: list[tuple[int, int, int]] = []
+    for color_index, color in enumerate(PALETTE):
+        mask = np.all(crop == np.asarray(color, dtype=np.uint8), axis=2)
+        for size, x, y in _components(mask):
+            if not 560 <= size <= 680 or y >= BEAM_Y_OFFSET - 10:
+                return None
+            delta = x - center
+            distance = int(round(abs(delta) / STEP))
+            if distance not in (1, 2, 3, 4) or abs(abs(delta) - distance * STEP) > 1.0:
+                return None
+            loads.append((color_index, -1 if delta < 0 else 1, distance))
+    return loads
+
+
+def _det3(matrix: list[list[int]]) -> int:
+    a, b, c = matrix
+    return a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])
+
+
+def _solve_masses(rows: list[list[int]]) -> tuple[int, int, int, int] | None:
+    solutions: set[tuple[int, int, int, int]] = set()
+    for chosen in itertools.combinations(rows, 3):
+        vector: list[int] = []
+        for column in range(4):
+            minor = [[row[index] for index in range(4) if index != column] for row in chosen]
+            vector.append(((-1) ** column) * _det3(minor))
+        if not any(vector):
+            continue
+        if next(value for value in vector if value) < 0:
+            vector = [-value for value in vector]
+        divisor = math.gcd(*[abs(value) for value in vector])
+        vector = [value // divisor for value in vector]
+        if any(value <= 0 or value > 20 for value in vector):
+            continue
+        if all(sum(a * b for a, b in zip(row, vector)) == 0 for row in rows):
+            solutions.add(tuple(vector))  # type: ignore[arg-type]
+    return next(iter(solutions)) if len(solutions) == 1 else None
+
+
+def _structure_ok(arr: np.ndarray) -> bool:
+    ink = np.asarray(INK, dtype=np.uint8)
+    points: list[tuple[int, int]] = []
+    for x0, y0, x1, _y1 in CLUE_RECTS + OPTION_RECTS:
+        points.append(((x0 + x1) // 2, y0 + BEAM_Y_OFFSET))
+        points.append((x0, y0 + 95))
+    return all(np.array_equal(arr[y, x], ink) for x, y in points)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape != (960, 1200, 3) or not _structure_ok(arr):
+        return "abstain"
+    rows: list[list[int]] = []
+    for rect, expected_count in zip(CLUE_RECTS, (2, 3, 3, 3)):
+        loads = _read_loads(arr, rect)
+        if loads is None or len(loads) != expected_count:
+            return "abstain"
+        row = [0, 0, 0, 0]
+        for color, side, distance in loads:
+            row[color] += side * distance
+        rows.append(row)
+    masses = _solve_masses(rows)
+    if masses is None:
+        return "abstain"
+    torques: list[int] = []
+    for rect in OPTION_RECTS:
+        loads = _read_loads(arr, rect)
+        if loads is None or len(loads) != 4 or sorted(color for color, _side, _distance in loads) != [0, 1, 2, 3]:
+            return "abstain"
+        torques.append(sum(side * distance * masses[color] for color, side, distance in loads))
+    matches = [index for index, torque in enumerate(torques, 1) if torque == 0]
+    return f"beam-{matches[0]}" if len(matches) == 1 else "abstain"

@@ -1,0 +1,135 @@
+"""Scene-free pixel inverse arm for recolour_rule_replay.
+
+Input: one rasterised PNG plus the public question contract.  Nothing else --
+no scene, no renderer, no gold, no layout constants beyond what the question
+text states (a board row above, a row of two-swatch rule cards below, cards
+acting left to right, one ringed tile).
+
+Procedure: segment the saturated squares, split them into the board row and the
+card row, pair the card swatches left to right into (looked-for, written)
+colours, find the ringed tile from the dark frame around it, name every square
+by hue, and replay the rules on the ringed tile's colour.
+"""
+
+from __future__ import annotations
+
+import colorsys
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "recolour_rule_replay-oracle-0.1.0"
+
+_NAMES = ("red", "amber", "green", "blue")
+_BOUNDS = (21.5, 87.0, 179.0, 293.0)
+
+
+def _name(rgb) -> str:
+    r, g, b = (float(v) / 255.0 for v in rgb)
+    h = colorsys.rgb_to_hsv(r, g, b)[0] * 360.0
+    if h < _BOUNDS[0] or h >= _BOUNDS[3]:
+        return "red"
+    if h < _BOUNDS[1]:
+        return "amber"
+    if h < _BOUNDS[2]:
+        return "green"
+    return "blue"
+
+
+def _components(mask: np.ndarray, min_area: int):
+    """Label the True pixels of ``mask`` with 4-connectivity."""
+    parent: dict[int, int] = {}
+
+    def find(a: int) -> int:
+        root = a
+        while parent[root] != root:
+            root = parent[root]
+        while parent[a] != root:
+            parent[a], a = root, parent[a]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    w = mask.shape[1]
+    pts = np.argwhere(mask)
+    seen = set()
+    for y, x in pts:
+        key = int(y) * w + int(x)
+        parent[key] = key
+        seen.add(key)
+        if key - w in seen:
+            union(key - w, key)
+        if x > 0 and key - 1 in seen:
+            union(key - 1, key)
+
+    groups: dict[int, list[int]] = {}
+    for key in seen:
+        groups.setdefault(find(key), []).append(key)
+
+    out = []
+    for keys in groups.values():
+        if len(keys) < min_area:
+            continue
+        ys = np.array([k // w for k in keys])
+        xs = np.array([k % w for k in keys])
+        out.append(
+            {
+                "y0": int(ys.min()), "y1": int(ys.max()),
+                "x0": int(xs.min()), "x1": int(xs.max()),
+                "area": len(keys),
+            }
+        )
+    return out
+
+
+def _mean_rgb(arr: np.ndarray, comp) -> tuple[float, float, float]:
+    hy = max(1, (comp["y1"] - comp["y0"]) // 4)
+    hx = max(1, (comp["x1"] - comp["x0"]) // 4)
+    patch = arr[comp["y0"] + hy: comp["y1"] - hy + 1, comp["x0"] + hx: comp["x1"] - hx + 1]
+    return tuple(float(v) for v in patch.reshape(-1, 3).mean(axis=0))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    mx = arr.max(axis=2)
+    mn = arr.min(axis=2)
+    mask = ((mx - mn) > 40) & (mx > 60)
+    comps = _components(mask, min_area=600)
+    if len(comps) < 3:
+        raise ValueError("no coloured squares found")
+
+    comps.sort(key=lambda c: (c["y0"] + c["y1"]) / 2.0)
+    centres = [(c["y0"] + c["y1"]) / 2.0 for c in comps]
+    gaps = [(centres[i + 1] - centres[i], i) for i in range(len(centres) - 1)]
+    split = max(gaps)[1] + 1
+    board = sorted(comps[:split], key=lambda c: c["x0"])
+    cards = sorted(comps[split:], key=lambda c: c["x0"])
+    if not board or len(cards) < 2 or len(cards) % 2:
+        raise ValueError("unexpected square layout")
+
+    dark = mx < 80
+    best, best_count = None, 0
+    for comp in board:
+        y0, y1 = comp["y0"], comp["y1"]
+        x0, x1 = comp["x0"], comp["x1"]
+        outer = dark[max(0, y0 - 17): y1 + 18, max(0, x0 - 17): x1 + 18].sum()
+        inner = dark[max(0, y0 - 3): y1 + 4, max(0, x0 - 3): x1 + 4].sum()
+        count = int(outer - inner)
+        if count > best_count:
+            best, best_count = comp, count
+    if best is None or best_count < 200:
+        raise ValueError("no ringed tile found")
+
+    start = _name(_mean_rgb(arr, best))
+    cur = start
+    for i in range(0, len(cards), 2):
+        src = _name(_mean_rgb(arr, cards[i]))
+        dst = _name(_mean_rgb(arr, cards[i + 1]))
+        if cur == src:
+            cur = dst
+    if cur not in _NAMES:  # pragma: no cover - defensive
+        raise ValueError("unnamed colour")
+    return f"{cur}|{'yes' if cur != start else 'no'}"

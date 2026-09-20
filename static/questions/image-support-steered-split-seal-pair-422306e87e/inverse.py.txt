@@ -1,0 +1,139 @@
+"""Independent pixel-only inverse for shared-turn detached pairs."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+GRID = 4
+PLATE_CODE = (218 << 16) | (229 << 8) | 237
+INK_CODE = (29 << 16) | (38 << 8) | 50
+TAG_CODES = {"red": (220 << 16) | (55 << 8) | 60, "blue": (45 << 16) | (100 << 8) | 210}
+
+
+def _runs(active: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(active)
+    if not len(indices):
+        return []
+    cuts = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.r_[0, cuts + 1]
+    ends = np.r_[cuts, len(indices) - 1]
+    return [(int(indices[a]), int(indices[b])) for a, b in zip(starts, ends, strict=True)]
+
+
+def _plate_boxes(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    # Filled plate fields make their two visible row bands and individual x-runs
+    # directly measurable. This projection parser is independent of renderer
+    # coordinates and rejects clipped/merged bands instead of repairing them.
+    row_runs = _runs(mask.sum(axis=1) >= 24)
+    if len(row_runs) != 2:
+        raise ValueError("expected two detached tile rows")
+    output = []
+    for index, (y0, y1) in enumerate(row_runs):
+        if not 70 <= y1 - y0 + 1 <= 74:
+            raise ValueError("tile row is incomplete")
+        sub = mask[y0:y1 + 1]
+        x_runs = _runs(sub.sum(axis=0) >= 20)
+        expected = 2 if index == 0 else 4
+        if len(x_runs) != expected:
+            raise ValueError("tile grouping is incomplete")
+        for x0, x1 in x_runs:
+            area = int(mask[y0:y1 + 1, x0:x1 + 1].sum())
+            output.append((x0, y0, x1, y1, area))
+    return output
+
+
+def _single_bbox(mask: np.ndarray, minimum: int) -> tuple[int, int, int, int, int]:
+    points = np.argwhere(mask)
+    if len(points) < minimum:
+        raise ValueError("required answer dot is missing")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    return int(x0), int(y0), int(x1), int(y1), int(len(points))
+
+
+def _read_plate(ink: np.ndarray, box) -> tuple[tuple[int, ...], ...]:
+    x0, y0, x1, y1, area = box
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if not (70 <= width <= 74 and 70 <= height <= 74 and area >= 4000):
+        raise ValueError("detached tile is incomplete")
+    rows = []
+    for row in range(GRID):
+        values = []
+        for col in range(GRID):
+            cx = x0 + 8 + col * 14 + 5
+            cy = y0 + 8 + row * 14 + 5
+            patch = ink[cy - 3:cy + 4, cx - 3:cx + 4]
+            ratio = float(patch.mean()) if patch.size else 0.0
+            if 0.08 < ratio < 0.92:
+                raise ValueError("tile cell is corrupted")
+            values.append(1 if ratio >= 0.92 else 0)
+        rows.append(tuple(values))
+    if sum(map(sum, rows)) != 6:
+        raise ValueError("tile ink count is corrupted")
+    return tuple(rows)
+
+
+def _rotate(value, turns: int) -> tuple[tuple[int, ...], ...]:
+    out = tuple(tuple(int(cell) for cell in row) for row in value)
+    for _ in range(int(turns) % 4):
+        out = tuple(tuple(out[GRID - 1 - c][r] for c in range(GRID)) for r in range(GRID))
+    return out
+
+
+def _hamming(left, right) -> int:
+    return sum(left[r][c] != right[r][c] for r in range(GRID) for c in range(GRID))
+
+
+def _score(reference, pair) -> int:
+    return min(
+        _hamming(reference[0], _rotate(pair[0], k)) + _hamming(reference[1], _rotate(pair[1], k))
+        for k in range(4)
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape != (768, 768, 3):
+        raise ValueError("unsupported raster size")
+    foreground = np.any(array != 255, axis=2)
+    points = np.argwhere(foreground)
+    if not len(points):
+        raise ValueError("blank raster")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    crop = array[int(y0):int(y1) + 1, int(x0):int(x1) + 1].astype(np.uint32)
+    encoded = (crop[:, :, 0] << 16) | (crop[:, :, 1] << 8) | crop[:, :, 2]
+    plate = encoded == PLATE_CODE
+    ink = encoded == INK_CODE
+    boxes = _plate_boxes(plate)
+    if len(boxes) != 6:
+        raise ValueError("expected six detached tiles")
+    boxes.sort(key=lambda box: ((box[1] + box[3]) / 2, (box[0] + box[2]) / 2))
+    top = boxes[:2]
+    lower = boxes[2:]
+    if max((b[1] + b[3]) / 2 for b in top) >= min((b[1] + b[3]) / 2 for b in lower) - 150:
+        raise ValueError("reference and candidates are not visibly separated")
+    reference = tuple(_read_plate(ink, box) for box in sorted(top))
+    candidate_plates = [(float((box[0] + box[2]) / 2), _read_plate(ink, box)) for box in lower]
+
+    tags = []
+    for label, code in TAG_CODES.items():
+        box = _single_bbox(encoded == code, 200)
+        if box[4] < 500 or box[2] - box[0] > 28 or box[3] - box[1] > 28:
+            raise ValueError("answer dot is missing or corrupted")
+        tags.append((label, float((box[0] + box[2]) / 2)))
+
+    matches = []
+    used: set[float] = set()
+    for label, tag_x in sorted(tags, key=lambda item: item[1]):
+        nearest = sorted(candidate_plates, key=lambda item: abs(item[0] - tag_x))[:2]
+        if len(nearest) != 2 or any(x in used for x, _ in nearest):
+            raise ValueError("candidate grouping is ambiguous")
+        used.update(x for x, _ in nearest)
+        pair = tuple(pattern for _, pattern in sorted(nearest))
+        if _score(reference, pair) == 0:
+            matches.append(label)
+    if len(used) != 4 or len(matches) != 1:
+        raise ValueError("image lacks one unique shared-turn correspondence")
+    return matches[0]

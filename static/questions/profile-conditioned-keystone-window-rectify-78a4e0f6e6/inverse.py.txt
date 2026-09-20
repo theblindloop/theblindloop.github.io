@@ -1,0 +1,106 @@
+"""Independent pixel-only inverse for the declared projective rectification."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+GRID = 17
+MIN_MARGIN = 0.20
+MARKERS = {
+    "tl": (220, 35, 145),
+    "tr": (245, 185, 20),
+    "br": (45, 95, 220),
+    "bl": (30, 170, 85),
+}
+
+
+def _segment_distance(xx: np.ndarray, yy: np.ndarray, a: tuple[float, float], b: tuple[float, float]) -> np.ndarray:
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    t = np.clip(((xx - ax) * dx + (yy - ay) * dy) / (dx * dx + dy * dy), 0.0, 1.0)
+    return np.hypot(xx - (ax + t * dx), yy - (ay + t * dy))
+
+
+def _reference_masks() -> dict[str, np.ndarray]:
+    yy, xx = np.mgrid[:GRID, :GRID]
+    c = 8
+    rr = np.hypot(xx - c, yy - c)
+    ring = (rr >= 5.0) & (rr <= 6.5)
+    edges = np.minimum.reduce([
+        _segment_distance(xx, yy, (8, 2), (2, 14)),
+        _segment_distance(xx, yy, (2, 14), (14, 14)),
+        _segment_distance(xx, yy, (14, 14), (8, 2)),
+    ]) <= 0.9
+    plus = (((np.abs(xx - c) <= 1) & (np.abs(yy - c) <= 6)) |
+            ((np.abs(yy - c) <= 1) & (np.abs(xx - c) <= 6)))
+    cross = (((np.abs((xx - c) - (yy - c)) <= 1) |
+              (np.abs((xx - c) + (yy - c)) <= 1)) &
+             (np.abs(xx - c) <= 6) & (np.abs(yy - c) <= 6))
+    plus[c, c] = False
+    cross[c, c] = False
+    return {"circle": ring, "triangle": edges, "plus": plus, "x": cross}
+
+
+REFERENCES = _reference_masks()
+
+
+def _find_marker(arr: np.ndarray, rgb: tuple[int, int, int]) -> tuple[float, float]:
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    mask = np.sum(delta * delta, axis=2, dtype=np.int64) < 55 * 55
+    yy, xx = np.nonzero(mask)
+    if len(xx) < 70:
+        raise ValueError("required colored corner fiducial is missing")
+    return float(xx.mean()), float(yy.mean())
+
+
+def _fit_projective(dst: list[tuple[float, float]]) -> np.ndarray:
+    src = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    matrix = []
+    target = []
+    for (x, y), (u, v) in zip(src, dst, strict=True):
+        matrix.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
+        matrix.append([0, 0, 0, x, y, 1, -v * x, -v * y])
+        target.extend([u, v])
+    coeff = np.linalg.solve(np.asarray(matrix), np.asarray(target))
+    return np.append(coeff, 1.0).reshape(3, 3)
+
+
+def _map(hom: np.ndarray, x: float, y: float) -> tuple[float, float]:
+    q = hom @ np.array([x, y, 1.0])
+    return float(q[0] / q[2]), float(q[1] / q[2])
+
+
+def _extract_cells(arr: np.ndarray, hom: np.ndarray) -> np.ndarray:
+    observed = np.zeros((GRID, GRID), dtype=bool)
+    height, width = arr.shape[:2]
+    for row in range(GRID):
+        for col in range(GRID):
+            x, y = _map(hom, (col + 0.5) / GRID, (row + 0.5) / GRID)
+            ix, iy = int(round(x)), int(round(y))
+            if ix < 3 or iy < 3 or ix >= width - 3 or iy >= height - 3:
+                raise ValueError("rectified cell sample falls outside raster")
+            patch = arr[iy - 1:iy + 2, ix - 1:ix + 2].astype(np.float32)
+            luminance = 0.2126 * patch[..., 0] + 0.7152 * patch[..., 1] + 0.0722 * patch[..., 2]
+            observed[row, col] = float(np.median(luminance)) < 105.0
+    return observed
+
+
+def _classify(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"))
+    corners = [_find_marker(arr, MARKERS[key]) for key in ("tl", "tr", "br", "bl")]
+    hom = _fit_projective(corners)
+    cells = _extract_cells(arr, hom)
+    ranking = sorted(
+        ((1.0 - float(np.mean(cells != mask)), label) for label, mask in REFERENCES.items()),
+        reverse=True,
+    )
+    gap = ranking[0][0] - ranking[1][0]
+    if gap < MIN_MARGIN:
+        raise ValueError(f"ambiguous rectified glyph (runner-up gap {gap:.3f})")
+    return ranking[0][1], gap
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _classify(image)[0]

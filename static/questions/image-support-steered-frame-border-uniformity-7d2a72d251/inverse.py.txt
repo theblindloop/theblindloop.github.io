@@ -1,0 +1,124 @@
+"""Independent pixel-only inverse for the frame-border question.
+
+The inverse never imports the renderer or reads latent scene data. It first
+segments the dark foreground from the light canvas, verifies that one connected
+ring has an intact outer perimeter, and then measures four raster run lengths
+from the outer bounding box toward the opening. Erased or ambiguous rings
+abstain rather than inventing a thickness.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstain(ValueError):
+    """The raster does not expose a reliable four-side frame measurement."""
+
+
+_FOREGROUND_DISTANCE = 42.0
+_MIN_SIDE_PX = 18
+_MAX_SIDE_PX = 90
+_SPREAD_LIMIT = 3
+
+
+def _foreground(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    # The frame is guaranteed to be away from the first eight pixels, so this
+    # small corner is a scene-free background estimate.
+    background = np.median(array[:8, :8].reshape(-1, 3), axis=0)
+    distance = np.linalg.norm(array - background, axis=2)
+    return distance > _FOREGROUND_DISTANCE
+
+
+def _connected_foreground(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    points = np.argwhere(mask)
+    if len(points) == 0:
+        raise OracleAbstain("no foreground component")
+    height, width = mask.shape
+    start_y, start_x = (int(value) for value in points[0])
+    seen = np.zeros_like(mask, dtype=bool)
+    seen[start_y, start_x] = True
+    stack = [(start_y, start_x)]
+    count = 0
+    while stack:
+        y, x = stack.pop()
+        count += 1
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                seen[ny, nx] = True
+                stack.append((ny, nx))
+    if count != int(mask.sum()):
+        raise OracleAbstain("foreground is not one connected frame ring")
+    return seen, count
+
+
+def _run_from_edge(values: np.ndarray, reverse: bool = False) -> int:
+    sequence = values[::-1] if reverse else values
+    run = 0
+    for value in sequence:
+        if not bool(value):
+            break
+        run += 1
+    return run
+
+
+def _measure_four_sides(mask: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise OracleAbstain("empty frame")
+    left, right = int(xs.min()), int(xs.max())
+    top, bottom = int(ys.min()), int(ys.max())
+    height, width = mask.shape
+    if min(left, top) < 10 or right > width - 11 or bottom > height - 11:
+        raise OracleAbstain("frame is clipped or too close to canvas edge")
+
+    # Every outer-edge pixel is decisive. A destructive grid ablation therefore
+    # produces an explicit abstention instead of a misleading partial answer.
+    top_edge = mask[top : min(bottom + 1, top + 6), left : right + 1].any(axis=0)
+    bottom_edge = mask[max(top, bottom - 5) : bottom + 1, left : right + 1].any(axis=0)
+    left_edge = mask[top : bottom + 1, left : min(right + 1, left + 6)].any(axis=1)
+    right_edge = mask[top : bottom + 1, max(left, right - 5) : right + 1].any(axis=1)
+    for name, edge in (
+        ("top", top_edge),
+        ("right", right_edge),
+        ("bottom", bottom_edge),
+        ("left", left_edge),
+    ):
+        if float(edge.mean()) < 0.995:
+            raise OracleAbstain(f"{name} perimeter is interrupted")
+
+    center_x = (left + right) // 2
+    center_y = (top + bottom) // 2
+    vertical = mask[top : bottom + 1, center_x]
+    horizontal = mask[center_y, left : right + 1]
+    top_t = _run_from_edge(vertical)
+    bottom_t = _run_from_edge(vertical, reverse=True)
+    left_t = _run_from_edge(horizontal)
+    right_t = _run_from_edge(horizontal, reverse=True)
+    values = (top_t, right_t, bottom_t, left_t)
+    if min(values) < _MIN_SIDE_PX or max(values) > _MAX_SIDE_PX:
+        raise OracleAbstain(f"side run outside pixel floor: {values}")
+    # A second blank run after each side is implicit in the four scan lines;
+    # without it a filled rectangle would be indistinguishable from a frame.
+    if not (
+        not bool(vertical[top_t])
+        and not bool(vertical[-bottom_t - 1])
+        and not bool(horizontal[left_t])
+        and not bool(horizontal[-right_t - 1])
+    ):
+        raise OracleAbstain("frame opening is not visible on all four scans")
+    return values
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the visible uniformity decision from the final RGB raster alone."""
+
+    mask = _foreground(image)
+    connected, _ = _connected_foreground(mask)
+    top_t, right_t, bottom_t, left_t = _measure_four_sides(connected)
+    spread = max(top_t, right_t, bottom_t, left_t) - min(top_t, right_t, bottom_t, left_t)
+    return "yes" if spread <= _SPREAD_LIMIT else "no"

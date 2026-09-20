@@ -1,0 +1,206 @@
+"""Independent PNG-only inverse arm for selective two-fold landing."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 1200
+HEIGHT = 800
+GRID_N = 9
+SOURCE_CELL = 58
+SOURCE_ORIGIN = (55, 158)
+OPTION_CELL = 24
+OPTION_ORIGINS = ((680, 190), (948, 190), (680, 480), (948, 480))
+
+BLUE = np.array((37, 99, 235), dtype=np.uint8)
+AMBER = np.array((245, 158, 11), dtype=np.uint8)
+RED = np.array((220, 38, 38), dtype=np.uint8)
+VIOLET = np.array((124, 58, 237), dtype=np.uint8)
+
+
+class OracleAbstention(ValueError):
+    """The required visible operands cannot be recovered confidently."""
+
+
+def _mask(arr: np.ndarray, color: np.ndarray) -> np.ndarray:
+    return np.all(arr == color, axis=2)
+
+
+def _center(origin: tuple[int, int], cell: int, x: int, y: int) -> tuple[int, int]:
+    return (
+        int(round(origin[0] + (x + 0.5) * cell)),
+        int(round(origin[1] + (y + 0.5) * cell)),
+    )
+
+
+def _decode_dots(
+    arr: np.ndarray,
+    origin: tuple[int, int],
+    cell: int,
+    color: np.ndarray,
+    patch_radius: int,
+    threshold: int,
+    expected_area: tuple[int, int],
+    label: str,
+) -> set[tuple[int, int]]:
+    points: set[tuple[int, int]] = set()
+    for y in range(GRID_N):
+        for x in range(GRID_N):
+            cx, cy = _center(origin, cell, x, y)
+            patch = arr[
+                cy - patch_radius : cy + patch_radius + 1,
+                cx - patch_radius : cx + patch_radius + 1,
+            ]
+            if int(_mask(patch, color).sum()) >= threshold:
+                points.add((x, y))
+    size = GRID_N * cell
+    crop = arr[origin[1] : origin[1] + size + 1, origin[0] : origin[0] + size + 1]
+    area = int(_mask(crop, color).sum())
+    if len(points) != 7 or not expected_area[0] <= area <= expected_area[1]:
+        raise OracleAbstention(f"{label}: found {len(points)} dots with area {area}")
+    return points
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    components: list[np.ndarray] = []
+    height, width = mask.shape
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _axis_value(point: tuple[int, int], fold: dict) -> int:
+    x, y = point
+    kind = fold["kind"]
+    if kind == "vertical":
+        return x - 4
+    if kind == "horizontal":
+        return y - 4
+    if kind == "diag_down":
+        return y - x
+    if kind == "diag_up":
+        return x + y - 8
+    raise OracleAbstention(f"unknown decoded line {kind!r}")
+
+
+def _decode_fold(arr: np.ndarray, color: np.ndarray, label: str) -> dict:
+    ox, oy = SOURCE_ORIGIN
+    size = GRID_N * SOURCE_CELL
+    crop = arr[oy : oy + size + 1, ox : ox + size + 1]
+    components = _components(_mask(crop, color))
+    if len(components) < 5:
+        raise OracleAbstention(f"{label}: too few dashed-line components")
+    components.sort(key=len, reverse=True)
+    marker = components[0]
+    if not 1050 <= len(marker) <= 1800:
+        raise OracleAbstention(f"{label}: malformed side disk area {len(marker)}")
+    line_components = [component for component in components[1:] if len(component) >= 20]
+    if len(line_components) < 4:
+        raise OracleAbstention(f"{label}: incomplete dashed line")
+    line_yx = np.concatenate(line_components, axis=0).astype(np.float64)
+    if not 1200 <= len(line_yx) <= 4400:
+        raise OracleAbstention(f"{label}: dashed-line area {len(line_yx)}")
+    line_xy = np.column_stack((line_yx[:, 1] + ox, line_yx[:, 0] + oy))
+    center = line_xy.mean(axis=0)
+    _, _, vt = np.linalg.svd(line_xy - center, full_matrices=False)
+    direction = vt[0]
+    normal = np.array((-direction[1], direction[0]))
+    residual = np.abs((line_xy - center) @ normal)
+    extent = float(np.ptp((line_xy - center) @ direction))
+    board_center = np.array((ox + 4.5 * SOURCE_CELL, oy + 4.5 * SOURCE_CELL))
+    if (
+        float(np.quantile(residual, 0.95)) > 5.5
+        or extent < 390.0
+        or abs(float((board_center - center) @ normal)) > 6.0
+    ):
+        raise OracleAbstention(f"{label}: malformed axis fit")
+    dx, dy = float(direction[0]), float(direction[1])
+    if abs(dx) > 0.92:
+        kind = "horizontal"
+    elif abs(dy) > 0.92:
+        kind = "vertical"
+    elif dx * dy > 0:
+        kind = "diag_down"
+    else:
+        kind = "diag_up"
+
+    marker_center = np.array((marker[:, 1].mean() + ox, marker[:, 0].mean() + oy))
+    mx = int(round((marker_center[0] - ox) / SOURCE_CELL - 0.5))
+    my = int(round((marker_center[1] - oy) / SOURCE_CELL - 0.5))
+    if not (0 <= mx < GRID_N and 0 <= my < GRID_N):
+        raise OracleAbstention(f"{label}: side disk is outside the board")
+    provisional = {"kind": kind, "sign": 1}
+    side_value = _axis_value((mx, my), provisional)
+    if abs(side_value) < 3:
+        raise OracleAbstention(f"{label}: side disk is too close to its axis")
+    provisional["sign"] = 1 if side_value > 0 else -1
+    return provisional
+
+
+def _reflect(point: tuple[int, int], fold: dict) -> tuple[int, int]:
+    x, y = point
+    kind = fold["kind"]
+    if kind == "vertical":
+        return 8 - x, y
+    if kind == "horizontal":
+        return x, 8 - y
+    if kind == "diag_down":
+        return y, x
+    return 8 - y, 8 - x
+
+
+def _apply(points: set[tuple[int, int]], fold: dict) -> set[tuple[int, int]]:
+    result = set()
+    for point in points:
+        if _axis_value(point, fold) * int(fold["sign"]) > 0:
+            result.add(_reflect(point, fold))
+        else:
+            result.add(point)
+    if len(result) != 7:
+        raise OracleAbstention("visible fold program merges distinct dots")
+    return result
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the answer from the final RGB raster and no latent scene data."""
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        raise OracleAbstention(f"unexpected raster size {rgb.size}")
+    arr = np.asarray(rgb, dtype=np.uint8)
+    source = _decode_dots(
+        arr, SOURCE_ORIGIN, SOURCE_CELL, BLUE, 5, 100, (6200, 7600), "start board"
+    )
+    folds = (_decode_fold(arr, RED, "fold 1"), _decode_fold(arr, VIOLET, "fold 2"))
+    if folds[0]["kind"] == folds[1]["kind"]:
+        raise OracleAbstention("the two visible axes are not distinct")
+    expected = source
+    for fold in folds:
+        expected = _apply(expected, fold)
+    options = [
+        _decode_dots(arr, origin, OPTION_CELL, AMBER, 4, 60, (1350, 1800), f"option {index + 1}")
+        for index, origin in enumerate(OPTION_ORIGINS)
+    ]
+    winners = [index for index, option in enumerate(options) if option == expected]
+    if len(winners) != 1:
+        raise OracleAbstention(f"found {len(winners)} exact final options")
+    runner_overlap = max(len(expected & option) for index, option in enumerate(options) if index != winners[0])
+    if len(expected) - runner_overlap < 2:
+        raise OracleAbstention("final option lacks a two-dot gap")
+    return f"option-{winners[0] + 1}"

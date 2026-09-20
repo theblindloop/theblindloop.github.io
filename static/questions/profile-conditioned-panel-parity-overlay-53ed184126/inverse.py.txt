@@ -1,0 +1,194 @@
+"""Pixel-only inverse arm for the panel-parity overlay question.
+
+Receives a rendered image and nothing else. It locates the three panel frames
+as visible fiducials, reads each panel's 7x7 cell occupancy, executes the
+declared parity overlay, and matches the result against the five named symbol
+templates from the public question contract. It shares no code with the
+renderer and never sees latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+
+from PIL import Image
+
+GRID = 7
+NPANEL = 3
+ABSTAIN = "abstain"
+
+_ART: dict[str, tuple[str, ...]] = {
+    "arrow": (
+        "...#...",
+        "..###..",
+        ".#.#.#.",
+        "#..#..#",
+        "...#...",
+        "...#...",
+        "...#...",
+    ),
+    "chevron": (
+        ".......",
+        "#.....#",
+        "##...##",
+        ".##.##.",
+        "..###..",
+        "...#...",
+        ".......",
+    ),
+    "ell": (
+        "#......",
+        "#......",
+        "#......",
+        "#......",
+        "#......",
+        "#......",
+        "#######",
+    ),
+    "hourglass": (
+        "#######",
+        ".#####.",
+        "..###..",
+        "...#...",
+        "..###..",
+        ".#####.",
+        "#######",
+    ),
+    "ring": (
+        ".#####.",
+        ".#...#.",
+        ".#...#.",
+        ".#...#.",
+        ".#...#.",
+        ".#...#.",
+        ".#####.",
+    ),
+}
+
+NAMES: tuple[str, ...] = tuple(sorted(_ART))
+_TEMPLATES = {
+    name: [1 if ch == "#" else 0 for row in art for ch in row]
+    for name, art in _ART.items()
+}
+
+_FG_TOLERANCE = 40
+_FILL_FRACTION = 0.6
+
+
+def _foreground_mask(image: Image.Image) -> tuple[list[list[bool]], int, int]:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    pixels = list(rgb.getdata())
+    background = Counter(pixels).most_common(1)[0][0]
+    br, bg_, bb = background
+    mask = []
+    for y in range(height):
+        row_start = y * width
+        row = []
+        for x in range(width):
+            r, g, b = pixels[row_start + x]
+            far = (
+                abs(r - br) > _FG_TOLERANCE
+                or abs(g - bg_) > _FG_TOLERANCE
+                or abs(b - bb) > _FG_TOLERANCE
+            )
+            row.append(far)
+        mask.append(row)
+    return mask, width, height
+
+
+def _runs(flags: list[bool], min_length: int) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start = None
+    for index, flag in enumerate(flags):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            if index - start >= min_length:
+                runs.append((start, index - 1))
+            start = None
+    if start is not None and len(flags) - start >= min_length:
+        runs.append((start, len(flags) - 1))
+    return runs
+
+
+def _panel_boxes(mask: list[list[bool]], width: int, height: int) -> list[tuple[int, int, int, int]]:
+    col_has = [any(mask[y][x] for y in range(height)) for x in range(width)]
+    col_runs = _runs(col_has, min_length=40)
+    boxes: list[tuple[int, int, int, int]] = []
+    for x0, x1 in col_runs:
+        rows = [y for y in range(height) if any(mask[y][x] for x in range(x0, x1 + 1))]
+        if not rows:
+            continue
+        boxes.append((x0, rows[0], x1, rows[-1]))
+    return boxes
+
+
+def _border_thickness(mask: list[list[bool]], box: tuple[int, int, int, int]) -> int:
+    x0, y0, x1, y1 = box
+    y_mid = (y0 + y1) // 2
+    thickness = 0
+    x = x0
+    while x <= x1 and mask[y_mid][x]:
+        thickness += 1
+        x += 1
+    return thickness
+
+
+def _read_cells(mask: list[list[bool]], box: tuple[int, int, int, int]) -> list[int] | None:
+    x0, y0, x1, y1 = box
+    thickness = _border_thickness(mask, box)
+    if thickness < 1 or thickness > 12:
+        return None
+    ix0, iy0 = x0 + thickness, y0 + thickness
+    ix1, iy1 = x1 - thickness, y1 - thickness
+    inner_w = ix1 - ix0 + 1
+    inner_h = iy1 - iy0 + 1
+    if inner_w < GRID * 8 or inner_h < GRID * 8:
+        return None
+    cw = inner_w / GRID
+    ch = inner_h / GRID
+    half = max(2, int(min(cw, ch) * 0.22))
+    bits: list[int] = []
+    for row in range(GRID):
+        for col in range(GRID):
+            cx = int(ix0 + (col + 0.5) * cw)
+            cy = int(iy0 + (row + 0.5) * ch)
+            hits = 0
+            total = 0
+            for y in range(cy - half, cy + half + 1):
+                for x in range(cx - half, cx + half + 1):
+                    total += 1
+                    if 0 <= y < len(mask) and 0 <= x < len(mask[0]) and mask[y][x]:
+                        hits += 1
+            bits.append(1 if hits >= _FILL_FRACTION * total else 0)
+    return bits
+
+
+def _classify(bits: list[int]) -> tuple[str, float]:
+    scored = sorted(
+        (
+            (float(sum(a ^ b for a, b in zip(bits, _TEMPLATES[name]))), NAMES.index(name), name)
+            for name in NAMES
+        )
+    )
+    return scored[0][2], scored[1][0] - scored[0][0]
+
+
+def decide_with_margin(image: Image.Image) -> tuple[str, float]:
+    mask, width, height = _foreground_mask(image)
+    boxes = _panel_boxes(mask, width, height)
+    if len(boxes) != NPANEL:
+        return ABSTAIN, 0.0
+    panels: list[list[int]] = []
+    for box in boxes:
+        bits = _read_cells(mask, box)
+        if bits is None:
+            return ABSTAIN, 0.0
+        panels.append(bits)
+    parity = [(a ^ b ^ c) for a, b, c in zip(*panels)]
+    return _classify(parity)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return decide_with_margin(image)[0]

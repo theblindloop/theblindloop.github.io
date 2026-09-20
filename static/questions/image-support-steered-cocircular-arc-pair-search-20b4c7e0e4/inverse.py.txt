@@ -1,0 +1,110 @@
+"""Independent pixel-only inverse arm for cocircular arc-pair search."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "red": (220, 48, 57),
+    "blue": (37, 99, 196),
+    "green": (32, 150, 90),
+    "purple": (139, 70, 185),
+}
+MIN_COMPONENT_AREA = 45
+MAX_COMPONENT_AREA = 180
+MIN_COMPONENT_SEPARATION = 55.0
+MAX_COMPONENT_SEPARATION = 125.0
+MAX_WINNER_RMS = 2.05
+MIN_RUNNER_UP_GAP = 0.75
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 8-connected component coordinate arrays as (y, x)."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(y, x)])
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _circle_rms(components: list[np.ndarray]) -> float:
+    points = np.concatenate(components, axis=0)
+    y = points[:, 0]
+    x = points[:, 1]
+    # Algebraic least squares on all visible ink. Opposed fragments make the
+    # common-circle fit well-conditioned without any renderer coordinates.
+    design = np.column_stack((2.0 * x, 2.0 * y, np.ones(len(points))))
+    rhs = x * x + y * y
+    solution, *_ = np.linalg.lstsq(design, rhs, rcond=None)
+    cx, cy, constant = (float(value) for value in solution)
+    radius_sq = constant + cx * cx + cy * cy
+    if not math.isfinite(radius_sq) or radius_sq <= 1.0:
+        raise ValueError("degenerate circle fit")
+    radius = math.sqrt(radius_sq)
+    residual = np.hypot(x - cx, y - cy) - radius
+    return float(np.sqrt(np.mean(residual * residual)))
+
+
+def _candidate_score(array: np.ndarray, rgb: tuple[int, int, int]) -> float | None:
+    mask = np.all(array == np.asarray(rgb, dtype=np.uint8), axis=2)
+    components = [
+        component
+        for component in _components(mask)
+        if MIN_COMPONENT_AREA <= len(component) <= MAX_COMPONENT_AREA
+    ]
+    if len(components) != 2:
+        return None
+    centers = [component.mean(axis=0) for component in components]
+    separation = float(np.linalg.norm(centers[0] - centers[1]))
+    if not MIN_COMPONENT_SEPARATION <= separation <= MAX_COMPONENT_SEPARATION:
+        return None
+    # Equal-radius fragments with equal arc length have matching second-moment
+    # spectra even when their locations differ.  Combining that local-curvature
+    # check with the joint-circle residual blocks both tangent-only and
+    # curvature-only distractors.
+    spectra = [np.linalg.eigvalsh(np.cov(component.T)) for component in components]
+    shape_mismatch = float(np.abs(spectra[0] - spectra[1]).sum())
+    return _circle_rms(components) + 0.15 * shape_mismatch
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    scores = []
+    for name, rgb in PALETTE.items():
+        score = _candidate_score(array, rgb)
+        if score is not None and math.isfinite(score):
+            scores.append((score, name))
+    scores.sort()
+    if not scores or scores[0][0] > MAX_WINNER_RMS:
+        raise ValueError("no visible color supplies a convincing common-circle fit")
+    if len(scores) > 1 and scores[1][0] - scores[0][0] < MIN_RUNNER_UP_GAP:
+        raise ValueError("ambiguous common-circle winner")
+    return scores[0][1]

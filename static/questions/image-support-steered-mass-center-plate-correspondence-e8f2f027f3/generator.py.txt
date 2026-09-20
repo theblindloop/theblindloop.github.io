@@ -1,0 +1,293 @@
+"""Renderer and analytic arm for connected regional mass-centroid correspondence."""
+
+from __future__ import annotations
+
+import copy
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "mass-center-plate-correspondence-0.1.0"
+WIDTH = 512
+HEIGHT = 512
+SCALE = 4
+
+BACKGROUND = (247, 245, 239)
+NAVY = (31, 76, 101)
+NAVY_EDGE = (20, 52, 72)
+BAY = (239, 235, 222)
+BAY_EDGE = (177, 185, 179)
+TEXT = (226, 235, 232)
+TEXT_DARK = (56, 68, 70)
+AMBER = (236, 163, 54)
+VIOLET = (172, 103, 194)
+NEUTRAL = (119, 164, 153)
+
+PLATE_W = 236
+PLATE_H = 200
+BAY_W = 64
+BAY_H = 132
+BAY_RELS = {"R": (10, 20), "A": (86, 20), "B": (162, 20)}
+RAIL_Y0 = 126
+RAIL_Y1 = 140
+PATCH_CROP = (0, 12, BAY_W, 104)
+QUARANTINE_GAP = 6.0
+
+# A centrally symmetric, non-axis-symmetric octagon. Rotations preserve area and
+# its centroid, while changing the visible local profile. The attached neck is
+# deliberately drawn separately so every patch is part of the one navy component.
+BASE_PROFILE = (
+    (-20, -28),
+    (14, -28),
+    (22, -14),
+    (20, 10),
+    (18, 28),
+    (-14, 28),
+    (-22, 14),
+    (-20, -10),
+)
+
+
+def _font(size: int):
+    for name in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ):
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size=size * SCALE)
+    return ImageFont.load_default()
+
+
+def _rotate(point: tuple[int, int], orientation: int) -> tuple[int, int]:
+    x, y = point
+    turns = int(orientation) % 4
+    for _ in range(turns):
+        x, y = -y, x
+    return x, y
+
+
+def _patch_values(patch: dict) -> tuple[int, int]:
+    if not isinstance(patch, dict):
+        raise ValueError("patch must be an object")
+    cx = int(patch["cx"])
+    orientation = int(patch["orientation"])
+    if not 24 <= cx <= 40:
+        raise ValueError("patch centroid coordinate is outside the bay")
+    if orientation not in range(4):
+        raise ValueError("patch orientation must be 0, 1, 2, or 3")
+    return cx, orientation
+
+
+def _panel_map(scene: dict) -> dict[str, dict]:
+    panels: dict[str, dict] = {}
+    for record in scene["candidate_panels"]:
+        if not isinstance(record, dict):
+            raise ValueError("candidate panel must be an object")
+        slot = str(record["slot"])
+        if slot in panels or slot not in {"A", "B"}:
+            raise ValueError("candidate slots must be unique A and B")
+        if record["badge"] not in {"amber", "violet"}:
+            raise ValueError("candidate badge must be amber or violet")
+        _patch_values(record["patch"])
+        panels[slot] = record
+    if set(panels) != {"A", "B"}:
+        raise ValueError("candidate slots must be A and B")
+    return panels
+
+
+def _validate_scene(scene: dict) -> tuple[dict, dict[str, dict], tuple[int, int]]:
+    reference = scene["reference_patch"]
+    _patch_values(reference)
+    panels = _panel_map(scene)
+    anchor = scene["plate_anchor"]
+    if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
+        raise ValueError("plate anchor must be an x,y pair")
+    ax, ay = int(anchor[0]), int(anchor[1])
+    if not (0 <= ax <= WIDTH - PLATE_W and 0 <= ay <= HEIGHT - PLATE_H):
+        raise ValueError("plate does not fit the canvas")
+    return reference, panels, (ax, ay)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample balanced profiles, centroid gaps, badge colors, and nuisance order."""
+
+    rng = random.Random(int(seed))
+    reference_cx = rng.randint(24, 40)
+    reference_orientation = rng.randrange(4)
+    # The correct candidate's reflected centroid is exactly reference_cx.
+    matching_cx = 64 - reference_cx
+    wrong_choices = [value for value in range(24, 41) if abs((64 - value) - reference_cx) >= 8]
+    wrong_cx = rng.choice(wrong_choices)
+    matching_slot = "A" if int(seed) % 3 else "B"
+    matching_badge = "amber" if int(seed) % 2 == 0 else "violet"
+    wrong_badge = "violet" if matching_badge == "amber" else "amber"
+    matching_orientation = (reference_orientation + 1 + rng.randrange(3)) % 4
+    wrong_orientation = (reference_orientation + 2 + rng.randrange(2)) % 4
+    records = [
+        {
+            "slot": "A",
+            "patch": {
+                "cx": matching_cx if matching_slot == "A" else wrong_cx,
+                "orientation": matching_orientation if matching_slot == "A" else wrong_orientation,
+            },
+            "badge": matching_badge if matching_slot == "A" else wrong_badge,
+        },
+        {
+            "slot": "B",
+            "patch": {
+                "cx": matching_cx if matching_slot == "B" else wrong_cx,
+                "orientation": matching_orientation if matching_slot == "B" else wrong_orientation,
+            },
+            "badge": matching_badge if matching_slot == "B" else wrong_badge,
+        },
+    ]
+    rng.shuffle(records)
+    # Keep the whole carrier inside grid cells 1 and 2 so its decisive ablation
+    # is a single compact regional support component.
+    anchor = [rng.randint(138, 146), rng.randint(150, 170)]
+    return {
+        "reference_patch": {"cx": reference_cx, "orientation": reference_orientation},
+        "candidate_panels": records,
+        "plate_anchor": anchor,
+    }
+
+
+def _centroid_errors(reference: dict, panels: dict[str, dict]) -> dict[str, float]:
+    ref_cx, _ = _patch_values(reference)
+    errors: dict[str, float] = {}
+    for slot in ("A", "B"):
+        cx, _ = _patch_values(panels[slot]["patch"])
+        errors[slot] = abs(float(ref_cx) - float(BAY_W - cx))
+    return errors
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return the badge on the uniquely closest reflected centroid."""
+
+    # Keep the analytic arm's scene boundary explicit at top level. The
+    # rendered-field audit can then distinguish these public latent fields from
+    # nested implementation details used only to draw or validate a patch.
+    reference = scene["reference_patch"]
+    records = scene["candidate_panels"]
+    _ = scene["plate_anchor"]
+    panels = {str(record["slot"]): record for record in records}
+    if set(panels) != {"A", "B"}:
+        raise ValueError("candidate slots must be A and B")
+    ref_cx = int(reference["cx"])
+    errors = {
+        slot: abs(float(ref_cx) - float(BAY_W - int(panels[slot]["patch"]["cx"])))
+        for slot in ("A", "B")
+    }
+    if errors["A"] == errors["B"]:
+        raise ValueError("reflected centroid errors are tied")
+    best = "A" if errors["A"] < errors["B"] else "B"
+    return str(panels[best]["badge"])
+
+
+def margin(scene: dict) -> float:
+    """Return the top-two reflected centroid-error gap in pixel units."""
+
+    reference, panels, _ = _validate_scene(scene)
+    values = sorted(_centroid_errors(reference, panels).values())
+    return float(values[1] - values[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        _validate_scene(scene)
+        return margin(scene) <= QUARANTINE_GAP
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _box(values: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SCALE)) for value in values)  # type: ignore[return-value]
+
+
+def _draw_patch(
+    draw: ImageDraw.ImageDraw,
+    bx: int,
+    by: int,
+    patch: dict,
+) -> None:
+    cx, orientation = _patch_values(patch)
+    center_y = by + 60
+    # The neck touches the shared rail, making all three regional patches part
+    # of a single connected navy component without changing the measured x
+    # centroid: it is centered on the same cx as the body.
+    draw.rectangle(
+        _box((bx + cx - 4, by + 78, bx + cx + 4, by + RAIL_Y0 + 2)),
+        fill=NAVY,
+    )
+    points = []
+    for point in BASE_PROFILE:
+        dx, dy = _rotate(point, orientation)
+        points.append(((bx + cx + dx) * SCALE, (center_y + dy) * SCALE))
+    draw.polygon(points, fill=NAVY)
+
+
+def _draw_bay(
+    draw: ImageDraw.ImageDraw,
+    bx: int,
+    by: int,
+    label: str,
+    patch: dict,
+    badge: str,
+) -> None:
+    draw.rounded_rectangle(
+        _box((bx, by, bx + BAY_W, by + BAY_H)),
+        radius=7 * SCALE,
+        fill=BAY,
+        outline=BAY_EDGE,
+        width=SCALE,
+    )
+    draw.text((int((bx + 6) * SCALE), int((by + 5) * SCALE)), label, font=_font(9), fill=TEXT_DARK)
+    badge_color = NEUTRAL if badge == "neutral" else AMBER if badge == "amber" else VIOLET
+    draw.rounded_rectangle(
+        _box((bx + 47, by + 6, bx + 58, by + 17)),
+        radius=3 * SCALE,
+        fill=badge_color,
+    )
+    _draw_patch(draw, bx, by, patch)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one translated connected plate with three thick bay patches."""
+
+    reference, panels, (ax, ay) = _validate_scene(scene)
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        _box((ax, ay, ax + PLATE_W, ay + PLATE_H)),
+        radius=18 * SCALE,
+        fill=NAVY,
+        outline=NAVY_EDGE,
+        width=2 * SCALE,
+    )
+    draw.rounded_rectangle(
+        _box((ax + 10, ay + 10, ax + PLATE_W - 10, ay + PLATE_H - 10)),
+        radius=11 * SCALE,
+        fill=BACKGROUND,
+        outline=NAVY_EDGE,
+        width=SCALE,
+    )
+    draw.text((int((ax + 18) * SCALE), int((ay + 165) * SCALE)), "AREA BALANCE", font=_font(8), fill=TEXT)
+    _draw_bay(draw, ax + BAY_RELS["R"][0], ay + BAY_RELS["R"][1], "R", reference, "neutral")
+    for slot in ("A", "B"):
+        record = panels[slot]
+        rx, ry = BAY_RELS[slot]
+        _draw_bay(draw, ax + rx, ay + ry, slot, record["patch"], record["badge"])
+    # Paint the bridge after the bay cards so it is a real continuous carrier
+    # through all three attached patches rather than three visually separated
+    # foreground islands.
+    draw.rectangle(_box((ax + 10, ay + RAIL_Y0, ax + PLATE_W - 10, ay + RAIL_Y1)), fill=NAVY)
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Reorder slot-addressed records without changing the visible plate."""
+
+    twin = copy.deepcopy(scene)
+    twin["candidate_panels"] = list(reversed(twin["candidate_panels"]))
+    return [("candidate_record_order", twin)]

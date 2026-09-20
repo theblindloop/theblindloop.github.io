@@ -1,0 +1,140 @@
+"""Scene-free pixel oracle: nesting depth of colored dots among closed loops.
+
+Reads only the rasterized PNG.  It labels the black ink into loop components
+and the non-ink plane into faces, notes which two faces each loop separates,
+and walks the resulting face/loop tree outward from the face that touches the
+image border.  A dot's depth is the tree distance of the face holding it, and
+the answer is the color at depth two.  No renderer, prompt, generator or
+latent scene data is used.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_DOT_RGB = {
+    (0, 150, 150): "teal",
+    (255, 140, 0): "orange",
+    (140, 60, 200): "violet",
+}
+
+
+def _label(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    """4-connected component labels of a boolean mask, run-length union-find."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    padded = np.zeros(width + 2, dtype=np.int8)
+    rows: list[tuple[list[tuple[int, int]], list[int]]] = []
+    for y in range(height):
+        padded[1:-1] = mask[y].view(np.int8)
+        edges = np.flatnonzero(np.diff(padded))
+        runs = list(zip(edges[0::2].tolist(), edges[1::2].tolist()))
+        labels = []
+        for _ in runs:
+            parent.append(len(parent))
+            labels.append(len(parent) - 1)
+        if y:
+            prev_runs, prev_labels = rows[-1]
+            i = j = 0
+            while i < len(runs) and j < len(prev_runs):
+                s1, e1 = runs[i]
+                s2, e2 = prev_runs[j]
+                if s1 < e2 and s2 < e1:
+                    union(labels[i], prev_labels[j])
+                if e1 < e2:
+                    i += 1
+                else:
+                    j += 1
+        rows.append((runs, labels))
+
+    out = np.full((height, width), -1, dtype=np.int32)
+    remap: dict[int, int] = {}
+    for y, (runs, labels) in enumerate(rows):
+        for (start, end), label in zip(runs, labels):
+            root = find(label)
+            if root not in remap:
+                remap[root] = len(remap)
+            out[y, start:end] = remap[root]
+    return out, len(remap)
+
+
+def _pairs(loop_lab: np.ndarray, face_lab: np.ndarray, face_count: int) -> set:
+    found = set()
+    views = (
+        (loop_lab[:, :-1], face_lab[:, 1:]),
+        (loop_lab[:, 1:], face_lab[:, :-1]),
+        (loop_lab[:-1, :], face_lab[1:, :]),
+        (loop_lab[1:, :], face_lab[:-1, :]),
+    )
+    for loops, faces in views:
+        hit = (loops >= 0) & (faces >= 0)
+        if not hit.any():
+            continue
+        codes = np.unique(loops[hit].astype(np.int64) * face_count + faces[hit])
+        for code in codes.tolist():
+            found.add((code // face_count, code % face_count))
+    return found
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    ink = (arr[:, :, 0] < 40) & (arr[:, :, 1] < 40) & (arr[:, :, 2] < 40)
+
+    face_lab, face_count = _label(~ink)
+    loop_lab, loop_count = _label(ink)
+    if loop_count == 0 or face_count == 0:
+        return ""
+
+    adjacency = _pairs(loop_lab, face_lab, face_count)
+    neighbours: dict[int, list[int]] = {i: [] for i in range(face_count)}
+    sides: dict[int, set] = {}
+    for loop, face in adjacency:
+        sides.setdefault(loop, set()).add(face)
+    for loop, faces in sides.items():
+        if len(faces) != 2:
+            return ""
+        a, b = sorted(faces)
+        neighbours[a].append(b)
+        neighbours[b].append(a)
+
+    root = int(face_lab[0, 0])
+    if root < 0:
+        return ""
+    depth = {root: 0}
+    queue = [root]
+    while queue:
+        cur = queue.pop(0)
+        for nxt in neighbours[cur]:
+            if nxt not in depth:
+                depth[nxt] = depth[cur] + 1
+                queue.append(nxt)
+
+    winners = []
+    for rgb, name in _DOT_RGB.items():
+        hit = (arr[:, :, 0] == rgb[0]) & (arr[:, :, 1] == rgb[1]) & (arr[:, :, 2] == rgb[2])
+        if not hit.any():
+            return ""
+        ys, xs = np.nonzero(hit)
+        cy = int(round(float(ys.mean())))
+        cx = int(round(float(xs.mean())))
+        face = int(face_lab[cy, cx])
+        if face < 0 or face not in depth:
+            return ""
+        if depth[face] == 2:
+            winners.append(name)
+    if len(winners) != 1:
+        return ""
+    return winners[0]

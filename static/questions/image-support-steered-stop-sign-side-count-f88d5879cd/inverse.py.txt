@@ -1,0 +1,137 @@
+"""Independent pixel-only inverse for a single filled STOP-sign polygon.
+
+The inverse receives only the final raster and public question contract. It
+segments the broad sign component, checks that its interior has not been
+erased, derives a radial outer contour, and selects the 6--10-fold periodicity
+with the strongest independently measured Fourier response.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(y, x)])
+        component: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            component.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    output = np.zeros_like(mask, dtype=bool)
+    if best:
+        ys, xs = zip(*best)
+        output[np.asarray(ys), np.asarray(xs)] = True
+    return output
+
+
+def _smooth_circular(values: np.ndarray, radius: int) -> np.ndarray:
+    extended = np.concatenate((values[-radius:], values, values[:radius]))
+    kernel = np.ones(2 * radius + 1, dtype=np.float64) / (2 * radius + 1)
+    return np.convolve(extended, kernel, mode="valid")
+
+
+def _hard_rectangular_cut(array: np.ndarray, background: np.ndarray) -> bool:
+    """Detect the long axis-aligned hard edges made by public erasure probes."""
+    for first, second, transpose in ((array[:, :-1], array[:, 1:], True),
+                                     (array[:-1, :], array[1:, :], False)):
+        first_bg = np.linalg.norm(first - background, axis=2)
+        second_bg = np.linalg.norm(second - background, axis=2)
+        jump = np.linalg.norm(first - second, axis=2)
+        hard = (jump > 70.0) & (((first_bg < 3.0) & (second_bg > 45.0)) |
+                                ((second_bg < 3.0) & (first_bg > 45.0)))
+        lines = hard.T if transpose else hard
+        for line in lines:
+            run = 0
+            for value in line:
+                run = run + 1 if value else 0
+                if run >= 18:
+                    return True
+    return False
+
+
+def _measurement(image: Image.Image) -> tuple[int, float, float]:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or min(array.shape[:2]) < 256:
+        raise ValueError("image is too small")
+    border = np.concatenate((array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3),
+                             array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)))
+    background = np.median(border, axis=0)
+    if _hard_rectangular_cut(array, background):
+        raise ValueError("sign evidence contains a hard rectangular erasure")
+    component = _largest_component(np.linalg.norm(array - background, axis=2) > 28.0)
+    area = int(component.sum())
+    height, width = component.shape
+    if not (0.42 * height * width < area < 0.64 * height * width):
+        raise ValueError("no valid broad filled sign component")
+    ys, xs = np.nonzero(component)
+    span_x, span_y = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+    if min(span_x, span_y) < 390 or max(span_x, span_y) > min(width, height) - 10:
+        raise ValueError("sign component has an implausible extent")
+
+    # The area centroid is derived from the recovered raster, not latent pose.
+    cx, cy = float(xs.mean()), float(ys.mean())
+    dx, dy = xs.astype(np.float64) - cx, ys.astype(np.float64) - cy
+    radii = np.hypot(dx, dy)
+    angles = np.mod(np.arctan2(dy, dx), 2.0 * np.pi)
+    bins = 1440
+    indices = np.floor(angles * bins / (2.0 * np.pi)).astype(int) % bins
+    profile = np.zeros(bins, dtype=np.float64)
+    np.maximum.at(profile, indices, radii)
+    for _ in range(8):
+        empty = profile == 0
+        if not empty.any():
+            break
+        profile[empty] = (np.roll(profile, 1)[empty] + np.roll(profile, -1)[empty]) / 2.0
+    if np.any(profile == 0):
+        raise ValueError("outer contour has unresolved angular gaps")
+
+    # A legitimate sign is filled continuously up to its outer contour. This
+    # makes deletion of any substantial tile in the one connected area cause
+    # abstention, yielding compact distributed support for the inverse arm.
+    grid_y, grid_x = np.indices(component.shape)
+    grid_dx, grid_dy = grid_x - cx, grid_y - cy
+    grid_r = np.hypot(grid_dx, grid_dy)
+    grid_a = np.mod(np.arctan2(grid_dy, grid_dx), 2.0 * np.pi)
+    grid_i = np.floor(grid_a * bins / (2.0 * np.pi)).astype(int) % bins
+    expected = (grid_r > 8.0) & (grid_r < profile[grid_i] - 8.0)
+    missing = int(np.count_nonzero(expected & ~component))
+    # Rasterized diagonal corners and the independently estimated area centroid
+    # account for a small baseline mismatch; a 1.2% allowance has wide headroom
+    # below even one overlapping ablation tile.
+    if missing > max(500, int(area * 0.012)):
+        raise ValueError("filled sign has missing interior support")
+
+    profile = _smooth_circular(profile, 5)
+    centered = profile - float(profile.mean())
+    spectrum = np.abs(np.fft.rfft(centered))
+    scores = {count: float(spectrum[count]) for count in range(6, 11)}
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    count, best = ranked[0]
+    runner_up = ranked[1][1]
+    decision_margin = (best - runner_up) / max(best, 1e-9)
+    prominence = float(np.percentile(profile, 98) - np.percentile(profile, 2))
+    if best < 1800.0 or prominence < 8.0 or decision_margin < 0.30:
+        raise ValueError("ambiguous polygon side periodicity")
+    return count, decision_margin, prominence
+
+
+def decision_from_image(image: Image.Image) -> str:
+    count, _, _ = _measurement(image)
+    return str(count)

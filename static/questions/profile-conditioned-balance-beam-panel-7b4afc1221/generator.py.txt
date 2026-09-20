@@ -1,0 +1,336 @@
+"""Renderer, sampler and analytic gold for the balanced-beam panel search world.
+
+Each scene is a row of five framed panels.  A panel holds one level bar, one
+pointed support touching the underside of the bar, and four identical square
+blocks standing on the bar.  Exactly one panel is balanced: the arithmetic mean
+of its four block centres equals its support tip position exactly.  Every other
+panel misses by at least ``DISTRACTOR_OFFSET_MIN`` pixels, and at least two of
+them are lures whose outermost-block midpoint sits over the support tip.
+
+Every drawn primitive is symmetric about its own centre line and is painted
+without antialiasing, so the pixel geometry reproduces the latent geometry
+exactly and both arms measure the same quantity.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS_MARGIN = 10
+PANEL_W = 220
+PANEL_H = 150
+PANEL_GAP = 10
+N_PANELS = 5
+CANVAS_W = 2 * CANVAS_MARGIN + N_PANELS * PANEL_W + (N_PANELS - 1) * PANEL_GAP
+CANVAS_H = 2 * CANVAS_MARGIN + PANEL_H
+
+FRAME_THICKNESS = 2
+BEAM_X0 = 14
+BEAM_X1 = 205  # inclusive
+BEAM_Y0 = 92
+BEAM_Y1 = 98  # inclusive
+BLOCK_HALF = 6  # blocks are (2 * BLOCK_HALF + 1) wide and tall
+BLOCK_SIDE = 2 * BLOCK_HALF + 1
+SUPPORT_HALF = 14
+SUPPORT_H = 26
+
+BLOCK_MIN_X = BEAM_X0 + BLOCK_HALF + 1
+BLOCK_MAX_X = BEAM_X1 - BLOCK_HALF - 1
+SUPPORT_MIN_X = 75
+SUPPORT_MAX_X = 144
+
+N_BLOCKS = 4
+MIN_SEPARATION = 16
+DISTRACTOR_OFFSET_MIN = 10.0
+ANSWER_SPAN_OFFSET_MIN = 10.0
+LURE_SPAN_OFFSET_MAX = 5.0
+LURE_HALF_SPAN_MIN = 46
+LURE_PANELS_MIN = 2
+QUARANTINE_MARGIN = 5.0
+MARGIN_FLOOR_PX = 10.0
+ANSWERS = tuple(f"panel-{index + 1}" for index in range(N_PANELS))
+
+def json_clone(scene: dict) -> dict:
+    """Round-trip a scene through JSON, as the stored manifest does."""
+    return json.loads(json.dumps(scene))
+
+
+def panel_box(index: int) -> tuple:
+    """Inclusive pixel box of one panel frame on the canvas."""
+    left = CANVAS_MARGIN + index * (PANEL_W + PANEL_GAP)
+    top = CANVAS_MARGIN
+    return (left, top, left + PANEL_W - 1, top + PANEL_H - 1)
+
+
+PALETTES = (
+    {
+        "background": (247, 246, 241),
+        "frame": (150, 150, 156),
+        "beam": (58, 62, 74),
+        "block": (196, 82, 62),
+        "support": (72, 104, 148),
+    },
+    {
+        "background": (243, 245, 247),
+        "frame": (146, 152, 152),
+        "beam": (48, 58, 60),
+        "block": (86, 122, 84),
+        "support": (168, 118, 60),
+    },
+    {
+        "background": (245, 243, 247),
+        "frame": (152, 148, 158),
+        "beam": (60, 54, 70),
+        "block": (110, 96, 160),
+        "support": (176, 120, 132),
+    },
+)
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+
+
+def _valid_positions(positions) -> bool:
+    ordered = sorted(positions)
+    if ordered[0] < BLOCK_MIN_X or ordered[-1] > BLOCK_MAX_X:
+        return False
+    return all(
+        ordered[i + 1] - ordered[i] >= MIN_SEPARATION for i in range(len(ordered) - 1)
+    )
+
+
+def _span_mid(positions) -> float:
+    return (min(positions) + max(positions)) / 2.0
+
+
+def _mean(positions) -> float:
+    return sum(positions) / float(len(positions))
+
+
+def _is_mirror_symmetric(positions, support_x: int) -> bool:
+    offsets = sorted(p - support_x for p in positions)
+    mirrored = sorted(-o for o in offsets)
+    return offsets == mirrored
+
+
+def _sample_balanced(rng: random.Random, support_x: int):
+    """Four block centres whose mean is exactly the support tip."""
+    target = N_BLOCKS * support_x
+    for _ in range(4000):
+        head = [rng.randrange(BLOCK_MIN_X, BLOCK_MAX_X + 1) for _ in range(N_BLOCKS - 1)]
+        last = target - sum(head)
+        positions = head + [last]
+        if len(set(positions)) != N_BLOCKS or not _valid_positions(positions):
+            continue
+        if _is_mirror_symmetric(positions, support_x):
+            continue
+        if abs(_span_mid(positions) - support_x) < ANSWER_SPAN_OFFSET_MIN:
+            continue
+        return sorted(positions)
+    raise RuntimeError("failed to sample a balanced panel")
+
+
+def _sample_plain_unbalanced(rng: random.Random, support_x: int):
+    """An unbalanced panel with no constraint on its outermost-block midpoint."""
+    for _ in range(4000):
+        positions = sorted(
+            rng.randrange(BLOCK_MIN_X, BLOCK_MAX_X + 1) for _ in range(N_BLOCKS)
+        )
+        if len(set(positions)) != N_BLOCKS or not _valid_positions(positions):
+            continue
+        if abs(_mean(positions) - support_x) < DISTRACTOR_OFFSET_MIN:
+            continue
+        return positions
+    raise RuntimeError("failed to sample an unbalanced panel")
+
+
+def _lure_half_span_range(support_x: int):
+    """Half-spans that let a lure straddle the support tip inside the bar."""
+    lows = []
+    for jitter in range(-int(LURE_SPAN_OFFSET_MAX), int(LURE_SPAN_OFFSET_MAX) + 1):
+        mid = support_x + jitter
+        reach = min(mid - BLOCK_MIN_X, BLOCK_MAX_X - mid)
+        if reach >= LURE_HALF_SPAN_MIN:
+            lows.append((jitter, reach))
+    return lows
+
+
+def _sample_lure(rng: random.Random, support_x: int):
+    """An unbalanced panel whose outermost-block midpoint sits on the tip."""
+    options = _lure_half_span_range(support_x)
+    if not options:
+        return None
+    for _ in range(4000):
+        jitter, reach = options[rng.randrange(len(options))]
+        mid = support_x + jitter
+        half = rng.randrange(LURE_HALF_SPAN_MIN, reach + 1)
+        low, high = mid - half, mid + half
+        inner_low = low + MIN_SEPARATION
+        inner_high = high - MIN_SEPARATION
+        if inner_high - inner_low < MIN_SEPARATION:
+            continue
+        first = rng.randrange(inner_low, inner_high - MIN_SEPARATION + 1)
+        second = rng.randrange(first + MIN_SEPARATION, inner_high + 1)
+        positions = sorted([low, first, second, high])
+        if len(set(positions)) != N_BLOCKS or not _valid_positions(positions):
+            continue
+        if abs(_mean(positions) - support_x) < DISTRACTOR_OFFSET_MIN:
+            continue
+        if abs(_span_mid(positions) - support_x) > LURE_SPAN_OFFSET_MAX:
+            continue
+        return positions
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one scene from an integer seed."""
+    rng = random.Random(seed * 7919 + 13)
+    answer = seed % N_PANELS  # exact answer-position counterbalancing across seeds
+
+    for _ in range(200):
+        supports = [
+            rng.randrange(SUPPORT_MIN_X, SUPPORT_MAX_X + 1) for _ in range(N_PANELS)
+        ]
+        wanted = [i for i in range(N_PANELS) if i != answer]
+        rng.shuffle(wanted)
+        panels = [None] * N_PANELS
+        panels[answer] = {
+            "support_x": supports[answer],
+            "blocks": _sample_balanced(rng, supports[answer]),
+        }
+        lures = 0
+        for index in wanted:
+            blocks = None
+            if lures < LURE_PANELS_MIN + rng.randrange(0, 2):
+                blocks = _sample_lure(rng, supports[index])
+            if blocks is None:
+                blocks = _sample_plain_unbalanced(rng, supports[index])
+            else:
+                lures += 1
+            panels[index] = {"support_x": supports[index], "blocks": blocks}
+        if lures >= LURE_PANELS_MIN:
+            break
+    else:
+        raise RuntimeError("failed to sample a scene with enough lure panels")
+
+    return {
+        "canvas": [CANVAS_W, CANVAS_H],
+        "palette": rng.randrange(0, len(PALETTES)),
+        "panels": panels,
+    }
+
+
+# --------------------------------------------------------------------------
+# analytic consequences
+# --------------------------------------------------------------------------
+
+
+def _offsets(scene: dict) -> list:
+    return [
+        abs(_mean(panel["blocks"]) - panel["support_x"]) for panel in scene["panels"]
+    ]
+
+
+def analytic_gold(scene: dict) -> str:
+    offsets = _offsets(scene)
+    best = min(range(len(offsets)), key=lambda i: offsets[i])
+    return f"panel-{best + 1}"
+
+
+def margin(scene: dict) -> float:
+    offsets = sorted(_offsets(scene))
+    return float(offsets[1] - offsets[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    offsets = _offsets(scene)
+    best = min(offsets)
+    if best > 0.0:
+        return True
+    if sum(1 for value in offsets if value == best) != 1:
+        return True
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Declared latent aliases: pixel-identical, gold-identical rewrites."""
+    reversed_blocks = {
+        "canvas": list(scene["canvas"]),
+        "palette": scene["palette"],
+        "panels": [
+            {"support_x": p["support_x"], "blocks": list(reversed(p["blocks"]))}
+            for p in scene["panels"]
+        ],
+    }
+    rotated_blocks = {
+        "canvas": list(scene["canvas"]),
+        "palette": scene["palette"],
+        "panels": [
+            {"support_x": p["support_x"], "blocks": p["blocks"][1:] + p["blocks"][:1]}
+            for p in scene["panels"]
+        ],
+    }
+    palette_period = {
+        "canvas": list(scene["canvas"]),
+        "palette": scene["palette"] + len(PALETTES),
+        "panels": [
+            {"support_x": p["support_x"], "blocks": list(p["blocks"])}
+            for p in scene["panels"]
+        ],
+    }
+    return [
+        ("block_order_reversal", reversed_blocks),
+        ("block_order_rotation", rotated_blocks),
+        ("palette_period", palette_period),
+    ]
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+
+def _draw_panel(draw: ImageDraw.ImageDraw, ox: int, oy: int, panel: dict, colours: dict):
+    draw.rectangle(
+        [ox, oy, ox + PANEL_W - 1, oy + PANEL_H - 1],
+        outline=colours["frame"],
+        width=FRAME_THICKNESS,
+    )
+    draw.rectangle(
+        [ox + BEAM_X0, oy + BEAM_Y0, ox + BEAM_X1, oy + BEAM_Y1],
+        fill=colours["beam"],
+    )
+    support_x = panel["support_x"]
+    for step in range(SUPPORT_H):
+        half = int(round(SUPPORT_HALF * (step + 1) / float(SUPPORT_H)))
+        y = oy + BEAM_Y1 + 1 + step
+        draw.rectangle(
+            [ox + support_x - half, y, ox + support_x + half, y],
+            fill=colours["support"],
+        )
+    for centre in panel["blocks"]:
+        draw.rectangle(
+            [
+                ox + centre - BLOCK_HALF,
+                oy + BEAM_Y0 - BLOCK_SIDE,
+                ox + centre + BLOCK_HALF,
+                oy + BEAM_Y0 - 1,
+            ],
+            fill=colours["block"],
+        )
+
+
+def render(scene: dict) -> Image.Image:
+    width, height = scene["canvas"]
+    colours = PALETTES[scene["palette"] % len(PALETTES)]
+    image = Image.new("RGB", (width, height), colours["background"])
+    draw = ImageDraw.Draw(image)
+    for index, panel in enumerate(scene["panels"]):
+        ox = CANVAS_MARGIN + index * (PANEL_W + PANEL_GAP)
+        _draw_panel(draw, ox, CANVAS_MARGIN, panel, colours)
+    return image

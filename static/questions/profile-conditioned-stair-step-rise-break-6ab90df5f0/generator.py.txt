@@ -1,0 +1,277 @@
+"""Renderer for `stair_step_rise_break`.
+
+One flight of steps is drawn in side view as a solid coloured block whose top
+edge is a staircase profile.  The decision is whether, read from the left edge
+to the right edge, every step top is drawn higher on the page than the step top
+immediately before it.
+
+The canonical prior -- a flight of steps rises steadily, step after step -- is
+recorded for analysis only and is never gold.  The set of step heights is
+sampled first and the two classes differ only in the ORDER of that same set: a
+rising page uses the sorted order, a broken page swaps one adjacent pair.  Total
+ink, tallest step, shortest step, step count, step width, palette and page
+position are therefore identical in distribution across the two answers.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "stair_step_rise_break-renderer-0.1.0"
+
+DECISIONS = ("yes", "no")
+
+# Saturated inks for the flight; every other mark on the page is colourless.
+STEP_INKS = (
+    (196, 68, 52),
+    (54, 104, 186),
+    (44, 138, 92),
+    (158, 84, 176),
+    (196, 132, 34),
+    (36, 142, 158),
+)
+FRAME_GREY = (168, 168, 168)
+RAIL_GREY = (128, 128, 128)
+GROUND_GREY = (96, 96, 96)
+DECO_GREY = (150, 150, 150)
+
+WIDTH = 640
+HEIGHT = 420
+
+MIN_GAP = 20
+MAX_GAP = 44
+QUARANTINE_PX = 12.0
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+
+    n_steps = rng.choice([5, 6, 7])
+    step_w = rng.choice([46, 52, 58])
+    while n_steps * step_w > 430:
+        step_w -= 6
+    span = n_steps * step_w
+    x0 = (WIDTH - span) // 2 + rng.randint(-26, 26)
+    base_y = rng.randint(330, 358)
+
+    # One sorted ladder of heights; both classes reuse it verbatim.
+    heights = [rng.randint(24, 56)]
+    for _ in range(n_steps - 1):
+        heights.append(heights[-1] + rng.randint(MIN_GAP, MAX_GAP))
+    ceiling = base_y - 96
+    if heights[-1] > ceiling:  # squeeze the ladder, keeping every gap legal
+        heights = [24 + i * MIN_GAP for i in range(n_steps)]
+
+    rising = rng.random() < 0.5
+    if not rising:
+        k = rng.randrange(n_steps - 1)
+        heights[k], heights[k + 1] = heights[k + 1], heights[k]
+
+    ink = rng.randrange(len(STEP_INKS))
+    deco_ink = (ink + 1 + rng.randrange(len(STEP_INKS) - 1)) % len(STEP_INKS)
+
+    n_deco = rng.randint(2, 4)
+    deco = []
+    for i in range(n_deco):
+        dx = 40 + i * 42 + rng.randint(0, 18)
+        dy = 30 + rng.randint(0, 34)
+        deco.append([dx, dy, rng.choice([7, 9, 11])])
+
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "n_steps": n_steps,
+        "step_w": step_w,
+        "x0": int(x0),
+        "base_y": int(base_y),
+        "heights": [int(h) for h in heights],
+        "step_ink": int(ink),
+        "deco_ink": int(deco_ink),
+        "deco": deco,
+        "rail_gap": rng.choice([24, 30, 36]),
+        "rail_rise": rng.choice([16, 24, 32]),
+        "tick_len": rng.choice([12, 16, 20]),
+        "frame_inset": rng.choice([8, 12, 16]),
+        "deco_box": [WIDTH - 46 - rng.randint(0, 10), 30 + rng.randint(0, 20), rng.choice([10, 12, 14])],
+    }
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+def step_tops(scene: dict) -> list[float]:
+    """Page y of each drawn step top, left to right."""
+    return [float(scene["base_y"] - h) for h in scene["heights"]]
+
+
+def deltas(scene: dict) -> list[float]:
+    """Signed rise from each step to the next, positive when it goes up."""
+    hs = scene["heights"]
+    return [float(hs[i + 1] - hs[i]) for i in range(len(hs) - 1)]
+
+
+def analytic_gold(scene: dict) -> str:
+    return "yes" if all(d > 0 for d in deltas(scene)) else "no"
+
+
+def margin(scene: dict) -> float:
+    """Pixels of height change that must vanish before the answer flips."""
+    ds = deltas(scene)
+    if all(d > 0 for d in ds):
+        return float(min(ds))
+    return float(min(abs(d) for d in ds if d <= 0))
+
+
+def min_abs_delta(scene: dict) -> float:
+    return float(min(abs(d) for d in deltas(scene)))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX or min_abs_delta(scene) < QUARANTINE_PX
+
+
+def variant(scene: dict) -> str:
+    return "canonical" if analytic_gold(scene) == "yes" else "counterfactual"
+
+
+def prior_answer(scene: dict) -> str:
+    """The canonical prior always predicts a steadily rising flight."""
+    return "yes"
+
+
+def runner_up(scene: dict) -> str:
+    return "no" if analytic_gold(scene) == "yes" else "yes"
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No pixel-identical latent aliases are declared."""
+    return []
+
+
+# --------------------------------------------------------------------------
+# label-preserving and label-transforming edits
+# --------------------------------------------------------------------------
+def translate(scene: dict, dx: float, dy: float) -> dict:
+    alt = _copy(scene)
+    alt["x0"] = int(scene["x0"] + dx)
+    alt["base_y"] = int(scene["base_y"] + dy)
+    return alt
+
+
+def recolor(scene: dict) -> dict:
+    alt = _copy(scene)
+    alt["step_ink"] = (scene["step_ink"] + 3) % len(STEP_INKS)
+    alt["deco_ink"] = (scene["deco_ink"] + 2) % len(STEP_INKS)
+    if alt["deco_ink"] == alt["step_ink"]:
+        alt["deco_ink"] = (alt["deco_ink"] + 1) % len(STEP_INKS)
+    return alt
+
+
+def restyle(scene: dict, seed: int) -> dict:
+    """Permute the colourless decoration: ticks, rail and floating diamonds."""
+    rng = random.Random(seed * 31 + 7)
+    alt = _copy(scene)
+    alt["tick_len"] = rng.choice([12, 16, 20])
+    alt["frame_inset"] = rng.choice([8, 12, 16])
+    alt["rail_gap"] = rng.choice([24, 30, 36])
+    alt["rail_rise"] = rng.choice([16, 24, 32])
+    alt["deco"] = [[40 + i * 46 + rng.randint(0, 12), 28 + rng.randint(0, 30), rng.choice([7, 9, 11])]
+                   for i in range(rng.randint(2, 4))]
+    return alt
+
+
+def rescale(scene: dict) -> dict:
+    """Widen the treads and stretch every height by the same factor."""
+    alt = _copy(scene)
+    alt["step_w"] = scene["step_w"] - 8
+    alt["heights"] = [int(round(h * 1.15)) for h in scene["heights"]]
+    alt["x0"] = scene["x0"] + 20
+    return alt
+
+
+def set_class(scene: dict, target: str) -> dict:
+    """Repaint the same set of step heights in a rising or a broken order."""
+    if target not in DECISIONS:
+        raise ValueError(f"unknown class: {target}")
+    alt = _copy(scene)
+    ordered = sorted(scene["heights"])
+    if target == "no":
+        k = (scene["step_ink"] + 1) % (len(ordered) - 1)
+        ordered[k], ordered[k + 1] = ordered[k + 1], ordered[k]
+    alt["heights"] = ordered
+    return alt
+
+
+def collapse_margin(scene: dict) -> dict:
+    """Drive the page onto the painted boundary: two neighbours drawn level."""
+    alt = _copy(scene)
+    hs = list(scene["heights"])
+    k = 0 if len(hs) < 3 else 1
+    hs[k + 1] = hs[k]
+    alt["heights"] = hs
+    return alt
+
+
+def _copy(scene: dict) -> dict:
+    alt = dict(scene)
+    alt["heights"] = list(scene["heights"])
+    alt["deco"] = [list(d) for d in scene["deco"]]
+    alt["deco_box"] = list(scene["deco_box"])
+    return alt
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    w, h = int(scene["width"]), int(scene["height"])
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+
+    inset = int(scene["frame_inset"])
+    d.rectangle([inset, inset, w - 1 - inset, h - 1 - inset], outline=FRAME_GREY, width=2)
+    t = int(scene["tick_len"])
+    for cx, cy, sx, sy in ((inset, inset, 1, 1), (w - 1 - inset, inset, -1, 1),
+                           (inset, h - 1 - inset, 1, -1), (w - 1 - inset, h - 1 - inset, -1, -1)):
+        d.line([cx, cy, cx + sx * t, cy + sy * t], fill=FRAME_GREY, width=2)
+
+    base_y = int(scene["base_y"])
+    d.line([inset + 6, base_y, w - 7 - inset, base_y], fill=GROUND_GREY, width=3)
+
+    for dx, dy, s in scene["deco"]:
+        d.polygon([(dx, dy - s), (dx + s, dy), (dx, dy + s), (dx - s, dy)], outline=DECO_GREY)
+
+    ink = STEP_INKS[int(scene["step_ink"]) % len(STEP_INKS)]
+    x0, sw = int(scene["x0"]), int(scene["step_w"])
+    tops = step_tops(scene)
+    for i, top in enumerate(tops):
+        left = x0 + i * sw
+        d.rectangle([left, int(top), left + sw - 1, base_y - 1], fill=ink)
+
+    # The handrail always climbs to the right; it is declared decoration.
+    tallest = base_y - max(scene["heights"])
+    gap, rise = int(scene["rail_gap"]), int(scene["rail_rise"])
+    d.line([x0 - 10, tallest - gap, x0 + len(tops) * sw + 10, tallest - gap - rise],
+           fill=RAIL_GREY, width=3)
+
+    bx, by, bs = (int(v) for v in scene["deco_box"])
+    d.rectangle([bx, by, bx + bs, by + bs],
+                fill=STEP_INKS[int(scene["deco_ink"]) % len(STEP_INKS)])
+    return img
+
+
+def ink_pixels(image: Image.Image) -> int:
+    px = image.convert("RGB").load()
+    w, h = image.size
+    n = 0
+    for y in range(h):
+        for x in range(w):
+            r, g, b = px[x, y]
+            if max(r, g, b) - min(r, g, b) > 60:
+                n += 1
+    return n

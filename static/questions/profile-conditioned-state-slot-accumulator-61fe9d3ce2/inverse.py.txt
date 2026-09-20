@@ -1,0 +1,137 @@
+"""Independent pixel-only inverse arm for the ordered-slot displacement accumulator.
+
+Receives only the final PNG. From the raster alone:
+  1. segments the five panel frames by their gray border color, ordered left to right;
+  2. reads the initial slot from the marker (black disk) in the leftmost marked panel,
+     mapping its x-position to one of the five equal slots the track exposes;
+  3. reads each inter-panel operator glyph by its fill color (red right-pointing
+     triangle = +1 advance, blue left-pointing triangle = -1 retreat);
+  4. replays the sequence from the initial slot and returns the final slot.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+INK = (0, 0, 0)
+TRACK_COLOR = (90, 90, 90)
+RING_MARK = (240, 150, 20)
+ADVANCE_COLOR = (210, 40, 40)
+RETREAT_COLOR = (40, 60, 210)
+BORDER = (205, 205, 205)
+
+PALETTE = [BG, INK, TRACK_COLOR, RING_MARK, ADVANCE_COLOR, RETREAT_COLOR, BORDER]
+_BG, _INK, _TRACK, _RING, _ADV, _RET, _BRD = range(7)
+
+N_SLOTS = 5
+MIN_PANELS = 5
+WINDOW = 3
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected panel structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points) -> tuple[int, int, int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _slot_of_token(labels: np.ndarray, x0: int, x1: int, y0: int, y1: int) -> int:
+    ix0 = max(0, x0 + 4)
+    ix1 = min(labels.shape[1], x1 - 3)
+    iy0 = max(0, y0 + 4)
+    iy1 = min(labels.shape[0], y1 - 3)
+    region = labels[iy0:iy1, ix0:ix1]
+    ink_ys, ink_xs = np.nonzero(region == _INK)
+    if len(ink_xs) < 12:
+        raise UnreadableImageError("no marker token found in a panel")
+    tok_x = ix0 + float(ink_xs.mean())
+    slot_width = (ix1 - ix0) / N_SLOTS
+    slot = int((tok_x - ix0) / slot_width)
+    return max(0, min(N_SLOTS - 1, slot))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+
+    frames = []
+    for points in _components(labels == _BRD):
+        box = _bbox(points)
+        if box[2] - box[0] < 60 or box[3] - box[1] < 60:
+            continue
+        frames.append(box)
+    frames.sort(key=lambda box: box[0])
+    if len(frames) < MIN_PANELS:
+        raise UnreadableImageError(f"found {len(frames)} panels; expected >= {MIN_PANELS}")
+
+    slots = [_slot_of_token(labels, x0, x1, y0, y1) for (x0, y0, x1, y1) in frames]
+    if len(slots) < MIN_PANELS:
+        raise UnreadableImageError("could not read a marker slot in every panel")
+
+    center_y = (frames[0][1] + frames[0][3]) // 2
+    ops = []
+    for i in range(len(frames) - 1):
+        _, _, rx, _ = frames[i]
+        lx, _, _, _ = frames[i + 1]
+        xlo = max(0, rx + 1)
+        xhi = min(labels.shape[1], lx)
+        y0 = max(0, frames[i][1] + 20)
+        y1 = min(labels.shape[0], frames[i][3] - 20)
+        region = labels[y0:y1, xlo:xhi]
+        adv = int((region == _ADV).sum())
+        ret = int((region == _RET).sum())
+        ops.append(1 if adv > ret else -1)
+    if len(ops) < len(slots) - 1:
+        raise UnreadableImageError("not enough operator glyphs detected")
+
+    final = slots[0]
+    for op in ops:
+        final += op
+    return str(final)

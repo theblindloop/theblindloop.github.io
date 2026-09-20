@@ -1,0 +1,225 @@
+"""Independent final-PNG inverse arm for Shuffled-Link Chain.
+
+The oracle discovers colored panel frames, segments the black glyph components,
+classifies glyph identity by component geometry, joins the directed gray-card
+pairs, compares the reconstructed order with all candidates, and only then
+returns the matching frame color.  It receives no scene and imports no world
+module.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+CANVAS = (960, 720)
+BACKGROUND = np.array((250, 248, 243), dtype=np.uint8)
+INK = np.array((43, 48, 56), dtype=np.uint8)
+CLUE = np.array((105, 116, 128), dtype=np.uint8)
+ARROW = np.array((44, 116, 179), dtype=np.uint8)
+TAG_PALETTE = {
+    "amber": np.array((230, 156, 31), dtype=np.uint8),
+    "cyan": np.array((25, 177, 194), dtype=np.uint8),
+    "violet": np.array((139, 83, 205), dtype=np.uint8),
+}
+FRAME = 8
+
+
+def _mask(array: np.ndarray, color: np.ndarray) -> np.ndarray:
+    return np.all(array == color, axis=2)
+
+
+def _components(mask: np.ndarray, *, minimum: int = 1) -> list[np.ndarray]:
+    """Return 4-connected components as arrays of (y, x) coordinates."""
+
+    work = mask.copy()
+    height, width = work.shape
+    output: list[np.ndarray] = []
+    for sy, sx in np.argwhere(work):
+        sy, sx = int(sy), int(sx)
+        if not work[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        work[sy, sx] = False
+        points = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and work[ny, nx]:
+                    work[ny, nx] = False
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _bbox(component: np.ndarray) -> tuple[int, int, int, int]:
+    y0, x0 = component.min(axis=0)
+    y1, x1 = component.max(axis=0)
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def _validate_frame(component: np.ndarray, name: str) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _bbox(component)
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if not (180 <= width <= 230 and 120 <= height <= 165):
+        raise ValueError(f"{name} has implausible frame dimensions")
+    inner_width = width - 2 * FRAME
+    inner_height = height - 2 * FRAME
+    expected = width * height - inner_width * inner_height
+    if len(component) != expected:
+        raise ValueError(f"{name} frame is incomplete or malformed")
+    points = {(int(y), int(x)) for y, x in component}
+    # Probe all four rims rather than accepting an equal-area foreign shape.
+    for x in range(x0, x1 + 1):
+        if (y0, x) not in points or (y1, x) not in points:
+            raise ValueError(f"{name} frame rim is broken")
+    for y in range(y0, y1 + 1):
+        if (y, x0) not in points or (y, x1) not in points:
+            raise ValueError(f"{name} frame rim is broken")
+    return x0, y0, x1, y1
+
+
+def _classify_shape(component: np.ndarray) -> tuple[str, float]:
+    x0, y0, x1, y1 = _bbox(component)
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if not (34 <= width <= 43 and 34 <= height <= 43):
+        raise ValueError("glyph component has implausible extent")
+    ratio = len(component) / float(width * height)
+    if ratio >= 0.94:
+        name = "square"
+        target = 1.0
+    elif ratio >= 0.68:
+        name = "circle"
+        target = 0.79
+    elif 0.46 <= ratio <= 0.60:
+        name = "triangle"
+        target = 0.52
+    else:
+        raise ValueError("glyph component has no public shape signature")
+    return name, abs(ratio - target)
+
+
+def _decode_shapes(
+    black: np.ndarray, box: tuple[int, int, int, int], expected_count: int, name: str
+) -> tuple[list[str], float]:
+    x0, y0, x1, y1 = box
+    interior = black[y0 + FRAME : y1 - FRAME + 1, x0 + FRAME : x1 - FRAME + 1]
+    components = _components(interior, minimum=50)
+    if len(components) != expected_count:
+        raise ValueError(f"{name} contains {len(components)} glyphs, expected {expected_count}")
+    ordered = sorted(components, key=lambda item: float(item[:, 1].mean()))
+    decoded = [_classify_shape(component) for component in ordered]
+    names = [item[0] for item in decoded]
+    centers = [float(component[:, 1].mean()) for component in ordered]
+    if len(set(names)) != expected_count or any(
+        right - left < 35.0 for left, right in zip(centers, centers[1:])
+    ):
+        raise ValueError(f"{name} glyph identities or spacing are ambiguous")
+    return names, max(item[1] for item in decoded)
+
+
+def _verify_arrow(blue: np.ndarray, box: tuple[int, int, int, int], name: str) -> None:
+    x0, y0, x1, y1 = box
+    interior = blue[y0 + FRAME : y1 - FRAME + 1, x0 + FRAME : x1 - FRAME + 1]
+    pieces = _components(interior, minimum=20)
+    if len(pieces) != 1:
+        raise ValueError(f"{name} lacks one intact direction arrow")
+    ax0, ay0, ax1, ay1 = _bbox(pieces[0])
+    if ax1 - ax0 < 25 or ay1 - ay0 < 15 or len(pieces[0]) < 180:
+        raise ValueError(f"{name} direction arrow is malformed")
+
+
+def _join(clues: list[list[str]]) -> list[str]:
+    successors: dict[str, str] = {}
+    indegree: dict[str, int] = {}
+    nodes: set[str] = set()
+    for left, right in clues:
+        if left == right or left in successors:
+            raise ValueError("pixel clues do not define a simple successor relation")
+        successors[left] = right
+        nodes.update((left, right))
+        indegree[right] = indegree.get(right, 0) + 1
+        indegree.setdefault(left, indegree.get(left, 0))
+    starts = [node for node in nodes if indegree.get(node, 0) == 0]
+    if len(nodes) != 3 or len(starts) != 1:
+        raise ValueError("pixel clues do not have one unique start")
+    chain = [starts[0]]
+    while chain[-1] in successors:
+        chain.append(successors[chain[-1]])
+        if len(chain) > 3:
+            raise ValueError("pixel successor cycle")
+    if len(chain) != 3 or len(set(chain)) != 3:
+        raise ValueError("pixel chain is incomplete")
+    return chain
+
+
+def decision_from_image(image: Image.Image) -> str:
+    if not isinstance(image, Image.Image):
+        raise TypeError("decision_from_image expects a PIL image")
+    rgb = image.convert("RGB")
+    if rgb.size != CANVAS:
+        raise ValueError("unexpected raster dimensions")
+    array = np.asarray(rgb, dtype=np.uint8)
+    border = np.concatenate(
+        (array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3), array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)),
+        axis=0,
+    )
+    if not bool(np.all(border == BACKGROUND)):
+        raise ValueError("outer image boundary is corrupted")
+
+    gray_components = _components(_mask(array, CLUE), minimum=100)
+    if len(gray_components) != 2:
+        raise ValueError("image must contain exactly two intact gray clue frames")
+    clue_boxes = [_validate_frame(component, "gray clue") for component in gray_components]
+    clue_boxes.sort(key=lambda box: box[0])
+
+    candidate_boxes: dict[str, tuple[int, int, int, int]] = {}
+    for tag, color in TAG_PALETTE.items():
+        pieces = _components(_mask(array, color), minimum=100)
+        if len(pieces) != 1:
+            raise ValueError(f"image must contain one intact {tag} frame")
+        candidate_boxes[tag] = _validate_frame(pieces[0], f"{tag} candidate")
+
+    clue_centers_y = [(box[1] + box[3]) / 2 for box in clue_boxes]
+    candidate_centers_y = [(box[1] + box[3]) / 2 for box in candidate_boxes.values()]
+    if max(clue_centers_y) >= min(candidate_centers_y):
+        raise ValueError("gray clues are not visibly separated above candidates")
+
+    black = _mask(array, INK)
+    blue = _mask(array, ARROW)
+    clues = []
+    residuals = []
+    for index, box in enumerate(clue_boxes):
+        shapes, residual = _decode_shapes(black, box, 2, f"clue {index}")
+        _verify_arrow(blue, box, f"clue {index}")
+        clues.append(shapes)
+        residuals.append(residual)
+    chain = _join(clues)
+
+    candidates: dict[str, list[str]] = {}
+    for tag, box in candidate_boxes.items():
+        shapes, residual = _decode_shapes(black, box, 3, f"{tag} candidate")
+        candidates[tag] = shapes
+        residuals.append(residual)
+    if len({tuple(value) for value in candidates.values()}) != 3:
+        raise ValueError("candidate orders are not unique")
+    if any(set(value) != set(chain) for value in candidates.values()):
+        raise ValueError("candidate symbol histograms leak or omit an identity")
+    matches = [tag for tag, value in candidates.items() if value == chain]
+    if len(matches) != 1:
+        raise ValueError("pixel correspondence assignment is not unique")
+    # A deliberately explicit image-derived runner-up check: every distractor
+    # must retain exactly one of the two clue links, making both clues necessary.
+    links = {(left, right) for left, right in clues}
+    distractor_scores = sorted(
+        sum((value[i], value[i + 1]) in links for i in range(2))
+        for tag, value in candidates.items()
+        if tag != matches[0]
+    )
+    if distractor_scores != [1, 1] or max(residuals, default=1.0) > 0.06:
+        raise ValueError("pixel assignment margin is ambiguous")
+    return matches[0]

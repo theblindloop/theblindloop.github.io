@@ -1,0 +1,442 @@
+"""Woven-cord strand world.
+
+Latent scene z: two rectilinear cords of one ink colour drawn on white paper.
+Wherever two cords meet, one cord passes over and the other one is interrupted
+by a white break centred on the meeting point, so the interrupted cord *looks*
+severed while it is in fact a single strand that continues straight through.
+Three coloured beads sit on cord centrelines, two on one cord and one on the
+other.
+
+The decision is topological in the weave, not in the ink: connectivity is the
+transitive closure of "continues straight through a break", so plain 2-D ink
+adjacency answers the question wrongly on every scene that has a break.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "weave_strand_pair-0.1.0"
+
+CANVAS = 480
+BACKGROUND = [255, 255, 255]
+INK_COLOR = [26, 26, 30]
+CORD_WIDTH = 9
+BREAK_HALF = 20
+NEAR_BOUNDARY_BREAK_HALF = 14
+BEAD_RADIUS = 10
+
+BEAD_COLORS = {
+    "red": [214, 38, 38],
+    "green": [16, 140, 60],
+    "blue": [30, 70, 210],
+}
+BEAD_ORDER = ("red", "green", "blue")
+
+# Below this clearance (px) the weave is a finite-resolution boundary case: a
+# break so short that the interrupted cord nearly touches the cord passing over
+# it, two cords that nearly graze, or a bead that nearly sits in a break.
+QUARANTINE_MARGIN_PX = 12.0
+
+
+# ---------------------------------------------------------------------------
+# geometry helpers (plain numbers only; none of these take a scene)
+# ---------------------------------------------------------------------------
+
+
+def _segments(points: list) -> list:
+    return [
+        (float(a[0]), float(a[1]), float(b[0]), float(b[1]))
+        for a, b in zip(points, points[1:])
+    ]
+
+
+def _is_horizontal(seg) -> bool:
+    return abs(seg[1] - seg[3]) < 1e-9
+
+
+def _span(seg):
+    """Return (fixed coordinate, low, high, horizontal?) for an axis segment."""
+    if _is_horizontal(seg):
+        return seg[1], min(seg[0], seg[2]), max(seg[0], seg[2]), True
+    return seg[0], min(seg[1], seg[3]), max(seg[1], seg[3]), False
+
+
+def _crossing(seg_a, seg_b):
+    """Intersection point of one horizontal and one vertical segment, or None."""
+    if _is_horizontal(seg_a) == _is_horizontal(seg_b):
+        return None
+    horizontal, vertical = (seg_a, seg_b) if _is_horizontal(seg_a) else (seg_b, seg_a)
+    y, hx0, hx1, _ = _span(horizontal)
+    x, vy0, vy1, _ = _span(vertical)
+    if hx0 < x < hx1 and vy0 < y < vy1:
+        return (x, y)
+    return None
+
+
+def _point_segment_distance(px, py, seg) -> float:
+    x0, y0, x1, y1 = seg
+    dx, dy = x1 - x0, y1 - y0
+    length2 = dx * dx + dy * dy
+    if length2 <= 0.0:
+        return float(np.hypot(px - x0, py - y0))
+    t = max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / length2))
+    return float(np.hypot(px - (x0 + t * dx), py - (y0 + t * dy)))
+
+
+def _segment_distance(seg_a, seg_b) -> float:
+    if _crossing(seg_a, seg_b) is not None:
+        return 0.0
+    return min(
+        _point_segment_distance(seg_a[0], seg_a[1], seg_b),
+        _point_segment_distance(seg_a[2], seg_a[3], seg_b),
+        _point_segment_distance(seg_b[0], seg_b[1], seg_a),
+        _point_segment_distance(seg_b[2], seg_b[3], seg_a),
+    )
+
+
+def _endpoint_clearance(point, seg) -> float:
+    return min(
+        float(np.hypot(point[0] - seg[0], point[1] - seg[1])),
+        float(np.hypot(point[0] - seg[2], point[1] - seg[3])),
+    )
+
+
+# ---------------------------------------------------------------------------
+# scene consequences
+# ---------------------------------------------------------------------------
+
+
+def _cord_segments(scene: dict) -> list:
+    return [_segments(cord["points"]) for cord in scene["cords"]]
+
+
+def _all_crossings(scene: dict) -> list:
+    """Every meeting point of the two cords, recomputed from the geometry."""
+    segs_a, segs_b = _cord_segments(scene)
+    found = []
+    for i, seg_a in enumerate(segs_a):
+        for j, seg_b in enumerate(segs_b):
+            point = _crossing(seg_a, seg_b)
+            if point is not None:
+                found.append({"at": point, "seg_a": i, "seg_b": j})
+    return found
+
+
+def analytic_gold(scene: dict) -> str:
+    """Name the bead pair that lies on one and the same cord."""
+    beads = scene["beads"]
+    pairs = [
+        (beads[i], beads[j])
+        for i in range(len(beads))
+        for j in range(i + 1, len(beads))
+        if beads[i]["cord"] == beads[j]["cord"]
+    ]
+    if len(pairs) != 1:
+        raise ValueError("scene must place exactly two beads on one cord")
+    names = sorted((pairs[0][0]["color"], pairs[0][1]["color"]), key=BEAD_ORDER.index)
+    return f"{names[0]}_{names[1]}"
+
+
+def margin(scene: dict) -> float:
+    """Smallest visible clearance (px) that keeps the weave readable."""
+    width = float(scene["cord_width"])
+    half = float(scene["break_half"])
+    radius = float(scene["bead_radius"])
+    segs = _cord_segments(scene)
+    crossings = _all_crossings(scene)
+
+    values = [half - width / 2.0]
+    for seg_a in segs[0]:
+        for seg_b in segs[1]:
+            if _crossing(seg_a, seg_b) is None:
+                values.append(_segment_distance(seg_a, seg_b) - width)
+    for crossing in crossings:
+        seg_a = segs[0][crossing["seg_a"]]
+        seg_b = segs[1][crossing["seg_b"]]
+        values.append(_endpoint_clearance(crossing["at"], seg_a) - half)
+        values.append(_endpoint_clearance(crossing["at"], seg_b) - half)
+    for bead in scene["beads"]:
+        bx, by = bead["at"]
+        other = segs[1 - bead["cord"]]
+        for seg in other:
+            values.append(_point_segment_distance(bx, by, seg) - radius - width / 2.0)
+        for crossing in crossings:
+            distance = float(np.hypot(bx - crossing["at"][0], by - crossing["at"][1]))
+            values.append(distance - half - radius)
+    return float(round(min(values), 4))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN_PX)
+
+
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+
+
+def _stroke_mask(segments, width: int, canvas: int) -> np.ndarray:
+    mask = np.zeros((canvas, canvas), dtype=bool)
+    half = width // 2
+    for seg in segments:
+        fixed, low, high, horizontal = _span(seg)
+        fixed = int(round(fixed))
+        low = int(round(low))
+        high = int(round(high))
+        a0, a1 = max(0, fixed - half), min(canvas, fixed + half + 1)
+        b0, b1 = max(0, low - half), min(canvas, high + half + 1)
+        if horizontal:
+            mask[a0:a1, b0:b1] = True
+        else:
+            mask[b0:b1, a0:a1] = True
+    return mask
+
+
+def _disk(canvas: int, cx: float, cy: float, radius: float) -> np.ndarray:
+    ys, xs = np.ogrid[:canvas, :canvas]
+    return (xs - cx) ** 2 + (ys - cy) ** 2 <= radius * radius
+
+
+def render(scene: dict) -> Image.Image:
+    """Deterministic aliasing-free raster of the woven cords and beads."""
+    canvas = int(scene["canvas"])
+    width = int(scene["cord_width"])
+    half = int(scene["break_half"])
+    masks = [
+        _stroke_mask(segs, width, canvas) for segs in _cord_segments(scene)
+    ]
+    for crossing in _all_crossings(scene):
+        under = None
+        for record in scene["breaks"]:
+            if abs(record["at"][0] - crossing["at"][0]) < 1e-6 and abs(
+                record["at"][1] - crossing["at"][1]
+            ) < 1e-6:
+                under = int(record["cord"])
+        if under is None:
+            raise ValueError("every crossing must declare which cord runs under")
+        cx, cy = crossing["at"]
+        x0, x1 = int(round(cx - half)), int(round(cx + half)) + 1
+        y0, y1 = int(round(cy - half)), int(round(cy + half)) + 1
+        masks[under][max(0, y0) : y1, max(0, x0) : x1] = False
+
+    image = np.zeros((canvas, canvas, 3), dtype=np.uint8)
+    image[:, :] = np.array(scene["background"], dtype=np.uint8)
+    ink = masks[0] | masks[1]
+    image[ink] = np.array(scene["ink_color"], dtype=np.uint8)
+    for bead in scene["beads"]:
+        blob = _disk(canvas, float(bead["at"][0]), float(bead["at"][1]), float(scene["bead_radius"]))
+        image[blob] = np.array(BEAD_COLORS[bead["color"]], dtype=np.uint8)
+    return Image.fromarray(image, mode="RGB")
+
+
+# ---------------------------------------------------------------------------
+# latent aliases
+# ---------------------------------------------------------------------------
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Pixel-identical relabelings of pure bookkeeping in the latent scene."""
+    twins = []
+
+    reversed_paths = dict(scene)
+    reversed_paths["cords"] = [
+        {"points": [list(p) for p in reversed(cord["points"])]} for cord in scene["cords"]
+    ]
+    twins.append(("reverse_cord_traversal_direction", reversed_paths))
+
+    shuffled_breaks = dict(scene)
+    shuffled_breaks["breaks"] = [dict(record) for record in reversed(scene["breaks"])]
+    twins.append(("reverse_break_list_order", shuffled_breaks))
+
+    swapped = dict(scene)
+    swapped["cords"] = [dict(cord) for cord in reversed(scene["cords"])]
+    swapped["breaks"] = [
+        {"at": list(record["at"]), "cord": 1 - int(record["cord"])} for record in scene["breaks"]
+    ]
+    swapped["beads"] = [
+        {"color": bead["color"], "cord": 1 - int(bead["cord"]), "at": list(bead["at"])}
+        for bead in scene["beads"]
+    ]
+    twins.append(("swap_cord_slot_indices", swapped))
+
+    reordered_beads = dict(scene)
+    reordered_beads["beads"] = [dict(bead) for bead in reversed(scene["beads"])]
+    twins.append(("reverse_bead_slot_order", reordered_beads))
+    return twins
+
+
+# ---------------------------------------------------------------------------
+# sampling
+# ---------------------------------------------------------------------------
+
+
+def _choose_lines(rng):
+    """Three well-spaced parallel cord lines plus the two jog lines between them.
+
+    The jogs of one cord always sit near the middle of a gap between two lines of
+    the other cord, which keeps parallel pieces of the two cords far apart.
+    """
+    first = rng.randrange(70, 151, 2)
+    third = rng.randrange(first + 260, 411, 2)
+    second = rng.randrange(first + 104, third - 102, 2)
+    jogs = [
+        (first + second) // 2 + rng.randrange(-6, 7),
+        (second + third) // 2 + rng.randrange(-6, 7),
+    ]
+    return [first, second, third], jogs
+
+
+def _bead_position(rng, seg, crossings, half, radius, other_segments):
+    fixed, low, high, horizontal = _span(seg)
+    for _ in range(120):
+        t = rng.uniform(low + 34.0, high - 34.0)
+        point = (t, fixed) if horizontal else (fixed, t)
+        if any(
+            float(np.hypot(point[0] - c["at"][0], point[1] - c["at"][1])) < half + radius + 14.0
+            for c in crossings
+        ):
+            continue
+        if any(
+            _point_segment_distance(point[0], point[1], other) < radius + 20.0
+            for other in other_segments
+        ):
+            continue
+        return [round(point[0], 2), round(point[1], 2)]
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic balanced sampler; the answering pair cycles with the seed."""
+    rng = random.Random((int(seed) * 6151 + 55021) % (2**63))
+    targets = ["red_green", "red_blue", "green_blue"]
+    target = targets[int(seed) % 3]
+    near_boundary = int(seed) % 7 == 4
+    half = NEAR_BOUNDARY_BREAK_HALF if near_boundary else BREAK_HALF
+
+    for _ in range(600):
+        rows, jog_y = _choose_lines(rng)
+        cols, jog_x = _choose_lines(rng)
+        rng.shuffle(rows)
+        rng.shuffle(cols)
+        if min(abs(r - j) for r in rows for j in jog_y) < 40:
+            continue
+        if min(abs(c - j) for c in cols for j in jog_x) < 40:
+            continue
+
+        cord_a = [
+            [8, rows[0]], [jog_x[0], rows[0]], [jog_x[0], rows[1]], [jog_x[1], rows[1]],
+            [jog_x[1], rows[2]], [CANVAS - 8, rows[2]],
+        ]
+        cord_b = [
+            [cols[0], 8], [cols[0], jog_y[0]], [cols[1], jog_y[0]], [cols[1], jog_y[1]],
+            [cols[2], jog_y[1]], [cols[2], CANVAS - 8],
+        ]
+        scene = {
+            "canvas": CANVAS,
+            "background": list(BACKGROUND),
+            "ink_color": list(INK_COLOR),
+            "cord_width": CORD_WIDTH,
+            "break_half": half,
+            "bead_radius": BEAD_RADIUS,
+            "cords": [{"points": cord_a}, {"points": cord_b}],
+            "breaks": [],
+            "beads": [],
+        }
+        segs = _cord_segments(scene)
+        crossings = _all_crossings(scene)
+        if len(crossings) < 3:
+            continue
+        # every crossing must sit well inside both segments, and two crossings on
+        # one segment must stay far apart, so no cord piece becomes a stub.
+        ok = True
+        for index, crossing in enumerate(crossings):
+            seg_a = segs[0][crossing["seg_a"]]
+            seg_b = segs[1][crossing["seg_b"]]
+            if min(_endpoint_clearance(crossing["at"], seg_a),
+                   _endpoint_clearance(crossing["at"], seg_b)) < 62.0:
+                ok = False
+                break
+            for other in crossings[index + 1 :]:
+                if other["seg_a"] == crossing["seg_a"] or other["seg_b"] == crossing["seg_b"]:
+                    distance = float(
+                        np.hypot(
+                            other["at"][0] - crossing["at"][0],
+                            other["at"][1] - crossing["at"][1],
+                        )
+                    )
+                    if distance < 96.0:
+                        ok = False
+                        break
+            if not ok:
+                break
+        if not ok:
+            continue
+        if any(
+            _crossing(seg_a, seg_b) is None and _segment_distance(seg_a, seg_b) < 30.0
+            for seg_a in segs[0]
+            for seg_b in segs[1]
+        ):
+            continue
+
+        # weave: each cord must run under at least one crossing, so neither cord
+        # can be read off as an unbroken piece of ink.
+        under = [rng.randrange(2) for _ in crossings]
+        if len(set(under)) < 2:
+            under[rng.randrange(len(under))] = 1 - under[0]
+        scene["breaks"] = [
+            {"at": [round(c["at"][0], 2), round(c["at"][1], 2)], "cord": int(u)}
+            for c, u in zip(crossings, under)
+        ]
+
+        pair_cord = rng.randrange(2)
+        solo_cord = 1 - pair_cord
+        pair_segments = rng.sample(range(len(segs[pair_cord])), 2)
+        solo_segment = rng.randrange(len(segs[solo_cord]))
+        spots = []
+        for cord_index, seg_index in (
+            (pair_cord, pair_segments[0]),
+            (pair_cord, pair_segments[1]),
+            (solo_cord, solo_segment),
+        ):
+            spot = _bead_position(
+                rng,
+                segs[cord_index][seg_index],
+                crossings,
+                half,
+                BEAD_RADIUS,
+                segs[1 - cord_index],
+            )
+            if spot is None:
+                break
+            spots.append((cord_index, spot))
+        if len(spots) < 3:
+            continue
+        if any(
+            float(np.hypot(spots[i][1][0] - spots[j][1][0], spots[i][1][1] - spots[j][1][1])) < 72.0
+            for i in range(3)
+            for j in range(i + 1, 3)
+        ):
+            continue
+
+        pair_names = target.split("_")
+        solo_name = next(name for name in BEAD_ORDER if name not in pair_names)
+        rng.shuffle(pair_names)
+        names = [pair_names[0], pair_names[1], solo_name]
+        scene["beads"] = [
+            {"color": name, "cord": cord_index, "at": spot}
+            for name, (cord_index, spot) in zip(names, spots)
+        ]
+
+        if analytic_gold(scene) != target:
+            continue
+        value = margin(scene)
+        if near_boundary and not (6.0 <= value < QUARANTINE_MARGIN_PX):
+            continue
+        if not near_boundary and value < QUARANTINE_MARGIN_PX + 1.0:
+            continue
+        return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")

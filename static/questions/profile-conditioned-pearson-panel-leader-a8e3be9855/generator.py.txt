@@ -1,0 +1,231 @@
+"""Deterministic sampler, RGB renderer, and analytic Pearson-selection arm."""
+
+from __future__ import annotations
+
+import itertools
+import math
+import random
+from copy import deepcopy
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 760
+HEIGHT = 650
+PANEL_LABELS = ("A", "B", "C", "D")
+QUARANTINE_GAP = 0.08
+POINT_COUNT = 8
+
+INK_PALETTES: tuple[tuple[int, int, int], ...] = (
+    (20, 132, 156),
+    (190, 67, 93),
+    (76, 133, 48),
+    (191, 102, 25),
+)
+
+_PANEL_LEFT = (42, 398)
+_PANEL_TOP = (104, 356)
+_TARGET_SCORES_REGULAR = (24, 54, 100, 134)
+_TARGET_SCORES_NEAR = (42, 46, 76, 134)
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    filename = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(filename, size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _permutation_pools() -> dict[int, list[tuple[int, ...]]]:
+    wanted = set(_TARGET_SCORES_REGULAR) | set(_TARGET_SCORES_NEAR)
+    pools: dict[int, list[tuple[int, ...]]] = {score: [] for score in wanted}
+    for permutation in itertools.permutations(range(POINT_COUNT)):
+        score = sum((index - value) ** 2 for index, value in enumerate(permutation))
+        if score in pools:
+            pools[score].append(permutation)
+    if any(not values for values in pools.values()):
+        raise RuntimeError("configured Pearson permutation pool is incomplete")
+    return pools
+
+
+_POOLS = _permutation_pools()
+
+
+def panel_geometry(panel: int, layout_dx: int = 0, layout_dy: int = 0) -> dict[str, int]:
+    """Return visible panel and plotting bounds for a reading-order panel index."""
+    if panel not in range(4):
+        raise ValueError(f"invalid panel index {panel}")
+    left = _PANEL_LEFT[panel % 2] + int(layout_dx)
+    top = _PANEL_TOP[panel // 2] + int(layout_dy)
+    return {
+        "left": left,
+        "top": top,
+        "right": left + 320,
+        "bottom": top + 226,
+        "plot_left": left + 52,
+        "plot_right": left + 276,
+        "plot_top": top + 34,
+        "plot_bottom": top + 202,
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample four panels with fixed marginals and counterbalanced winner position."""
+    seed = int(seed)
+    rng = random.Random(seed ^ 0x50EA25A)
+    winner_panel = seed % 4
+    near_boundary = seed % 11 == 0
+    score_sequence = _TARGET_SCORES_NEAR if near_boundary else _TARGET_SCORES_REGULAR
+
+    other_scores = list(score_sequence[1:])
+    rng.shuffle(other_scores)
+    score_by_panel = {winner_panel: score_sequence[0]}
+    score_by_panel.update(
+        dict(zip((panel for panel in range(4) if panel != winner_panel), other_scores, strict=True))
+    )
+
+    reflect_both_axes = bool((seed // 4) % 2)
+    panels = []
+    for panel in range(4):
+        score = score_by_panel[panel]
+        permutation = _POOLS[score][rng.randrange(len(_POOLS[score]))]
+        points = []
+        for x_value, y_value in enumerate(permutation):
+            if reflect_both_axes:
+                x_value, y_value = 7 - x_value, 7 - y_value
+            points.append([int(x_value), int(y_value)])
+        rng.shuffle(points)
+        panels.append({"panel": panel, "points": points})
+    rng.shuffle(panels)
+
+    shift_cycle = ((-5, -3), (4, -3), (-5, 3), (4, 3))
+    layout_dx, layout_dy = shift_cycle[(seed // 16) % len(shift_cycle)]
+    return {
+        "panels": panels,
+        "ink_rgb": list(INK_PALETTES[(seed // 4) % len(INK_PALETTES)]),
+        "layout_dx": layout_dx,
+        "layout_dy": layout_dy,
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    """Select the panel with the largest Pearson correlation coefficient."""
+    ranked: list[tuple[float, int]] = []
+    for panel in scene["panels"]:
+        points = panel["points"]
+        if len(points) != POINT_COUNT:
+            raise ValueError("every panel must contain eight coordinate pairs")
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+        mean_x = sum(xs) / len(xs)
+        mean_y = sum(ys) / len(ys)
+        numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+        sum_x2 = sum((x - mean_x) ** 2 for x in xs)
+        sum_y2 = sum((y - mean_y) ** 2 for y in ys)
+        if sum_x2 <= 0 or sum_y2 <= 0:
+            raise ValueError("Pearson correlation requires nonconstant coordinates")
+        ranked.append((numerator / math.sqrt(sum_x2 * sum_y2), int(panel["panel"])))
+    ranked.sort(reverse=True)
+    if len(ranked) != 4 or ranked[0][0] - ranked[1][0] <= 1e-12:
+        raise ValueError("scene has no unique Pearson leader")
+    return PANEL_LABELS[ranked[0][1]]
+
+
+def _panel_correlation(panel: dict) -> float:
+    points = panel["points"]
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+    denominator = math.sqrt(
+        sum((x - mean_x) ** 2 for x in xs) * sum((y - mean_y) ** 2 for y in ys)
+    )
+    if denominator <= 0:
+        raise ValueError("Pearson correlation requires nonconstant coordinates")
+    return numerator / denominator
+
+
+def margin(scene: dict) -> float:
+    values = sorted((_panel_correlation(panel) for panel in scene["panels"]), reverse=True)
+    if len(values) != 4:
+        raise ValueError("scene must contain four panels")
+    return float(values[0] - values[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_GAP
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = deepcopy(scene)
+    twin["panels"] = list(reversed(twin["panels"]))
+    return [("reverse_panel_record_order", twin)]
+
+
+def render(scene: dict) -> Image.Image:
+    """Render the four equal-scale scatter panels to one RGB PNG."""
+    ink = tuple(int(channel) for channel in scene["ink_rgb"])
+    if len(ink) != 3 or any(channel < 0 or channel > 255 for channel in ink):
+        raise ValueError("ink_rgb must be a valid RGB triplet")
+    layout_dx = int(scene["layout_dx"])
+    layout_dy = int(scene["layout_dy"])
+    image = Image.new("RGB", (WIDTH, HEIGHT), (243, 246, 250))
+    draw = ImageDraw.Draw(image)
+    draw.text((42, 20), "PEARSON CORRELATION ACROSS SCATTER PANELS", fill=(39, 48, 62), font=_font(21, True))
+    draw.text(
+        (42, 52),
+        "Same x and y scales  •  eight points per panel  •  compare paired coordinates",
+        fill=(83, 94, 110),
+        font=_font(14),
+    )
+
+    seen: set[int] = set()
+    for record in scene["panels"]:
+        panel = int(record["panel"])
+        points = record["points"]
+        if panel in seen or panel not in range(4) or len(points) != POINT_COUNT:
+            raise ValueError("panel indices must be unique and contain eight points")
+        seen.add(panel)
+        geometry = panel_geometry(panel, layout_dx, layout_dy)
+        left, top = geometry["left"], geometry["top"]
+        draw.rounded_rectangle(
+            (left, top, geometry["right"], geometry["bottom"]),
+            radius=8,
+            fill=(255, 255, 255),
+            outline=(208, 216, 227),
+            width=1,
+        )
+        draw.text((left + 13, top + 9), PANEL_LABELS[panel], fill=(48, 58, 73), font=_font(16, True))
+        plot_left = geometry["plot_left"]
+        plot_right = geometry["plot_right"]
+        plot_top = geometry["plot_top"]
+        plot_bottom = geometry["plot_bottom"]
+        for fraction in (0.0, 0.5, 1.0):
+            x = round(plot_left + fraction * (plot_right - plot_left))
+            y = round(plot_bottom - fraction * (plot_bottom - plot_top))
+            draw.line((x, plot_top, x, plot_bottom), fill=(231, 235, 241), width=1)
+            draw.line((plot_left, y, plot_right, y), fill=(231, 235, 241), width=1)
+        draw.line((plot_left, plot_top, plot_left, plot_bottom), fill=(102, 113, 128), width=2)
+        draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill=(102, 113, 128), width=2)
+        draw.text((plot_right - 4, plot_bottom + 6), "x", fill=(101, 112, 127), font=_font(10))
+        draw.text((plot_left - 18, plot_top - 4), "y", fill=(101, 112, 127), font=_font(10))
+
+        observed_x: set[int] = set()
+        observed_y: set[int] = set()
+        for point in points:
+            x_value, y_value = int(point[0]), int(point[1])
+            if x_value not in range(8) or y_value not in range(8):
+                raise ValueError("point coordinates must be ranks from zero through seven")
+            observed_x.add(x_value)
+            observed_y.add(y_value)
+            x = plot_left + x_value * 32
+            y = plot_bottom - y_value * 24
+            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=(255, 255, 255))
+            draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=ink)
+        if observed_x != set(range(8)) or observed_y != set(range(8)):
+            raise ValueError("every panel must expose identical complete coordinate marginals")
+    if seen != set(range(4)):
+        raise ValueError("scene must contain panels A through D exactly once")
+    draw.text((631, 622), "x  →", fill=(83, 94, 110), font=_font(12, True))
+    return image

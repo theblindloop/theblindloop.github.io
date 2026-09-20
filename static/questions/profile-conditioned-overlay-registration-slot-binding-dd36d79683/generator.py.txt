@@ -1,0 +1,357 @@
+"""Overlay-registration slot binding: sample, render, and score one scene.
+
+World summary
+-------------
+Two framed panels are drawn one above the other.  The upper panel (the board)
+carries four dark square outlines, exactly one of which is filled light gray
+(the shaded square), plus one solid black registration cross.  The lower panel
+(the sheet) carries four solid colored dots and one solid black registration
+cross of the same shape.
+
+The declared rule is that the sheet is slid -- without rotation, mirroring or
+rescaling -- until its cross sits exactly on the board's cross.  That fixes a
+single translation
+
+    t = board_fid - sheet_fid
+
+Every dot then moves to ``dot + t`` and the decision is the color of the dot
+whose translated position is closest to the center of the shaded square.  The
+decision therefore cannot be read off either panel alone: the answer requires
+recovering the registration translation from the two fiducials and only then
+reading the color attribute of the winning part.
+
+Everything in the scene dict is drawn.  Coordinates are integers so that the
+raster is exactly reproducible after a JSON round-trip.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "overlay_registration_slot_binding-0.1.0"
+
+# --- fixed geometry ---------------------------------------------------------
+CANVAS = [700, 790]
+BOARD_RECT = [30, 26, 670, 356]  # outer frame of the upper panel
+SHEET_RECT = [30, 424, 670, 754]  # outer frame of the lower panel
+PANEL_SHIFT = [0, 398]  # SHEET_RECT - BOARD_RECT, exact for both corners
+
+SQUARE_HALF = 26
+DOT_RADIUS = 11
+CROSS_ARM = 17
+CROSS_THICK = 5
+
+# --- fixed palette ----------------------------------------------------------
+BACKGROUND = (255, 255, 255)
+FRAME_GRAY = (128, 128, 128)
+SQUARE_GRAY = (64, 64, 64)
+SHADE_GRAY = (206, 206, 206)
+CROSS_BLACK = (0, 0, 0)
+DOT_COLORS = {
+    "red": (214, 36, 36),
+    "blue": (36, 74, 214),
+    "green": (22, 140, 64),
+    "orange": (240, 150, 24),
+}
+COLOR_ORDER = ("red", "blue", "green", "orange")
+
+# --- sampling constants -----------------------------------------------------
+INTERIOR_PAD = 40  # min distance of a square center from the board interior edge
+SQUARE_MIN_SEP = 130  # min distance between two square centers
+FID_SQUARE_CLEAR = 58  # min distance between the board cross and any square
+DOT_MIN_SEP = 46  # min distance between two dots on the sheet
+DOT_FID_CLEAR = 46  # min distance between a dot and the sheet cross
+DOT_EDGE_PAD = 26  # min distance of a dot from the sheet interior edge
+
+QUARANTINE_MARGIN_PX = 14.0  # runner-up gap below which the choice is ambiguous
+QUARANTINE_LANDING_PX = 46.0  # winner must clearly sit at the shaded square
+
+
+def _interior(rect: list[int]) -> tuple[int, int, int, int]:
+    return rect[0] + 6, rect[1] + 6, rect[2] - 6, rect[3] - 6
+
+
+def _dist(a, b) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _place_squares(rng: random.Random) -> list[list[int]] | None:
+    x0, y0, x1, y1 = _interior(BOARD_RECT)
+    centers: list[list[int]] = []
+    for _ in range(400):
+        if len(centers) == 4:
+            return centers
+        p = [
+            rng.randint(x0 + INTERIOR_PAD, x1 - INTERIOR_PAD),
+            rng.randint(y0 + INTERIOR_PAD, y1 - INTERIOR_PAD),
+        ]
+        if all(_dist(p, q) >= SQUARE_MIN_SEP for q in centers):
+            centers.append(p)
+    return centers if len(centers) == 4 else None
+
+
+def _mapped_positions(rng: random.Random, squares, marked_index, near_boundary):
+    """Positions the four dots occupy after registration (board coordinates)."""
+    x0, y0, x1, y1 = _interior(BOARD_RECT)
+    marked = squares[marked_index]
+    others = [i for i in range(4) if i != marked_index]
+
+    if not near_boundary:
+        mapped = []
+        for center in squares:
+            mapped.append(
+                [center[0] + rng.randint(-9, 9), center[1] + rng.randint(-9, 9)]
+            )
+        return mapped, marked_index
+
+    radius = rng.uniform(19.0, 38.0)
+    theta = rng.uniform(0.0, 2 * math.pi)
+    win = [
+        int(round(marked[0] + radius * math.cos(theta))),
+        int(round(marked[1] + radius * math.sin(theta))),
+    ]
+    gap = rng.uniform(2.0, 62.0)
+    runner = None
+    for _ in range(400):
+        # Opposite side of the shaded center, so the two front-runners stay far
+        # apart on the sheet while their distances to that center stay close.
+        phi = theta + math.pi + rng.uniform(-0.7, 0.7)
+        reach = _dist(win, marked) + gap
+        cand = [
+            int(round(marked[0] + reach * math.cos(phi))),
+            int(round(marked[1] + reach * math.sin(phi))),
+        ]
+        if not (x0 + 18 <= cand[0] <= x1 - 18 and y0 + 18 <= cand[1] <= y1 - 18):
+            continue
+        if _dist(cand, win) < DOT_MIN_SEP:
+            continue
+        if any(_dist(cand, squares[i]) < 62 for i in others):
+            continue
+        runner = cand
+        break
+    if runner is None:
+        return None, None
+
+    mapped = [None, None, None, None]
+    mapped[marked_index] = win
+    mapped[others[0]] = runner
+    for i in others[1:]:
+        mapped[i] = [
+            squares[i][0] + rng.randint(-9, 9),
+            squares[i][1] + rng.randint(-9, 9),
+        ]
+    return mapped, marked_index
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic scene for ``seed``.
+
+    The winning color cycles with ``seed % 4`` so that answer identity is
+    counterbalanced by construction, and the scene is rejected unless the
+    "ignore the crosses and take the dot that is already nearest the shaded
+    square" heuristic agrees with the true answer at exactly the chance rate of
+    one seed in four.
+    """
+    rng = random.Random((seed * 2654435761) % (2**31))
+    win_color = COLOR_ORDER[seed % 4]
+    want_naive_agreement = (seed // 4) % 4 == 0
+    sx0, sy0, sx1, sy1 = _interior(SHEET_RECT)
+
+    for _ in range(600):
+        squares = _place_squares(rng)
+        if squares is None:
+            continue
+        marked_index = rng.randrange(4)
+        near_boundary = rng.random() < 0.45
+        mapped, win_index = _mapped_positions(rng, squares, marked_index, near_boundary)
+        if mapped is None:
+            continue
+
+        bx0, by0, bx1, by1 = _interior(BOARD_RECT)
+        board_fid = None
+        for _ in range(200):
+            cand = [
+                rng.randint(bx0 + 30, bx1 - 30),
+                rng.randint(by0 + 30, by1 - 30),
+            ]
+            if all(_dist(cand, s) >= FID_SQUARE_CLEAR for s in squares):
+                board_fid = cand
+                break
+        if board_fid is None:
+            continue
+
+        shift = [
+            rng.randint(-46, 46) + PANEL_SHIFT[0],
+            rng.randint(-46, 46) + PANEL_SHIFT[1],
+        ]
+        sheet_fid = [board_fid[0] + shift[0], board_fid[1] + shift[1]]
+        if not (sx0 + 30 <= sheet_fid[0] <= sx1 - 30 and sy0 + 30 <= sheet_fid[1] <= sy1 - 30):
+            continue
+        dots_xy = [[m[0] + shift[0], m[1] + shift[1]] for m in mapped]
+        if any(
+            not (sx0 + DOT_EDGE_PAD <= p[0] <= sx1 - DOT_EDGE_PAD)
+            or not (sy0 + DOT_EDGE_PAD <= p[1] <= sy1 - DOT_EDGE_PAD)
+            for p in dots_xy
+        ):
+            continue
+        if any(_dist(p, sheet_fid) < DOT_FID_CLEAR for p in dots_xy):
+            continue
+        if any(
+            _dist(dots_xy[i], dots_xy[j]) < DOT_MIN_SEP
+            for i in range(4)
+            for j in range(i + 1, 4)
+        ):
+            continue
+
+        marked = squares[marked_index]
+        order = sorted(range(4), key=lambda i: (_dist(mapped[i], marked), i))
+        if order[0] != win_index:
+            continue
+        gap = _dist(mapped[order[1]], marked) - _dist(mapped[order[0]], marked)
+        if gap < 1.5:
+            continue
+
+        # Counterbalance: the un-registered "closest dot on the page" shortcut
+        # must be right exactly at chance.
+        naive = min(range(4), key=lambda i: (_dist(dots_xy[i], marked), i))
+        if (naive == win_index) is not want_naive_agreement:
+            continue
+
+        colors = [c for c in COLOR_ORDER if c != win_color]
+        rng.shuffle(colors)
+        names = [None, None, None, None]
+        names[win_index] = win_color
+        for i, idx in enumerate(i for i in range(4) if i != win_index):
+            names[idx] = colors[i]
+
+        dots = [{"color": names[i], "xy": dots_xy[i]} for i in range(4)]
+        rng.shuffle(dots)
+        square_list = list(squares)
+        rng.shuffle(square_list)
+        return {
+            "canvas": list(CANVAS),
+            "board_rect": list(BOARD_RECT),
+            "sheet_rect": list(SHEET_RECT),
+            "board_fid": board_fid,
+            "sheet_fid": sheet_fid,
+            "squares": square_list,
+            "marked_square": list(marked),
+            "dots": dots,
+            "square_half": SQUARE_HALF,
+            "dot_radius": DOT_RADIUS,
+            "cross_arm": CROSS_ARM,
+            "cross_thick": CROSS_THICK,
+        }
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+# --- rendering --------------------------------------------------------------
+
+
+def _draw_cross(draw: ImageDraw.ImageDraw, center, arm: int, thick: int) -> None:
+    cx, cy = center
+    half = thick // 2
+    draw.rectangle([cx - arm, cy - half, cx + arm, cy + half], fill=CROSS_BLACK)
+    draw.rectangle([cx - half, cy - arm, cx + half, cy + arm], fill=CROSS_BLACK)
+
+
+def render(scene: dict) -> Image.Image:
+    canvas = scene["canvas"]
+    image = Image.new("RGB", (int(canvas[0]), int(canvas[1])), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for rect in (scene["board_rect"], scene["sheet_rect"]):
+        draw.rectangle([rect[0], rect[1], rect[2], rect[3]], outline=FRAME_GRAY, width=3)
+
+    half = int(scene["square_half"])
+    marked = scene["marked_square"]
+    draw.rectangle(
+        [marked[0] - half, marked[1] - half, marked[0] + half, marked[1] + half],
+        fill=SHADE_GRAY,
+    )
+    for center in scene["squares"]:
+        draw.rectangle(
+            [center[0] - half, center[1] - half, center[0] + half, center[1] + half],
+            outline=SQUARE_GRAY,
+            width=3,
+        )
+
+    arm = int(scene["cross_arm"])
+    thick = int(scene["cross_thick"])
+    _draw_cross(draw, scene["board_fid"], arm, thick)
+    _draw_cross(draw, scene["sheet_fid"], arm, thick)
+
+    radius = int(scene["dot_radius"])
+    for dot in scene["dots"]:
+        x, y = dot["xy"]
+        draw.ellipse(
+            [x - radius, y - radius, x + radius, y + radius],
+            fill=DOT_COLORS[dot["color"]],
+        )
+    return image
+
+
+# --- analytic decision ------------------------------------------------------
+
+
+def _registered_dots(scene: dict) -> list[tuple[str, float, float]]:
+    """Dot colors and their positions after the fiducials are made to coincide."""
+    tx = scene["board_fid"][0] - scene["sheet_fid"][0]
+    ty = scene["board_fid"][1] - scene["sheet_fid"][1]
+    out = []
+    for dot in scene["dots"]:
+        out.append((dot["color"], dot["xy"][0] + tx, dot["xy"][1] + ty))
+    return out
+
+
+def _ranked(scene: dict) -> list[tuple[float, str]]:
+    target = scene["marked_square"]
+    ranked = [
+        (math.hypot(x - target[0], y - target[1]), color)
+        for color, x, y in _registered_dots(scene)
+    ]
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return ranked
+
+
+def analytic_gold(scene: dict) -> str:
+    return _ranked(scene)[0][1]
+
+
+def margin(scene: dict) -> float:
+    ranked = _ranked(scene)
+    return float(ranked[1][0] - ranked[0][0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    ranked = _ranked(scene)
+    return bool(
+        ranked[1][0] - ranked[0][0] < QUARANTINE_MARGIN_PX
+        or ranked[0][0] > QUARANTINE_LANDING_PX
+    )
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Render-invariant relabelings of the scene dict.
+
+    The order of the ``dots`` list and of the ``squares`` list is latent: the
+    parts do not overlap, so drawing order is not observable, and the decision
+    is defined by geometry rather than by list index.  Both transforms must
+    leave the raster and the gold answer untouched.
+    """
+    twins: list[tuple[str, dict]] = []
+
+    rotated_dots = dict(scene)
+    rotated_dots["dots"] = scene["dots"][1:] + scene["dots"][:1]
+    twins.append(("dot_list_rotation", rotated_dots))
+
+    reversed_dots = dict(scene)
+    reversed_dots["dots"] = list(reversed(scene["dots"]))
+    twins.append(("dot_list_reversal", reversed_dots))
+
+    reversed_squares = dict(scene)
+    reversed_squares["squares"] = list(reversed(scene["squares"]))
+    twins.append(("square_list_reversal", reversed_squares))
+    return twins

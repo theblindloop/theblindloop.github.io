@@ -1,0 +1,139 @@
+"""Independent PNG-only inverse arm for visible clock-numeral winding.
+
+The oracle discovers four light numeral badges from their pixels, recognizes
+their block glyphs, estimates the dial center from the four badge centers, and
+computes the signed shorter-arc displacement from 12 to 3. It receives no scene,
+renderer state, filename, metadata, or analytic answer.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+_BADGE_RGB = np.array((255, 249, 226), dtype=np.int16)
+_PATTERNS = {
+    "1": ("00100", "01100", "10100", "00100", "00100", "00100", "11111"),
+    "2": ("11110", "00001", "00001", "11110", "10000", "10000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "6": ("01111", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "11110"),
+}
+
+
+def _template(label: str) -> np.ndarray:
+    digits = []
+    for index, digit in enumerate(label):
+        if index:
+            digits.append(np.zeros((7, 1), dtype=bool))
+        digits.append(np.array([[bit == "1" for bit in row] for row in _PATTERNS[digit]], dtype=bool))
+    return np.concatenate(digits, axis=1)
+
+
+_TEMPLATES = {label: _template(label) for label in ("12", "3", "6", "9")}
+
+
+class AmbiguousRasterError(ValueError):
+    """The final raster does not visibly support one exact winding answer."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return coordinate arrays for 4-connected true components."""
+    work = mask.copy()
+    components: list[np.ndarray] = []
+    height, width = work.shape
+    while work.any():
+        y, x = np.argwhere(work)[0]
+        work[y, x] = False
+        stack = [(int(y), int(x))]
+        coords: list[tuple[int, int]] = []
+        while stack:
+            yy, xx = stack.pop()
+            coords.append((yy, xx))
+            for ny, nx in ((yy - 1, xx), (yy + 1, xx), (yy, xx - 1), (yy, xx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and work[ny, nx]:
+                    work[ny, nx] = False
+                    stack.append((ny, nx))
+        components.append(np.asarray(coords, dtype=np.int32))
+    return components
+
+
+def _sample_grid(mask: np.ndarray, rows: int, columns: int) -> np.ndarray:
+    sampled = np.zeros((rows, columns), dtype=bool)
+    height, width = mask.shape
+    for row in range(rows):
+        top = round(row * height / rows)
+        bottom = round((row + 1) * height / rows)
+        for column in range(columns):
+            left = round(column * width / columns)
+            right = round((column + 1) * width / columns)
+            cell = mask[top:bottom, left:right]
+            sampled[row, column] = bool(cell.size and cell.mean() >= 0.58)
+    return sampled
+
+
+def _read_label(arr: np.ndarray, center: tuple[float, float], badge_width: float) -> str:
+    yy, xx = np.indices(arr.shape[:2])
+    radial = np.hypot(xx - center[0], yy - center[1]) <= badge_width * 0.43
+    maximum = arr.max(axis=2)
+    minimum = arr.min(axis=2)
+    ink = radial & (maximum < 145) & ((maximum - minimum) > 18)
+    ys, xs = np.nonzero(ink)
+    if len(xs) < 250:
+        raise AmbiguousRasterError("a numeral badge has too little readable glyph ink")
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    glyph = ink[y0:y1, x0:x1]
+    if glyph.shape[0] < 35 or glyph.shape[1] < 25:
+        raise AmbiguousRasterError("a numeral glyph is below the declared readable scale")
+
+    distances: list[tuple[int, str]] = []
+    for label, template in _TEMPLATES.items():
+        sampled = _sample_grid(glyph, template.shape[0], template.shape[1])
+        distances.append((int(np.count_nonzero(sampled != template)), label))
+    distances.sort()
+    if distances[0][0] != 0 or (len(distances) > 1 and distances[1][0] == 0):
+        raise AmbiguousRasterError(f"numeral has no exact unique match: {distances[:2]}")
+    return distances[0][1]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if arr.ndim != 3 or arr.shape[0] < 420 or arr.shape[1] < 420:
+        raise AmbiguousRasterError("raster is too small for the public dial contract")
+
+    badge_mask = np.linalg.norm(arr - _BADGE_RGB, axis=2) < 5.0
+    components = [component for component in _components(badge_mask) if 3500 <= len(component) <= 9000]
+    if len(components) != 4:
+        raise AmbiguousRasterError(f"expected four complete numeral badges, found {len(components)}")
+
+    observations: list[tuple[str, float, float]] = []
+    for component in components:
+        ys, xs = component[:, 0], component[:, 1]
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if not (88 <= width <= 104 and 88 <= height <= 104):
+            raise AmbiguousRasterError(f"malformed numeral badge extent {(width, height)}")
+        bx, by = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        label = _read_label(arr, (bx, by), float(max(width, height)))
+        observations.append((label, bx, by))
+
+    labels = [item[0] for item in observations]
+    if sorted(labels) != sorted(("12", "3", "6", "9")):
+        raise AmbiguousRasterError(f"visible numeral inventory is invalid: {labels}")
+    center_x = sum(item[1] for item in observations) / 4.0
+    center_y = sum(item[2] for item in observations) / 4.0
+    by_label = {label: (x, y) for label, x, y in observations}
+
+    def angle(label: str) -> float:
+        x, y = by_label[label]
+        return math.degrees(math.atan2(y - center_y, x - center_x))
+
+    delta = (angle("3") - angle("12") + 180.0) % 360.0 - 180.0
+    clearance = min(abs(delta), 180.0 - abs(delta))
+    if clearance < 12.0:
+        raise AmbiguousRasterError(f"12-to-3 direction is angularly ambiguous (delta={delta:.2f})")
+    return "clockwise" if delta > 0 else "counterclockwise"

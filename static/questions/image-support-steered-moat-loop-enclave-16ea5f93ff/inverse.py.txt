@@ -1,0 +1,134 @@
+"""Image-only inverse arm for moat_loop_enclave.
+
+Receives a rendered PNG and nothing else. It segments the dark wall ink and the
+two coloured dots by generic colour predicates, labels the free space with a
+run-based union-find so that the whole wall trace is followed at once, marks
+every free component that touches the image border as outside, and reports the
+colour of the dot whose component is not border-reachable. It abstains whenever
+the two dots share a component, when either dot is missing, or when the wall ink
+is not one connected trace.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "moat_loop_enclave-oracle-0.1.0"
+ABSTAIN = "abstain"
+
+_DARK_MAX = 120       # walls are dark
+_DARK_SPREAD = 45     # ... and nearly achromatic
+_CHROMA_MIN = 60      # dots are strongly chromatic
+_MIN_DOT_PIXELS = 24
+
+
+def _masks(arr: np.ndarray):
+    r = arr[:, :, 0].astype(np.int16)
+    g = arr[:, :, 1].astype(np.int16)
+    b = arr[:, :, 2].astype(np.int16)
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    spread = mx - mn
+    wall = (mx < _DARK_MAX) & (spread < _DARK_SPREAD)
+    chroma = spread >= _CHROMA_MIN
+    warm = chroma & (r > b + 40) & (r >= g)
+    cool = chroma & (b > r) & (b > g + 30)
+    return wall, warm, cool
+
+
+def _label_free(free: np.ndarray):
+    """Run-based connected components of the free space (4-connectivity)."""
+    h, w = free.shape
+    parent: list[int] = []
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    rows = []
+    border_ids: set[int] = set()
+    for y in range(h):
+        line = free[y].astype(np.int8)
+        d = np.diff(np.concatenate(([0], line, [0])))
+        starts = np.flatnonzero(d == 1)
+        ends = np.flatnonzero(d == -1)
+        cur = []
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            rid = len(parent)
+            parent.append(rid)
+            cur.append((s, e, rid))
+            if y == 0 or y == h - 1 or s == 0 or e == w:
+                border_ids.add(rid)
+        if y:
+            prev = rows[-1]
+            i = j = 0
+            while i < len(prev) and j < len(cur):
+                ps, pe, pid = prev[i]
+                cs, ce, cid = cur[j]
+                if ps < ce and cs < pe:
+                    union(pid, cid)
+                if pe < ce:
+                    i += 1
+                else:
+                    j += 1
+        rows.append(cur)
+    return rows, find, border_ids
+
+
+def _run_at(rows, x: int, y: int):
+    for s, e, rid in rows[y]:
+        if s <= x < e:
+            return rid
+    return None
+
+
+def _centroid(mask: np.ndarray):
+    ys, xs = np.nonzero(mask)
+    if xs.size < _MIN_DOT_PIXELS:
+        return None
+    return int(round(xs.mean())), int(round(ys.mean()))
+
+
+def _one_component(mask: np.ndarray) -> bool:
+    rows, find, _ = _label_free(mask)
+    roots = {find(rid) for row in rows for _, _, rid in row}
+    return len(roots) == 1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    wall, warm, cool = _masks(arr)
+    if wall.sum() < 200:
+        return ABSTAIN
+    if not _one_component(wall):
+        return ABSTAIN
+
+    warm_c = _centroid(warm)
+    cool_c = _centroid(cool)
+    if warm_c is None or cool_c is None:
+        return ABSTAIN
+
+    free = ~wall
+    rows, find, border_ids = _label_free(free)
+    outside = {find(rid) for rid in border_ids}
+
+    verdicts = {}
+    for name, (cx, cy) in (("orange", warm_c), ("purple", cool_c)):
+        rid = _run_at(rows, cx, cy)
+        if rid is None:
+            return ABSTAIN
+        verdicts[name] = find(rid) not in outside  # True == enclosed
+
+    if verdicts["orange"] == verdicts["purple"]:
+        return ABSTAIN
+    return "orange" if verdicts["orange"] else "purple"

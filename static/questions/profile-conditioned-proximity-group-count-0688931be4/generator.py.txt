@@ -1,0 +1,260 @@
+"""Proximity-grouping world: how many groups do identical dots form?
+
+Latent scene z = {canvas, palette, dot_radius, dots, bar_px, bar_x, bar_y}.
+The image I = R(z) shows N identical dots plus a black reference bar of length
+``bar_px`` pixels. The declared rule (stated verbatim in every prompt family) is
+
+    dots i and j are linked  iff  ||p_i - p_j||_2 < bar_px
+    groups = connected components of that link graph
+
+so the answer is a property of the GLOBAL proximity graph, not of any dot.
+
+Counterbalancing: every scene contains exactly ``N_DOTS`` dots of one size and
+one colour, so total ink, dot count, colour and dot size carry no information
+about the answer. Only the spatial organisation does. The linking threshold is
+resampled per scene and is visible in the image as the reference bar, so no
+code-only constant enters the decision.
+
+Margin: m = min over all dot pairs of |d_ij - bar_px| (pixels). Scenes are
+sampled so that no pair distance sits in a forbidden band around the threshold;
+a deliberate minority of near-boundary scenes is generated and quarantined.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "proximity_group_count-0.1.0"
+
+CANVAS = 640
+N_DOTS = 14
+GROUP_CHOICES = (2, 3, 4, 5)
+
+# Threshold (reference-bar length) range in pixels; resampled per scene.
+BAR_MIN, BAR_MAX = 78, 96
+BAR_HEIGHT = 7
+BAR_CAP_HEIGHT = 19
+BAR_CAP_WIDTH = 3
+
+# Placement constants, all expressed as fractions of the threshold bar_px.
+MIN_SEP = 0.34  # dots never touch or crowd
+LINK_LO, LINK_HI = 0.42, 0.80  # chain step inside a group (always an edge)
+CLEAR_BAND = 0.16  # no pair distance within +-CLEAR_BAND * bar_px of threshold
+NEAR_BAND = 0.05  # relaxed band used for deliberate near-boundary scenes
+NEAR_LO, NEAR_HI = 0.055, 0.10  # planted near-threshold separation range
+
+QUARANTINE_BAND = 0.12  # |d - bar_px| < 0.12 * bar_px  =>  quarantined
+BOUNDARY_EVERY = 6  # one in six sampled scenes targets the boundary
+
+DOT_COLORS = ("#c8283c", "#1e7d8c", "#d2691e", "#7a3fb4", "#2e8b40", "#b0248c")
+BG_COLORS = ("#ffffff", "#f7f4ec", "#f2f5fa")
+DOT_RADII = (6, 7, 8)
+
+MARGIN_X = 44
+MARGIN_Y = 44
+DOT_MAX_Y = 548  # dots stay clear of the reference-bar strip
+BAR_Y = 596
+
+
+def _dist(a: list[float], b: list[float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _group_count(points: list, threshold: float) -> int:
+    """Connected components of the graph {i~j : ||p_i - p_j|| < threshold}."""
+    parent = list(range(len(points)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            if _dist(points[i], points[j]) < threshold:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+    return len({find(i) for i in range(len(points))})
+
+
+def _min_threshold_gap(points: list, threshold: float) -> float:
+    gaps = [
+        abs(_dist(points[i], points[j]) - threshold)
+        for i in range(len(points))
+        for j in range(i + 1, len(points))
+    ]
+    return min(gaps) if gaps else float(threshold)
+
+
+def _partition(total: int, parts: int, rng: random.Random) -> list[int]:
+    """Split ``total`` dots into ``parts`` groups of at least two dots each."""
+    sizes = [2] * parts
+    for _ in range(total - 2 * parts):
+        sizes[rng.randrange(parts)] += 1
+    return sizes
+
+
+def _acceptable(
+    point: list[float],
+    cluster: int,
+    dots: list,
+    labels: list[int],
+    bar_px: int,
+    band: float,
+) -> bool:
+    lo, hi = bar_px * (1.0 - band), bar_px * (1.0 + band)
+    for other, other_cluster in zip(dots, labels):
+        d = _dist(point, other)
+        if d < MIN_SEP * bar_px:
+            return False
+        if lo <= d <= hi:
+            return False
+        if other_cluster != cluster and d < bar_px:
+            return False
+    return True
+
+
+def _try_scene(rng: random.Random, groups: int, bar_px: int, boundary: bool) -> list | None:
+    band = NEAR_BAND if boundary else CLEAR_BAND
+    sizes = _partition(N_DOTS, groups, rng)
+    dots: list = []
+    labels: list[int] = []
+    for cluster, size in enumerate(sizes):
+        seeded = False
+        for _ in range(400):
+            if boundary and cluster == 1 and dots:
+                # Plant one cross-group pair just beyond the linking threshold.
+                anchor = dots[rng.randrange(len(dots))]
+                radius = bar_px * (1.0 + rng.uniform(NEAR_LO, NEAR_HI))
+                angle = rng.uniform(0.0, 2.0 * math.pi)
+                point = [anchor[0] + radius * math.cos(angle), anchor[1] + radius * math.sin(angle)]
+            else:
+                point = [
+                    rng.uniform(MARGIN_X, CANVAS - MARGIN_X),
+                    rng.uniform(MARGIN_Y, DOT_MAX_Y),
+                ]
+            if not (MARGIN_X <= point[0] <= CANVAS - MARGIN_X and MARGIN_Y <= point[1] <= DOT_MAX_Y):
+                continue
+            if _acceptable(point, cluster, dots, labels, bar_px, band):
+                dots.append(point)
+                labels.append(cluster)
+                seeded = True
+                break
+        if not seeded:
+            return None
+        for _ in range(size - 1):
+            placed = False
+            for _ in range(400):
+                own = [d for d, lab in zip(dots, labels) if lab == cluster]
+                anchor = own[rng.randrange(len(own))]
+                radius = bar_px * rng.uniform(LINK_LO, LINK_HI)
+                angle = rng.uniform(0.0, 2.0 * math.pi)
+                point = [anchor[0] + radius * math.cos(angle), anchor[1] + radius * math.sin(angle)]
+                if not (
+                    MARGIN_X <= point[0] <= CANVAS - MARGIN_X and MARGIN_Y <= point[1] <= DOT_MAX_Y
+                ):
+                    continue
+                if _acceptable(point, cluster, dots, labels, bar_px, band):
+                    dots.append(point)
+                    labels.append(cluster)
+                    placed = True
+                    break
+            if not placed:
+                return None
+    if _group_count(dots, bar_px) != groups:
+        return None
+    gap = _min_threshold_gap(dots, bar_px)
+    if boundary and not gap < QUARANTINE_BAND * bar_px:
+        return None
+    if not boundary and gap < QUARANTINE_BAND * bar_px:
+        return None
+    return [[round(x, 4), round(y, 4)] for x, y in dots]
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one latent scene."""
+    rng = random.Random(seed * 7919 + 13)
+    boundary = (seed % BOUNDARY_EVERY) == 3
+    groups = GROUP_CHOICES[seed % len(GROUP_CHOICES)]
+    for _ in range(240):
+        bar_px = rng.randrange(BAR_MIN, BAR_MAX + 1)
+        dots = _try_scene(rng, groups, bar_px, boundary)
+        if dots is None:
+            continue
+        bar_x = rng.randrange(MARGIN_X, CANVAS - MARGIN_X - bar_px)
+        return {
+            "width": CANVAS,
+            "height": CANVAS,
+            "bg_color": BG_COLORS[rng.randrange(len(BG_COLORS))],
+            "dot_color": DOT_COLORS[rng.randrange(len(DOT_COLORS))],
+            "dot_radius": DOT_RADII[rng.randrange(len(DOT_RADII))],
+            "dots": dots,
+            "bar_px": bar_px,
+            "bar_x": bar_x,
+            "bar_y": BAR_Y,
+        }
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+def render(scene: dict, supersample: int = 3) -> Image.Image:
+    """I = R(z). Dots are supersampled; the reference bar is drawn sharp so its
+    pixel length equals the declared threshold exactly."""
+    width, height = scene["width"], scene["height"]
+    ss = supersample
+    img = Image.new("RGB", (width * ss, height * ss), scene["bg_color"])
+    draw = ImageDraw.Draw(img)
+    radius = scene["dot_radius"]
+    color = scene["dot_color"]
+    for x, y in scene["dots"]:
+        draw.ellipse(
+            [(x - radius) * ss, (y - radius) * ss, (x + radius) * ss, (y + radius) * ss],
+            fill=color,
+        )
+    img = img.resize((width, height), Image.LANCZOS)
+
+    draw = ImageDraw.Draw(img)
+    x0, y0, length = scene["bar_x"], scene["bar_y"], scene["bar_px"]
+    draw.rectangle([x0, y0, x0 + length - 1, y0 + BAR_HEIGHT - 1], fill="#000000")
+    cap_top = y0 - (BAR_CAP_HEIGHT - BAR_HEIGHT) // 2
+    for cap_x in (x0, x0 + length - BAR_CAP_WIDTH):
+        draw.rectangle(
+            [cap_x, cap_top, cap_x + BAR_CAP_WIDTH - 1, cap_top + BAR_CAP_HEIGHT - 1],
+            fill="#000000",
+        )
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Number of proximity groups, as a decimal string."""
+    return str(_group_count(scene["dots"], scene["bar_px"]))
+
+
+def margin(scene: dict) -> float:
+    """m = min_{i<j} |d_ij - bar_px| in pixels: how far the nearest pair sits
+    from the visible linking threshold. m -> 0 is the ambiguity event."""
+    return round(_min_threshold_gap(scene["dots"], scene["bar_px"]), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Near-threshold scenes: a pair distance within 12% of the bar length."""
+    return margin(scene) < QUARANTINE_BAND * scene["bar_px"]
+
+
+def latent_symmetries(scene: dict):
+    """Declared pixel-identical latent aliases.
+
+    The dot list is an unordered set: dots are pairwise disjoint (enforced
+    separation >= 0.34 * bar_px > 2 * dot_radius) and share one colour, so any
+    permutation of ``dots`` paints exactly the same pixels, and the group count
+    is permutation-invariant by construction. Two nontrivial permutations are
+    exercised."""
+    dots = scene["dots"]
+    shift = max(1, len(dots) // 3)
+    rotated = dict(scene, dots=dots[shift:] + dots[:shift])
+    reversed_scene = dict(scene, dots=list(reversed(dots)))
+    return [("dot_order_rotation", rotated), ("dot_order_reversal", reversed_scene)]

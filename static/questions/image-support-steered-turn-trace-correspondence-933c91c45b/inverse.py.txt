@@ -1,0 +1,133 @@
+"""Independent image-only inverse arm for the turn-trace world."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+CORE = (0, 0, 0)
+GOLD = (226, 174, 43)
+PALE = (170, 220, 214)
+END = (143, 105, 181)
+TAG_COLORS = {
+    "red": (210, 67, 62),
+    "green": (48, 151, 101),
+    "blue": (55, 103, 184),
+}
+
+
+def _mask(array: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    return np.all(array == np.asarray(color, dtype=np.uint8), axis=2)
+
+
+def _dilate(mask: np.ndarray, rounds: int = 2) -> np.ndarray:
+    result = mask.copy()
+    for _ in range(rounds):
+        padded = np.pad(result, 1)
+        expanded = np.zeros_like(result)
+        for dy in range(3):
+            for dx in range(3):
+                expanded |= padded[dy : dy + result.shape[0], dx : dx + result.shape[1]]
+        result = expanded
+    return result
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny in range(max(0, cy - 1), min(height, cy + 2)):
+                for nx in range(max(0, cx - 1), min(width, cx + 2)):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _single_center(array: np.ndarray, color: tuple[int, int, int]) -> tuple[float, float]:
+    points = np.argwhere(_mask(array, color))
+    if len(points) < 25:
+        raise ValueError("required colored tag is missing")
+    y, x = points.mean(axis=0)
+    return float(x), float(y)
+
+
+def _marker_centers(array: np.ndarray, color: tuple[int, int, int], expected: int) -> list[tuple[float, float]]:
+    original = _mask(array, color)
+    grown = _dilate(original, 2)
+    centers: list[tuple[float, float]] = []
+    for component in _components(grown):
+        if len(component) < 20:
+            continue
+        y0, x0 = component.min(axis=0)
+        y1, x1 = component.max(axis=0)
+        local = original[y0 : y1 + 1, x0 : x1 + 1]
+        points = np.argwhere(local)
+        if len(points) < 15:
+            continue
+        y, x = points.mean(axis=0)
+        centers.append((float(x + x0), float(y + y0)))
+    if len(centers) != expected:
+        raise ValueError(f"expected {expected} visible landmarks, found {len(centers)}")
+    return sorted(centers)
+
+
+def _turn_signature(points: list[tuple[float, float]]) -> tuple[int, int, int]:
+    if len(points) != 5:
+        raise ValueError("a section must expose five ordered landmarks")
+    vectors = [(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1]) for i in range(4)]
+    turns: list[int] = []
+    for first, second in zip(vectors, vectors[1:]):
+        cross = first[0] * second[1] - first[1] * second[0]
+        if abs(cross) < 80.0:
+            raise ValueError("a bend is too close to the visible straight boundary")
+        turns.append(1 if cross > 0 else -1)
+    return tuple(turns)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+    # The route must remain one connected thin raster component. Grid erasures
+    # through any interior portion therefore cause abstention before matching.
+    core_components = [part for part in _components(_mask(array, CORE)) if len(part) >= 8]
+    if len(core_components) != 1 or len(core_components[0]) < 350:
+        raise ValueError("the continuous route is broken or missing")
+
+    tagged = [("gold", _single_center(array, GOLD))]
+    tagged.extend((name, _single_center(array, color)) for name, color in TAG_COLORS.items())
+    tagged.sort(key=lambda item: item[1][0])
+    if tagged[0][0] != "gold":
+        raise ValueError("the gold reference must be the first route section")
+
+    ends = _marker_centers(array, END, 4)
+    bends = _marker_centers(array, PALE, 12)
+    signatures: list[tuple[str, tuple[int, int, int]]] = []
+    for index, (name, start) in enumerate(tagged):
+        end = ends[index]
+        if end[0] <= start[0] + 45:
+            raise ValueError("section endpoint is not visibly separated from its tag")
+        interior = [point for point in bends if start[0] + 4 < point[0] < end[0] - 4]
+        if len(interior) != 3:
+            raise ValueError("section does not contain exactly three ordered bend pegs")
+        interior.sort(key=lambda point: point[0])
+        signatures.append((name, _turn_signature([start, *interior, end])))
+
+    reference = signatures[0][1]
+    matches = [name for name, signature in signatures[1:] if signature == reference]
+    if len(matches) != 1:
+        raise ValueError("pixel trace does not yield one unique correspondence")
+    return matches[0]

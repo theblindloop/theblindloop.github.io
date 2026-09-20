@@ -1,0 +1,143 @@
+"""Pixel-only inverse arm for the speckle-disparity world.
+
+Receives one rendered image and nothing else. It locates the coloured
+fiducials (two plate frames and the two gauge ticks), reads the printed slide
+distance from the gauge, executes the declared comparison between the plates
+cell by cell, and names the nearest of the five declared symbols.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+GRID = 7
+DOTS_PER_CELL = 7
+SYMBOLS: tuple[str, ...] = ("crescent", "funnel", "pinwheel", "spiral", "staircase")
+
+_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "crescent": ("..###..", ".##....", ".#.....", ".#.....", ".#.....", ".##....", "..###.."),
+    "funnel": ("#######", ".#####.", "..###..", "...#...", "...#...", "...#...", "..###.."),
+    "pinwheel": ("##.....", "##.....", "##.####", "...#...", "####.##", ".....##", ".....##"),
+    "spiral": (".#####.", ".#.....", ".#.###.", ".#.#.#.", ".#...#.", ".#####.", "......."),
+    "staircase": (".....##", ".....#.", "...###.", "...#...", ".###...", ".#.....", "##....."),
+}
+
+ABSTAIN = "abstain"
+MIN_CELL_CONFIDENCE = 0.12
+
+
+def _template(name: str) -> np.ndarray:
+    return np.array([[1 if ch == "#" else 0 for ch in row] for row in _TEMPLATES[name]], dtype=np.int8)
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            runs.append((start, index - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(flags) - 1))
+    return runs
+
+
+def _chromatic(arr: np.ndarray) -> np.ndarray:
+    hi = arr.max(axis=2).astype(np.int16)
+    lo = arr.min(axis=2).astype(np.int16)
+    return (hi - lo) > 45
+
+
+def _recovered_mask(image: Image.Image):
+    """Execute the declared comparison; return the 7x7 slid-cell mask or None."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    colour = _chromatic(arr)
+    row_bands = _runs(colour.any(axis=1))
+    if len(row_bands) < 2:
+        return None
+    gauge_band = row_bands[0]
+    plate_band = max(row_bands[1:], key=lambda band: band[1] - band[0])
+
+    gauge_cols = _runs(colour[gauge_band[0] : gauge_band[1] + 1].any(axis=0))
+    if len(gauge_cols) != 2:
+        return None
+    shift = gauge_cols[1][0] - gauge_cols[0][0]
+    if shift <= 0:
+        return None
+
+    plate = colour[plate_band[0] : plate_band[1] + 1]
+    plate_cols = _runs(plate.any(axis=0))
+    if len(plate_cols) != 2:
+        return None
+
+    fields = []
+    for left_col, right_col in plate_cols:
+        top, bottom = plate_band
+        # Step inward from the frame until the coloured border stops.
+        col_flags = colour[top : bottom + 1, left_col : right_col + 1]
+        border = 0
+        while border < 12 and col_flags[:, border].all():
+            border += 1
+        x0, x1 = left_col + border, right_col - border
+        y0, y1 = top + border, bottom - border
+        interior = arr[y0 : y1 + 1, x0 : x1 + 1]
+        if interior.shape[0] < GRID * DOTS_PER_CELL or interior.shape[1] < GRID * DOTS_PER_CELL:
+            return None
+        grey = interior.mean(axis=2)
+        mid = 0.5 * (float(grey.min()) + float(grey.max()))
+        side = GRID * DOTS_PER_CELL
+        dot = interior.shape[0] / side
+        ys = (np.arange(side) * dot + dot / 2).astype(int)
+        xs = (np.arange(side) * dot + dot / 2).astype(int)
+        fields.append((grey[np.ix_(ys, xs)] < mid).astype(np.int8))
+        if not fields[-1].any() or fields[-1].all():
+            return None
+        dot_px = dot
+
+    left, right = fields
+    shift_dots = int(round(shift / dot_px))
+    if shift_dots <= 0 or shift_dots >= DOTS_PER_CELL:
+        return None
+    slid_source = np.roll(left, -shift_dots, axis=1)
+
+    mask = np.zeros((GRID, GRID), dtype=np.int8)
+    confidence = 1.0
+    for row in range(GRID):
+        for col in range(GRID):
+            sl = (
+                slice(row * DOTS_PER_CELL, (row + 1) * DOTS_PER_CELL),
+                slice(col * DOTS_PER_CELL, (col + 1) * DOTS_PER_CELL),
+            )
+            block = right[sl]
+            plain = float(np.mean(block == left[sl]))
+            slid = float(np.mean(block == slid_source[sl]))
+            mask[row, col] = 1 if slid > plain else 0
+            confidence = min(confidence, abs(slid - plain))
+    if confidence < MIN_CELL_CONFIDENCE:
+        return None
+    return mask
+
+
+def decision_from_image(image: Image.Image) -> str:
+    mask = _recovered_mask(image)
+    if mask is None:
+        return ABSTAIN
+    scored = sorted(
+        (float(np.sum(mask != _template(name))), name) for name in SYMBOLS
+    )
+    if scored[1][0] - scored[0][0] <= 0:
+        return ABSTAIN
+    return scored[0][1]
+
+
+def decision_and_margin_from_image(image: Image.Image) -> tuple[str, float]:
+    """Image-only decision plus the runner-up template gap it was decided by."""
+    decision = decision_from_image(image)
+    if decision == ABSTAIN:
+        return ABSTAIN, 0.0
+    mask = _recovered_mask(image)
+    scored = sorted((float(np.sum(mask != _template(name))), name) for name in SYMBOLS)
+    return decision, scored[1][0] - scored[0][0]

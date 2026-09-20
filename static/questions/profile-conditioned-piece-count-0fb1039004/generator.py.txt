@@ -1,0 +1,247 @@
+"""Connected-piece-count world renderer.
+
+Each scene is a set of thick dark line pieces (polylines) drawn on a white
+background. Two segments count as part of the SAME piece when their rendered
+ink is connected (an endpoint touching or a crossing). The decision is the
+number of distinct connected pieces = the number of 4-connected components of
+the ink mask.
+
+The scene is a plain dict so the verifier's AST reachability audit is free of
+side effects.
+
+    z = {
+        "pieces": [[[x0,y0],[x1,y1],...], ...],   # one polyline per connected piece
+        "color": "black",
+        "width": 400,
+        "height": 400,
+        "background": "white",
+    }
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections.abc import Iterator
+
+from PIL import Image, ImageDraw
+
+import numpy as np
+
+RENDERER_VERSION = "piece_count-0.4.0"
+
+MAX_PIECES = 4
+MIN_SEGMENTS = 1
+MAX_SEGMENTS = 3
+LINE_WIDTH = 8.0            # final on-raster stroke width (px)
+CLEARANCE_MIN = 16.0        # minimum centerline gap between pieces (px)
+QUARANTINE_MIN = 16.0       # below this clearance the component split is fragile
+_MARGIN = 34.0              # keep pieces away from the picture border
+_SS = 3                     # supersampling factor
+
+
+def _seg_point_dist(ax, ay, bx, by, px, py):
+    dx, dy = bx - ax, by - ay
+    length2 = dx * dx + dy * dy
+    if length2 == 0.0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _seg_seg_distance(a, b, c, d):
+    """Euclidean distance between two closed segments (a-b) and (c-d)."""
+    best = min(
+        _seg_point_dist(a[0], a[1], b[0], b[1], c[0], c[1]),
+        _seg_point_dist(a[0], a[1], b[0], b[1], d[0], d[1]),
+        _seg_point_dist(c[0], c[1], d[0], d[1], a[0], a[1]),
+        _seg_point_dist(c[0], c[1], d[0], d[1], b[0], b[1]),
+    )
+    return best
+
+
+def _piece_segments(piece):
+    for i in range(len(piece) - 1):
+        yield (piece[i], piece[i + 1])
+
+
+def _within_bounds(pt, width, height):
+    x, y = pt
+    return _MARGIN <= x <= width - _MARGIN and _MARGIN <= y <= height - _MARGIN
+
+
+def _sample_piece(rng, width, height):
+    """A random connected polyline fully inside the canvas."""
+    n_pts = rng.randint(2, 5)
+    pts = []
+    for _ in range(400):
+        pts = []
+        x = rng.uniform(_MARGIN, width - _MARGIN)
+        y = rng.uniform(_MARGIN, height - _MARGIN)
+        pts.append([x, y])
+        angle = rng.uniform(0.0, 2.0 * math.pi)
+        ok = True
+        for _ in range(n_pts - 1):
+            angle += rng.uniform(-1.0, 1.0)
+            length = rng.uniform(35.0, 70.0)
+            x += length * math.cos(angle)
+            y += length * math.sin(angle)
+            pt = [x, y]
+            if not _within_bounds(pt, width, height):
+                ok = False
+                break
+            pts.append(pt)
+        if ok:
+            return pts
+    return pts or [[_MARGIN, _MARGIN], [width - _MARGIN, height - _MARGIN]]
+
+
+def _ink_component_count(scene: dict) -> int:
+    """Number of 4-connected ink components of the rendered scene.
+
+    Detected on the supersampled mask so it stays consistent with the pixel
+    oracle's threshold; used to guarantee that distinct pieces never merge.
+    """
+    img = render(scene, supersample=_SS)
+    arr = np.array(img)
+    ink = arr.min(axis=-1) < 210
+    h, w = ink.shape
+    seen = np.zeros_like(ink, dtype=bool)
+    count = 0
+    for y in range(h):
+        for x in range(w):
+            if ink[y, x] and not seen[y, x]:
+                count += 1
+                seen[y, x] = True
+                stack = [(x, y)]
+                while stack:
+                    cx, cy = stack.pop()
+                    for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                        if (
+                            0 <= nx < w
+                            and 0 <= ny < h
+                            and ink[ny, nx]
+                            and not seen[ny, nx]
+                        ):
+                            seen[ny, nx] = True
+                            stack.append((nx, ny))
+    return count
+
+
+def sample_scene(
+    rng: random.Random,
+    n_pieces: int | None = None,
+    width: int = 400,
+    height: int = 400,
+) -> dict:
+    """Sample 1..MAX_PIECES connected pieces, mutually well separated.
+
+    A candidate is accepted only when its rendered ink contains exactly
+    ``n_pieces`` connected components, so distinct pieces can never be bridged by
+    rasterization or antialiasing and the pixel oracle always agrees.
+    """
+    if n_pieces is None:
+        n_pieces = rng.randint(1, MAX_PIECES)
+    pieces: list[list[list[float]]] = []
+    for attempt in range(4000):
+        candidate = [_sample_piece(rng, width, height) for _ in range(n_pieces)]
+        scene = {
+            "pieces": candidate,
+            "color": "black",
+            "width": width,
+            "height": height,
+            "background": "white",
+        }
+        if _ink_component_count(scene) == n_pieces:
+            pieces = candidate
+            break
+    if not pieces:
+        pieces = [_sample_piece(rng, width, height) for _ in range(n_pieces)]
+    return {
+        "pieces": pieces,
+        "color": "black",
+        "width": width,
+        "height": height,
+        "background": "white",
+    }
+
+
+def _min_clearance(pieces):
+    """Minimum centerline distance between any two segments of different pieces."""
+    if len(pieces) < 2:
+        return float("inf")
+    best = float("inf")
+    all_seg = []
+    for idx, piece in enumerate(pieces):
+        for seg in _piece_segments(piece):
+            all_seg.append((idx, seg))
+    for i in range(len(all_seg)):
+        ia, sa = all_seg[i]
+        for j in range(i + 1, len(all_seg)):
+            ib, sb = all_seg[j]
+            if ia == ib:
+                continue
+            dist = _seg_seg_distance(sa[0], sa[1], sb[0], sb[1])
+            if dist < best:
+                best = dist
+    return best
+
+
+def render(scene: dict, supersample: int = _SS) -> Image.Image:
+    """Render I = R(z). Deterministic pure function of the scene dict."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    background = scene["background"]
+    color = scene["color"]
+    pieces = scene["pieces"]
+    ss = supersample
+    img = Image.new("RGB", (width * ss, height * ss), background)
+    draw = ImageDraw.Draw(img)
+    line_width = max(1, int(round(LINE_WIDTH * ss)))
+    for piece in pieces:
+        pts = [(p[0] * ss, p[1] * ss) for p in piece]
+        if len(pts) == 1:
+            r = line_width // 2
+            (px, py) = pts[0]
+            draw.ellipse([px - r, py - r, px + r, py + r], fill=color)
+        else:
+            draw.line(pts, fill=color, width=line_width, joint="curve")
+    if ss > 1:
+        img = img.resize((width, height), Image.LANCZOS)
+    return img
+
+
+def analytic_gold(scene: dict) -> int:
+    """Number of connected pieces = number of components of the ink network."""
+    return len(scene["pieces"])
+
+
+def margin(scene: dict) -> float:
+    """Robustness margin: the thinnest ink gap guarding any component split.
+
+    Reported as the minimum centerline clearance between two segments of
+    different pieces; a small value denotes a scene whose component count is
+    fragile at pixel scale (quarantined by ``is_quarantined``).
+    """
+    clear = _min_clearance(scene["pieces"])
+    if not math.isfinite(clear):
+        return float(400.0)
+    return float(clear)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine scenes whose pieces are too close to trust the split."""
+    clear = _min_clearance(scene["pieces"])
+    if clear < QUARANTINE_MIN:
+        return True
+    return False
+
+
+def latent_symmetries(scene: dict) -> Iterator[dict]:
+    """No nontrivial render symmetry: every field directly changes the picture.
+
+    Reordering the piece list is a numerically identical parametrization (same
+    pixels, same count) but the world keeps a canonical order; declared
+    not_applicable.
+    """
+    return iter(())

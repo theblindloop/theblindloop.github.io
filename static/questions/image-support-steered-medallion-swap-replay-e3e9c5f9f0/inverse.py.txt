@@ -1,0 +1,189 @@
+"""Pixel-only oracle for the medallion swap-replay world.
+
+The oracle receives a rendered RGB image and nothing else. It isolates the
+saturated pixels, robustly fits the medallion's circle, classifies every
+saturated pixel by hue into one of the five named colours, reads the radial
+sequence of left-half and right-half colours as a majority over the surviving
+pixels of each half, and replays the swap rules from the central disk outwards.
+
+It imports no renderer, prompt, generator, verifier or analytic-gold code and
+never sees latent scene data.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "medallion_swap_replay-oracle-0.1.0"
+
+# Public contract: the five nameable colours, as hue anchors in degrees.
+_HUE_ANCHORS = (
+    ("red", 0.0),
+    ("orange", 33.0),
+    ("green", 132.0),
+    ("blue", 225.0),
+    ("purple", 281.0),
+)
+_HUE_TOLERANCE = 15.0
+_SATURATION = 45
+_MIN_PIXELS = 250
+_MIN_RUN = 2
+_RINGS = 4
+
+
+def _hue_labels(rgb: np.ndarray) -> np.ndarray:
+    """Label saturated pixels by nearest hue anchor; -1 when no anchor fits."""
+    values = rgb.astype(np.float64)
+    high = values.max(axis=1)
+    low = values.min(axis=1)
+    delta = np.maximum(high - low, 1e-6)
+    red, green, blue = values[:, 0], values[:, 1], values[:, 2]
+    hue = np.zeros(len(values), dtype=np.float64)
+    is_red = high == red
+    is_green = (high == green) & ~is_red
+    is_blue = ~is_red & ~is_green
+    hue[is_red] = 60.0 * (((green - blue)[is_red] / delta[is_red]) % 6.0)
+    hue[is_green] = 60.0 * (2.0 + (blue - red)[is_green] / delta[is_green])
+    hue[is_blue] = 60.0 * (4.0 + (red - green)[is_blue] / delta[is_blue])
+    hue %= 360.0
+
+    best = np.full(len(values), -1, dtype=np.int64)
+    best_gap = np.full(len(values), 1e9, dtype=np.float64)
+    for index, (_name, anchor) in enumerate(_HUE_ANCHORS):
+        gap = np.abs(((hue - anchor + 180.0) % 360.0) - 180.0)
+        closer = gap < best_gap
+        best_gap = np.where(closer, gap, best_gap)
+        best = np.where(closer, index, best)
+    best[best_gap > _HUE_TOLERANCE] = -1
+    return best
+
+
+def _fit_circle(points: np.ndarray) -> tuple[float, float, float]:
+    """Algebraic circle fit with outlier rejection, tolerant of a clipped disk."""
+    active = points
+    centre_x = centre_y = radius = 0.0
+    for round_index in range(4):
+        if len(active) < 12:
+            raise ValueError("too few boundary pixels for a circle fit")
+        x = active[:, 1].astype(np.float64)
+        y = active[:, 0].astype(np.float64)
+        design = np.stack([x, y, np.ones_like(x)], axis=1)
+        target = -(x * x + y * y)
+        solution, *_ = np.linalg.lstsq(design, target, rcond=None)
+        centre_x = -solution[0] / 2.0
+        centre_y = -solution[1] / 2.0
+        squared = centre_x * centre_x + centre_y * centre_y - solution[2]
+        if squared <= 1.0:
+            raise ValueError("degenerate circle fit")
+        radius = math.sqrt(squared)
+        if round_index == 3:
+            break
+        distance = np.hypot(x - centre_x, y - centre_y)
+        keep = np.abs(distance - radius) <= 2.5
+        if keep.sum() < max(12, int(0.25 * len(active))):
+            break
+        active = active[keep]
+    return centre_x, centre_y, radius
+
+
+def _runs(labels: dict[int, int], limit: int) -> list[tuple[int, int]]:
+    """Run-length encode the radial label sequence, skipping empty radii."""
+    encoded: list[list[int]] = []
+    for radius in range(limit + 1):
+        label = labels.get(radius)
+        if label is None:
+            continue
+        if encoded and encoded[-1][0] == label:
+            encoded[-1][1] += 1
+        else:
+            encoded.append([label, 1])
+    return [(label, length) for label, length in encoded if length >= _MIN_RUN]
+
+
+def _half_profile(
+    radii: np.ndarray, labels: np.ndarray, limit: int
+) -> dict[int, int]:
+    """Majority colour label per integer radius over one half of the medallion."""
+    profile: dict[int, int] = {}
+    if not len(radii):
+        return profile
+    bins = np.rint(radii).astype(np.int64)
+    valid = (labels >= 0) & (bins <= limit)
+    bins = bins[valid]
+    labels = labels[valid]
+    if not len(bins):
+        return profile
+    counts = np.zeros((limit + 1, len(_HUE_ANCHORS)), dtype=np.int64)
+    np.add.at(counts, (bins, labels), 1)
+    totals = counts.sum(axis=1)
+    for radius in range(limit + 1):
+        if totals[radius] >= 3:
+            profile[radius] = int(counts[radius].argmax())
+    return profile
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    saturation = array.max(axis=2) - array.min(axis=2)
+    mask = saturation > _SATURATION
+    if int(mask.sum()) < _MIN_PIXELS:
+        raise ValueError("no medallion: too few saturated pixels")
+
+    interior = np.zeros_like(mask)
+    interior[1:-1, 1:-1] = (
+        mask[1:-1, 1:-1]
+        & mask[:-2, 1:-1]
+        & mask[2:, 1:-1]
+        & mask[1:-1, :-2]
+        & mask[1:-1, 2:]
+    )
+    boundary = np.argwhere(mask & ~interior)
+    centre_x, centre_y, radius = _fit_circle(boundary)
+
+    points = np.argwhere(mask)
+    # Integrity check: the medallion must be wholly visible. Any missing sector
+    # of its outer rim means the evidence is occluded or erased, and the oracle
+    # abstains rather than replaying a partially visible rule stack.
+    rim_outer = radius - 0.5
+    rim_inner = max(1.0, radius - 2.5)
+    rim_expected = math.pi * (rim_outer * rim_outer - rim_inner * rim_inner)
+    rim_distance = np.hypot(
+        points[:, 1].astype(np.float64) - centre_x, points[:, 0].astype(np.float64) - centre_y
+    )
+    rim_observed = int(((rim_distance >= rim_inner) & (rim_distance <= rim_outer)).sum())
+    if rim_expected <= 0.0 or rim_observed / rim_expected < 0.95:
+        raise ValueError("medallion rim is incomplete: occluded or erased evidence")
+
+    dy = points[:, 0].astype(np.float64) - centre_y
+    dx = points[:, 1].astype(np.float64) - centre_x
+    distance = np.hypot(dx, dy)
+    labels = _hue_labels(array[points[:, 0], points[:, 1]])
+    limit = int(math.floor(radius - 0.5))
+    if limit < 8:
+        raise ValueError("medallion too small to read")
+
+    left = dx < -0.5
+    right = dx > 0.5
+    left_runs = _runs(_half_profile(distance[left], labels[left], limit), limit)
+    right_runs = _runs(_half_profile(distance[right], labels[right], limit), limit)
+    if len(left_runs) != _RINGS + 1 or len(right_runs) != _RINGS + 1:
+        raise ValueError(
+            f"unreadable radial structure: {len(left_runs)} left, {len(right_runs)} right runs"
+        )
+    if left_runs[0][0] != right_runs[0][0]:
+        raise ValueError("central disk colour is ambiguous between the two halves")
+
+    carried = left_runs[0][0]
+    for index in range(1, _RINGS + 1):
+        left_label = left_runs[index][0]
+        right_label = right_runs[index][0]
+        if left_label == right_label:
+            raise ValueError(f"ring {index} does not show two different colours")
+        if carried == left_label:
+            carried = right_label
+        elif carried == right_label:
+            carried = left_label
+    return _HUE_ANCHORS[carried][0]

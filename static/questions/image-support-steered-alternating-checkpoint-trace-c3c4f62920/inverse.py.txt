@@ -1,0 +1,160 @@
+"""Independent pixel-only inverse arm for the alternating checkpoint trace.
+
+The implementation knows only the public visual contract and broad palette
+families.  It segments the raster, validates a single connected dark route,
+projects six independently found checkpoint components onto that route, and
+orders them by image-derived graph distance from the blue port.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    records: list[np.ndarray] = []
+    for y_raw, x_raw in np.argwhere(mask):
+        y, x = int(y_raw), int(x_raw)
+        if seen[y, x]:
+            continue
+        queue = [(y, x)]
+        seen[y, x] = True
+        points = []
+        while queue:
+            cy, cx = queue.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        records.append(np.asarray(points, dtype=np.int32))
+    return records
+
+
+def _single_component(mask: np.ndarray, name: str, area_min: int, area_max: int) -> np.ndarray:
+    components = _components(mask)
+    if len(components) != 1:
+        raise OracleAbstention(f"expected one {name} component, found {len(components)}")
+    points = components[0]
+    if not area_min <= len(points) <= area_max:
+        raise OracleAbstention(f"{name} area {len(points)} outside [{area_min}, {area_max}]")
+    return points
+
+
+def _nearest_route(route_points: np.ndarray, center_yx: np.ndarray) -> tuple[int, int, float]:
+    delta = route_points.astype(np.float64) - center_yx[None, :]
+    squared = np.sum(delta * delta, axis=1)
+    index = int(np.argmin(squared))
+    y, x = route_points[index]
+    return int(y), int(x), float(np.sqrt(squared[index]))
+
+
+def _graph_distances(route: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = route.shape
+    distance = np.full(route.shape, -1, dtype=np.int32)
+    queue: deque[tuple[int, int]] = deque([start])
+    distance[start] = 0
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distance[y, x]) + 1
+        for ny, nx in (
+            (y - 1, x),
+            (y + 1, x),
+            (y, x - 1),
+            (y, x + 1),
+            (y - 1, x - 1),
+            (y - 1, x + 1),
+            (y + 1, x - 1),
+            (y + 1, x + 1),
+        ):
+            if 0 <= ny < height and 0 <= nx < width and route[ny, nx] and distance[ny, nx] < 0:
+                distance[ny, nx] = next_distance
+                queue.append((ny, nx))
+    return distance
+
+
+def _checkpoint_records(mask: np.ndarray, name: str) -> list[tuple[str, np.ndarray]]:
+    records = []
+    for points in _components(mask):
+        if not 160 <= len(points) <= 240:
+            raise OracleAbstention(f"{name} checkpoint area {len(points)} is ambiguous")
+        records.append((name, points))
+    return records
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.ndim != 3 or array.shape[0] < 300 or array.shape[1] < 400:
+        raise OracleAbstention("unexpected raster size")
+    red_channel, green_channel, blue_channel = array[..., 0], array[..., 1], array[..., 2]
+
+    route = (red_channel < 80) & (green_channel < 90) & (blue_channel < 120)
+    blue_port = (blue_channel > 150) & (blue_channel > red_channel + 80) & (blue_channel > green_channel + 55)
+    orange_port = (red_channel > 190) & (green_channel > 85) & (green_channel < 175) & (blue_channel < 90)
+    red_markers = (red_channel > 165) & (green_channel < 100) & (blue_channel < 125)
+    green_markers = (green_channel > 120) & (red_channel < 90) & (blue_channel < 135)
+
+    route_components = sorted(_components(route), key=len, reverse=True)
+    if (
+        not route_components
+        or not 8000 <= len(route_components[0]) <= 18000
+        or len(route_components) > 3
+        or any(len(points) > 150 for points in route_components[1:])
+    ):
+        raise OracleAbstention("dark route is missing, broken, or not unique")
+    # The two colored endpoint rings visibly cross the final few dark pixels,
+    # leaving a tiny dark centre stub inside each ring.  Only the unique large
+    # component is the route used for ordering.
+    route_points = route_components[0]
+    start_points = _single_component(blue_port, "blue port", 300, 520)
+    finish_points = _single_component(orange_port, "orange port", 300, 520)
+    checkpoints = _checkpoint_records(red_markers, "red") + _checkpoint_records(green_markers, "green")
+    if len(checkpoints) != 6:
+        raise OracleAbstention(f"expected six checkpoints, found {len(checkpoints)}")
+    if sum(name == "red" for name, _ in checkpoints) != 3:
+        raise OracleAbstention("checkpoint colors are not counterbalanced")
+
+    start_center = start_points.mean(axis=0)
+    finish_center = finish_points.mean(axis=0)
+    start_y, start_x, start_gap = _nearest_route(route_points, start_center)
+    finish_y, finish_x, finish_gap = _nearest_route(route_points, finish_center)
+    if not 10.0 <= start_gap <= 20.0 or not 10.0 <= finish_gap <= 20.0:
+        raise OracleAbstention("a port is detached from the route endpoint")
+
+    distances = _graph_distances(route, (start_y, start_x))
+    finish_distance = int(distances[finish_y, finish_x])
+    if finish_distance < 800:
+        raise OracleAbstention("route is too short or folds onto itself ambiguously")
+    maximum_distance = int(distances[route].max())
+    if maximum_distance - finish_distance > 12:
+        raise OracleAbstention("orange port is not at the opposite route endpoint")
+
+    ordered = []
+    for name, points in checkpoints:
+        center = points.mean(axis=0)
+        y, x, gap = _nearest_route(route_points, center)
+        # Gap is measured to the outer edge of the nine-pixel route, not its
+        # centerline; the marker center is rendered fourteen pixels away.
+        if not 7.0 <= gap <= 14.0:
+            raise OracleAbstention(f"{name} checkpoint attachment gap {gap:.2f} is ambiguous")
+        along = int(distances[y, x])
+        if along < 0:
+            raise OracleAbstention("checkpoint projects onto an unreachable route pixel")
+        ordered.append((along, name))
+    ordered.sort()
+    if any(right[0] - left[0] < 55 for left, right in zip(ordered, ordered[1:])):
+        raise OracleAbstention("checkpoint order lacks a stable pixel margin")
+    if ordered[0][0] < 60 or finish_distance - ordered[-1][0] < 60:
+        raise OracleAbstention("an endpoint checkpoint lacks clearance")
+
+    word = [name for _, name in ordered]
+    return "yes" if all(left != right for left, right in zip(word, word[1:])) else "no"

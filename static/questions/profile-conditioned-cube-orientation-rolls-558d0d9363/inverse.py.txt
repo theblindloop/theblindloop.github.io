@@ -1,0 +1,178 @@
+"""Independent PNG-only inverse arm for six-face cube roll replay."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_FACE_A = np.array((220, 244, 241), dtype=np.int16)
+_FACE_B = np.array((229, 239, 250), dtype=np.int16)
+_CARD = np.array((252, 239, 213), dtype=np.int16)
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _near(arr: np.ndarray, color: np.ndarray, tolerance: float = 13.0) -> np.ndarray:
+    return np.linalg.norm(arr.astype(np.int16) - color, axis=2) <= tolerance
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(values)
+    if not len(indices):
+        return []
+    breaks = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.r_[indices[0], indices[breaks + 1]]
+    ends = np.r_[indices[breaks], indices[-1]]
+    return [(int(a), int(b)) for a, b in zip(starts, ends, strict=True)]
+
+
+def _rect_components(mask: np.ndarray, minimum_area: int) -> list[tuple[int, int, int, int]]:
+    """Find separated rectangular fill islands using only projection runs."""
+    boxes: list[tuple[int, int, int, int]] = []
+    for y0, y1 in _runs(mask.any(axis=1)):
+        for x0, x1 in _runs(mask[y0 : y1 + 1].any(axis=0)):
+            area = int(mask[y0 : y1 + 1, x0 : x1 + 1].sum())
+            if area >= minimum_area:
+                boxes.append((x0, y0, x1, y1))
+    return boxes
+
+
+def _blob_areas(mask: np.ndarray, minimum_area: int) -> list[int]:
+    """Eight-connected components in a small cell crop, independent of layout."""
+    remaining = mask.copy()
+    height, width = remaining.shape
+    areas: list[int] = []
+    for start_y, start_x in zip(*np.nonzero(remaining), strict=True):
+        if not remaining[start_y, start_x]:
+            continue
+        remaining[start_y, start_x] = False
+        queue = deque([(int(start_y), int(start_x))])
+        area = 0
+        while queue:
+            y, x = queue.popleft()
+            area += 1
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if remaining[ny, nx]:
+                        remaining[ny, nx] = False
+                        queue.append((ny, nx))
+        if area >= minimum_area:
+            areas.append(area)
+    return areas
+
+
+def _box_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
+def _count_face_pips(
+    dark: np.ndarray, box: tuple[int, int, int, int]
+) -> tuple[int, float]:
+    x0, y0, x1, y1 = box
+    pad = max(7, round(min(x1 - x0 + 1, y1 - y0 + 1) * 0.11))
+    crop = dark[y0 + pad : y1 - pad + 1, x0 + pad : x1 - pad + 1]
+    areas = _blob_areas(crop, minimum_area=35)
+    if not 1 <= len(areas) <= 6 or any(area > 180 for area in areas):
+        raise PixelParseError(f"face has invalid separated-pip evidence {sorted(areas)}")
+    return len(areas), float(min(area - 35 for area in areas) / 10.0)
+
+
+def _count_card_pips(
+    purple: np.ndarray, box: tuple[int, int, int, int]
+) -> tuple[int, float]:
+    x0, y0, x1, y1 = box
+    pad = max(7, round(min(x1 - x0 + 1, y1 - y0 + 1) * 0.11))
+    crop = purple[y0 + pad : y1 - pad + 1, x0 + pad : x1 - pad + 1]
+    areas = _blob_areas(crop, minimum_area=35)
+    if not 1 <= len(areas) <= 4 or any(area > 180 for area in areas):
+        raise PixelParseError(f"card has invalid separated-pip evidence {sorted(areas)}")
+    return len(areas), float(min(area - 35 for area in areas) / 10.0)
+
+
+def _roll(state: tuple[int, ...], direction_code: int) -> tuple[int, ...]:
+    top, north, east, south, west, bottom = state
+    if direction_code == 1:
+        return (south, top, east, bottom, west, north)
+    if direction_code == 2:
+        return (west, north, top, south, bottom, east)
+    if direction_code == 3:
+        return (north, bottom, east, top, west, south)
+    if direction_code == 4:
+        return (east, north, bottom, south, top, west)
+    raise PixelParseError(f"invalid roll code {direction_code}")
+
+
+def _decode(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3 or min(arr.shape[:2]) < 100:
+        raise PixelParseError("raster is too small")
+
+    face_mask = _near(arr, _FACE_A) | _near(arr, _FACE_B)
+    faces = _rect_components(face_mask, minimum_area=1800)
+    if len(faces) != 6:
+        raise PixelParseError(f"expected six net cells, found {len(faces)}")
+    widths = [box[2] - box[0] + 1 for box in faces]
+    median_width = float(np.median(widths))
+    if max(widths) - min(widths) > 0.18 * median_width:
+        raise PixelParseError("net cell sizes are inconsistent")
+
+    # Infer roles from the net topology: four y-levels with row counts 1,3,1,1.
+    ordered = sorted(faces, key=lambda box: _box_center(box)[1])
+    rows: list[list[tuple[int, int, int, int]]] = []
+    for box in ordered:
+        cy = _box_center(box)[1]
+        if not rows or abs(cy - np.mean([_box_center(item)[1] for item in rows[-1]])) > 0.38 * median_width:
+            rows.append([box])
+        else:
+            rows[-1].append(box)
+    if len(rows) != 4 or [len(row) for row in rows] != [1, 3, 1, 1]:
+        raise PixelParseError(f"net rows are unresolved: {[len(row) for row in rows]}")
+    middle = sorted(rows[1], key=lambda box: _box_center(box)[0])
+    role_boxes = (middle[1], rows[0][0], middle[2], rows[2][0], middle[0], rows[3][0])
+
+    dark = np.all(arr < 95, axis=2)
+    face_values = []
+    confidence = []
+    for box in role_boxes:
+        value, gap = _count_face_pips(dark, box)
+        face_values.append(value)
+        confidence.append(gap)
+    if sorted(face_values) != list(range(1, 7)):
+        raise PixelParseError(f"face values are not the complete 1..6 set: {face_values}")
+
+    cards = _rect_components(_near(arr, _CARD), minimum_area=2200)
+    if not 6 <= len(cards) <= 8:
+        raise PixelParseError(f"expected six to eight roll cards, found {len(cards)}")
+    cards.sort(key=lambda box: _box_center(box)[0])
+    card_centers = [_box_center(box) for box in cards]
+    card_width = float(np.median([box[2] - box[0] + 1 for box in cards]))
+    if max(y for _, y in card_centers) - min(y for _, y in card_centers) > 0.25 * card_width:
+        raise PixelParseError("roll card order is not a single horizontal sequence")
+    if min(np.diff([x for x, _ in card_centers])) < 1.05 * card_width:
+        raise PixelParseError("roll cards are merged or their order is ambiguous")
+
+    purple = (
+        (arr[..., 2].astype(np.int16) > arr[..., 0].astype(np.int16) + 10)
+        & (arr[..., 0] > 70)
+        & (arr[..., 0] < 175)
+        & (arr[..., 1] < 120)
+    )
+    state = tuple(face_values)
+    for box in cards:
+        code, gap = _count_card_pips(purple, box)
+        confidence.append(gap)
+        state = _roll(state, code)
+    return str(state[0]), float(min(confidence))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _decode(image)[0]
+
+
+def decision_margin_from_image(image: Image.Image) -> float:
+    """Pixel-only separation of the weakest retained pip from rejection."""
+    return _decode(image)[1]

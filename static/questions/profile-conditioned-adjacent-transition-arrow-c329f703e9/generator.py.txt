@@ -1,0 +1,260 @@
+"""Deterministic scene sampler and renderer for the adjacent-transition world."""
+
+from __future__ import annotations
+
+import random
+import itertools
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+ROWS = 9
+SOURCE_COLS = 10
+RESULT_COLS = 9
+QUARANTINE_GAP = 4.0
+
+LABELS = ("up", "right", "down", "left")
+
+_UP = (
+    "....#....",
+    "...###...",
+    "..#####..",
+    "....#....",
+    "....#....",
+    "....#....",
+    "....#....",
+    "....#....",
+    "....#....",
+)
+
+
+def _rotate_clockwise(rows: Iterable[str]) -> tuple[str, ...]:
+    grid = tuple(rows)
+    return tuple("".join(grid[ROWS - 1 - r][c] for r in range(ROWS)) for c in range(ROWS))
+
+
+_RIGHT = _rotate_clockwise(_UP)
+_DOWN = _rotate_clockwise(_RIGHT)
+_LEFT = _rotate_clockwise(_DOWN)
+_TEMPLATES = dict(zip(LABELS, (_UP, _RIGHT, _DOWN, _LEFT), strict=True))
+
+_PALETTES = (
+    ((244, 239, 218), (28, 49, 78)),
+    ((251, 230, 179), (84, 45, 112)),
+    ((219, 242, 235), (25, 79, 73)),
+    ((245, 222, 228), (71, 62, 111)),
+)
+_FRAME_COLORS = ((26, 174, 190), (51, 142, 218), (0, 160, 150), (0, 150, 190))
+
+
+def _bits(rows: Iterable[str]) -> list[list[int]]:
+    return [[1 if value == "#" else 0 for value in row] for row in rows]
+
+
+def _decode(source: list[list[int]]) -> list[list[int]]:
+    return [[int(row[col] != row[col + 1]) for col in range(RESULT_COLS)] for row in source]
+
+
+def _distances(decoded: list[list[int]]) -> list[tuple[int, str]]:
+    scored = []
+    for label in LABELS:
+        target = _bits(_TEMPLATES[label])
+        distance = sum(
+            decoded[row][col] != target[row][col]
+            for row in range(ROWS)
+            for col in range(RESULT_COLS)
+        )
+        scored.append((int(distance), label))
+    return sorted(scored)
+
+
+def _classification(source: list[list[int]]) -> tuple[str, float, int]:
+    scored = _distances(_decode(source))
+    best_distance, label = scored[0]
+    return label, float(scored[1][0] - best_distance), best_distance
+
+
+def _base_rows(target: list[list[int]]) -> list[list[int]]:
+    bases = []
+    for row in target:
+        values = [0]
+        for transition in row:
+            values.append(values[-1] ^ transition)
+        bases.append(values)
+    return bases
+
+
+def _supports_ink_total(target: list[list[int]], total: int) -> bool:
+    possible = {0}
+    for row in _base_rows(target):
+        ones = sum(row)
+        possible = {prior + value for prior in possible for value in (ones, SOURCE_COLS - ones)}
+    return total in possible
+
+
+def _integrate_with_balanced_ink(target: list[list[int]], rng: random.Random) -> list[list[int]]:
+    """Choose a row complementation with exactly half of source cells dark."""
+
+    bases = _base_rows(target)
+    target_ink = (SOURCE_COLS * ROWS) // 2
+    best_sources: list[list[list[int]]] = []
+    for mask in range(1 << ROWS):
+        source = [
+            [value ^ ((mask >> row) & 1) for value in bases[row]]
+            for row in range(ROWS)
+        ]
+        ink = sum(sum(row) for row in source)
+        if ink == target_ink:
+            best_sources.append(source)
+    if not best_sources:
+        raise RuntimeError("target does not admit a half-ink row complementation")
+    return rng.choice(best_sources)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced scene from only its integer seed."""
+
+    group = int(seed) // len(LABELS)
+    rng = random.Random(group ^ 0x5A17D1FF)
+    style_rng = random.Random(group ^ 0x137CA55E)
+    label = LABELS[int(seed) % len(LABELS)]
+    target = _bits(_TEMPLATES[label])
+
+    # Every eighth quartet is a declared near-boundary set. Move four cells
+    # toward the nearest competitor, balanced as two on->off and two off->on,
+    # so every answer has the same ink count and a small positive class gap.
+    if group % 8 == 7:
+        competitors = []
+        for other in LABELS:
+            if other == label:
+                continue
+            other_bits = _bits(_TEMPLATES[other])
+            differing = [
+                (row, col)
+                for row in range(ROWS)
+                for col in range(RESULT_COLS)
+                if target[row][col] != other_bits[row][col]
+            ]
+            competitors.append((len(differing), other, differing))
+        _, other, differing = min(competitors)
+        other_bits = _bits(_TEMPLATES[other])
+        one_to_zero = [(r, c) for r, c in differing if target[r][c] == 1 and other_bits[r][c] == 0]
+        zero_to_one = [(r, c) for r, c in differing if target[r][c] == 0 and other_bits[r][c] == 1]
+        valid_variants = []
+        for falling in itertools.combinations(one_to_zero, 2):
+            for rising in itertools.combinations(zero_to_one, 2):
+                variant = [row[:] for row in target]
+                for row, col in falling + rising:
+                    variant[row][col] ^= 1
+                if _supports_ink_total(variant, (SOURCE_COLS * ROWS) // 2):
+                    valid_variants.append(variant)
+        if not valid_variants:
+            raise RuntimeError("no balanced near-boundary variant exists")
+        target = rng.choice(valid_variants)
+    else:
+        # Clean quartets provide the far-margin stratum; all four templates have
+        # identical decoded ink and admit an exactly half-dark source field.
+        pass
+
+    # Integrate the target, selecting among row complements to balance total
+    # source ink. Neither displayed color has a fixed semantic value.
+    source = _integrate_with_balanced_ink(target, rng)
+
+    # Style depends only on the four-scene group, not on answer identity.
+    cell_size = style_rng.choice((28, 29, 30, 31))
+    grid_w = SOURCE_COLS * cell_size
+    grid_h = ROWS * cell_size
+    origin_x = (WIDTH - grid_w) // 2 + style_rng.randint(-12, 12)
+    origin_y = 105 + style_rng.randint(-10, 10)
+    palette_index = style_rng.randrange(len(_PALETTES))
+    low_color, high_color = _PALETTES[palette_index]
+    if style_rng.randrange(2):
+        low_color, high_color = high_color, low_color
+
+    return {
+        "source": source,
+        "cell_size": cell_size,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "frame_color": list(_FRAME_COLORS[palette_index]),
+        "low_color": list(low_color),
+        "high_color": list(high_color),
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Render the source field; the answer is never drawn directly."""
+
+    source = scene["source"]
+    cell = int(scene["cell_size"])
+    x0 = int(scene["origin_x"])
+    y0 = int(scene["origin_y"])
+    frame = tuple(scene["frame_color"])
+    low = tuple(scene["low_color"])
+    high = tuple(scene["high_color"])
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), (249, 248, 243))
+    draw = ImageDraw.Draw(image)
+    x1 = x0 + SOURCE_COLS * cell
+    y1 = y0 + ROWS * cell
+    draw.rounded_rectangle((x0 - 18, y0 - 18, x1 + 18, y1 + 18), radius=12, fill=(235, 234, 228))
+    draw.rectangle((x0 - 6, y0 - 6, x1 + 6, y1 + 6), outline=frame, width=5)
+
+    grid_line = (111, 113, 116)
+    for row in range(ROWS):
+        for col in range(SOURCE_COLS):
+            left = x0 + col * cell
+            top = y0 + row * cell
+            fill = high if int(source[row][col]) else low
+            draw.rectangle((left + 2, top + 2, left + cell - 2, top + cell - 2), fill=fill)
+    for col in range(SOURCE_COLS + 1):
+        x = x0 + col * cell
+        draw.line((x, y0, x, y1), fill=grid_line, width=2)
+    for row in range(ROWS + 1):
+        y = y0 + row * cell
+        draw.line((x0, y, x1, y), fill=grid_line, width=2)
+
+    # A purely geometric left-to-right cue reinforces the declared comparison
+    # direction without carrying any answer-specific payload.
+    cue_y = y0 - 38
+    cue_x0 = x0 + cell
+    cue_x1 = x1 - cell
+    draw.line((cue_x0, cue_y, cue_x1, cue_y), fill=(218, 128, 36), width=5)
+    draw.polygon(
+        ((cue_x1, cue_y), (cue_x1 - 15, cue_y - 10), (cue_x1 - 15, cue_y + 10)),
+        fill=(218, 128, 36),
+    )
+
+    # Visual truth-table legend: equal neighbors produce an empty result cell;
+    # unequal neighbors produce a filled result cell.
+    legend_y = y1 + 48
+    size = 18
+    for offset, values in ((-78, (0, 0, 0)), (55, (0, 1, 1))):
+        base = (x0 + x1) // 2 + offset
+        for idx, bit in enumerate(values[:2]):
+            fill = high if bit else low
+            draw.rectangle((base + idx * 24, legend_y, base + idx * 24 + size, legend_y + size), fill=fill, outline=grid_line, width=1)
+        arrow_x = base + 52
+        draw.line((arrow_x, legend_y + 9, arrow_x + 20, legend_y + 9), fill=(218, 128, 36), width=3)
+        draw.polygon(((arrow_x + 20, legend_y + 9), (arrow_x + 14, legend_y + 4), (arrow_x + 14, legend_y + 14)), fill=(218, 128, 36))
+        result_fill = high if values[2] else (249, 248, 243)
+        draw.rectangle((arrow_x + 27, legend_y, arrow_x + 27 + size, legend_y + size), fill=result_fill, outline=grid_line, width=2)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return _classification(scene["source"])[0]
+
+
+def margin(scene: dict) -> float:
+    return _classification(scene["source"])[1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= QUARANTINE_GAP
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

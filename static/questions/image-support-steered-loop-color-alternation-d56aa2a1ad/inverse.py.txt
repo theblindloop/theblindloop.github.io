@@ -1,0 +1,134 @@
+"""Independent image-only inverse arm for cyclic station alternation."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BACKGROUND = np.array((248, 247, 243), dtype=np.float32)
+NAVY = np.array((31, 55, 78), dtype=np.float32)
+ORANGE = np.array((230, 126, 34), dtype=np.float32)
+PURPLE = np.array((132, 74, 177), dtype=np.float32)
+GRAY = np.array((218, 222, 226), dtype=np.float32)
+PALETTE = np.stack((BACKGROUND, NAVY, ORANGE, PURPLE, GRAY))
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose a safely recoverable four-station cycle."""
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    distances = ((array[:, :, None, :] - PALETTE[None, None, :, :]) ** 2).sum(axis=3)
+    return distances.argmin(axis=2)
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            result.append(np.asarray(points, dtype=np.float64))
+    return result
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _circle_fit(mask: np.ndarray) -> tuple[float, float, float]:
+    """Algebraically fit the visible navy annulus without renderer geometry."""
+    points = np.argwhere(mask).astype(np.float64)
+    if len(points) < 140:
+        raise OracleAbstention("too little visible trail ink")
+    if len(points) > 4000:
+        points = points[:: max(1, len(points) // 4000)]
+    y, x = points[:, 0], points[:, 1]
+    design = np.column_stack((x, y, np.ones_like(x)))
+    target = x * x + y * y
+    solution, *_ = np.linalg.lstsq(design, target, rcond=None)
+    cx, cy = solution[0] / 2.0, solution[1] / 2.0
+    radius = math.sqrt(max(solution[2] + cx * cx + cy * cy, 0.0))
+    return float(cx), float(cy), float(radius)
+
+
+def _measure(image: Image.Image) -> tuple[list[tuple[float, str]], float]:
+    labels = _labels(image)
+    orange = _components(labels == 2, minimum=65)
+    purple = _components(labels == 3, minimum=65)
+    if len(orange) != 2 or len(purple) != 2:
+        raise OracleAbstention("need exactly two visible orange and two visible purple stations")
+
+    stations = [(_centroid(component), "orange") for component in orange]
+    stations += [(_centroid(component), "purple") for component in purple]
+    station_cx = sum(point[0][0] for point in stations) / 4.0
+    station_cy = sum(point[0][1] for point in stations) / 4.0
+
+    fit_cx, fit_cy, fit_radius = _circle_fit(labels == 1)
+    if not 28.0 <= fit_radius <= 75.0:
+        raise OracleAbstention("recovered trail radius is unsafe")
+    if math.hypot(fit_cx - station_cx, fit_cy - station_cy) > 25.0:
+        raise OracleAbstention("stations do not share the recovered trail center")
+
+    radii = [math.hypot(x - station_cx, y - station_cy) for (x, y), _ in stations]
+    median_radius = float(np.median(radii))
+    if median_radius < 30.0 or max(abs(value - median_radius) for value in radii) > 10.0:
+        raise OracleAbstention("station-to-cycle incidence is inconsistent")
+
+    # Reconstruct enclosure from angular coverage of the union. Large missing
+    # nuisance arcs are tolerated, but a blank/noncyclic picture is rejected.
+    structure = (labels == 1) | (labels == 2) | (labels == 3)
+    yy, xx = np.nonzero(structure)
+    radial = np.hypot(xx - station_cx, yy - station_cy)
+    annular = (radial > median_radius - 14.0) & (radial < median_radius + 14.0)
+    angles = (np.arctan2(yy[annular] - station_cy, xx[annular] - station_cx) + 2 * np.pi) % (
+        2 * np.pi
+    )
+    covered = len(np.unique(np.floor(angles / (2 * np.pi) * 36).astype(int)))
+    center_y, center_x = int(round(station_cy)), int(round(station_cx))
+    if covered < 18 or labels[center_y, center_x] != 0:
+        raise OracleAbstention("the reconstructed trail does not enclose a visible center")
+
+    ordered = []
+    raw_angles = []
+    for (x, y), color in stations:
+        angle = (math.atan2(y - station_cy, x - station_cx) + 2 * math.pi) % (2 * math.pi)
+        raw_angles.append(angle)
+        ordered.append((angle, color))
+    ordered.sort()
+    gaps = [
+        (raw_angles[(index + 1) % 4] - raw_angles[index]) % (2 * math.pi)
+        for index in range(4)
+    ]
+    # The order itself is unsafe only if any recovered centroids nearly coincide.
+    for index, first in enumerate(raw_angles):
+        for second in raw_angles[index + 1 :]:
+            gap = abs((first - second + math.pi) % (2 * math.pi) - math.pi)
+            if math.degrees(gap) < 36.0:
+                raise OracleAbstention("station order is near the raster boundary")
+    return ordered, min(math.degrees(value) for value in gaps)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    ordered, _clearance = _measure(image)
+    colors = [color for _angle, color in ordered]
+    alternating = all(colors[index] != colors[(index + 1) % 4] for index in range(4))
+    return "yes" if alternating else "no"
+

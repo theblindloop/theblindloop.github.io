@@ -1,0 +1,131 @@
+"""Pixel-only inverse arm for the balanced-beam panel search world.
+
+The oracle sees a rasterized image and nothing else.  It takes the modal colour
+as background, splits the canvas into panels at the fully background columns,
+locates each panel's bar as the band of rows whose ink spans most of the panel,
+reads the block centres as the column runs of ink above the bar, reads the
+support tip as the horizontal centroid of the ink below the bar, and selects
+the panel whose block-centre average is closest to its support tip.  It abstains
+whenever the layout is not recovered or the runner-up gap is too small.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+AMBIGUOUS = "ambiguous"
+
+N_PANELS = 5
+N_BLOCKS = 4
+PANEL_INSET = 4
+MIN_PANEL_WIDTH = 60
+MIN_RUN = 4
+BEAM_ROW_FRACTION = 0.6
+ABSTAIN_MARGIN_PX = 4.0
+
+
+def _modal_colour(pixels: np.ndarray) -> np.ndarray:
+    flat = pixels.reshape(-1, 3).astype(np.int64)
+    keys = (flat[:, 0] << 16) | (flat[:, 1] << 8) | flat[:, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    key = int(values[int(np.argmax(counts))])
+    return np.array([(key >> 16) & 255, (key >> 8) & 255, key & 255], dtype=np.int64)
+
+
+def _runs(flags: np.ndarray, min_length: int = 1) -> list:
+    runs = []
+    start = None
+    for index, flag in enumerate(flags):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            if index - start >= min_length:
+                runs.append((start, index))
+            start = None
+    if start is not None and len(flags) - start >= min_length:
+        runs.append((start, len(flags)))
+    return runs
+
+
+def _panel_measurement(ink: np.ndarray):
+    """Return (block_mean_x, support_tip_x) in panel-interior coordinates."""
+    height, width = ink.shape
+    if height < 40 or width < 40:
+        return None
+    row_counts = ink.sum(axis=1)
+    beam_rows = np.flatnonzero(row_counts >= BEAM_ROW_FRACTION * width)
+    if beam_rows.size == 0:
+        return None
+    beam_top = int(beam_rows.min())
+    beam_bottom = int(beam_rows.max())
+    if beam_bottom - beam_top + 1 != beam_rows.size:
+        return None
+    if beam_top < 2 or beam_bottom > height - 4:
+        return None
+
+    above = ink[:beam_top, :]
+    if not above.any():
+        return None
+    columns = above.any(axis=0)
+    block_runs = _runs(columns, MIN_RUN)
+    if len(block_runs) != N_BLOCKS:
+        return None
+    centres = [(start + end - 1) / 2.0 for start, end in block_runs]
+
+    below = ink[beam_bottom + 1 :, :]
+    coords = np.argwhere(below)
+    if coords.shape[0] < 40:
+        return None
+    if int(coords[:, 0].min()) != 0:
+        return None
+    support_x = float(coords[:, 1].mean())
+
+    return float(sum(centres) / len(centres)), support_x
+
+
+def analyse(image: Image.Image) -> dict:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int64)
+    background = _modal_colour(pixels)
+    ink = np.any(pixels != background.reshape(1, 1, 3), axis=2)
+    if not ink.any():
+        return {"decision": AMBIGUOUS, "margin": 0.0, "offsets": []}
+
+    panel_runs = [
+        run for run in _runs(ink.any(axis=0), MIN_PANEL_WIDTH)
+    ]
+    if len(panel_runs) != N_PANELS:
+        return {"decision": AMBIGUOUS, "margin": 0.0, "offsets": []}
+
+    offsets = []
+    for x0, x1 in panel_runs:
+        column = ink[:, x0:x1]
+        row_runs = _runs(column.any(axis=1), MIN_PANEL_WIDTH)
+        if len(row_runs) != 1:
+            return {"decision": AMBIGUOUS, "margin": 0.0, "offsets": []}
+        y0, y1 = row_runs[0]
+        interior = column[y0 + PANEL_INSET : y1 - PANEL_INSET, PANEL_INSET : (x1 - x0) - PANEL_INSET]
+        measurement = _panel_measurement(interior)
+        if measurement is None:
+            return {"decision": AMBIGUOUS, "margin": 0.0, "offsets": []}
+        block_mean, support_x = measurement
+        offsets.append(abs(block_mean - support_x))
+
+    order = sorted(range(N_PANELS), key=lambda i: offsets[i])
+    best = order[0]
+    gap = offsets[order[1]] - offsets[best]
+    if gap < ABSTAIN_MARGIN_PX:
+        return {"decision": AMBIGUOUS, "margin": float(gap), "offsets": offsets}
+    return {
+        "decision": f"panel-{best + 1}",
+        "margin": float(gap),
+        "offsets": offsets,
+    }
+
+
+def margin_from_image(image: Image.Image) -> float:
+    return float(analyse(image)["margin"])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return analyse(image)["decision"]

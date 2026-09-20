@@ -1,0 +1,151 @@
+"""Independent pixel-only inverse arm for the FSA transition-table register.
+
+Receives only the final PNG. From the raster alone it:
+  1. reads the ringed START token's colour state;
+  2. classifies the four operator glyphs (circle/square/triangle) read left to
+     right;
+  3. reads the legend: row headers give the three current states, column
+     headers give the three operator glyphs, and the 3x3 cells give the next
+     state colour for every (state, operator) pair;
+  4. replays the ordered operators from the start state through the table and
+     returns the final colour.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+DARK = (50, 50, 50)
+BG = (255, 255, 255)
+
+COLOR_NAMES = ["red", "green", "blue"]
+COLORS = {
+    "red": (220, 40, 40),
+    "green": (40, 170, 80),
+    "blue": (40, 80, 220),
+}
+OPERATOR_NAMES = ["circle", "square", "triangle"]
+
+START_CENTER = (115, 115)
+OPERATOR_CENTERS = [(250 + i * 120, 118) for i in range(4)]
+OPERATOR_GLYPH_R = 26
+LEGEND_ROW_X = 90
+LEGEND_ROW_YS = [330, 420, 510]
+LEGEND_COL_XS = [210, 300, 390]
+LEGEND_COL_Y = 295
+LEGEND_GLYPH_R = 20
+WINDOW = 4
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected state-machine structure."""
+
+
+def _is_dark(pixel) -> bool:
+    return (
+        abs(int(pixel[0]) - DARK[0]) < 8
+        and abs(int(pixel[1]) - DARK[1]) < 8
+        and abs(int(pixel[2]) - DARK[2]) < 8
+    )
+
+
+def _glyph_mask(shape: str, radius: int) -> np.ndarray:
+    size = 2 * radius + 1
+    cy = cx = radius
+    mask = np.zeros((size, size), dtype=bool)
+    ys, xs = np.mgrid[0:size, 0:size]
+    if shape == "circle":
+        mask = (ys - cy) ** 2 + (xs - cx) ** 2 <= radius * radius
+    elif shape == "square":
+        mask = (np.abs(ys - cy) <= radius) & (np.abs(xs - cx) <= radius)
+    elif shape == "triangle":
+        # vertex at (0,-r) on top, base corners (-r,r) and (r,r) at bottom:
+        # |x| <= (y+r)/2 for y in [-r, r].
+        y = ys - cy
+        x = xs - cx
+        mask = (np.abs(x) <= (y + radius) / 2.0) & (y >= -radius)
+    return mask
+
+
+def _classify_glyph(arr: np.ndarray, cx: int, cy: int, radius: int) -> str:
+    region = arr[
+        max(0, cy - radius) : cy + radius + 1,
+        max(0, cx - radius) : cx + radius + 1,
+    ]
+    if region.shape[0] != 2 * radius + 1 or region.shape[1] != 2 * radius + 1:
+        raise UnreadableImageError("glyph region out of bounds")
+    dark_mask = np.zeros(region.shape[:2], dtype=bool)
+    for dy in range(region.shape[0]):
+        for dx in range(region.shape[1]):
+            dark_mask[dy, dx] = _is_dark(region[dy, dx])
+    best = None
+    best_iou = -1.0
+    for shape in OPERATOR_NAMES:
+        template = _glyph_mask(shape, radius)
+        inter = int(np.logical_and(dark_mask, template).sum())
+        union = int(np.logical_or(dark_mask, template).sum())
+        iou = inter / union if union else 0.0
+        if iou > best_iou:
+            best_iou = iou
+            best = shape
+    if best is None or best_iou < 0.5:
+        raise UnreadableImageError(f"cannot identify operator glyph (iou={best_iou:.2f})")
+    return best
+
+
+def _read_color(arr: np.ndarray, cx: int, cy: int) -> int:
+    y0 = max(0, cy - WINDOW)
+    y1 = min(arr.shape[0], cy + WINDOW + 1)
+    x0 = max(0, cx - WINDOW)
+    x1 = min(arr.shape[1], cx + WINDOW + 1)
+    win = arr[y0:y1, x0:x1]
+    counts = [0, 0, 0]
+    for idx, color in enumerate(COLORS.values()):
+        counts[idx] = int(
+            ((win[:, :, 0] == color[0]) & (win[:, :, 1] == color[1]) & (win[:, :, 2] == color[2])).sum()
+        )
+    best = max(range(3), key=lambda i: counts[i])
+    if counts[best] == 0:
+        raise UnreadableImageError("no recognizable state colour at expected centre")
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+
+    start = _read_color(arr, START_CENTER[0], START_CENTER[1])
+
+    op_shapes = [
+        _classify_glyph(arr, cx, cy, OPERATOR_GLYPH_R) for cx, cy in OPERATOR_CENTERS
+    ]
+
+    col_shapes = [
+        _classify_glyph(arr, x, LEGEND_COL_Y, LEGEND_GLYPH_R) for x in LEGEND_COL_XS
+    ]
+
+    shape_to_col: dict[str, int] = {}
+    for c, shape in enumerate(col_shapes):
+        if shape in shape_to_col:
+            raise UnreadableImageError(f"duplicate legend operator {shape}")
+        shape_to_col[shape] = c
+    if len(shape_to_col) != 3:
+        raise UnreadableImageError("legend operator columns are incomplete")
+
+    row_state = [_read_color(arr, LEGEND_ROW_X, y) for y in LEGEND_ROW_YS]
+    if len(set(row_state)) != 3:
+        raise UnreadableImageError("legend state rows are not distinct")
+    row_index = {state: r for r, state in enumerate(row_state)}
+
+    table = [[0] * 3 for _ in range(3)]
+    for r, y in enumerate(LEGEND_ROW_YS):
+        for c, x in enumerate(LEGEND_COL_XS):
+            table[r][c] = _read_color(arr, x, y)
+
+    cur = start
+    for shape in op_shapes:
+        col = shape_to_col[shape]
+        cur = table[row_index[cur]][col]
+    return COLOR_NAMES[cur]

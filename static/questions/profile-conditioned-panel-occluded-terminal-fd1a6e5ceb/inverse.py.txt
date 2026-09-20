@@ -1,0 +1,231 @@
+"""Pixel-only oracle for panel_occluded_terminal.
+
+Receives a rendered PNG and nothing else: no scene, no renderer, no gold. It
+segments the panels, the pipe ink, the ring and the coloured squares, splits the
+pipe ink into the fragments the panels leave visible, then re-binds fragments
+across each panel by amodal straight continuation (each stub is extrapolated
+through the panel and matched to the stub it lands on). The fragment carrying
+the ring is followed through those bindings to a coloured square.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+ORACLE_VERSION = "panel_occluded_terminal-oracle-0.1.0"
+
+_PIPE = (88, 92, 104)
+_PANEL = (198, 202, 210)
+_PANEL_EDGE = (150, 155, 165)
+_MARK = (0, 0, 0)
+_SQUARES = {
+    "blue": (33, 98, 220),
+    "orange": (232, 120, 20),
+    "purple": (140, 60, 200),
+}
+
+_FIT_RUN = 30  # px of stub used to estimate the direction a pipe entered with
+_ABSTAIN = "abstain"
+
+
+def _mask(arr: np.ndarray, rgb) -> np.ndarray:
+    return (arr[:, :, 0] == rgb[0]) & (arr[:, :, 1] == rgb[1]) & (arr[:, :, 2] == rgb[2])
+
+
+class _DSU:
+    def __init__(self):
+        self.parent = {}
+
+    def find(self, a):
+        self.parent.setdefault(a, a)
+        while self.parent[a] != a:
+            self.parent[a] = self.parent[self.parent[a]]
+            a = self.parent[a]
+        return a
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
+def _label(mask: np.ndarray) -> np.ndarray:
+    """8-connected labelling by row runs and union-find."""
+    h, w = mask.shape
+    labels = np.zeros((h, w), dtype=np.int32)
+    dsu = _DSU()
+    next_id = 1
+    prev_runs = []
+    for y in range(h):
+        row = mask[y]
+        if not row.any():
+            prev_runs = []
+            continue
+        idx = np.flatnonzero(row)
+        breaks = np.flatnonzero(np.diff(idx) > 1)
+        starts = np.concatenate(([idx[0]], idx[breaks + 1]))
+        ends = np.concatenate((idx[breaks], [idx[-1]]))
+        runs = []
+        for s, e in zip(starts, ends):
+            cur = None
+            for ps, pe, pid in prev_runs:
+                if ps <= e + 1 and s <= pe + 1:
+                    if cur is None:
+                        cur = pid
+                    else:
+                        dsu.union(cur, pid)
+            if cur is None:
+                cur = next_id
+                next_id += 1
+                dsu.find(cur)
+            labels[y, s:e + 1] = cur
+            runs.append((s, e, cur))
+        prev_runs = runs
+    if next_id > 1:
+        remap = np.arange(next_id, dtype=np.int32)
+        for i in range(1, next_id):
+            remap[i] = dsu.find(i)
+        labels = remap[labels]
+    return labels
+
+
+def _components(mask: np.ndarray):
+    labels = _label(mask)
+    out = {}
+    ids = np.unique(labels)
+    for i in ids:
+        if i == 0:
+            continue
+        ys, xs = np.nonzero(labels == i)
+        out[int(i)] = (ys, xs)
+    return labels, out
+
+
+def _panel_columns(arr: np.ndarray):
+    """Left- and right-face x of every opaque panel, ordered left to right."""
+    panel = _mask(arr, _PANEL) | _mask(arr, _PANEL_EDGE)
+    cols = np.flatnonzero(panel.any(axis=0))
+    if cols.size == 0:
+        return []
+    breaks = np.flatnonzero(np.diff(cols) > 1)
+    starts = np.concatenate(([cols[0]], cols[breaks + 1]))
+    ends = np.concatenate((cols[breaks], [cols[-1]]))
+    return [(int(s), int(e) + 1) for s, e in zip(starts, ends)]
+
+
+def _stub(labels: np.ndarray, frag_ids, column: int, direction: int):
+    """Stubs touching a face column, as (fragment id, mean y, slope dy/dx)."""
+    out = []
+    col = labels[:, column]
+    for fid in np.unique(col):
+        if fid == 0 or fid not in frag_ids:
+            continue
+        ys = np.flatnonzero(col == fid)
+        y0 = float(ys.mean())
+        xs, yy = [], []
+        for k in range(0, _FIT_RUN):
+            x = column + direction * k
+            if x < 0 or x >= labels.shape[1]:
+                break
+            sel = np.flatnonzero(labels[:, x] == fid)
+            if sel.size == 0:
+                break
+            xs.append(float(x))
+            yy.append(float(sel.mean()))
+        if len(xs) >= 6:
+            xs_a, yy_a = np.array(xs), np.array(yy)
+            slope = float(
+                ((xs_a - xs_a.mean()) * (yy_a - yy_a.mean())).sum()
+                / max(((xs_a - xs_a.mean()) ** 2).sum(), 1e-9)
+            )
+        else:
+            slope = 0.0
+        out.append((int(fid), y0, slope))
+    return out
+
+
+def _match(left, right, span: float):
+    """Best assignment of left stubs to right stubs under straight continuation.
+
+    Returns (pairs, decision margin in px)."""
+    if len(left) != len(right) or not left:
+        return None, 0.0
+    import itertools
+
+    scored = []
+    for perm in itertools.permutations(range(len(right))):
+        cost = 0.0
+        for i, j in enumerate(perm):
+            fl, yl, ml = left[i]
+            fr, yr, mr = right[j]
+            cost += abs(yr - (yl + ml * span)) + abs(yl - (yr - mr * span))
+        scored.append((cost, perm))
+    scored.sort()
+    best_cost, best = scored[0]
+    runner = scored[1][0] if len(scored) > 1 else float("inf")
+    pairs = [(left[i][0], right[j][0]) for i, j in enumerate(best)]
+    return pairs, (runner - best_cost) / 2.0
+
+
+def _nearest_fragment(labels, frag_ids, cy: float, cx: float, limit: float = 60.0):
+    best, best_d = None, limit
+    for fid in frag_ids:
+        ys, xs = frag_ids[fid]
+        d = float(np.min((ys - cy) ** 2 + (xs - cx) ** 2)) ** 0.5
+        if d < best_d:
+            best, best_d = fid, d
+    return best
+
+
+def decision_from_image(image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    panels = _panel_columns(arr)
+    if len(panels) < 1:
+        return _ABSTAIN
+
+    # The ring annulus and the port dot are painted over the pipe end, so pipe ink
+    # and mark ink are labelled together: a marker must not split a fragment.
+    labels, frags = _components(_mask(arr, _PIPE) | _mask(arr, _MARK))
+    if len(frags) < 2:
+        return _ABSTAIN
+
+    dsu = _DSU()
+    for fid in frags:
+        dsu.find(fid)
+
+    for xl, xr in panels:
+        if xl - 1 < 0 or xr >= arr.shape[1]:
+            return _ABSTAIN
+        left = _stub(labels, frags, xl - 1, -1)
+        right = _stub(labels, frags, xr, +1)
+        pairs, mrg = _match(left, right, float(xr - (xl - 1)))
+        if pairs is None or mrg < 4.0:
+            return _ABSTAIN
+        for a, b in pairs:
+            dsu.union(a, b)
+
+    _, marks = _components(_mask(arr, _MARK))
+    if not marks:
+        return _ABSTAIN
+    ring = max(
+        marks.values(),
+        key=lambda p: (p[0].max() - p[0].min()) * (p[1].max() - p[1].min()),
+    )
+    ring_y = float(ring[0].mean())
+    ring_x = float(ring[1].mean())
+    start = _nearest_fragment(labels, frags, ring_y, ring_x)
+    if start is None:
+        return _ABSTAIN
+
+    hits = []
+    for name, rgb in _SQUARES.items():
+        m = _mask(arr, rgb)
+        if not m.any():
+            continue
+        ys, xs = np.nonzero(m)
+        fid = _nearest_fragment(labels, frags, float(ys.mean()), float(xs.mean()))
+        if fid is not None and dsu.find(fid) == dsu.find(start):
+            hits.append(name)
+    if len(hits) != 1:
+        return _ABSTAIN
+    return hits[0]

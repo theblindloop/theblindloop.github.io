@@ -1,0 +1,160 @@
+"""Independent PNG-only inverse arm for Hinge Mirror Unfold."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+LABELS = ("X", "arrow", "crown")
+
+# Independently specified complete 7-by-7 reference glyphs.
+REFERENCE_GLYPHS = {
+    "X": (
+        (1, 0, 0, 0, 0, 0, 1),
+        (0, 1, 0, 0, 0, 1, 0),
+        (0, 0, 1, 0, 1, 0, 0),
+        (0, 0, 0, 1, 0, 0, 0),
+        (0, 0, 1, 0, 1, 0, 0),
+        (0, 1, 0, 0, 0, 1, 0),
+        (1, 0, 0, 0, 0, 0, 1),
+    ),
+    "arrow": (
+        (0, 0, 0, 1, 0, 0, 0),
+        (0, 0, 1, 0, 1, 0, 0),
+        (0, 1, 0, 0, 0, 1, 0),
+        (1, 0, 0, 0, 0, 0, 1),
+        (0, 0, 1, 0, 1, 0, 0),
+        (0, 0, 1, 0, 1, 0, 0),
+        (0, 0, 1, 0, 1, 0, 0),
+    ),
+    "crown": (
+        (1, 0, 0, 1, 0, 0, 1),
+        (1, 0, 1, 0, 1, 0, 1),
+        (1, 1, 0, 0, 0, 1, 1),
+        (1, 0, 0, 0, 0, 0, 1),
+        (0, 0, 0, 0, 0, 0, 0),
+        (0, 0, 0, 0, 0, 0, 0),
+        (0, 0, 0, 0, 0, 0, 0),
+    ),
+}
+
+
+def _border_background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (array[:3].reshape(-1, 3), array[-3:].reshape(-1, 3), array[:, :3].reshape(-1, 3), array[:, -3:].reshape(-1, 3)),
+        axis=0,
+    )
+    return np.median(border, axis=0)
+
+
+def _red_mask(array: np.ndarray) -> np.ndarray:
+    return (array[:, :, 0] > 175) & (array[:, :, 1] < 105) & (array[:, :, 2] < 105)
+
+
+def _hinged_component(array: np.ndarray, background: np.ndarray) -> np.ndarray:
+    foreground = np.max(np.abs(array.astype(np.int16) - background.astype(np.int16)), axis=2) > 18
+    red = _red_mask(array)
+    red_points = np.argwhere(red)
+    if len(red_points) < 20:
+        raise ValueError("the visible red hinge is missing")
+    start = tuple(int(value) for value in red_points[len(red_points) // 2])
+    queue = deque([start])
+    seen = {start}
+    height, width = foreground.shape
+    while queue:
+        y, x = queue.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            point = (ny, nx)
+            if 0 <= ny < height and 0 <= nx < width and foreground[ny, nx] and point not in seen:
+                seen.add(point)
+                queue.append(point)
+    component = np.zeros_like(foreground)
+    yy, xx = zip(*seen)
+    component[np.asarray(yy), np.asarray(xx)] = True
+    if int((red & component).sum()) != int(red.sum()):
+        raise ValueError("the red hinge is disconnected")
+    return component
+
+
+def _canonical_patch(array: np.ndarray) -> tuple[np.ndarray, int]:
+    background = _border_background(array)
+    component = _hinged_component(array, background)
+    points = np.argwhere(component)
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0) + 1
+    crop = array[y0:y1, x0:x1]
+    candidates = []
+    for turns in range(4):
+        oriented = np.rot90(crop, turns)
+        height, width = oriented.shape[:2]
+        if height % 7:
+            continue
+        cell_size = height // 7
+        hinge_width = width - 4 * cell_size
+        if not (9 <= cell_size <= 13 and 3 <= hinge_width <= 5):
+            continue
+        red = _red_mask(oriented)
+        panel_red = float(red[:, : 4 * cell_size].mean())
+        hinge_red = float(red[:, 4 * cell_size :].mean())
+        foreground = (
+            np.max(np.abs(oriented.astype(np.int16) - background.astype(np.int16)), axis=2) > 18
+        )
+        if panel_red < 0.01 and hinge_red > 0.985 and float(foreground.mean()) > 0.985:
+            candidates.append((oriented, cell_size))
+    if len(candidates) != 1:
+        raise ValueError("the hinged panel has no unique intact orientation")
+    return candidates[0]
+
+
+def _read_half_grid(oriented: np.ndarray, cell_size: int) -> np.ndarray:
+    values = []
+    pad = max(2, cell_size // 4)
+    for row in range(7):
+        for col in range(4):
+            tile = oriented[
+                row * cell_size + pad : (row + 1) * cell_size - pad,
+                col * cell_size + pad : (col + 1) * cell_size - pad,
+            ].astype(np.float64)
+            if tile.size == 0 or tile.std(axis=(0, 1)).max() > 2.0:
+                raise ValueError("a stencil cell is corrupted or occluded")
+            values.append(float((0.2126 * tile[:, :, 0] + 0.7152 * tile[:, :, 1] + 0.0722 * tile[:, :, 2]).mean()))
+    values_array = np.asarray(values, dtype=np.float64)
+    low, high = float(values_array.min()), float(values_array.max())
+    for _ in range(12):
+        midpoint = (low + high) / 2.0
+        low_group = values_array[values_array <= midpoint]
+        high_group = values_array[values_array > midpoint]
+        if not len(low_group) or not len(high_group):
+            raise ValueError("the stencil has no visible dark/light separation")
+        low, high = float(low_group.mean()), float(high_group.mean())
+    if high - low < 45.0:
+        raise ValueError("dark and light stencil cells are not separable")
+    bits = (values_array < (low + high) / 2.0).astype(np.uint8).reshape(7, 4)
+    if not 5 <= int(bits.sum()) <= 9:
+        raise ValueError("the recovered stencil occupancy is implausible")
+    return bits
+
+
+def analyze_image(image: Image.Image) -> dict:
+    """Return the pixel-only decision, distances, and runner-up margin."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    oriented, cell_size = _canonical_patch(array)
+    half = _read_half_grid(oriented, cell_size)
+    completed = np.concatenate((half[:, :3], half[:, 3:4], half[:, :3][:, ::-1]), axis=1)
+    distances = {
+        name: int(np.count_nonzero(completed != np.asarray(reference, dtype=np.uint8)))
+        for name, reference in REFERENCE_GLYPHS.items()
+    }
+    ranked = sorted((distance, name) for name, distance in distances.items())
+    margin = float(ranked[1][0] - ranked[0][0])
+    decision = "ambiguous" if margin == 0 else ranked[0][1]
+    return {"decision": decision, "distances": distances, "margin": margin}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])
+

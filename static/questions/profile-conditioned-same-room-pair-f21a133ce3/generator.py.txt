@@ -1,0 +1,407 @@
+"""Same-room world: rooms cut out of white paper by crossing closed fences.
+
+Latent scene z = {grid geometry, a list of closed rectangular fences given in
+lattice-line coordinates, three jittered coloured dots}. The picture is the
+white paper with the fences painted on it. Two dots are in the same *room* when
+a path on white paper joins them without crossing a fence line, i.e. when their
+cells lie in one connected component of the cell graph whose edges are cut by
+painted fence sides.
+
+Every scene is sampled so that all three dots sit at the *same* enclosure depth
+(inside the same number of fences), so counting the fences around a dot can
+never decide the answer; only the connectivity of the white complement can.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "same_room_pair-0.1.0"
+
+GRID = 11              # cells per side
+CELL = 52              # pixels per cell
+PAGE_MARGIN = 22       # white border in pixels
+INK_WIDTH = 12         # painted fence thickness in pixels
+DOT_RADIUS = 8
+JITTER = 5.0           # maximum dot offset from its cell centre, in pixels
+SUPERSAMPLE = 3
+CANVAS = 2 * PAGE_MARGIN + GRID * CELL
+
+BACKGROUND = "#ffffff"
+INK_COLOR = "#141414"
+DOT_COLORS = {"red": "#c81e32", "green": "#1e8c46", "blue": "#2846c8"}
+COLOR_ORDER = ("red", "green", "blue")
+PAIRS = (("red", "green"), ("red", "blue"), ("green", "blue"))
+
+N_FENCES = 4
+MIN_SIDE = 3           # smallest fence, in cells
+MAX_SIDE = 7
+MIN_CELL_SEPARATION = 2
+QUARANTINE_MARGIN_PX = 6.0
+
+
+# --------------------------------------------------------------------------
+# lattice topology
+# --------------------------------------------------------------------------
+def _blocked_lines(fences: list[list[int]]) -> tuple[set, set]:
+    """Lattice unit edges painted over by a fence side.
+
+    ``vertical[(x, j)]`` means the unit piece of the vertical lattice line x
+    beside cell row j is painted, so cells (x-1, j) and (x, j) are separated.
+    """
+    vertical: set[tuple[int, int]] = set()
+    horizontal: set[tuple[int, int]] = set()
+    for x0, y0, x1, y1 in fences:
+        for j in range(y0, y1):
+            vertical.add((x0, j))
+            vertical.add((x1, j))
+        for i in range(x0, x1):
+            horizontal.add((i, y0))
+            horizontal.add((i, y1))
+    return vertical, horizontal
+
+
+def _neighbours(cell: tuple[int, int], vertical: set, horizontal: set):
+    """4-neighbours of a cell together with whether a fence side is in the way."""
+    i, j = cell
+    if i > 0:
+        yield (i - 1, j), (i, j) in vertical
+    if i < GRID - 1:
+        yield (i + 1, j), (i + 1, j) in vertical
+    if j > 0:
+        yield (i, j - 1), (i, j) in horizontal
+    if j < GRID - 1:
+        yield (i, j + 1), (i, j + 1) in horizontal
+
+
+def _rooms(fences: list[list[int]]) -> dict[tuple[int, int], int]:
+    """Label every cell with the index of its room (white connected component)."""
+    vertical, horizontal = _blocked_lines(fences)
+    label: dict[tuple[int, int], int] = {}
+    room = 0
+    for start in ((i, j) for i in range(GRID) for j in range(GRID)):
+        if start in label:
+            continue
+        queue = deque([start])
+        label[start] = room
+        while queue:
+            cell = queue.popleft()
+            for other, cut in _neighbours(cell, vertical, horizontal):
+                if cut or other in label:
+                    continue
+                label[other] = room
+                queue.append(other)
+        room += 1
+    return label
+
+
+def _depth(cell: tuple[int, int], fences: list[list[int]]) -> int:
+    """Number of fences whose enclosed area contains the cell."""
+    i, j = cell
+    return sum(1 for x0, y0, x1, y1 in fences if x0 <= i < x1 and y0 <= j < y1)
+
+
+def _min_cuts(a: tuple[int, int], b: tuple[int, int], fences: list[list[int]]) -> int:
+    """Fewest fence sides any path from cell a to cell b must cross (0-1 BFS)."""
+    vertical, horizontal = _blocked_lines(fences)
+    best = {a: 0}
+    queue = deque([a])
+    while queue:
+        cell = queue.popleft()
+        cost = best[cell]
+        for other, cut in _neighbours(cell, vertical, horizontal):
+            step = cost + (1 if cut else 0)
+            if step < best.get(other, math.inf):
+                best[other] = step
+                if cut:
+                    queue.append(other)
+                else:
+                    queue.appendleft(other)
+    return int(best.get(b, 10**6))
+
+
+def _crossing_pairs(fences: list[list[int]]) -> int:
+    """How many fence pairs genuinely cross (overlap without nesting)."""
+    count = 0
+    for a in range(len(fences)):
+        for b in range(a + 1, len(fences)):
+            ax0, ay0, ax1, ay1 = fences[a]
+            bx0, by0, bx1, by1 = fences[b]
+            if min(ax1, bx1) <= max(ax0, bx0) or min(ay1, by1) <= max(ay0, by0):
+                continue  # disjoint interiors
+            a_in_b = bx0 <= ax0 and ax1 <= bx1 and by0 <= ay0 and ay1 <= by1
+            b_in_a = ax0 <= bx0 and bx1 <= ax1 and ay0 <= by0 and by1 <= ay1
+            if not a_in_b and not b_in_a:
+                count += 1
+    return count
+
+
+# --------------------------------------------------------------------------
+# pixel geometry
+# --------------------------------------------------------------------------
+def _line_px(value: int) -> float:
+    return PAGE_MARGIN + value * CELL
+
+
+def _dot_centre(dot: dict) -> tuple[float, float]:
+    i, j = dot["cell"]
+    dx, dy = dot["offset"]
+    return (_line_px(i) + CELL / 2.0 + dx, _line_px(j) + CELL / 2.0 + dy)
+
+
+def _fence_bands(fences: list[list[int]]) -> list[tuple[float, float, float, float]]:
+    """Fence sides as painted centre-line segments (x0, y0, x1, y1) in pixels."""
+    bands = []
+    for x0, y0, x1, y1 in fences:
+        px0, py0, px1, py1 = _line_px(x0), _line_px(y0), _line_px(x1), _line_px(y1)
+        bands.append((px0, py0, px1, py0))
+        bands.append((px0, py1, px1, py1))
+        bands.append((px0, py0, px0, py1))
+        bands.append((px1, py0, px1, py1))
+    return bands
+
+
+def _distance_to_ink(point: tuple[float, float], fences: list[list[int]]) -> float:
+    """Distance from a point to the nearest painted pixel of any fence."""
+    px, py = point
+    best = math.inf
+    for x0, y0, x1, y1 in _fence_bands(fences):
+        dx = max(min(x0, x1) - px, 0.0, px - max(x0, x1))
+        dy = max(min(y0, y1) - py, 0.0, py - max(y0, y1))
+        best = min(best, math.hypot(dx, dy) - INK_WIDTH / 2.0)
+    return best
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _sample_fences(rng: random.Random) -> list[list[int]] | None:
+    fences: list[list[int]] = []
+    for _ in range(N_FENCES):
+        width = rng.randint(MIN_SIDE, MAX_SIDE)
+        height = rng.randint(MIN_SIDE, MAX_SIDE)
+        x0 = rng.randint(0, GRID - width)
+        y0 = rng.randint(0, GRID - height)
+        rect = [x0, y0, x0 + width, y0 + height]
+        if rect in fences:
+            return None
+        fences.append(rect)
+    if _crossing_pairs(fences) < 2:
+        return None
+    # The outermost fence seals the sheet: without it the white page border
+    # would be a corridor joining every room that reaches the edge.
+    return [[0, 0, GRID, GRID]] + fences
+
+
+def _candidate_triples(fences: list[list[int]], rooms: dict) -> list[tuple]:
+    """(pair_cell_a, pair_cell_b, lone_cell) triples at one common depth."""
+    buckets: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for cell, room in rooms.items():
+        buckets.setdefault((_depth(cell, fences), room), []).append(cell)
+
+    by_depth: dict[int, dict[int, list]] = {}
+    for (depth, room), cells in buckets.items():
+        by_depth.setdefault(depth, {})[room] = cells
+
+    triples = []
+    for depth, per_room in by_depth.items():
+        rooms_here = sorted(per_room)
+        if len(rooms_here) < 2:
+            continue
+        for room in rooms_here:
+            cells = per_room[room]
+            others = [c for r in rooms_here if r != room for c in per_room[r]]
+            for index_a in range(len(cells)):
+                for index_b in range(index_a + 1, len(cells)):
+                    a, b = cells[index_a], cells[index_b]
+                    if _chebyshev(a, b) < MIN_CELL_SEPARATION:
+                        continue
+                    for lone in others:
+                        if _chebyshev(a, lone) < MIN_CELL_SEPARATION:
+                            continue
+                        if _chebyshev(b, lone) < MIN_CELL_SEPARATION:
+                            continue
+                        triples.append((a, b, lone, depth))
+    return triples
+
+
+def _chebyshev(a: tuple[int, int], b: tuple[int, int]) -> int:
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced scene. Deterministic in ``seed``."""
+    rng = random.Random(int(seed) * 7919 + 13)
+    target_pair = PAIRS[rng.randrange(len(PAIRS))]
+    want_answer_closest = rng.random() < 0.5
+
+    for _ in range(4000):
+        fences = _sample_fences(rng)
+        if fences is None:
+            continue
+        rooms = _rooms(fences)
+        triples = _candidate_triples(fences, rooms)
+        if not triples:
+            continue
+        rng.shuffle(triples)
+        for cell_a, cell_b, cell_lone, _depth_value in triples[:40]:
+            lone_color = next(c for c in COLOR_ORDER if c not in target_pair)
+            first, second = target_pair
+            if rng.random() < 0.5:
+                cell_a, cell_b = cell_b, cell_a
+            placement = {first: cell_a, second: cell_b, lone_color: cell_lone}
+            dots = []
+            for color in COLOR_ORDER:
+                offset = (
+                    round(rng.uniform(-JITTER, JITTER), 2),
+                    round(rng.uniform(-JITTER, JITTER), 2),
+                )
+                dots.append(
+                    {
+                        "color": color,
+                        "cell": list(placement[color]),
+                        "offset": list(offset),
+                        "radius": DOT_RADIUS,
+                    }
+                )
+            scene = {
+                "grid": GRID,
+                "cell": CELL,
+                "page_margin": PAGE_MARGIN,
+                "canvas": CANVAS,
+                "ink_width": INK_WIDTH,
+                "supersample": SUPERSAMPLE,
+                "background": BACKGROUND,
+                "ink_color": INK_COLOR,
+                "fences": [list(f) for f in fences],
+                "dots": dots,
+            }
+            # counterbalance the cheap "the two nearest dots share a room" cue
+            if (_closest_pair(scene) == _canonical(target_pair)) != want_answer_closest:
+                continue
+            if margin(scene) < QUARANTINE_MARGIN_PX + 1.0:
+                continue
+            return scene
+    raise RuntimeError(f"could not sample a same-room scene for seed {seed}")
+
+
+def _canonical(pair) -> str:
+    ordered = [c for c in COLOR_ORDER if c in pair]
+    return f"{ordered[0]}_{ordered[1]}"
+
+
+def _closest_pair(scene: dict) -> str:
+    centres = {dot["color"]: _dot_centre(dot) for dot in scene["dots"]}
+    best, best_pair = math.inf, ""
+    for pair in PAIRS:
+        distance = math.dist(centres[pair[0]], centres[pair[1]])
+        if distance < best:
+            best, best_pair = distance, _canonical(pair)
+    return best_pair
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    """Which colour pair shares a room: 'red_green', 'red_blue' or 'green_blue'."""
+    fences = [list(f) for f in scene["fences"]]
+    rooms = _rooms(fences)
+    cells = {dot["color"]: tuple(dot["cell"]) for dot in scene["dots"]}
+    together = [pair for pair in PAIRS if rooms[cells[pair[0]]] == rooms[cells[pair[1]]]]
+    if len(together) != 1:
+        raise ValueError("scene does not have exactly one same-room pair")
+    return _canonical(together[0])
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin in pixels.
+
+    The smallest of: white clearance around a dot, the width of the narrowest
+    corridor a room path may use, and the thickness of fence ink that would have
+    to be erased to join a runner-up pair.
+    """
+    fences = [list(f) for f in scene["fences"]]
+    cells = {dot["color"]: tuple(dot["cell"]) for dot in scene["dots"]}
+    decision = analytic_gold(scene)
+
+    clearance = min(
+        _distance_to_ink(_dot_centre(dot), fences) - dot["radius"] for dot in scene["dots"]
+    )
+    corridor = float(scene["cell"] - scene["ink_width"])
+    cuts = [
+        _min_cuts(cells[pair[0]], cells[pair[1]], fences)
+        for pair in PAIRS
+        if _canonical(pair) != decision
+    ]
+    erasure = min(cuts) * float(scene["ink_width"])
+    return float(min(clearance, corridor, erasure))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN_PX)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabelings of bookkeeping-only latent fields.
+
+    Fences all share one ink colour and are painted with the same stroke, so the
+    order of the fence list and the corner order inside one fence are pure
+    bookkeeping; the dot list is keyed by colour, so its slot order is too.
+    """
+    twins: list[tuple[str, dict]] = []
+
+    rotated = dict(scene)
+    fences = [list(f) for f in scene["fences"]]
+    rotated["fences"] = fences[1:] + fences[:1]
+    twins.append(("fence_draw_order_rotated", rotated))
+
+    reversed_fences = dict(scene)
+    reversed_fences["fences"] = [list(f) for f in reversed(scene["fences"])]
+    twins.append(("fence_draw_order_reversed", reversed_fences))
+
+    dot_slots = dict(scene)
+    dot_slots["dots"] = [dict(dot) for dot in reversed(scene["dots"])]
+    twins.append(("dot_slot_order_reversed", dot_slots))
+
+    return twins
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    """Paint the fences and the three dots on white paper."""
+    scale = int(scene["supersample"])
+    size = int(scene["canvas"])
+    image = Image.new("RGB", (size * scale, size * scale), scene["background"])
+    draw = ImageDraw.Draw(image)
+
+    half = scene["ink_width"] / 2.0
+    for x0, y0, x1, y1 in scene["fences"]:
+        left = (_line_px(x0) - half) * scale
+        top = (_line_px(y0) - half) * scale
+        right = (_line_px(x1) + half) * scale
+        bottom = (_line_px(y1) + half) * scale
+        draw.rectangle(
+            [left, top, right, bottom],
+            outline=scene["ink_color"],
+            width=int(round(scene["ink_width"] * scale)),
+        )
+
+    for dot in scene["dots"]:
+        cx, cy = _dot_centre(dot)
+        radius = dot["radius"]
+        draw.ellipse(
+            [(cx - radius) * scale, (cy - radius) * scale,
+             (cx + radius) * scale, (cy + radius) * scale],
+            fill=DOT_COLORS[dot["color"]],
+        )
+
+    if scale > 1:
+        image = image.resize((size, size), Image.LANCZOS)
+    return image

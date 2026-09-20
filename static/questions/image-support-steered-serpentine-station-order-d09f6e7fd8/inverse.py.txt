@@ -1,0 +1,113 @@
+"""Independent image-only inverse arm for directed trail order.
+
+The implementation knows the public color names and trail rules, but no sampler
+state, geometry template, station fractions, or analytic label. It segments the
+raster, verifies that all ink belongs to one robust connected trace, and then
+compares pixel-geodesic distances from the green terminal.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _color_masks(array: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    values = array.astype(np.int16)
+    height, width = values.shape[:2]
+    border = np.concatenate(
+        (values[:4].reshape(-1, 3), values[-4:].reshape(-1, 3), values[:, :4].reshape(-1, 3), values[:, -4:].reshape(-1, 3)),
+        axis=0,
+    )
+    background = np.median(border, axis=0)
+    delta = np.sqrt(np.sum((values - background) ** 2, axis=2))
+    foreground = delta > 48.0
+
+    red = values[:, :, 0]
+    green_channel = values[:, :, 1]
+    blue = values[:, :, 2]
+    green = foreground & (green_channel > 105) & (green_channel > red + 24) & (green_channel > blue + 8) & (red < 115)
+    orange = foreground & (red > 175) & (green_channel > 72) & (green_channel < 180) & (blue < 105) & (red > green_channel + 55)
+    purple = foreground & (red > 88) & (red < 190) & (green_channel < 125) & (blue > 125) & (blue > green_channel + 38)
+
+    if foreground.shape != (height, width):
+        raise OracleAbstention("invalid raster shape")
+    return foreground, green, orange, purple
+
+
+def _validate_marker(mask: np.ndarray, name: str) -> None:
+    area = int(mask.sum())
+    if not 360 <= area <= 1250:
+        raise OracleAbstention(f"{name} station area is ambiguous: {area}")
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise OracleAbstention(f"missing {name} station")
+    if np.ptp(xs) < 18 or np.ptp(ys) < 18:
+        raise OracleAbstention(f"{name} station is clipped or malformed")
+
+
+def _traverse(
+    foreground: np.ndarray,
+    source: np.ndarray,
+    orange: np.ndarray,
+    purple: np.ndarray,
+) -> tuple[int, int, int]:
+    height, width = foreground.shape
+    distance = np.full((height, width), -1, dtype=np.int32)
+    queue: deque[tuple[int, int]] = deque()
+    for y, x in np.argwhere(source):
+        yy, xx = int(y), int(x)
+        distance[yy, xx] = 0
+        queue.append((yy, xx))
+    visited = 0
+    orange_distance = None
+    purple_distance = None
+    while queue:
+        y, x = queue.popleft()
+        visited += 1
+        current = int(distance[y, x])
+        if orange[y, x] and orange_distance is None:
+            orange_distance = current
+        if purple[y, x] and purple_distance is None:
+            purple_distance = current
+        for ny, nx in (
+            (y - 1, x - 1), (y - 1, x), (y - 1, x + 1),
+            (y, x - 1), (y, x + 1),
+            (y + 1, x - 1), (y + 1, x), (y + 1, x + 1),
+        ):
+            if 0 <= ny < height and 0 <= nx < width and foreground[ny, nx] and distance[ny, nx] < 0:
+                distance[ny, nx] = current + 1
+                queue.append((ny, nx))
+    if orange_distance is None or purple_distance is None:
+        raise OracleAbstention("a query station is disconnected from the green terminal")
+    return orange_distance, purple_distance, visited
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 100:
+        raise OracleAbstention("unsupported image")
+    foreground, green, orange, purple = _color_masks(array)
+    _validate_marker(green, "green")
+    _validate_marker(orange, "orange")
+    _validate_marker(purple, "purple")
+    ink = int(foreground.sum())
+    if not 8500 <= ink <= 36000:
+        raise OracleAbstention(f"unexpected trail ink: {ink}")
+    ys, xs = np.nonzero(foreground)
+    if np.ptp(xs) < int(array.shape[1] * 0.82) or np.ptp(ys) < int(array.shape[0] * 0.22):
+        raise OracleAbstention("trail does not robustly span the canvas")
+    orange_distance, purple_distance, visited = _traverse(foreground, green, orange, purple)
+    unvisited = ink - visited
+    if unvisited > 100:
+        raise OracleAbstention(f"trail is broken into multiple substantial components: {unvisited} pixels")
+    gap = abs(orange_distance - purple_distance)
+    if gap < 120:
+        raise OracleAbstention(f"station-order margin is too small: {gap}")
+    return "yes" if orange_distance < purple_distance else "no"

@@ -1,0 +1,205 @@
+"""Deterministic latent sampler and renderer for Euler components-versus-holes."""
+
+from __future__ import annotations
+
+from collections import deque
+import itertools
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+
+WIDTH = 440
+HEIGHT = 440
+GRID_EXTENT = 33
+SLOT_ANCHORS = ((1, 1), (18, 1), (9, 18))
+INK_PALETTES = (
+    (27, 36, 48),
+    (48, 31, 55),
+    (20, 52, 48),
+    (56, 35, 29),
+)
+BACKGROUNDS = ((248, 247, 242), (245, 248, 250), (250, 246, 248))
+DECORATION_COLORS = ((190, 220, 235), (235, 203, 215), (218, 214, 174))
+
+
+def _neighbors(cell: tuple[int, int]) -> Iterable[tuple[int, int]]:
+    x, y = cell
+    yield x - 1, y
+    yield x + 1, y
+    yield x, y - 1
+    yield x, y + 1
+
+
+def _component_count(cells: set[tuple[int, int]]) -> int:
+    remaining = set(cells)
+    count = 0
+    while remaining:
+        count += 1
+        start = remaining.pop()
+        queue = [start]
+        while queue:
+            for neighbor in _neighbors(queue.pop()):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    queue.append(neighbor)
+    return count
+
+
+def _topology_counts(tiles: list[list[int]]) -> tuple[int, int]:
+    """Count 4-connected foreground components and bounded complement regions."""
+    dark = {(int(x), int(y)) for x, y in tiles}
+    if not dark:
+        return 0, 0
+    components = _component_count(dark)
+    min_x = min(x for x, _ in dark) - 1
+    max_x = max(x for x, _ in dark) + 1
+    min_y = min(y for _, y in dark) - 1
+    max_y = max(y for _, y in dark) + 1
+    light = {
+        (x, y)
+        for y in range(min_y, max_y + 1)
+        for x in range(min_x, max_x + 1)
+        if (x, y) not in dark
+    }
+    holes = 0
+    while light:
+        start = light.pop()
+        queue = deque([start])
+        touches_frame = False
+        while queue:
+            x, y = queue.popleft()
+            touches_frame |= x in (min_x, max_x) or y in (min_y, max_y)
+            for neighbor in _neighbors((x, y)):
+                if neighbor in light:
+                    light.remove(neighbor)
+                    queue.append(neighbor)
+        holes += int(not touches_frame)
+    return components, holes
+
+
+def topology_counts(scene: dict) -> tuple[int, int]:
+    """Public analytic diagnostic used by generation captions and tests."""
+    return _topology_counts(scene["tiles"])
+
+
+def _module_tiles(hole_count: int) -> set[tuple[int, int]]:
+    """A 13x7 connected module with constant ink and 0..3 visible holes.
+
+    Each of three equal-area cutouts is either internal (a hole) or opens
+    through the top edge (a bay). Thus local ink area is independent of holes.
+    """
+    if hole_count not in range(4):
+        raise ValueError("hole_count must be in 0..3")
+    cells = {(x, y) for y in range(7) for x in range(13)}
+    for index, column in enumerate((2, 6, 10)):
+        rows = range(2, 5) if index < hole_count else range(0, 3)
+        for x in (column, column + 1):
+            for y in rows:
+                cells.remove((x, y))
+    return cells
+
+
+def _rotate(cells: set[tuple[int, int]], quarter_turns: int) -> set[tuple[int, int]]:
+    rotated = set(cells)
+    for _ in range(quarter_turns % 4):
+        rotated = {(-y, x) for x, y in rotated}
+        min_x = min(x for x, _ in rotated)
+        min_y = min(y for _, y in rotated)
+        rotated = {(x - min_x, y - min_y) for x, y in rotated}
+    return rotated
+
+
+def _bounded_compositions(total: int, parts: int) -> list[tuple[int, ...]]:
+    return [values for values in itertools.product(range(4), repeat=parts) if sum(values) == total]
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a balanced robust scene; seed parity fixes the answer class."""
+    rng = random.Random(int(seed))
+    equal = int(seed) % 2 == 0
+    component_count = 2 + ((int(seed) // 2) % 2)
+    if equal:
+        hole_count = component_count
+    else:
+        delta = 1 if ((int(seed) // 4) % 2 == 0) else -1
+        hole_count = component_count + delta
+    distributions = _bounded_compositions(hole_count, component_count)
+    holes_per_component = list(rng.choice(distributions))
+    rng.shuffle(holes_per_component)
+
+    chosen_slots = rng.sample(list(SLOT_ANCHORS), component_count)
+    tiles: list[list[int]] = []
+    for holes, (slot_x, slot_y) in zip(holes_per_component, chosen_slots):
+        module = _rotate(_module_tiles(holes), rng.randrange(4))
+        module_w = max(x for x, _ in module) + 1
+        module_h = max(y for _, y in module) + 1
+        anchor_x = slot_x + (13 - module_w) // 2
+        anchor_y = slot_y + (13 - module_h) // 2
+        tiles.extend([[anchor_x + x, anchor_y + y] for x, y in module])
+    rng.shuffle(tiles)
+
+    tile_px = rng.choice((9, 10, 11))
+    origin_x = (WIDTH - GRID_EXTENT * tile_px) // 2 + rng.randint(-8, 8)
+    origin_y = (HEIGHT - GRID_EXTENT * tile_px) // 2 + rng.randint(-8, 8)
+    edge_marks = ((20, 22), (WIDTH - 22, 25), (22, HEIGHT - 22), (WIDTH - 24, HEIGHT - 25))
+    decorations = []
+    for index, (x, y) in enumerate(rng.sample(list(edge_marks), rng.randrange(1, 4))):
+        decorations.append([x, y, 5 + rng.randrange(3), list(DECORATION_COLORS[index])])
+    rng.shuffle(decorations)
+    return {
+        "tiles": tiles,
+        "width": WIDTH,
+        "height": HEIGHT,
+        "tile_px": tile_px,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "ink_rgb": list(rng.choice(INK_PALETTES)),
+        "background_rgb": list(rng.choice(BACKGROUNDS)),
+        "decorations": decorations,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Render exact-edged tiles; no metadata or latent labels enter the PNG."""
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), tuple(scene["background_rgb"]))
+    draw = ImageDraw.Draw(image)
+    for cx, cy, radius, rgb in scene["decorations"]:
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=tuple(rgb))
+    size = int(scene["tile_px"])
+    ox, oy = int(scene["origin_x"]), int(scene["origin_y"])
+    ink = tuple(scene["ink_rgb"])
+    for gx, gy in scene["tiles"]:
+        x0, y0 = ox + int(gx) * size, oy + int(gy) * size
+        draw.rectangle((x0, y0, x0 + size - 1, y0 + size - 1), fill=ink)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    components, holes = _topology_counts(scene["tiles"])
+    return "equal" if components == holes else "different"
+
+
+def margin(scene: dict) -> float:
+    components, holes = _topology_counts(scene["tiles"])
+    return float(max(1, abs(components - holes)))
+
+
+def is_quarantined(scene: dict) -> bool:
+    tile_px = int(scene["tile_px"])
+    ink = tuple(int(v) for v in scene["ink_rgb"])
+    background = tuple(int(v) for v in scene["background_rgb"])
+    contrast = abs(sum(background) / 3.0 - sum(ink) / 3.0)
+    xs = [int(scene["origin_x"]) + int(x) * tile_px for x, _ in scene["tiles"]]
+    ys = [int(scene["origin_y"]) + int(y) * tile_px for _, y in scene["tiles"]]
+    padding = min(min(xs), min(ys), int(scene["width"]) - max(xs) - tile_px, int(scene["height"]) - max(ys) - tile_px)
+    return tile_px < 8 or contrast < 120 or padding < tile_px
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Serialization order is a real latent alias for same-color set elements."""
+    twin = dict(scene)
+    twin["tiles"] = list(reversed(scene["tiles"]))
+    twin["decorations"] = list(reversed(scene["decorations"]))
+    return [("reverse_set_serialization", twin)]

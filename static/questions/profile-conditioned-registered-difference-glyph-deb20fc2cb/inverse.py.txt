@@ -1,0 +1,187 @@
+"""Independent pixel-only inverse for the registered-difference glyph.
+
+This module receives only a raster. It discovers the green corner components and
+colored role tabs, crops the two interiors, rotates the transform crop, computes
+an absolute grayscale difference, and classifies that evidence against its own
+equal-area geometric templates.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_PANEL_SIZE = 184
+_INNER_SIZE = 144
+_INNER_OFFSET = 20
+_TILE_TARGET = 1400
+_SYMBOLS = ("triangle", "ring", "cross", "zigzag")
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[tuple[int, int, int]] = []
+    for y, x in zip(*np.where(mask & ~seen)):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= 30:
+            ys = np.asarray([p[0] for p in points], dtype=float)
+            xs = np.asarray([p[1] for p in points], dtype=float)
+            found.append((len(points), int(round(xs.mean())), int(round(ys.mean()))))
+    return found
+
+
+def _role_points(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    red, green, blue = [rgb[:, :, i].astype(np.int16) for i in range(3)]
+    blue_mask = (blue > 150) & (blue > green + 45) & (blue > red + 80)
+    orange_mask = (red > 180) & (green > 70) & (green < 180) & (red > blue + 80)
+    return np.column_stack(np.where(blue_mask)), np.column_stack(np.where(orange_mask))
+
+
+def _panel_crops(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    red, green, blue = [rgb[:, :, i].astype(np.int16) for i in range(3)]
+    green_mask = (green > 130) & (green > red + 55) & (green > blue + 15) & (red < 100)
+    markers = _components(green_mask)
+    if len(markers) != 8:
+        raise ValueError("expected eight green fiducial components")
+    centers = sorted([(x, y) for _, x, y in markers])
+    groups: list[list[tuple[int, int]]] = []
+    for center in centers:
+        if not groups or center[0] - groups[-1][0][0] > 180:
+            groups.append([center])
+        else:
+            groups[-1].append(center)
+    if len(groups) != 2 or any(len(group) != 4 for group in groups):
+        raise ValueError("fiducials do not define two panels")
+    blue_points, orange_points = _role_points(rgb)
+    panels: dict[str, np.ndarray] = {}
+    for group in groups:
+        xs = [point[0] for point in group]
+        ys = [point[1] for point in group]
+        x0 = int(round(min(xs) - 12))
+        y0 = int(round(min(ys) - 12))
+        crop = rgb[y0 + _INNER_OFFSET : y0 + _INNER_OFFSET + _INNER_SIZE,
+                   x0 + _INNER_OFFSET : x0 + _INNER_OFFSET + _INNER_SIZE]
+        if crop.shape != (_INNER_SIZE, _INNER_SIZE, 3):
+            raise ValueError("panel crop is incomplete")
+        blue_inside = int(np.sum((blue_points[:, 0] >= y0) & (blue_points[:, 0] < y0 + _PANEL_SIZE) &
+                                 (blue_points[:, 1] >= x0) & (blue_points[:, 1] < x0 + _PANEL_SIZE)))
+        orange_inside = int(np.sum((orange_points[:, 0] >= y0) & (orange_points[:, 0] < y0 + _PANEL_SIZE) &
+                                   (orange_points[:, 1] >= x0) & (orange_points[:, 1] < x0 + _PANEL_SIZE)))
+        if blue_inside and not orange_inside:
+            panels["reference"] = crop
+        elif orange_inside and not blue_inside:
+            panels["transform"] = crop
+        else:
+            raise ValueError("panel role marks are missing or ambiguous")
+    if set(panels) != {"reference", "transform"}:
+        raise ValueError("both panel roles are required")
+    return panels["reference"], panels["transform"]
+
+
+def _segment_distance(x: np.ndarray, y: np.ndarray, a: tuple[float, float], b: tuple[float, float]) -> np.ndarray:
+    ax, ay = a
+    bx, by = b
+    vx = bx - ax
+    vy = by - ay
+    t = ((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy)
+    t = np.clip(t, 0.0, 1.0)
+    return np.hypot(x - (ax + t * vx), y - (ay + t * vy))
+
+
+def _template(symbol: str) -> np.ndarray:
+    yy, xx = np.indices((_INNER_SIZE, _INNER_SIZE), dtype=np.float64)
+    x = xx - _INNER_SIZE / 2.0
+    y = yy - _INNER_SIZE / 2.0
+    if symbol == "ring":
+        score = np.abs(np.hypot(x, y) - 28.0) + 0.012 * np.hypot(x, y)
+    elif symbol == "cross":
+        radius = np.maximum(np.abs(x), np.abs(y))
+        score = np.minimum(np.abs(x), np.abs(y)) + 0.025 * radius
+        score = np.where(radius <= 40.0, score, score + 100.0)
+    elif symbol == "triangle":
+        top, bottom = -36.0, 36.0
+        progress = np.clip((y - top) / (bottom - top), 0.0, 1.0)
+        half_width = 3.0 + 34.0 * progress
+        inside = (y >= top) & (y <= bottom) & (np.abs(x) <= half_width)
+        score = np.where(inside, 0.055 * np.abs(x) + 0.014 * np.abs(y),
+                         100.0 + np.abs(y) + 0.1 * np.abs(x))
+    elif symbol == "zigzag":
+        points = [(-38.0, -25.0), (-13.0, 25.0), (13.0, -25.0), (38.0, 25.0)]
+        score = np.minimum.reduce([_segment_distance(x, y, a, b) for a, b in zip(points, points[1:])])
+        score = np.where((np.abs(x) <= 44.0) & (np.abs(y) <= 38.0), score, score + 100.0)
+        score = score + 0.01 * np.hypot(x, y)
+    else:
+        raise ValueError(f"unknown glyph template: {symbol}")
+    order = np.lexsort((xx.ravel(), yy.ravel(), score.ravel()))
+    mask = np.zeros(_INNER_SIZE * _INNER_SIZE, dtype=bool)
+    mask[order[:_TILE_TARGET]] = True
+    return mask.reshape((_INNER_SIZE, _INNER_SIZE))
+
+
+def _shift(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    shifted = np.zeros_like(mask)
+    source_y0 = max(0, -dy)
+    source_y1 = min(mask.shape[0], mask.shape[0] - dy)
+    source_x0 = max(0, -dx)
+    source_x1 = min(mask.shape[1], mask.shape[1] - dx)
+    target_y0 = source_y0 + dy
+    target_y1 = source_y1 + dy
+    target_x0 = source_x0 + dx
+    target_x1 = source_x1 + dx
+    shifted[target_y0:target_y1, target_x0:target_x1] = mask[source_y0:source_y1, source_x0:source_x1]
+    return shifted
+
+
+def _decode(image: Image.Image) -> tuple[str, float]:
+    rgb = np.asarray(image.convert("RGB"))
+    reference, transform = _panel_crops(rgb)
+    aligned = np.rot90(transform, 2)
+    difference = np.abs(reference[:, :, 0].astype(np.int16) - aligned[:, :, 0].astype(np.int16))
+    peak = int(difference.max())
+    if peak < 12:
+        raise ValueError("registered difference has no usable contrast")
+    mask = difference >= max(10, int(round(peak * 0.45)))
+    count = int(mask.sum())
+    if not 500 <= count <= 2600:
+        raise ValueError("difference evidence is absent or corrupted")
+    ys, xs = np.where(mask)
+    observed_cx = float(xs.mean())
+    observed_cy = float(ys.mean())
+    scores: list[tuple[float, str]] = []
+    for symbol in _SYMBOLS:
+        template = _template(symbol)
+        template_y, template_x = np.where(template)
+        dx = int(round(observed_cx - float(template_x.mean())))
+        dy = int(round(observed_cy - float(template_y.mean())))
+        shifted = _shift(template, dx, dy)
+        intersection = int(np.logical_and(mask, shifted).sum())
+        union = int(np.logical_or(mask, shifted).sum())
+        scores.append((intersection / max(union, 1), symbol))
+    scores.sort(reverse=True)
+    if scores[0][0] < 0.52 or scores[0][0] - scores[1][0] < 0.04:
+        raise ValueError("difference glyph is ambiguous")
+    return scores[0][1], float(scores[0][0] - scores[1][0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the selected glyph using only the final PNG."""
+
+    return _decode(image)[0]
+
+
+def confidence_margin(image: Image.Image) -> float:
+    """Return the top-versus-runner-up template margin from the raster evidence."""
+
+    return _decode(image)[1]

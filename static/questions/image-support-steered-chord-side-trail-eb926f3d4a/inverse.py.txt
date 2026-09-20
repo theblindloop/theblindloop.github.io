@@ -1,0 +1,112 @@
+"""Independent PNG-only inverse arm for chord-side trail classification."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose a single sufficiently resolved trail."""
+
+
+def _largest_component(mask: np.ndarray) -> tuple[np.ndarray, list[int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[list[tuple[int, int]]] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        stack = [(y0, x0)]
+        points: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        components.append(points)
+    if not components:
+        raise OracleAbstention("no foreground trail")
+    components.sort(key=len, reverse=True)
+    output = np.zeros_like(mask, dtype=bool)
+    for y, x in components[0]:
+        output[y, x] = True
+    return output, [len(item) for item in components]
+
+
+def _trail_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    border = np.concatenate(
+        (array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3),
+         array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)), axis=0
+    )
+    background = np.median(border, axis=0)
+    raw = np.linalg.norm(array - background, axis=2) > 42.0
+    component, sizes = _largest_component(raw)
+    if len(sizes) > 1 and sizes[1] >= 18:
+        raise OracleAbstention("trail is broken into multiple substantial components")
+    if not 300 <= sizes[0] <= 900:
+        raise OracleAbstention(f"implausible trail ink area {sizes[0]}")
+    return component
+
+
+def _lobe_offsets(image: Image.Image) -> tuple[float, float]:
+    mask = _trail_mask(image)
+    points = np.argwhere(mask).astype(np.float64)[:, ::-1] + 0.5
+    center = points.mean(axis=0)
+    centered = points - center
+    covariance = centered.T @ centered / len(points)
+    values, vectors = np.linalg.eigh(covariance)
+    if values[-1] < 6.0 * max(values[0], 1e-6):
+        raise OracleAbstention("foreground is not a thin elongated trail")
+    along = vectors[:, -1]
+    across = np.array([-along[1], along[0]])
+    s = centered @ along
+    q = centered @ across
+    span = float(np.ptp(s))
+    if not 82.0 <= span <= 108.0:
+        raise OracleAbstention(f"trail span {span:.1f} is outside the supported range")
+
+    edges = np.linspace(float(s.min()), float(s.max()), 26)
+    centers = []
+    profile = []
+    for index in range(25):
+        selected = (s >= edges[index]) & (s < edges[index + 1])
+        if index == 24:
+            selected |= s == edges[-1]
+        if selected.sum() < 4:
+            raise OracleAbstention("centerline has an unresolved longitudinal bin")
+        centers.append(float(np.median(s[selected])))
+        profile.append(float(np.median(q[selected])))
+    centers_a = np.asarray(centers)
+    profile_a = np.asarray(profile)
+    q_start = float(np.median(profile_a[:2]))
+    q_end = float(np.median(profile_a[-2:]))
+    fraction = (centers_a - centers_a[0]) / (centers_a[-1] - centers_a[0])
+    chord = q_start + fraction * (q_end - q_start)
+    residual = profile_a - chord
+    first = float(np.median(residual[4:10]))
+    second = float(np.median(residual[15:21]))
+    if min(abs(first), abs(second)) < 3.2:
+        raise OracleAbstention(
+            f"weak chord-side evidence ({first:.2f}, {second:.2f})"
+        )
+    return first, second
+
+
+def decision_from_image(image: Image.Image) -> str:
+    first, second = _lobe_offsets(image)
+    return "both sides" if first * second < 0.0 else "one side"

@@ -1,0 +1,266 @@
+"""Self-symmetry-type world: which isometry about a shape's own centre of mass
+maps one thick sprawling region onto itself?
+
+The latent scene is a list of thick capsule/disk parts painted in one dark
+colour on a light cluttered background. The parts are built as ``H`` union
+``T(H)`` for a chosen isometry ``T`` about an integer centre, so the rendered
+region is exactly ``T``-symmetric on the pixel grid.
+
+The analytic decision rasterises the region from the latent geometry, recovers
+the region's own centroid, and compares the intersection-over-union of the
+region with three candidate isometries about that centroid:
+
+    s_v = IoU(M, flip_x(M)), s_h = IoU(M, flip_y(M)), s_r = IoU(M, rot180(M))
+
+The winner must be both self-consistent (>= ACCEPT) and clearly ahead of the
+runner-up (top gap >= GAP); otherwise the scene is an explicit ambiguous case.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "self_symmetry_type-0.1.0"
+
+CANVAS = 320
+ACCEPT = 0.96
+GAP = 0.08
+MIN_AREA_FRACTION = 0.04
+MAX_AREA_FRACTION = 0.55
+
+LABELS = ("vertical_mirror", "horizontal_mirror", "point_rotation")
+AMBIGUOUS = "ambiguous"
+
+# Deterministic construction cycle: which isometry the sampler tries to install.
+CONSTRUCTIONS = (
+    "vertical_mirror",
+    "horizontal_mirror",
+    "point_rotation",
+    "vertical_mirror",
+    "horizontal_mirror",
+    "point_rotation",
+    "vertical_mirror",
+    "horizontal_mirror",
+    "point_rotation",
+    "ambiguous",
+)
+
+FG_PALETTE = (
+    (24, 38, 92),
+    (96, 22, 30),
+    (20, 74, 54),
+    (66, 30, 90),
+    (30, 30, 30),
+    (16, 62, 96),
+)
+BG_PALETTE = ((246, 246, 240), (240, 244, 250), (250, 244, 236), (238, 240, 238))
+DISTRACTOR_PALETTE = ((198, 200, 206), (206, 196, 182), (188, 202, 200), (204, 200, 210))
+
+
+# --------------------------------------------------------------------------
+# rasterisation and the three symmetry scores (analytic path; uses the scene)
+# --------------------------------------------------------------------------
+def _region_mask(scene: dict) -> np.ndarray:
+    """Boolean raster of the dark region implied by the latent parts."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    ys, xs = np.mgrid[0:height, 0:width]
+    mask = np.zeros((height, width), dtype=bool)
+    for part in scene["parts"]:
+        x1, y1, x2, y2, radius = (float(value) for value in part)
+        dx, dy = x2 - x1, y2 - y1
+        length2 = dx * dx + dy * dy
+        if length2 <= 0.0:
+            px, py = x1, y1
+        else:
+            t = np.clip(((xs - x1) * dx + (ys - y1) * dy) / length2, 0.0, 1.0)
+            px, py = x1 + t * dx, y1 + t * dy
+        mask |= (xs - px) ** 2 + (ys - py) ** 2 <= radius * radius
+    return mask
+
+
+def _flip_columns(mask: np.ndarray, cx: int) -> np.ndarray:
+    height, width = mask.shape
+    out = np.zeros_like(mask)
+    source = 2 * cx - np.arange(width)
+    keep = (source >= 0) & (source < width)
+    out[:, keep] = mask[:, source[keep]]
+    return out
+
+
+def _flip_rows(mask: np.ndarray, cy: int) -> np.ndarray:
+    height, width = mask.shape
+    out = np.zeros_like(mask)
+    source = 2 * cy - np.arange(height)
+    keep = (source >= 0) & (source < height)
+    out[keep, :] = mask[source[keep], :]
+    return out
+
+
+def _iou(a: np.ndarray, b: np.ndarray) -> float:
+    union = int(np.count_nonzero(a | b))
+    if union == 0:
+        return 0.0
+    return float(np.count_nonzero(a & b)) / float(union)
+
+
+def _scores_from_mask(mask: np.ndarray) -> dict:
+    """Self-overlap of the region under the three isometries about its centroid."""
+    area = int(np.count_nonzero(mask))
+    total = mask.shape[0] * mask.shape[1]
+    if area < MIN_AREA_FRACTION * total or area > MAX_AREA_FRACTION * total:
+        return {}
+    rows, cols = np.nonzero(mask)
+    cx = int(round(float(cols.mean())))
+    cy = int(round(float(rows.mean())))
+    flipped_x = _flip_columns(mask, cx)
+    flipped_y = _flip_rows(mask, cy)
+    return {
+        "vertical_mirror": _iou(mask, flipped_x),
+        "horizontal_mirror": _iou(mask, flipped_y),
+        "point_rotation": _iou(mask, _flip_rows(flipped_x, cy)),
+    }
+
+
+def _decide(scores: dict) -> tuple[str, float]:
+    """Declared decision rule shared by the analytic and the pixel-only arm."""
+    if not scores:
+        return AMBIGUOUS, 0.0
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    (best, best_score), (_, second_score) = ranked[0], ranked[1]
+    gap = best_score - second_score
+    if best_score < ACCEPT or gap < GAP:
+        return AMBIGUOUS, gap
+    return best, gap
+
+
+def analytic_gold(scene: dict) -> str:
+    return _decide(_scores_from_mask(_region_mask(scene)))[0]
+
+
+def margin(scene: dict) -> float:
+    return round(_decide(_scores_from_mask(_region_mask(scene)))[1], 9)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return analytic_gold(scene) == AMBIGUOUS
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _transform(part: list[int], kind: str, cx: int, cy: int) -> list[int]:
+    x1, y1, x2, y2, radius = part
+    if kind == "vertical_mirror":
+        return [2 * cx - x1, y1, 2 * cx - x2, y2, radius]
+    if kind == "horizontal_mirror":
+        return [x1, 2 * cy - y1, x2, 2 * cy - y2, radius]
+    return [2 * cx - x1, 2 * cy - y1, 2 * cx - x2, 2 * cy - y2, radius]
+
+
+def _half_parts(rng: random.Random, cx: int, cy: int, limit: float) -> list[list[int]]:
+    """A connected thick sprawl: a central hub plus arms reaching far out."""
+    parts = [[cx, cy, cx, cy, rng.randint(26, 34)]]
+    arms = 3
+    base = rng.uniform(0.0, 2.0 * math.pi)
+    for index in range(arms):
+        angle = base + index * (2.0 * math.pi / arms) + rng.uniform(-0.5, 0.5)
+        reach = rng.uniform(0.86, 1.0) * limit
+        mid = reach * rng.uniform(0.45, 0.6)
+        bend = angle + rng.uniform(-0.7, 0.7)
+        mx = int(round(cx + mid * math.cos(angle)))
+        my = int(round(cy + mid * math.sin(angle)))
+        tx = int(round(cx + reach * math.cos(bend)))
+        ty = int(round(cy + reach * math.sin(bend)))
+        radius = rng.randint(16, 22)
+        parts.append([cx, cy, mx, my, radius])
+        parts.append([mx, my, tx, ty, rng.randint(14, 20)])
+    return parts
+
+
+def _distractors(rng: random.Random, count: int, width: int, height: int) -> list[list[int]]:
+    return [
+        [rng.randint(10, width - 10), rng.randint(10, height - 10), rng.randint(4, 13)]
+        for _ in range(count)
+    ]
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic scene for ``seed``; the construction cycles over the classes."""
+    rng = random.Random(seed * 7919 + 13)
+    construction = CONSTRUCTIONS[seed % len(CONSTRUCTIONS)]
+    width = height = CANVAS
+    best_scene = None
+    for _ in range(60):
+        cx = width // 2 + rng.randint(-7, 7)
+        cy = height // 2 + rng.randint(-7, 7)
+        limit = min(cx, cy, width - cx, height - cy) - 16
+        half = _half_parts(rng, cx, cy, limit)
+        if construction == "ambiguous":
+            parts = list(half)
+            for kind in LABELS:
+                parts.extend(_transform(part, kind, cx, cy) for part in half)
+        else:
+            parts = list(half) + [_transform(part, construction, cx, cy) for part in half]
+        scene = {
+            "parts": parts,
+            "width": width,
+            "height": height,
+            "fg": list(FG_PALETTE[rng.randrange(len(FG_PALETTE))]),
+            "bg": list(BG_PALETTE[rng.randrange(len(BG_PALETTE))]),
+            "dfg": list(DISTRACTOR_PALETTE[rng.randrange(len(DISTRACTOR_PALETTE))]),
+            "distractors": _distractors(rng, rng.randint(7, 14), width, height),
+        }
+        best_scene = best_scene or scene
+        scores = _scores_from_mask(_region_mask(scene))
+        if not scores:
+            continue
+        decision, _ = _decide(scores)
+        if construction == "ambiguous":
+            if decision == AMBIGUOUS:
+                return scene
+            continue
+        ranked = sorted(scores.values(), reverse=True)
+        if decision == construction and ranked[0] >= 0.99 and ranked[1] <= 0.80:
+            return scene
+    return best_scene
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    """Flat-colour render: light clutter first, then the dark region on top.
+
+    No antialiasing or noise touches the region, so the set of dark pixels in
+    the PNG is exactly the analytic raster of the latent parts.
+    """
+    width = int(scene["width"])
+    height = int(scene["height"])
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:, :] = np.asarray(scene["bg"], dtype=np.uint8)
+    ys, xs = np.mgrid[0:height, 0:width]
+    clutter = np.zeros((height, width), dtype=bool)
+    for x, y, radius in scene["distractors"]:
+        clutter |= (xs - float(x)) ** 2 + (ys - float(y)) ** 2 <= float(radius) ** 2
+    canvas[clutter] = np.asarray(scene["dfg"], dtype=np.uint8)
+    canvas[_region_mask(scene)] = np.asarray(scene["fg"], dtype=np.uint8)
+    return Image.fromarray(canvas, mode="RGB")
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical latent aliases: the paint order inside each same-colour
+    group is unobservable because every part of a group shares one flat colour
+    and the render is a set union."""
+    reversed_parts = dict(scene)
+    reversed_parts["parts"] = list(reversed(scene["parts"]))
+    rotated_clutter = dict(scene)
+    rotated_clutter["distractors"] = scene["distractors"][3:] + scene["distractors"][:3]
+    return [
+        ("figure_part_paint_order", reversed_parts),
+        ("clutter_paint_order", rotated_clutter),
+    ]

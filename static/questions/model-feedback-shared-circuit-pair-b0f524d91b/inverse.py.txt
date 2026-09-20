@@ -1,0 +1,201 @@
+"""Pixel-only oracle: which two coloured rooms share one round trip.
+
+Receives a rendered RGB image and nothing else.  It recovers the room lattice
+from the wall ink, reads each internal boundary as solid or doorway, locates the
+four coloured floors, deletes every bridge doorway, and reports the unique pair
+of coloured rooms that survive in one and the same bridgeless component.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+CELLS = 6
+WALL_MAX = 110
+MIN_LOOP = 6
+
+FLOOR_COLOURS: dict[str, tuple[int, int, int]] = {
+    "orange": (235, 130, 25),
+    "green": (26, 150, 60),
+    "blue": (32, 82, 214),
+    "pink": (240, 105, 185),
+}
+COLOUR_ORDER = ("orange", "green", "blue", "pink")
+
+
+class OracleAbstention(ValueError):
+    """Raised when the raster does not present a readable scene."""
+
+
+def _blobs(mask: np.ndarray, minimum: int) -> list[tuple[float, float]]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    rows, cols = np.nonzero(mask)
+    out: list[tuple[float, float]] = []
+    for start_row, start_col in zip(rows.tolist(), cols.tolist()):
+        if seen[start_row, start_col]:
+            continue
+        queue = deque([(start_row, start_col)])
+        seen[start_row, start_col] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            row, col = queue.popleft()
+            pixels.append((row, col))
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nr, nc = row + dr, col + dc
+                if 0 <= nr < mask.shape[0] and 0 <= nc < mask.shape[1]:
+                    if mask[nr, nc] and not seen[nr, nc]:
+                        seen[nr, nc] = True
+                        queue.append((nr, nc))
+        if len(pixels) < minimum:
+            continue
+        out.append(
+            (
+                sum(p[0] for p in pixels) / len(pixels),
+                sum(p[1] for p in pixels) / len(pixels),
+            )
+        )
+    return sorted(out)
+
+
+def _lattice(wall: np.ndarray) -> tuple[int, int, int]:
+    rows, cols = np.nonzero(wall)
+    if rows.size == 0:
+        raise OracleAbstention("no wall ink in the raster")
+    top, bottom = int(rows.min()), int(rows.max())
+    left, right = int(cols.min()), int(cols.max())
+    extent = right - left + 1
+    if extent != bottom - top + 1:
+        raise OracleAbstention("wall ink is not a square block of rooms")
+    full = wall[:, left : right + 1].all(axis=1)
+    thickness = 0
+    while top + thickness <= bottom and full[top + thickness]:
+        thickness += 1
+    if thickness < 4 or thickness > 40:
+        raise OracleAbstention(f"implausible wall thickness {thickness}")
+    span = extent - thickness
+    if span % CELLS:
+        raise OracleAbstention("room pitch is not an integer")
+    step = span // CELLS
+    if step < 40:
+        raise OracleAbstention("rooms are too small to read")
+    return left + thickness // 2, step, thickness
+
+
+def _room_of(centre: tuple[float, float], origin: int, step: int) -> tuple[int, int]:
+    row = int((centre[0] - origin) // step)
+    col = int((centre[1] - origin) // step)
+    if not (0 <= row < CELLS and 0 <= col < CELLS):
+        raise OracleAbstention("a marker lies outside the room lattice")
+    return row, col
+
+
+def _edge_key(a, b):
+    first, second = sorted((a, b))
+    return (first[0], first[1], second[0], second[1])
+
+
+def _doorway_graph(wall: np.ndarray, origin: int, step: int, thickness: int) -> dict:
+    half = thickness // 2 + 2
+    adjacency: dict[tuple[int, int], set] = {
+        (r, c): set() for r in range(CELLS) for c in range(CELLS)
+    }
+
+    def clear(row_lo: int, row_hi: int, col_lo: int, col_hi: int) -> bool:
+        window = wall[max(0, row_lo): row_hi, max(0, col_lo): col_hi]
+        return window.size > 0 and not window.any()
+
+    for row in range(CELLS):
+        for col in range(1, CELLS):
+            x = origin + col * step
+            y = origin + row * step + step // 2
+            if clear(y - 2, y + 3, x - half, x + half + 1):
+                adjacency[(row, col - 1)].add((row, col))
+                adjacency[(row, col)].add((row, col - 1))
+    for col in range(CELLS):
+        for row in range(1, CELLS):
+            y = origin + row * step
+            x = origin + col * step + step // 2
+            if clear(y - half, y + half + 1, x - 2, x + 3):
+                adjacency[(row - 1, col)].add((row, col))
+                adjacency[(row, col)].add((row - 1, col))
+    return adjacency
+
+
+def _reach(adjacency: dict, source, blocked=frozenset()) -> set:
+    seen = {source}
+    stack = [source]
+    while stack:
+        current = stack.pop()
+        for n in adjacency[current]:
+            if n in seen or _edge_key(current, n) in blocked:
+                continue
+            seen.add(n)
+            stack.append(n)
+    return seen
+
+
+def _loop_blocks(adjacency: dict) -> list[set]:
+    edges = {
+        _edge_key(cell, n) for cell, neighbours in adjacency.items() for n in neighbours
+    }
+    bridges = set()
+    for edge in edges:
+        a = (edge[0], edge[1])
+        if len(_reach(adjacency, a, frozenset({edge}))) != CELLS * CELLS:
+            bridges.add(edge)
+    core = {
+        cell: {n for n in neighbours if _edge_key(cell, n) not in bridges}
+        for cell, neighbours in adjacency.items()
+    }
+    seen: set = set()
+    out: list[set] = []
+    for cell in sorted(core):
+        if cell in seen:
+            continue
+        block = _reach(core, cell)
+        seen |= block
+        if len(block) > 1:
+            out.append(block)
+    return out
+
+
+def decision_from_image(image: Image.Image) -> str:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int16)
+    wall = np.all(pixels <= WALL_MAX, axis=2)
+    origin, step, thickness = _lattice(wall)
+    adjacency = _doorway_graph(wall, origin, step, thickness)
+    if len(_reach(adjacency, (0, 0))) != CELLS * CELLS:
+        raise OracleAbstention("the free space is not one connected region")
+
+    rooms: dict[str, tuple[int, int]] = {}
+    for colour in COLOUR_ORDER:
+        found = _blobs(
+            np.all(pixels == np.array(FLOOR_COLOURS[colour], dtype=np.int16), axis=2), 2000
+        )
+        if len(found) != 1:
+            raise OracleAbstention(f"expected one {colour} floor, found {len(found)}")
+        rooms[colour] = _room_of(found[0], origin, step)
+    if len(set(rooms.values())) != 4:
+        raise OracleAbstention("two coloured floors share a room")
+
+    blocks = _loop_blocks(adjacency)
+    if len(blocks) != 3 or min(len(b) for b in blocks) < MIN_LOOP:
+        raise OracleAbstention("the image does not show three readable loops")
+    home: dict[str, int] = {}
+    for colour in COLOUR_ORDER:
+        on = [i for i, block in enumerate(blocks) if rooms[colour] in block]
+        if len(on) != 1:
+            raise OracleAbstention(f"the {colour} room is not on exactly one loop")
+        home[colour] = on[0]
+    shared = [
+        (a, b)
+        for i, a in enumerate(COLOUR_ORDER)
+        for b in COLOUR_ORDER[i + 1:]
+        if home[a] == home[b]
+    ]
+    if len(shared) != 1:
+        raise OracleAbstention(f"image does not show exactly one shared pair: {shared}")
+    return f"{shared[0][0]}+{shared[0][1]}"

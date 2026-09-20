@@ -1,0 +1,170 @@
+"""Scene-free pixel oracle for the exclusion-matching binding world.
+
+Receives a rendered PNG and nothing else. It segments the four key colors to
+recover the rows, labels the black ink to recover the shapes and the ring,
+assigns every shape to the row it is drawn in, and then solves the bipartite
+matching itself before reporting the key color bound to the ringed shape.
+
+It imports no renderer, prompt, generator, verifier or analytic-gold code and
+never accepts latent scene data.
+"""
+
+from __future__ import annotations
+
+import itertools
+
+import numpy as np
+from PIL import Image
+
+_COLOR_RGB = {
+    "blue": (30, 90, 220),
+    "green": (25, 150, 60),
+    "orange": (240, 140, 20),
+    "purple": (150, 45, 190),
+    "red": (225, 35, 45),
+}
+_SHAPES = ("square", "circle", "up_tri", "plus", "diamond")
+_N_ROWS = 5
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Run-based 8-connected labeling; returns bbox, area and bottom width."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list[tuple[int, int, int, int]] = []
+    prev: list[tuple[int, int, int]] = []
+    flat = mask.astype(np.int8)
+    for y in range(height):
+        row = flat[y]
+        if not row.any():
+            prev = []
+            continue
+        idx = np.flatnonzero(np.diff(np.concatenate(([0], row, [0]))))
+        cur: list[tuple[int, int, int]] = []
+        for s, e in zip(idx[0::2], idx[1::2]):
+            x0, x1 = int(s), int(e) - 1
+            label = len(parent)
+            parent.append(label)
+            for px0, px1, plabel in prev:
+                if x0 <= px1 + 1 and px0 <= x1 + 1:
+                    union(label, plabel)
+            cur.append((x0, x1, label))
+            runs.append((y, x0, x1, label))
+        prev = cur
+
+    groups: dict[int, dict] = {}
+    for y, x0, x1, label in runs:
+        root = find(label)
+        comp = groups.setdefault(
+            root,
+            {"x0": x0, "x1": x1, "y0": y, "y1": y, "area": 0, "rows": {}},
+        )
+        comp["x0"] = min(comp["x0"], x0)
+        comp["x1"] = max(comp["x1"], x1)
+        comp["y0"] = min(comp["y0"], y)
+        comp["y1"] = max(comp["y1"], y)
+        comp["area"] += x1 - x0 + 1
+        comp["rows"][y] = comp["rows"].get(y, 0) + (x1 - x0 + 1)
+    out = []
+    for comp in groups.values():
+        comp["w"] = comp["x1"] - comp["x0"] + 1
+        comp["h"] = comp["y1"] - comp["y0"] + 1
+        comp["fill"] = comp["area"] / float(comp["w"] * comp["h"])
+        comp["bottom_w"] = comp["rows"][comp["y1"]]
+        comp["cx"] = 0.5 * (comp["x0"] + comp["x1"])
+        comp["cy"] = 0.5 * (comp["y0"] + comp["y1"])
+        out.append(comp)
+    return sorted(out, key=lambda c: (c["y0"], c["x0"]))
+
+
+def _classify(comp: dict) -> str:
+    fill = comp["fill"]
+    if abs(comp["w"] - comp["h"]) > 3:
+        raise ValueError("shape is not square-bounded")
+    if fill >= 0.95:
+        return "square"
+    if 0.70 <= fill <= 0.90:
+        return "circle"
+    if 0.40 <= fill <= 0.68:
+        bottom = comp["bottom_w"] / float(comp["w"])
+        if bottom >= 0.80:
+            return "up_tri"
+        if 0.20 <= bottom <= 0.45:
+            return "plus"
+        if bottom <= 0.12:
+            return "diamond"
+    raise ValueError(f"unclassifiable ink component (fill={fill:.3f})")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+
+    rows: list[tuple[float, str]] = []
+    for name, rgb in _COLOR_RGB.items():
+        mask = np.all(arr == np.array(rgb, dtype=np.int16), axis=2)
+        if not mask.any():
+            raise ValueError(f"key color {name} is missing")
+        ys, xs = np.nonzero(mask)
+        if xs.max() - xs.min() + 1 < 40 or ys.max() - ys.min() + 1 < 20:
+            raise ValueError(f"key bar {name} is degenerate")
+        rows.append((0.5 * (ys.min() + ys.max()), name))
+    rows.sort()
+    if len(rows) != _N_ROWS:
+        raise ValueError("expected five key rows")
+    row_cy = [cy for cy, _ in rows]
+    row_color = [name for _, name in rows]
+
+    black = np.all(arr <= 40, axis=2)
+    comps = [c for c in _components(black) if c["area"] >= 200]
+    rings = [c for c in comps if c["fill"] < 0.40 and c["w"] > 110]
+    if len(rings) != 1:
+        raise ValueError("expected exactly one ring")
+    ring = rings[0]
+
+    inside = [
+        c
+        for c in comps
+        if c is not ring
+        and ring["x0"] < c["cx"] < ring["x1"]
+        and ring["y0"] < c["cy"] < ring["y1"]
+    ]
+    if len(inside) != 1:
+        raise ValueError("expected exactly one shape inside the ring")
+    query = _classify(inside[0])
+
+    row_sets: list[list[str]] = [[] for _ in range(_N_ROWS)]
+    for comp in comps:
+        if comp is ring or comp is inside[0]:
+            continue
+        if comp["cy"] > ring["y0"]:
+            raise ValueError("stray ink below the rows")
+        r = min(range(_N_ROWS), key=lambda i: abs(row_cy[i] - comp["cy"]))
+        if abs(row_cy[r] - comp["cy"]) > 55:
+            raise ValueError("shape does not sit on any key row")
+        shape = _classify(comp)
+        if shape in row_sets[r]:
+            raise ValueError("duplicate shape within one row")
+        row_sets[r].append(shape)
+
+    if any(not rs for rs in row_sets):
+        raise ValueError("a key row shows no shapes")
+    found = [
+        perm
+        for perm in itertools.permutations(_SHAPES)
+        if all(perm[r] in row_sets[r] for r in range(_N_ROWS))
+    ]
+    if len(found) != 1:
+        raise ValueError(f"matching is not unique ({len(found)} solutions)")
+    return row_color[found[0].index(query)]

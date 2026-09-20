@@ -1,0 +1,168 @@
+"""Independent image-only inverse arm for Common Cycle Station.
+
+The oracle segments station interiors and navy corridors, reconstructs the
+visible undirected graph, and checks whether deleting the red station leaves a
+cycle.  It receives neither scene state nor renderer code.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_PALETTE = np.asarray(
+    [
+        (248, 247, 243),  # background
+        (29, 47, 67),     # navy trail
+        (218, 224, 228),  # ordinary station interior
+        (216, 55, 70),    # red station interior
+    ],
+    dtype=np.int16,
+)
+
+
+class OracleAbstention(ValueError):
+    """Raised when the public eight-station/one-missing-link contract is damaged."""
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    # Promote before squaring: int16 would overflow for full-range RGB deltas.
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    palette = _PALETTE.astype(np.int32)
+    distance = ((array[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=3)
+    # Navy/background antialias blends can be nearer to the pale station fill
+    # than either endpoint color.  Reserve station labels for pixels genuinely
+    # close to their fill colors; classify every other pixel as ink/background.
+    labels = distance[:, :, :2].argmin(axis=2)
+    labels[distance[:, :, 2] <= 500] = 2
+    labels[distance[:, :, 3] <= 700] = 3
+    return labels
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        queue = deque([(y0, x0)])
+        seen[y0, x0] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= 20:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _station_centers(labels: np.ndarray) -> tuple[list[tuple[float, float]], int]:
+    ordinary = _components(labels == 2)
+    red = _components(labels == 3)
+    if len(ordinary) != 7 or len(red) != 1:
+        raise OracleAbstention(
+            f"expected seven ordinary and one red station, found {len(ordinary)} and {len(red)}"
+        )
+    all_parts = [(part, False) for part in ordinary] + [(red[0], True)]
+    centers: list[tuple[float, float, bool]] = []
+    for part, is_red in all_parts:
+        if not 120 <= len(part) <= 420:
+            raise OracleAbstention("a station interior has implausible visible area")
+        ys, xs = part[:, 0], part[:, 1]
+        if (xs.max() - xs.min()) < 13 or (ys.max() - ys.min()) < 13:
+            raise OracleAbstention("a station interior is clipped or malformed")
+        centers.append((float(xs.mean()), float(ys.mean()), is_red))
+
+    centers.sort(key=lambda item: item[1])
+    top = sorted(centers[:4], key=lambda item: item[0])
+    bottom = sorted(centers[4:], key=lambda item: item[0])
+    if max(item[1] for item in top) - min(item[1] for item in top) > 4.0:
+        raise OracleAbstention("top station row is not intact")
+    if max(item[1] for item in bottom) - min(item[1] for item in bottom) > 4.0:
+        raise OracleAbstention("bottom station row is not intact")
+    ordered = top + bottom
+    for col in range(4):
+        if abs(ordered[col][0] - ordered[col + 4][0]) > 4.0:
+            raise OracleAbstention("station columns are not aligned")
+    red_indices = [index for index, item in enumerate(ordered) if item[2]]
+    if len(red_indices) != 1:
+        raise OracleAbstention("red station is ambiguous")
+    return [(item[0], item[1]) for item in ordered], red_indices[0]
+
+
+def _corridor_coverage(
+    navy: np.ndarray,
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> float:
+    x1, y1 = first
+    x2, y2 = second
+    guard = 16
+    half_band = 3
+    if abs(y1 - y2) <= 4.0:
+        left, right = sorted((x1, x2))
+        xa, xb = int(round(left)) + guard, int(round(right)) - guard
+        yc = int(round((y1 + y2) / 2.0))
+        patch = navy[yc - half_band : yc + half_band + 1, xa:xb]
+    elif abs(x1 - x2) <= 4.0:
+        top, bottom = sorted((y1, y2))
+        ya, yb = int(round(top)) + guard, int(round(bottom)) - guard
+        xc = int(round((x1 + x2) / 2.0))
+        patch = navy[ya:yb, xc - half_band : xc + half_band + 1]
+    else:
+        raise OracleAbstention("neighboring stations are not axis-aligned")
+    if patch.size < 40:
+        raise OracleAbstention("station clearance is too small to inspect")
+    return float(patch.mean())
+
+
+def _has_cycle(edges: list[tuple[int, int]], removed: int | None = None) -> bool:
+    parent = list(range(8))
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    for left, right in edges:
+        if left == removed or right == removed:
+            continue
+        a, b = find(left), find(right)
+        if a == b:
+            return True
+        parent[a] = b
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the yes/no answer from final RGB pixels alone."""
+    labels = _labels(image)
+    centers, red_index = _station_centers(labels)
+    navy = labels == 1
+    possible = [
+        (0, 1), (1, 2), (2, 3),
+        (4, 5), (5, 6), (6, 7),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    edges: list[tuple[int, int]] = []
+    for edge in possible:
+        coverage = _corridor_coverage(navy, centers[edge[0]], centers[edge[1]])
+        if coverage >= 0.72:
+            edges.append(edge)
+        elif coverage > 0.16:
+            raise OracleAbstention(f"link {edge} is only partially visible")
+    if len(edges) != 9:
+        raise OracleAbstention(f"expected exactly nine visible links, found {len(edges)}")
+    if not _has_cycle(edges):
+        raise OracleAbstention("the recovered graph contains no closed loop")
+    return "yes" if not _has_cycle(edges, removed=red_index) else "no"

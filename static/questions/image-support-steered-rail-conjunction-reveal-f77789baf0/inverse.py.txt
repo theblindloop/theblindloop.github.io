@@ -1,0 +1,195 @@
+"""Pixel-only inverse arm for the rail-conjunction reveal world.
+
+Receives nothing but the final PNG.  It locates the square pads, groups them
+into the upright and flat rails by collinearity, recovers each pad's index from
+the rail pitch, classifies pad tone against the midpoint of the two tones
+rendered inside the rails, and names the figure produced by the declared
+conjunction.  Ambiguous or incomplete evidence raises, which the harness treats
+as an abstention.
+
+It imports no renderer, prompt, generator, verifier or analytic-gold code and
+never sees latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "rail_conjunction_reveal-oracle-0.1.0"
+
+_PAD_MIN, _PAD_MAX = 24, 46
+_FIGURE_BY_TYPES = {
+    ("tight", "tight"): "solid_block",
+    ("spread", "spread"): "dot_lattice",
+    ("tight", "spread"): "upright_bars",
+    ("spread", "tight"): "flat_bars",
+}
+
+
+def _luma(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    return 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out: list[dict] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        queue = deque([(start_y, start_x)])
+        seen[start_y, start_x] = True
+        pixels = 0
+        y0 = y1 = start_y
+        x0 = x1 = start_x
+        while queue:
+            y, x = queue.popleft()
+            pixels += 1
+            if y < y0:
+                y0 = y
+            if y > y1:
+                y1 = y
+            if x < x0:
+                x0 = x
+            if x > x1:
+                x1 = x
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        out.append({"box": (x0, y0, x1, y1), "pixels": pixels,
+                    "w": x1 - x0 + 1, "h": y1 - y0 + 1})
+    return out
+
+
+def _pads(image: Image.Image) -> tuple[np.ndarray, list[dict]]:
+    luma = _luma(image)
+    values, counts = np.unique(np.round(luma).astype(int), return_counts=True)
+    background = float(values[int(np.argmax(counts))])
+    mask = np.abs(luma - background) > 10.0
+    pads = []
+    for comp in _components(mask):
+        w, h = comp["w"], comp["h"]
+        if not (_PAD_MIN <= w <= _PAD_MAX and _PAD_MIN <= h <= _PAD_MAX):
+            continue
+        if abs(w - h) > 3:
+            continue
+        if comp["pixels"] < 0.85 * w * h:
+            continue
+        x0, y0, x1, y1 = comp["box"]
+        cy, cx = (y0 + y1) / 2.0, (x0 + x1) / 2.0
+        inset = max(3, min(w, h) // 4)
+        patch = luma[y0 + inset:y1 + 1 - inset, x0 + inset:x1 + 1 - inset]
+        if patch.size == 0:
+            continue
+        pads.append({"cx": cx, "cy": cy, "tone": float(patch.mean()),
+                     "spread": float(patch.max() - patch.min())})
+    return luma, pads
+
+
+def _rail(pads: list[dict], along: str) -> list[dict]:
+    """Group pads that share the coordinate orthogonal to the rail axis."""
+
+    key = "cx" if along == "cy" else "cy"
+    best: list[dict] = []
+    for anchor in pads:
+        group = [p for p in pads if abs(p[key] - anchor[key]) <= 4.0]
+        if len(group) > len(best):
+            best = group
+    if len(best) < 5:
+        raise ValueError(f"no {along} rail: only {len(best)} collinear pads")
+    return sorted(best, key=lambda p: p[along])
+
+
+def _lattice(rail: list[dict], along: str) -> tuple[list[dict], list[int]]:
+    """Largest subset of the group that sits on one uniform nine-slot lattice.
+
+    A pad of the perpendicular rail can share the grouping coordinate by chance;
+    such an intruder does not fall on the rail's own pitch and is dropped here.
+    """
+
+    positions = sorted(p[along] for p in rail)
+    gaps = sorted({positions[i + 1] - positions[i] for i in range(len(positions) - 1)})
+    best: tuple[int, float, float] | None = None
+    for pitch in gaps:
+        if pitch < 20.0:
+            continue
+        for anchor in positions:
+            keep = []
+            for pos in positions:
+                steps = (pos - anchor) / pitch
+                if abs(steps - round(steps)) <= 0.2 and -8 <= round(steps) <= 8:
+                    keep.append((int(round(steps)), pos))
+            span = max(k[0] for k in keep) - min(k[0] for k in keep)
+            if span > 8 or len({k[0] for k in keep}) != len(keep):
+                continue
+            score = (len(keep), -pitch, -anchor)
+            if best is None or score > best[0]:
+                best = (score, pitch, anchor)
+    if best is None or best[0][0] < 5:
+        raise ValueError("pad positions do not form a uniform nine-slot rail")
+    _, pitch, anchor = best
+    kept: list[dict] = []
+    indices: list[int] = []
+    for pad in sorted(rail, key=lambda p: p[along]):
+        steps = (pad[along] - anchor) / pitch
+        if abs(steps - round(steps)) <= 0.2 and -8 <= round(steps) <= 8:
+            kept.append(pad)
+            indices.append(int(round(steps)))
+    base = min(indices)
+    indices = [index - base for index in indices]
+    if max(indices) > 8 or len(set(indices)) != len(indices):
+        raise ValueError("pad indices are not a subset of a nine-slot rail")
+    return kept, indices
+
+
+def _pattern_type(indices: list[int]) -> str:
+    if len(indices) != 3:
+        raise ValueError(f"expected three dark pads, saw {len(indices)}")
+    ordered = sorted(indices)
+    gaps = [ordered[1] - ordered[0], ordered[2] - ordered[1]]
+    if gaps == [1, 1]:
+        return "tight"
+    if min(gaps) >= 3:
+        return "spread"
+    raise ValueError(f"dark pad set {ordered} is neither tight nor spread")
+
+
+def _dark_indices(rail: list[tuple[dict, int]], threshold: float) -> list[int]:
+    return [index for pad, index in rail if pad["tone"] < threshold]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Name the figure formed by the declared conjunction, or raise."""
+
+    _, pads = _pads(image)
+    if len(pads) < 10:
+        raise ValueError(f"too few pads for two rails: {len(pads)}")
+    upright, up_index = _lattice(_rail(pads, "cy"), "cy")
+    flat, flat_index = _lattice(_rail(pads, "cx"), "cx")
+    up_keys = {(p["cx"], p["cy"]) for p in upright}
+    flat_keys = {(p["cx"], p["cy"]) for p in flat}
+    if len(up_keys & flat_keys) > 1:
+        raise ValueError("the two rail groups are not distinct")
+    if upright[-1]["cy"] - upright[0]["cy"] < 100.0:
+        raise ValueError("the upright rail does not span the canvas")
+    if flat[-1]["cx"] - flat[0]["cx"] < 100.0:
+        raise ValueError("the flat rail does not span the canvas")
+
+    tones = sorted(p["tone"] for p in upright + flat)
+    splits = [(tones[i + 1] - tones[i], i) for i in range(len(tones) - 1)]
+    gap, at = max(splits)
+    if gap < 30.0:
+        raise ValueError("pad tones do not separate into a dark and a pale class")
+    threshold = (tones[at] + tones[at + 1]) / 2.0
+    if max(p["spread"] for p in upright + flat) > 6.0:
+        raise ValueError("pads are not flat single-tone blocks")
+
+    row_type = _pattern_type(_dark_indices(list(zip(upright, up_index)), threshold))
+    col_type = _pattern_type(_dark_indices(list(zip(flat, flat_index)), threshold))
+    return _FIGURE_BY_TYPES[(row_type, col_type)]

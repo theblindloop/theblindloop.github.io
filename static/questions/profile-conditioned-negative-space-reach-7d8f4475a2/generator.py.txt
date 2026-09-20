@@ -1,0 +1,373 @@
+"""Negative-space reachability world.
+
+A jittered arrangement of thick walls partitions the light background into
+three disjoint empty regions.  Five dots are painted inside the empty space:
+one red start dot and four coloured candidates.  Exactly one candidate shares
+its empty region with the red dot, i.e. it can be reached from the red dot by
+travelling through background only.  The answer is that candidate's colour.
+
+The evidence is the *complement* of the ink: nothing about a single dot, its
+colour, its size or its distance to the red dot determines the answer -- only
+the global connectivity of the negative space does.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+CANVAS = 480
+ROWS = 4
+COLS = 4
+N_AREAS = 3
+MIN_AREA_CELLS = 3
+
+WALL_MIN = 10
+WALL_MAX = 15
+DOOR_MIN = 18
+DOOR_MAX = 54
+DOT_RADIUS = 9
+
+CLEAR_MIN = 10.0          # ordinary dot clearance from the wall surface, px
+CLEAR_MAX = 24.0
+CLEAR_BOUNDARY_MIN = 3.0  # deliberately near-ambiguous scenes
+CLEAR_BOUNDARY_MAX = 5.4
+BOUNDARY_EVERY = 7
+
+QUARANTINE_PX = 12.0
+
+BG_COLORS = ["#f4f2ec", "#eef1f4", "#f6f1f1", "#eff3ef"]
+INK_COLORS = ["#16181c", "#1d1a20", "#141a18", "#1b1717"]
+
+CANDIDATE_COLORS = ("green", "blue", "orange", "purple")
+DOT_RGB = {
+    "red": "#d62a2a",
+    "green": "#1f9638",
+    "blue": "#2656c8",
+    "orange": "#ee8c14",
+    "purple": "#8c3cb4",
+}
+
+
+# --------------------------------------------------------------------------
+# combinatorial helpers on the cell grid
+# --------------------------------------------------------------------------
+def _neighbours(cell: tuple[int, int]) -> list[tuple[int, int]]:
+    r, c = cell
+    out = []
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < ROWS and 0 <= nc < COLS:
+            out.append((nr, nc))
+    return out
+
+
+def _grow_areas(rng: random.Random) -> dict | None:
+    """Partition the ROWS x COLS cells into N_AREAS grid-connected areas."""
+    cells = [(r, c) for r in range(ROWS) for c in range(COLS)]
+    seeds = rng.sample(cells, N_AREAS)
+    owner = {cell: None for cell in cells}
+    frontier: list[list[tuple[int, int]]] = []
+    for area, seed_cell in enumerate(seeds):
+        owner[seed_cell] = area
+        frontier.append([n for n in _neighbours(seed_cell)])
+    remaining = len(cells) - N_AREAS
+    while remaining:
+        area = rng.randrange(N_AREAS)
+        pool = [c for c in frontier[area] if owner[c] is None]
+        frontier[area] = pool
+        if not pool:
+            if all(not [c for c in f if owner[c] is None] for f in frontier):
+                return None
+            continue
+        pick = pool[rng.randrange(len(pool))]
+        owner[pick] = area
+        frontier[area].extend(_neighbours(pick))
+        remaining -= 1
+    sizes = [sum(1 for v in owner.values() if v == a) for a in range(N_AREAS)]
+    if min(sizes) < MIN_AREA_CELLS:
+        return None
+    return owner
+
+
+def _bottleneck(owner: dict, doors: dict, start: tuple[int, int], goal: tuple[int, int]) -> float:
+    """Widest-path bottleneck: the narrowest door on the best in-area route."""
+    best = {start: float("inf")}
+    queue = deque([start])
+    while queue:
+        cell = queue.popleft()
+        for nb in _neighbours(cell):
+            if owner[nb] != owner[cell]:
+                continue
+            width = doors[frozenset((cell, nb))]
+            value = min(best[cell], width)
+            if value > best.get(nb, -1.0):
+                best[nb] = value
+                queue.append(nb)
+    return float(best.get(goal, 0.0))
+
+
+def _edges(owner: dict) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    seen = set()
+    out = []
+    for cell in owner:
+        for nb in _neighbours(cell):
+            key = frozenset((cell, nb))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((cell, nb) if cell < nb else (nb, cell))
+    return sorted(out)
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _cell_box(scene: dict, cell: tuple[int, int]) -> tuple[float, float, float, float]:
+    r, c = cell
+    xs, ys = scene["xs"], scene["ys"]
+    return float(xs[c]), float(ys[r]), float(xs[c + 1]), float(ys[r + 1])
+
+
+def _clearance(scene: dict, cell: tuple[int, int], point: list[float]) -> float:
+    """Distance from the dot's painted edge to the nearest wall surface."""
+    x0, y0, x1, y1 = _cell_box(scene, cell)
+    half = scene["wall_px"] / 2.0
+    inner = min(point[0] - x0, x1 - point[0], point[1] - y0, y1 - point[1])
+    return inner - half - DOT_RADIUS
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one latent scene."""
+    rng = random.Random(seed * 6151 + 29)
+    boundary = (seed % BOUNDARY_EVERY) == 4
+    answer_colour = CANDIDATE_COLORS[seed % len(CANDIDATE_COLORS)]
+
+    for _ in range(400):
+        owner = _grow_areas(rng)
+        if owner is None:
+            continue
+        wall_px = rng.randrange(WALL_MIN, WALL_MAX + 1)
+        step_x = CANVAS / COLS
+        step_y = CANVAS / ROWS
+        xs = [0.0] + [round(step_x * i + rng.uniform(-22.0, 22.0), 3) for i in range(1, COLS)] + [float(CANVAS)]
+        ys = [0.0] + [round(step_y * i + rng.uniform(-22.0, 22.0), 3) for i in range(1, ROWS)] + [float(CANVAS)]
+        if min(xs[i + 1] - xs[i] for i in range(COLS)) < 84.0:
+            continue
+        if min(ys[i + 1] - ys[i] for i in range(ROWS)) < 84.0:
+            continue
+
+        doors: dict = {}
+        door_offsets: dict = {}
+        for a, b in _edges(owner):
+            key = frozenset((a, b))
+            if owner[a] != owner[b]:
+                doors[key] = 0.0
+                door_offsets[key] = 0.0
+            else:
+                doors[key] = float(rng.randrange(DOOR_MIN, DOOR_MAX + 1))
+                door_offsets[key] = round(rng.uniform(-0.22, 0.22), 4)
+
+        area_cells: dict[int, list] = {a: [] for a in range(N_AREAS)}
+        for cell, area in owner.items():
+            area_cells[area].append(cell)
+        for area in area_cells:
+            area_cells[area].sort()
+
+        home = rng.randrange(N_AREAS)
+        if len(area_cells[home]) < 2:
+            continue
+        red_cell, match_cell = rng.sample(area_cells[home], 2)
+        other_cells = [c for a in range(N_AREAS) if a != home for c in area_cells[a]]
+        if len(other_cells) < 3:
+            continue
+        distractor_cells = rng.sample(other_cells, 3)
+
+        scene = {
+            "width": CANVAS,
+            "height": CANVAS,
+            "bg_color": BG_COLORS[rng.randrange(len(BG_COLORS))],
+            "ink_color": INK_COLORS[rng.randrange(len(INK_COLORS))],
+            "wall_px": wall_px,
+            "dot_radius": DOT_RADIUS,
+            "xs": xs,
+            "ys": ys,
+            "cells": [[list(a), list(b), doors[frozenset((a, b))], door_offsets[frozenset((a, b))]] for a, b in _edges(owner)],
+            "areas": [[list(cell), owner[cell]] for cell in sorted(owner)],
+        }
+
+        lo, hi = (CLEAR_BOUNDARY_MIN, CLEAR_BOUNDARY_MAX) if boundary else (CLEAR_MIN, CLEAR_MAX)
+        placed: dict[str, list[float]] = {}
+        order = ["red"] + list(CANDIDATE_COLORS)
+        cells_by_colour = {"red": red_cell, answer_colour: match_cell}
+        spare = [c for c in CANDIDATE_COLORS if c != answer_colour]
+        for colour, cell in zip(spare, distractor_cells):
+            cells_by_colour[colour] = cell
+        ok = True
+        for colour in order:
+            cell = cells_by_colour[colour]
+            x0, y0, x1, y1 = _cell_box(scene, cell)
+            half = scene["wall_px"] / 2.0
+            pad = half + DOT_RADIUS
+            spot = None
+            for _ in range(250):
+                point = [round(rng.uniform(x0 + pad, x1 - pad), 3), round(rng.uniform(y0 + pad, y1 - pad), 3)]
+                clear = _clearance(scene, cell, point)
+                if lo <= clear <= hi:
+                    spot = point
+                    break
+            if spot is None:
+                ok = False
+                break
+            placed[colour] = spot
+        if not ok:
+            continue
+
+        scene["dots"] = [[colour, placed[colour][0], placed[colour][1]] for colour in order]
+
+        # anti-shortcut: the reachable candidate must never be the candidate
+        # closest to the red dot, so Euclidean proximity cannot stand in for
+        # negative-space connectivity.
+        red = placed["red"]
+        ranked = sorted(
+            CANDIDATE_COLORS,
+            key=lambda c: (placed[c][0] - red[0]) ** 2 + (placed[c][1] - red[1]) ** 2,
+        )
+        if ranked[0] == answer_colour:
+            continue
+
+        clear_min = min(_clearance(scene, cells_by_colour[c], placed[c]) for c in order)
+        neck = _bottleneck(owner, doors, red_cell, match_cell)
+        scene["margin_px"] = round(min(neck, 2.0 * clear_min), 6)
+        scene["answer"] = answer_colour
+        if boundary and scene["margin_px"] >= QUARANTINE_PX:
+            continue
+        if not boundary and scene["margin_px"] < QUARANTINE_PX:
+            continue
+        return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _wall_rects(scene: dict) -> list[tuple[float, float, float, float]]:
+    """Axis-aligned wall rectangles: the outer frame plus one segment per cell
+    edge.  Edges between different areas are closed; edges inside one area
+    carry a door of the sampled width."""
+    half = scene["wall_px"] / 2.0
+    w, h = float(scene["width"]), float(scene["height"])
+    rects: list[tuple[float, float, float, float]] = [
+        (0.0, 0.0, w, 2 * half),
+        (0.0, h - 2 * half, w, h),
+        (0.0, 0.0, 2 * half, h),
+        (w - 2 * half, 0.0, w, h),
+    ]
+    owner = {tuple(cell): area for cell, area in scene["areas"]}
+    xs, ys = scene["xs"], scene["ys"]
+    for a, b, door, offset in scene["cells"]:
+        a, b = tuple(a), tuple(b)
+        vertical = a[0] == b[0]
+        if vertical:  # shared edge is the vertical line between two columns
+            x = xs[max(a[1], b[1])]
+            lo, hi = ys[a[0]], ys[a[0] + 1]
+        else:
+            y = ys[max(a[0], b[0])]
+            lo, hi = xs[a[1]], xs[a[1] + 1]
+        span = hi - lo
+        if owner[a] == owner[b] and door > 0.0:
+            centre = (lo + hi) / 2.0 + offset * span
+            centre = min(max(centre, lo + half + door / 2.0), hi - half - door / 2.0)
+            pieces = [(lo, centre - door / 2.0), (centre + door / 2.0, hi)]
+        else:
+            pieces = [(lo, hi)]
+        for p0, p1 in pieces:
+            if p1 - p0 <= 0.0:
+                continue
+            if vertical:
+                rects.append((x - half, p0, x + half, p1))
+            else:
+                rects.append((p0, y - half, p1, y + half))
+    return rects
+
+
+def render(scene: dict, supersample: int = 3) -> Image.Image:
+    """I = R(z).  Dots are supersampled for round edges; the walls are painted
+    sharp at final resolution so the empty regions have exact pixel widths."""
+    width, height = scene["width"], scene["height"]
+    ss = supersample
+    img = Image.new("RGB", (width * ss, height * ss), scene["bg_color"])
+    draw = ImageDraw.Draw(img)
+    radius = scene["dot_radius"]
+    for colour, x, y in scene["dots"]:
+        draw.ellipse(
+            [(x - radius) * ss, (y - radius) * ss, (x + radius) * ss, (y + radius) * ss],
+            fill=DOT_RGB[colour],
+        )
+    img = img.resize((width, height), Image.LANCZOS)
+
+    draw = ImageDraw.Draw(img)
+    for x0, y0, x1, y1 in _wall_rects(scene):
+        draw.rectangle([round(x0), round(y0), round(x1) - 1, round(y1) - 1], fill=scene["ink_color"])
+    return img
+
+
+# --------------------------------------------------------------------------
+# analytic gold
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    """Colour of the one candidate dot sharing the red dot's empty region."""
+    owner = {tuple(cell): area for cell, area in scene["areas"]}
+    doors = {frozenset((tuple(a), tuple(b))): door for a, b, door, _ in scene["cells"]}
+    where = {colour: None for colour, _, _ in scene["dots"]}
+    for colour, x, y in scene["dots"]:
+        for cell in owner:
+            x0, y0, x1, y1 = _cell_box(scene, cell)
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                where[colour] = cell
+                break
+    red_cell = where["red"]
+    reachable = [
+        colour
+        for colour in CANDIDATE_COLORS
+        if owner[where[colour]] == owner[red_cell]
+        and _bottleneck(owner, doors, red_cell, where[colour]) > 0.0
+    ]
+    if len(reachable) != 1:
+        raise ValueError("scene does not expose exactly one reachable candidate")
+    return reachable[0]
+
+
+def margin(scene: dict) -> float:
+    """m = min(narrowest doorway on the red->answer route, twice the smallest
+    dot-to-wall clearance), in pixels.  m -> 0 is the ambiguity event: either
+    the corridor closes or a dot's region membership stops being resolvable."""
+    return float(scene["margin_px"])
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Scenes whose narrowest structural width is under 12 px."""
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict):
+    """Declared pixel-identical latent aliases.
+
+    ``cells`` is an unordered edge set and ``areas`` an unordered cell->area
+    map: the walls are painted as identical opaque rectangles, so permuting
+    either list paints exactly the same pixels.  Area *labels* are arbitrary
+    names for the same partition, so relabelling them leaves both the raster
+    and the reachable candidate untouched.  All three are exercised."""
+    rotated = dict(scene, cells=scene["cells"][1:] + scene["cells"][:1])
+    reversed_areas = dict(scene, areas=list(reversed(scene["areas"])))
+    relabelled = dict(
+        scene,
+        areas=[[cell, (area + 1) % N_AREAS] for cell, area in scene["areas"]],
+    )
+    return [
+        ("edge_order_rotation", rotated),
+        ("area_list_reversal", reversed_areas),
+        ("area_label_rotation", relabelled),
+    ]

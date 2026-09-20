@@ -1,0 +1,176 @@
+"""Independent final-PNG inverse arm for Seeded Flood-Fill Reveal.
+
+This module deliberately contains its own palette tests, panel recovery, wall
+sampling, flood fill, and templates.  It receives no latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+GRID = 7
+BORDER = 4
+WALL_HALF = 2
+SOURCE_GOLD_MIN = np.array((180, 105, 0), dtype=np.int16)
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _dark(array: np.ndarray) -> np.ndarray:
+    values = array.astype(np.int16)
+    return (values.max(axis=2) < 115) & (values.mean(axis=2) < 78)
+
+
+def _gold(array: np.ndarray) -> np.ndarray:
+    values = array.astype(np.int16)
+    return (
+        (values[:, :, 0] >= SOURCE_GOLD_MIN[0])
+        & (values[:, :, 1] >= SOURCE_GOLD_MIN[1])
+        & (values[:, :, 1] <= 215)
+        & (values[:, :, 2] <= 90)
+        & (values[:, :, 0] - values[:, :, 2] >= 120)
+    )
+
+
+def _templates() -> dict[str, set[tuple[int, int]]]:
+    return {
+        "plus": {(3, c) for c in range(7)} | {(r, 3) for r in range(7)},
+        "tee": {(1, c) for c in range(7)} | {(r, 3) for r in range(7)},
+        "arch": {(1, c) for c in range(1, 6)}
+        | {(r, c) for r in range(2, 6) for c in (1, 5)},
+    }
+
+
+def _panel_geometry(array: np.ndarray) -> tuple[int, int, int]:
+    mask = _dark(array)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 500:
+        raise OracleError("dark maze frame is missing")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if width != height:
+        raise OracleError("dark component bounding box is not square")
+    inner = width - 2 * BORDER
+    if inner <= 0 or inner % GRID:
+        raise OracleError("frame does not contain a regular 7 by 7 lattice")
+    cell = inner // GRID
+    if cell not in (14, 15, 16):
+        raise OracleError("unsupported cell scale")
+    # A clean outer frame is solid; this also makes destructive ablations abstain.
+    frame = np.concatenate(
+        (
+            mask[y0 : y0 + BORDER, x0 : x1 + 1].ravel(),
+            mask[y1 - BORDER + 1 : y1 + 1, x0 : x1 + 1].ravel(),
+            mask[y0 : y1 + 1, x0 : x0 + BORDER].ravel(),
+            mask[y0 : y1 + 1, x1 - BORDER + 1 : x1 + 1].ravel(),
+        )
+    )
+    if float(frame.mean()) < 0.985:
+        raise OracleError("outer maze frame is damaged")
+    return x0, y0, cell
+
+
+def _source_cell(array: np.ndarray, x0: int, y0: int, cell: int) -> tuple[int, int]:
+    gold = _gold(array)
+    ys, xs = np.nonzero(gold)
+    if not 25 <= len(xs) <= 180:
+        raise OracleError("gold source is missing or nonunique")
+    cx, cy = float(xs.mean()), float(ys.mean())
+    col = int((cx - x0 - BORDER) // cell)
+    row = int((cy - y0 - BORDER) // cell)
+    if not (0 <= row < GRID and 0 <= col < GRID):
+        raise OracleError("gold source lies outside the lattice")
+    expected_x = x0 + BORDER + col * cell + cell / 2.0
+    expected_y = y0 + BORDER + row * cell + cell / 2.0
+    if abs(cx - expected_x) > 2.0 or abs(cy - expected_y) > 2.0:
+        raise OracleError("gold source is not centered in one cell")
+    return row, col
+
+
+def _wall_state(mask: np.ndarray, *, horizontal: bool, boundary: int, center: int, cell: int) -> bool:
+    """Return True for an open doorway and reject intermediate raster damage."""
+    reach = max(2, cell // 4 - 1)
+    if horizontal:
+        # Cells are horizontal neighbors: sample the intervening vertical wall.
+        sample = mask[center - reach : center + reach + 1, boundary - 1 : boundary + 2]
+    else:
+        # Cells are vertical neighbors: sample the intervening horizontal wall.
+        sample = mask[boundary - 1 : boundary + 2, center - reach : center + reach + 1]
+    dark_fraction = float(sample.mean()) if sample.size else 0.5
+    if dark_fraction <= 0.12:
+        return True
+    if dark_fraction >= 0.88:
+        return False
+    raise OracleError("a wall edge is raster-ambiguous or damaged")
+
+
+def measure_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise OracleError("RGB raster required")
+    x0, y0, cell = _panel_geometry(array)
+    source = _source_cell(array, x0, y0, cell)
+    dark = _dark(array)
+    graph: dict[tuple[int, int], list[tuple[int, int]]] = {
+        (r, c): [] for r in range(GRID) for c in range(GRID)
+    }
+    open_edges = 0
+    for row in range(GRID):
+        cy = y0 + BORDER + row * cell + cell // 2
+        for col in range(GRID - 1):
+            boundary = x0 + BORDER + (col + 1) * cell
+            if _wall_state(dark, horizontal=True, boundary=boundary, center=cy, cell=cell):
+                a, b = (row, col), (row, col + 1)
+                graph[a].append(b)
+                graph[b].append(a)
+                open_edges += 1
+    for row in range(GRID - 1):
+        boundary = y0 + BORDER + (row + 1) * cell
+        for col in range(GRID):
+            cx = x0 + BORDER + col * cell + cell // 2
+            if _wall_state(dark, horizontal=False, boundary=boundary, center=cx, cell=cell):
+                a, b = (row, col), (row + 1, col)
+                graph[a].append(b)
+                graph[b].append(a)
+                open_edges += 1
+    if open_edges != 12:
+        raise OracleError(f"expected twelve doorways, found {open_edges}")
+
+    reached = {source}
+    queue = deque((source,))
+    while queue:
+        current = queue.popleft()
+        for nxt in graph[current]:
+            if nxt not in reached:
+                reached.add(nxt)
+                queue.append(nxt)
+    if len(reached) != 13:
+        raise OracleError(f"expected thirteen flooded cells, found {len(reached)}")
+    distances = sorted(
+        (len(reached.symmetric_difference(template)), name)
+        for name, template in _templates().items()
+    )
+    best_distance, decision = distances[0]
+    runner_distance = distances[1][0]
+    decision_margin = float(runner_distance - best_distance)
+    if decision_margin <= 2.0:
+        decision = "ambiguous"
+    return {
+        "decision": decision,
+        "margin": decision_margin,
+        "best_distance": int(best_distance),
+        "runner_distance": int(runner_distance),
+        "source": list(source),
+        "open_edges": open_edges,
+        "reachable_cells": len(reached),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure_image(image)["decision"])

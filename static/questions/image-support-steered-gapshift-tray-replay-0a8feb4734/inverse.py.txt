@@ -1,0 +1,170 @@
+"""Scene-free pixel oracle for `gapshift_tray_replay`.
+
+Reads only the rasterised image.  It locates the two pale beds of the cassette
+(the square tray bed and the wide move strip below it), reads the nine tray
+cells as colours or as the empty square, reads the ringed cell from the black
+stroke drawn inside one cell, reads each arrow's pointing direction from the
+offset of its filled centroid, replays the gap moves and reports the colour
+standing in the ringed cell.  It abstains whenever the picture does not present
+exactly the declared structure.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "gapshift_tray_replay-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+BED_TONE = 228
+NAMES = ("red", "green", "blue", "yellow")
+REFERENCE = {
+    "red": (208, 32, 40),
+    "green": (26, 140, 58),
+    "blue": (36, 72, 196),
+    "yellow": (226, 168, 20),
+}
+_DELTA = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+
+
+def _row_bands(mask: np.ndarray) -> list:
+    rows = np.flatnonzero(mask.any(axis=1))
+    if rows.size == 0:
+        return []
+    bands = []
+    start = rows[0]
+    previous = rows[0]
+    for value in rows[1:]:
+        if value != previous + 1:
+            bands.append((int(start), int(previous)))
+            start = value
+        previous = value
+    bands.append((int(start), int(previous)))
+    return bands
+
+
+def _band_box(mask: np.ndarray, band: tuple) -> tuple:
+    top, bottom = band
+    cols = np.flatnonzero(mask[top : bottom + 1].any(axis=0))
+    return int(cols[0]), top, int(cols[-1]), bottom
+
+
+def _patch_colour(pixels: np.ndarray, cx: float, cy: float, radius: int) -> tuple:
+    y0 = max(0, int(round(cy)) - radius)
+    y1 = min(pixels.shape[0], int(round(cy)) + radius + 1)
+    x0 = max(0, int(round(cx)) - radius)
+    x1 = min(pixels.shape[1], int(round(cx)) + radius + 1)
+    patch = pixels[y0:y1, x0:x1].reshape(-1, 3)
+    if patch.size == 0:
+        return (0, 0, 0)
+    values, counts = np.unique(patch, axis=0, return_counts=True)
+    return tuple(int(v) for v in values[int(np.argmax(counts))])
+
+
+def _classify(colour: tuple) -> str:
+    if all(abs(c - BED_TONE) <= 3 for c in colour):
+        return "empty"
+    best = None
+    best_distance = None
+    for name, reference in REFERENCE.items():
+        distance = sum(abs(int(a) - int(b)) for a, b in zip(colour, reference))
+        if best_distance is None or distance < best_distance:
+            best, best_distance = name, distance
+    if best_distance is not None and best_distance <= 40:
+        return best
+    return "unknown"
+
+
+def decision_from_image(image: Image.Image) -> str:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if pixels.ndim != 3 or pixels.shape[2] != 3:
+        return ABSTAIN
+
+    bed = (np.abs(pixels - BED_TONE) <= 1).all(axis=2)
+    bands = [band for band in _row_bands(bed) if band[1] - band[0] >= 12]
+    if len(bands) != 2:
+        return ABSTAIN
+    tray_band, strip_band = bands
+    tray = _band_box(bed, tray_band)
+    strip = _band_box(bed, strip_band)
+
+    tray_w = tray[2] - tray[0] + 1
+    tray_h = tray[3] - tray[1] + 1
+    strip_w = strip[2] - strip[0] + 1
+    strip_h = strip[3] - strip[1] + 1
+    if tray_h < 60 or abs(tray_w - tray_h) > 6:
+        return ABSTAIN
+    if strip_h > tray_h // 2 or strip_w < tray_w - 8 or strip_w > tray_w + 8:
+        return ABSTAIN
+
+    black = (pixels <= 24).all(axis=2)
+
+    cell_w = tray_w / 3.0
+    cell_h = tray_h / 3.0
+    grid = []
+    ring_scores = []
+    for index in range(9):
+        row, col = divmod(index, 3)
+        cx = tray[0] + (col + 0.5) * cell_w
+        cy = tray[1] + (row + 0.5) * cell_h
+        grid.append(_classify(_patch_colour(pixels, cx, cy, 3)))
+        half = int(cell_w * 0.44)
+        y0 = max(0, int(cy) - half)
+        x0 = max(0, int(cx) - half)
+        window = black[y0 : int(cy) + half + 1, x0 : int(cx) + half + 1]
+        ring_scores.append(int(window.sum()))
+
+    if grid.count("empty") != 1 or "unknown" in grid:
+        return ABSTAIN
+    counts = {name: grid.count(name) for name in NAMES}
+    if sorted(counts.values()) != [2, 2, 2, 2]:
+        return ABSTAIN
+
+    order = sorted(range(9), key=lambda i: ring_scores[i], reverse=True)
+    if ring_scores[order[0]] < 60 or ring_scores[order[1]] > ring_scores[order[0]] // 4:
+        return ABSTAIN
+    ring = order[0]
+    if grid[ring] == "empty":
+        return ABSTAIN
+
+    slot_w = strip_w / 4.0
+    moves = []
+    for slot in range(4):
+        cx = strip[0] + (slot + 0.5) * slot_w
+        cy = (strip[1] + strip[3]) / 2.0
+        half_x = int(slot_w * 0.5)
+        half_y = strip_h // 2
+        y0 = max(0, int(cy) - half_y)
+        x0 = max(0, int(cx) - half_x)
+        window = black[y0 : int(cy) + half_y + 1, x0 : int(cx) + half_x + 1]
+        ys, xs = np.nonzero(window)
+        if ys.size < 40:
+            return ABSTAIN
+        # reference the glyph's own bounding-box centre, so the reading does
+        # not depend on exactly where the slot window was placed
+        offset_x = xs.mean() - (xs.min() + xs.max()) / 2.0
+        offset_y = ys.mean() - (ys.min() + ys.max()) / 2.0
+        if abs(abs(offset_x) - abs(offset_y)) < 1.2:
+            return ABSTAIN
+        if abs(offset_x) > abs(offset_y):
+            moves.append("L" if offset_x > 0 else "R")
+        else:
+            moves.append("U" if offset_y > 0 else "D")
+
+    state = list(grid)
+    hole = state.index("empty")
+    for direction in moves:
+        dr, dc = _DELTA[direction]
+        r, c = divmod(hole, 3)
+        nr, nc = r + dr, c + dc
+        if not (0 <= nr < 3 and 0 <= nc < 3):
+            return ABSTAIN
+        target = nr * 3 + nc
+        state[hole], state[target] = state[target], state[hole]
+        hole = target
+
+    answer = state[ring]
+    if answer == "empty" or answer not in NAMES:
+        return ABSTAIN
+    return answer

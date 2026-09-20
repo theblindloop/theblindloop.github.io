@@ -1,0 +1,364 @@
+"""Forward arm: sample, draw and analytically label one hinge-hub scene.
+
+A scene is a planar network of black struts joining round black junctions.
+Three junctions are painted as large coloured hubs (red, green, blue).  Every
+hub carries exactly three struts and exactly one outward branch of three extra
+junctions.  Two of those branches run back onto the network; one dead-ends.
+The hub whose branch dead-ends is the only coloured hub whose removal breaks
+the network into more than one piece.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS = 720
+SUPERSAMPLE = 3
+STRUT_WIDTH = 7
+NODE_RADIUS = 6
+HUB_RADIUS = 16
+RING_NODES = 11
+RING_RADIUS = 225.0
+
+INK = (20, 20, 20)
+PAPER = (255, 255, 255)
+HUB_COLORS = {
+    "red": (208, 32, 44),
+    "green": (24, 128, 52),
+    "blue": (36, 72, 200),
+}
+COLOR_ORDER = ("blue", "green", "red")  # fixed painting order, index-independent
+
+QUARANTINE_PX = 12.0
+SAMPLE_FLOOR_PX = 16.0
+DEAD_END_GAP_PX = 42.0
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+
+
+def _wedge_choice(rng: random.Random, k: int, count: int) -> list[int]:
+    """Pick `count` pairwise non-adjacent wedges out of a cycle of length k."""
+
+    for _ in range(400):
+        picked = sorted(rng.sample(range(k), count))
+        ok = True
+        for a in picked:
+            for b in picked:
+                if a == b:
+                    continue
+                d = (a - b) % k
+                if d == 1 or d == k - 1:
+                    ok = False
+        if ok:
+            return picked
+    raise RuntimeError("no non-adjacent wedge assignment")
+
+
+def _petal(rng: random.Random, theta_a, theta_b, radius_a, radius_b, closing):
+    """Return three branch points inside one angular wedge, outside the ring."""
+
+    span = (theta_b - theta_a) % (2.0 * math.pi)
+    base = 0.5 * (radius_a + radius_b)
+    depth = [rng.uniform(58.0, 74.0), rng.uniform(80.0, 98.0), rng.uniform(58.0, 74.0)]
+    ts = [0.24 + rng.uniform(-0.03, 0.03), 0.5 + rng.uniform(-0.03, 0.03), 0.0]
+    ts[2] = (0.78 if closing else 0.68) + rng.uniform(-0.03, 0.03)
+    points = []
+    for t, d in zip(ts, depth):
+        ang = theta_a + span * t
+        r = base + d
+        points.append((360.0 + r * math.cos(ang), 360.0 + r * math.sin(ang)))
+    return points
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    for _ in range(600):
+        scene = _try_scene(rng, seed)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+def _try_scene(rng: random.Random, seed: int) -> dict | None:
+    k = RING_NODES
+    phase = rng.uniform(0.0, 2.0 * math.pi)
+    thetas = []
+    radii = []
+    for i in range(k):
+        thetas.append(phase + 2.0 * math.pi * i / k + rng.uniform(-0.055, 0.055))
+        radii.append(RING_RADIUS + rng.uniform(-10.0, 10.0))
+
+    nodes = [
+        (360.0 + radii[i] * math.cos(thetas[i]), 360.0 + radii[i] * math.sin(thetas[i]))
+        for i in range(k)
+    ]
+    edges = [(i, (i + 1) % k) for i in range(k)]
+
+    wedges = _wedge_choice(rng, k, 5)
+    rng.shuffle(wedges)
+    hub_wedges = wedges[:3]
+    decoy_wedges = wedges[3:]
+
+    dead_count = rng.randrange(1, 4)
+    dead_slots = set(rng.sample(range(3), dead_count))
+    colors = list(HUB_COLORS)
+    rng.shuffle(colors)
+    hubs = {}
+
+    def add_petal(wedge: int, closing: bool) -> None:
+        a = wedge
+        b = (wedge + 1) % k
+        pts = _petal(rng, thetas[a], thetas[b], radii[a], radii[b], closing)
+        first = len(nodes)
+        nodes.extend(pts)
+        edges.append((a, first))
+        edges.append((first, first + 1))
+        edges.append((first + 1, first + 2))
+        if closing:
+            edges.append((first + 2, b))
+
+    for slot, wedge in enumerate(hub_wedges):
+        add_petal(wedge, closing=slot not in dead_slots)
+        hubs[colors[slot]] = wedge
+    for wedge in decoy_wedges:
+        add_petal(wedge, closing=rng.random() < 0.5)
+
+    scene = {
+        "seed": int(seed),
+        "canvas": CANVAS,
+        "supersample": SUPERSAMPLE,
+        "strut_width": STRUT_WIDTH,
+        "node_radius": NODE_RADIUS,
+        "hub_radius": HUB_RADIUS,
+        "ring_nodes": k,
+        "nodes": [[round(x, 3), round(y, 3)] for x, y in nodes],
+        "edges": sorted([sorted(e) for e in edges]),
+        "hubs": {c: int(i) for c, i in sorted(hubs.items())},
+    }
+
+    if not _structurally_sound(scene):
+        return None
+    if _clearance(scene) < SAMPLE_FLOOR_PX:
+        return None
+    if _dead_end_gap(scene) < DEAD_END_GAP_PX:
+        return None
+    for x, y in scene["nodes"]:
+        if not (26.0 <= x <= CANVAS - 26.0 and 26.0 <= y <= CANVAS - 26.0):
+            return None
+    return scene
+
+
+# --------------------------------------------------------------------------
+# graph reasoning
+# --------------------------------------------------------------------------
+
+
+def _adjacency(scene: dict) -> list[set]:
+    adj = [set() for _ in scene["nodes"]]
+    for a, b in scene["edges"]:
+        adj[a].add(b)
+        adj[b].add(a)
+    return adj
+
+
+def _component_count(scene: dict, removed) -> int:
+    gone = set() if removed is None else ({removed} if isinstance(removed, int) else set(removed))
+    adj = _adjacency(scene)
+    alive = [i for i in range(len(scene["nodes"])) if i not in gone]
+    seen = set()
+    count = 0
+    for start in alive:
+        if start in seen:
+            continue
+        count += 1
+        stack = [start]
+        seen.add(start)
+        while stack:
+            cur = stack.pop()
+            for nxt in adj[cur]:
+                if nxt not in gone and nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+    return count
+
+
+def _pieces_after_removal(scene: dict) -> int:
+    """Pieces left when all three coloured hubs are rubbed out together."""
+
+    return _component_count(scene, set(scene["hubs"].values()))
+
+
+def _structurally_sound(scene: dict) -> bool:
+    if _component_count(scene, None) != 1:
+        return False
+    adj = _adjacency(scene)
+    for color, idx in scene["hubs"].items():
+        if len(adj[idx]) != 3:
+            return False
+    return _pieces_after_removal(scene) in (4, 5, 6)
+
+
+def analytic_gold(scene: dict) -> str:
+    pieces = _pieces_after_removal(scene)
+    if pieces not in (4, 5, 6):
+        raise ValueError("scene is outside the declared piece-count range")
+    return str(pieces)
+
+
+# --------------------------------------------------------------------------
+# geometry, margin and quarantine
+# --------------------------------------------------------------------------
+
+
+def _seg_point(ax, ay, bx, by, px, py) -> float:
+    vx, vy = bx - ax, by - ay
+    denom = vx * vx + vy * vy
+    t = 0.0 if denom == 0.0 else ((px - ax) * vx + (py - ay) * vy) / denom
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _seg_seg(p, q, r, s) -> float:
+    return min(
+        _seg_point(r[0], r[1], s[0], s[1], p[0], p[1]),
+        _seg_point(r[0], r[1], s[0], s[1], q[0], q[1]),
+        _seg_point(p[0], p[1], q[0], q[1], r[0], r[1]),
+        _seg_point(p[0], p[1], q[0], q[1], s[0], s[1]),
+    )
+
+
+def _radius_of(scene: dict, index: int) -> float:
+    if index in set(scene["hubs"].values()):
+        return float(scene["hub_radius"])
+    return float(scene["node_radius"])
+
+
+def _clearance(scene: dict) -> float:
+    nodes = [tuple(p) for p in scene["nodes"]]
+    edges = [tuple(e) for e in scene["edges"]]
+    half = scene["strut_width"] / 2.0
+    best = 1e9
+
+    for i, (a, b) in enumerate(edges):
+        for c, d in edges[i + 1 :]:
+            if {a, b} & {c, d}:
+                continue
+            best = min(best, _seg_seg(nodes[a], nodes[b], nodes[c], nodes[d]) - 2.0 * half)
+
+    for n in range(len(nodes)):
+        rn = _radius_of(scene, n)
+        for a, b in edges:
+            if n in (a, b):
+                continue
+            gap = _seg_point(nodes[a][0], nodes[a][1], nodes[b][0], nodes[b][1], *nodes[n])
+            best = min(best, gap - rn - half)
+
+    adj = _adjacency(scene)
+    for n in range(len(nodes)):
+        for m in range(n + 1, len(nodes)):
+            if m in adj[n]:
+                continue
+            gap = math.hypot(nodes[n][0] - nodes[m][0], nodes[n][1] - nodes[m][1])
+            best = min(best, gap - _radius_of(scene, n) - _radius_of(scene, m))
+    return best
+
+
+def _dead_end_gap(scene: dict) -> float:
+    """Smallest distance from the dead-ending branch tip to unconnected ink."""
+
+    adj = _adjacency(scene)
+    nodes = [tuple(p) for p in scene["nodes"]]
+    # a dead-ending branch ends in a degree-one junction
+    tips = [n for n in range(len(nodes)) if len(adj[n]) == 1]
+    if not tips:
+        return 0.0
+    best = 1e9
+    for tip in tips:
+        for m in range(len(nodes)):
+            if m == tip or m in adj[tip]:
+                continue
+            best = min(best, math.hypot(nodes[tip][0] - nodes[m][0], nodes[tip][1] - nodes[m][1]))
+    return best
+
+
+def margin(scene: dict) -> float:
+    return round(_clearance(scene), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+# --------------------------------------------------------------------------
+# declared latent relabellings (pixel-identical by construction)
+# --------------------------------------------------------------------------
+
+
+def _permute(scene: dict, perm: list[int]) -> dict:
+    where = {old: new for new, old in enumerate(perm)}
+    out = dict(scene)
+    out["nodes"] = [scene["nodes"][old] for old in perm]
+    out["edges"] = sorted([sorted([where[a], where[b]]) for a, b in scene["edges"]])
+    out["hubs"] = {c: where[i] for c, i in scene["hubs"].items()}
+    return out
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    n = len(scene["nodes"])
+    out = []
+
+    out.append(("node_index_reversal", _permute(scene, list(range(n - 1, -1, -1)))))
+
+    rotated = _permute(scene, [(i + 5) % n for i in range(n)])
+    out.append(("node_index_rotation", rotated))
+
+    swapped = dict(scene)
+    swapped["edges"] = [[b, a] for a, b in scene["edges"]][::-1]
+    out.append(("edge_endpoint_and_order_swap", swapped))
+
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+
+def render(scene: dict) -> Image.Image:
+    s = int(scene["supersample"])
+    size = int(scene["canvas"]) * s
+    image = Image.new("RGB", (size, size), PAPER)
+    draw = ImageDraw.Draw(image)
+    nodes = [(p[0] * s, p[1] * s) for p in scene["nodes"]]
+    width = int(round(scene["strut_width"] * s))
+    half = width / 2.0
+
+    for a, b in sorted([sorted(e) for e in scene["edges"]]):
+        draw.line([nodes[a], nodes[b]], fill=INK, width=width)
+    for x, y in nodes:  # round the joints; identical ink for every ordering
+        draw.ellipse([x - half, y - half, x + half, y + half], fill=INK)
+
+    hub_index = {i: c for c, i in scene["hubs"].items()}
+    plain_r = scene["node_radius"] * s
+    for index, (x, y) in enumerate(nodes):
+        if index in hub_index:
+            continue
+        draw.ellipse([x - plain_r, y - plain_r, x + plain_r, y + plain_r], fill=INK)
+
+    hub_r = scene["hub_radius"] * s
+    for color in COLOR_ORDER:
+        if color not in scene["hubs"]:
+            continue
+        x, y = nodes[scene["hubs"][color]]
+        draw.ellipse(
+            [x - hub_r, y - hub_r, x + hub_r, y + hub_r],
+            fill=HUB_COLORS[color],
+        )
+
+    return image.resize((int(scene["canvas"]), int(scene["canvas"])), Image.Resampling.BOX)

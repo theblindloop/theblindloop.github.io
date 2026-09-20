@@ -1,0 +1,286 @@
+"""Deterministic visible-world renderer for cumulative turn-balance search.
+
+The scene contains only visible geometry.  Gold is recomputed from the rendered
+polyline points and the color-bound checkpoint records; no answer field exists.
+"""
+
+from __future__ import annotations
+
+import copy
+import itertools
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+BACKGROUND = (250, 248, 243)
+INK = (36, 43, 50)
+JOINT = (151, 160, 168)
+GOLD = (224, 170, 38)
+PALETTE = {
+    "red": (211, 67, 61),
+    "blue": (48, 113, 190),
+    "green": (46, 145, 91),
+    "purple": (139, 82, 174),
+}
+COLOR_NAMES = ("red", "blue", "green", "purple")
+
+
+def _turn_values(points: list[list[float]]) -> list[int]:
+    """Return +1 for left and -1 for right in image coordinates."""
+    values: list[int] = []
+    for a, b, c in zip(points, points[1:], points[2:]):
+        ux, uy = b[0] - a[0], b[1] - a[1]
+        vx, vy = c[0] - b[0], c[1] - b[1]
+        cross_screen = ux * vy - uy * vx
+        if abs(cross_screen) < 1e-8:
+            raise ValueError("route contains a non-bend interior point")
+        values.append(1 if cross_screen < 0 else -1)
+    return values
+
+
+def _scores(scene: dict) -> dict[str, int]:
+    points = scene["points"]
+    checkpoints = scene["checkpoints"]
+    turns = _turn_values(points)
+    running = 0
+    balance_at: dict[int, int] = {}
+    for point_index, value in enumerate(turns, start=1):
+        running += value
+        balance_at[point_index] = running
+    scores: dict[str, int] = {}
+    for checkpoint in checkpoints:
+        color = str(checkpoint["color"])
+        point_index = int(checkpoint["point_index"])
+        if color in scores or point_index not in balance_at:
+            raise ValueError("invalid checkpoint records")
+        scores[color] = -abs(balance_at[point_index])
+    if set(scores) != set(COLOR_NAMES):
+        raise ValueError("scene must contain one checkpoint of every answer color")
+    return scores
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _scores(scene)
+    best = max(scores.values())
+    winners = sorted(color for color, score in scores.items() if score == best)
+    if len(winners) != 1:
+        raise ValueError("scene has no unique turn-balance winner")
+    return winners[0]
+
+
+def margin(scene: dict) -> float:
+    ranked = sorted(_scores(scene).values(), reverse=True)
+    return float(ranked[0] - ranked[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = _scores(scene)
+    return max(scores.values()) != 0 or margin(scene) < 2.0
+
+
+def _simplify_walk(raw: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    simplified = [raw[0]]
+    for point in raw[1:]:
+        if len(simplified) >= 2:
+            old = (
+                simplified[-1][0] - simplified[-2][0],
+                simplified[-1][1] - simplified[-2][1],
+            )
+            new = (point[0] - simplified[-1][0], point[1] - simplified[-1][1])
+            old_axis = (0 if old[0] == 0 else int(math.copysign(1, old[0])),
+                        0 if old[1] == 0 else int(math.copysign(1, old[1])))
+            if old_axis == new:
+                simplified[-1] = point
+                continue
+        simplified.append(point)
+    return simplified
+
+
+def _lattice_walk(rng: random.Random, desired_rank: int) -> tuple[list[tuple[int, int]], list[int]]:
+    directions = ((1, 0), (0, 1), (-1, 0), (0, -1))
+    for _ in range(6000):
+        raw = [(0, 0)]
+        used = {(0, 0)}
+        previous: tuple[int, int] | None = None
+        for _step in range(26):
+            choices = []
+            for direction in directions:
+                if previous is not None and direction == (-previous[0], -previous[1]):
+                    continue
+                nxt = (raw[-1][0] + direction[0], raw[-1][1] + direction[1])
+                if nxt not in used:
+                    # Keep the route induced as well as self-avoiding: a new
+                    # cell may touch only its predecessor.  This prevents a
+                    # visually ambiguous near-contact with an unrelated leg.
+                    neighbors = {
+                        (nxt[0] + dx, nxt[1] + dy) for dx, dy in directions
+                    }
+                    if not any(point in used and point != raw[-1] for point in neighbors):
+                        choices.append((direction, nxt))
+            if not choices:
+                break
+            previous, nxt = rng.choice(choices)
+            raw.append(nxt)
+            used.add(nxt)
+        if len(raw) != 27:
+            continue
+        points = _simplify_walk(raw)
+        if not 16 <= len(points) <= 24:
+            continue
+        turns = _turn_values([[float(x), float(y)] for x, y in points])
+        cumulative: list[int] = []
+        running = 0
+        for value in turns:
+            running += value
+            cumulative.append(running)
+        usable = list(range(4, len(points) - 2))
+        zeros = [index for index in usable if cumulative[index - 1] == 0]
+        nonzeros = [index for index in usable if abs(cumulative[index - 1]) >= 2]
+        if not _checkpoint_options(points, cumulative, desired_rank):
+            continue
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        span_x, span_y = max(xs) - min(xs), max(ys) - min(ys)
+        short_span, long_span = sorted((span_x, span_y))
+        if short_span < 3 or long_span > 13 or long_span / short_span < 2.0:
+            continue
+        return points, cumulative
+    raise RuntimeError("could not sample a valid self-avoiding route")
+
+
+def _checkpoint_options(
+    points: list[tuple[int, int]], cumulative: list[int], desired_rank: int
+) -> list[tuple[int, tuple[int, ...]]]:
+    usable = list(range(4, len(points) - 2))
+    zeros = [index for index in usable if cumulative[index - 1] == 0]
+    nonzeros = [index for index in usable if abs(cumulative[index - 1]) >= 2]
+    options: list[tuple[int, tuple[int, ...]]] = []
+    for target in zeros:
+        before = [index for index in nonzeros if index < target]
+        after = [index for index in nonzeros if index > target]
+        for chosen_before in itertools.combinations(before, desired_rank):
+            for chosen_after in itertools.combinations(after, 3 - desired_rank):
+                selected = tuple(sorted((*chosen_before, target, *chosen_after)))
+                # Adjacent path nodes can carry touching rings; keep a full
+                # intervening route segment between every candidate pair.
+                if all(right - left >= 2 for left, right in zip(selected, selected[1:])):
+                    options.append((target, selected))
+    return options
+
+
+def _transform(point: tuple[int, int], transform: int) -> tuple[int, int]:
+    x, y = point
+    if transform == 0:
+        return x, y
+    if transform == 1:
+        return -y, x
+    if transform == 2:
+        return -x, -y
+    if transform == 3:
+        return y, -x
+    if transform == 4:
+        return -x, y
+    if transform == 5:
+        return y, x
+    if transform == 6:
+        return x, -y
+    return -y, -x
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    desired_rank = int(seed) % 4
+    lattice, _ = _lattice_walk(rng, desired_rank)
+    transform = rng.randrange(8)
+    transformed = [_transform(point, transform) for point in lattice]
+
+    # Recompute the visible signed-turn prefixes after possible reflection.
+    lattice_points = [[float(x), float(y)] for x, y in transformed]
+    turns = _turn_values(lattice_points)
+    cumulative: list[int] = []
+    running = 0
+    for value in turns:
+        running += value
+        cumulative.append(running)
+    options = _checkpoint_options(transformed, cumulative, desired_rank)
+    if not options:
+        raise RuntimeError("route transform invalidated checkpoint ranking")
+    target_index, selected_tuple = rng.choice(options)
+    selected = list(selected_tuple)
+
+    xs = [point[0] for point in transformed]
+    ys = [point[1] for point in transformed]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    target_span = float(rng.randint(246, 258))
+    scale = target_span / max(max_x - min_x, max_y - min_y)
+    center_x = WIDTH / 2 + rng.uniform(-16.0, 16.0)
+    center_y = HEIGHT / 2 + rng.uniform(-16.0, 16.0)
+    mid_x, mid_y = (min_x + max_x) / 2.0, (min_y + max_y) / 2.0
+    points = [
+        [round(center_x + (x - mid_x) * scale, 3), round(center_y + (y - mid_y) * scale, 3)]
+        for x, y in transformed
+    ]
+
+    answer_color = COLOR_NAMES[(int(seed) // 4) % 4]
+    remaining_colors = [color for color in COLOR_NAMES if color != answer_color]
+    rng.shuffle(remaining_colors)
+    checkpoints = []
+    for point_index in selected:
+        color = answer_color if point_index == target_index else remaining_colors.pop()
+        checkpoints.append({"point_index": point_index, "color": color})
+    rng.shuffle(checkpoints)
+    scene = {
+        "points": points,
+        "checkpoints": checkpoints,
+        "width": WIDTH,
+        "height": HEIGHT,
+        "stroke": 10,
+    }
+    if is_quarantined(scene):
+        raise RuntimeError("sampler produced a quarantined scene")
+    return scene
+
+
+def _ellipse(draw: ImageDraw.ImageDraw, center: tuple[float, float], radius: float, **kwargs) -> None:
+    x, y = center
+    draw.ellipse((x - radius, y - radius, x + radius, y + radius), **kwargs)
+
+
+def render(scene: dict) -> Image.Image:
+    points = scene["points"]
+    checkpoints = scene["checkpoints"]
+    width = int(scene["width"])
+    height = int(scene["height"])
+    stroke = int(scene["stroke"])
+    ss = 3
+    image = Image.new("RGB", (width * ss, height * ss), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    scaled_points = [(float(x) * ss, float(y) * ss) for x, y in points]
+    draw.line(scaled_points, fill=INK, width=stroke * ss, joint="curve")
+
+    # All turn and endpoint locations receive the same neutral center dot.  These
+    # are visible landmarks, not metadata: the inverse arm segments them afresh.
+    for x, y in scaled_points:
+        _ellipse(draw, (x, y), 3.2 * ss, fill=JOINT)
+
+    start = scaled_points[0]
+    _ellipse(draw, start, 10.0 * ss, outline=GOLD, width=4 * ss)
+    for checkpoint in checkpoints:
+        point = scaled_points[int(checkpoint["point_index"])]
+        color = PALETTE[str(checkpoint["color"])]
+        _ellipse(draw, point, 10.0 * ss, outline=color, width=4 * ss)
+
+    # Redraw the neutral centers so every geometric node has the same core.
+    for x, y in scaled_points:
+        _ellipse(draw, (x, y), 3.2 * ss, fill=JOINT)
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["checkpoints"] = list(reversed(twin["checkpoints"]))
+    return [("reverse_checkpoint_record_order", twin)]

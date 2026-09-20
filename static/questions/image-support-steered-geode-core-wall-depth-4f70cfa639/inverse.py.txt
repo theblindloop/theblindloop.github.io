@@ -1,0 +1,144 @@
+"""Pixel-only inverse arm for the geode world.
+
+Input is one RGB image and nothing else. The arm segments black barrier ink,
+labels the free space and the barrier ink into connected components, builds the
+adjacency between free regions and barrier components, and runs a breadth-first
+sweep outward from the region that touches the page edge. The number of barrier
+components on the shortest chain from the outside to the region holding the
+green patch is the answer. No renderer state, palette table, canvas size, stamp
+position or scene field is used.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_BLACK_MAX = 90
+_ABSTAIN = "abstain"
+
+
+def _label(mask: np.ndarray, diagonal: bool) -> tuple:
+    """Run-length connected-component labelling with union-find."""
+    height, width = mask.shape
+    parent = [0]
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    labels = np.zeros((height, width), dtype=np.int32)
+    previous: list = []
+    tol = 1 if diagonal else 0
+    for y in range(height):
+        row = mask[y]
+        if not row.any():
+            previous = []
+            continue
+        delta = np.diff(row.astype(np.int8))
+        starts = (np.flatnonzero(delta == 1) + 1).tolist()
+        ends = (np.flatnonzero(delta == -1) + 1).tolist()
+        if row[0]:
+            starts.insert(0, 0)
+        if row[-1]:
+            ends.append(width)
+        current = []
+        for start, end in zip(starts, ends):
+            parent.append(len(parent))
+            tag = len(parent) - 1
+            labels[y, start:end] = tag
+            current.append((start, end, tag))
+        for start, end, tag in current:
+            for pstart, pend, ptag in previous:
+                if pstart < end + tol and start < pend + tol:
+                    union(tag, ptag)
+        previous = current
+
+    roots = np.zeros(len(parent), dtype=np.int32)
+    remap = {}
+    for tag in range(1, len(parent)):
+        root = find(tag)
+        if root not in remap:
+            remap[root] = len(remap) + 1
+        roots[tag] = remap[root]
+    return roots[labels], len(remap)
+
+
+def _adjacency(free_labels: np.ndarray, ink_labels: np.ndarray) -> dict:
+    links: dict = {}
+
+    def add(free_side: np.ndarray, ink_side: np.ndarray) -> None:
+        touching = (free_side > 0) & (ink_side > 0)
+        if not touching.any():
+            return
+        pairs = np.stack([free_side[touching], ink_side[touching]], axis=1)
+        for free_id, ink_id in np.unique(pairs, axis=0).tolist():
+            links.setdefault(int(free_id), set()).add(int(ink_id))
+
+    add(free_labels[:, :-1], ink_labels[:, 1:])
+    add(free_labels[:, 1:], ink_labels[:, :-1])
+    add(free_labels[:-1, :], ink_labels[1:, :])
+    add(free_labels[1:, :], ink_labels[:-1, :])
+    return links
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB")).astype(np.int16)
+    red, grn, blu = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+
+    ink = (red < _BLACK_MAX) & (grn < _BLACK_MAX) & (blu < _BLACK_MAX)
+    green = (grn > 110) & (grn - red > 50) & (grn - blu > 50)
+    if int(green.sum()) < 40 or not ink.any():
+        return _ABSTAIN
+
+    free_labels, free_count = _label(~ink, diagonal=False)
+    ink_labels, _ink_count = _label(ink, diagonal=True)
+    if free_count < 2:
+        return _ABSTAIN
+
+    # the green patch must sit in exactly one free region
+    green_ids = np.unique(free_labels[green])
+    green_ids = [int(v) for v in green_ids.tolist() if v > 0]
+    if len(green_ids) != 1:
+        return _ABSTAIN
+    target = green_ids[0]
+
+    border = set()
+    for edge in (free_labels[0, :], free_labels[-1, :], free_labels[:, 0], free_labels[:, -1]):
+        border.update(int(v) for v in np.unique(edge).tolist() if v > 0)
+    if not border:
+        return _ABSTAIN
+    if target in border:
+        return _ABSTAIN
+
+    free_to_ink = _adjacency(free_labels, ink_labels)
+    ink_to_free: dict = {}
+    for free_id, ink_ids in free_to_ink.items():
+        for ink_id in ink_ids:
+            ink_to_free.setdefault(ink_id, set()).add(free_id)
+
+    depth = {free_id: 0 for free_id in border}
+    queue = deque(border)
+    while queue:
+        current = queue.popleft()
+        for ink_id in free_to_ink.get(current, ()):  # cross this barrier once
+            for neighbour in ink_to_free.get(ink_id, ()):
+                if neighbour not in depth:
+                    depth[neighbour] = depth[current] + 1
+                    queue.append(neighbour)
+
+    value = depth.get(target)
+    if value == 1:
+        return "d1"
+    if value == 2:
+        return "d2"
+    return _ABSTAIN

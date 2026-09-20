@@ -1,0 +1,188 @@
+"""Independent pixel-only inverse arm for the reflecting-track replay world.
+
+This module never imports the renderer, the generator, the prompts, or the
+analytic gold, and it never receives latent scene data. It reconstructs the
+board geometry from the raster itself (seam bands, not stored coordinates),
+reads every cell's role from its own colour vocabulary, replays the declared
+move rule, and returns the cap colour name of the final row.
+
+The colour vocabulary below is public: the question wording names the marker,
+the two move colours, the inert filler, and the five cap colours, so a solver
+that can see the image has exactly this information. Nothing here depends on
+renderer constants: cell sizes, seam widths, margins, board position, stage
+count, and row count are all measured from pixels.
+
+If the raster cannot be parsed unambiguously - a seam band missing, a cell that
+is not a single legible colour, a stage with mixed move colours, an incomplete
+legend - the oracle refuses to guess and returns UNREADABLE.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "reflect_track_replay-oracle-0.1.0"
+UNREADABLE = "unreadable"
+
+# Public colour vocabulary (RGB anchors for the names used by the question).
+ANCHORS: dict[str, tuple[int, int, int]] = {
+    "page": (255, 255, 255),
+    "seam": (95, 100, 110),
+    "inert": (170, 174, 182),
+    "marker": (20, 20, 24),
+    "up": (0, 150, 150),
+    "down": (235, 165, 20),
+    "red": (214, 40, 40),
+    "blue": (40, 80, 210),
+    "green": (40, 150, 60),
+    "purple": (140, 50, 190),
+    "pink": (245, 120, 180),
+}
+_NAMES = tuple(ANCHORS)
+_ANCHOR_ARRAY = np.asarray([ANCHORS[name] for name in _NAMES], dtype=np.float32)
+CAP_NAMES = ("red", "blue", "green", "purple", "pink")
+MOVE_NAMES = ("up", "down")
+
+SEAM_BAND_FRACTION = 0.90  # a seam band is a line almost entirely seam-coloured
+CELL_PURITY = 0.97  # fraction of a cell's core patch that must share one role
+MIN_CELL_PX = 12  # smaller cell cores are not measurable
+CORE_FRACTION = 0.45
+
+
+def _classify(pixels: np.ndarray) -> np.ndarray:
+    """Nearest-anchor label index for an (..., 3) float array."""
+    flat = pixels.reshape(-1, 1, 3)
+    distances = np.linalg.norm(flat - _ANCHOR_ARRAY[None, :, :], axis=2)
+    return distances.argmin(axis=1).reshape(pixels.shape[:-1])
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """Maximal [start, stop) runs of True."""
+    spans: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            spans.append((start, index))
+            start = None
+    if start is not None:
+        spans.append((start, len(flags)))
+    return spans
+
+
+def _core_role(labels: np.ndarray, y0: int, y1: int, x0: int, x1: int) -> str | None:
+    height, width = y1 - y0, x1 - x0
+    if height < MIN_CELL_PX or width < MIN_CELL_PX:
+        return None
+    dy = int(height * (1.0 - CORE_FRACTION) / 2.0)
+    dx = int(width * (1.0 - CORE_FRACTION) / 2.0)
+    patch = labels[y0 + dy : y1 - dy, x0 + dx : x1 - dx]
+    if patch.size == 0:
+        return None
+    counts = np.bincount(patch.ravel(), minlength=len(_NAMES))
+    best = int(counts.argmax())
+    if counts[best] / patch.size < CELL_PURITY:
+        return None
+    return _NAMES[best]
+
+
+def read_board(image: Image.Image) -> list[list[str]] | None:
+    """Recover the grid of cell roles from pixels alone, or None if illegible."""
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or min(array.shape[:2]) < 32:
+        return None
+    labels = _classify(array)
+    page_index = _NAMES.index("page")
+    seam_index = _NAMES.index("seam")
+
+    ink = labels != page_index
+    rows_with_ink = np.flatnonzero(ink.any(axis=1))
+    cols_with_ink = np.flatnonzero(ink.any(axis=0))
+    if rows_with_ink.size < 32 or cols_with_ink.size < 32:
+        return None
+    top, bottom = int(rows_with_ink[0]), int(rows_with_ink[-1]) + 1
+    left, right = int(cols_with_ink[0]), int(cols_with_ink[-1]) + 1
+    window = labels[top:bottom, left:right]
+
+    if (window == page_index).any():
+        # A hole inside the board: information is missing, not merely different.
+        return None
+
+    seam = window == seam_index
+    col_bands = _runs(seam.mean(axis=0) >= SEAM_BAND_FRACTION)
+    row_bands = _runs(seam.mean(axis=1) >= SEAM_BAND_FRACTION)
+    if len(col_bands) < 3 or len(row_bands) < 3:
+        return None
+    col_spans = [(a[1], b[0]) for a, b in zip(col_bands, col_bands[1:], strict=False)]
+    row_spans = [(a[1], b[0]) for a, b in zip(row_bands, row_bands[1:], strict=False)]
+    if not col_spans or not row_spans:
+        return None
+    if any(x1 - x0 < MIN_CELL_PX for x0, x1 in col_spans):
+        return None
+    if any(y1 - y0 < MIN_CELL_PX for y0, y1 in row_spans):
+        return None
+
+    grid: list[list[str]] = []
+    for y0, y1 in row_spans:
+        line: list[str] = []
+        for x0, x1 in col_spans:
+            role = _core_role(window, y0, y1, x0, x1)
+            if role is None or role in ("page", "seam"):
+                return None
+            line.append(role)
+        grid.append(line)
+    return grid
+
+
+def _replay(start: int, moves: list[tuple[str, int]], rows: int) -> int:
+    position = start
+    for direction, magnitude in moves:
+        step = -1 if direction == "up" else 1
+        for _ in range(magnitude):
+            nxt = position + step
+            if nxt < 0 or nxt > rows - 1:
+                step = -step
+                nxt = position + step
+            position = nxt
+    return position
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Cap colour name of the row the token reaches, from the image alone."""
+    grid = read_board(image)
+    if grid is None:
+        return UNREADABLE
+    rows = len(grid)
+    cols = len(grid[0])
+    if rows < 3 or cols < 3:
+        return UNREADABLE
+
+    start_rows = [r for r in range(rows) if grid[r][0] == "marker"]
+    if len(start_rows) != 1:
+        return UNREADABLE
+    if any(grid[r][0] != "inert" for r in range(rows) if r != start_rows[0]):
+        return UNREADABLE
+
+    moves: list[tuple[str, int]] = []
+    for col in range(1, cols - 1):
+        column = [grid[r][col] for r in range(rows)]
+        present = {role for role in column if role in MOVE_NAMES}
+        if len(present) != 1:
+            return UNREADABLE
+        direction = present.pop()
+        if any(role not in ("inert", direction) for role in column):
+            return UNREADABLE
+        magnitude = sum(1 for role in column if role == direction)
+        if not 1 <= magnitude <= rows - 1:
+            return UNREADABLE
+        moves.append((direction, magnitude))
+    if not moves:
+        return UNREADABLE
+
+    legend = [grid[r][cols - 1] for r in range(rows)]
+    if any(role not in CAP_NAMES for role in legend) or len(set(legend)) != rows:
+        return UNREADABLE
+
+    return legend[_replay(start_rows[0], moves, rows)]

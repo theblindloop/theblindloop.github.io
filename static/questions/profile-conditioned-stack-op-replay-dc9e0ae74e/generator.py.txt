@@ -1,0 +1,282 @@
+"""stack_op_replay: replay a visible sequence of stack operations.
+
+Latent scene z = (initial block stack, ordered operation cards, colour jitter).
+The image shows, on the left, a bin holding coloured blocks (the initial stack,
+bottom to top) and, on the right, a left-to-right row of square operation cards.
+A card carrying a white PLUS glyph pushes a block of the card's own colour onto
+the top of the stack; a card carrying a white MINUS glyph removes the current
+top block. The final stack is never drawn: the answer exists only as the result
+of replaying the declared operations from the drawn initial state.
+
+Analytic gold is ``"<top colour name>|<final height>"``.
+
+Margin. Two independent finite-resolution clearances gate the readability of
+the evidence:
+
+  * colour clearance -- every drawn ink is a palette colour perturbed by a
+    per-scene jitter; the clearance of one ink is half the amount by which it is
+    still closer to its own palette anchor than to any other anchor. As the
+    jitter grows an ink drifts toward a neighbouring anchor and its identity
+    stops being decidable from pixels.
+  * order clearance -- the smallest horizontal gap between adjacent cards; as it
+    closes, the operation order stops being resolvable.
+
+``margin`` is the minimum of the two (order gap scaled by 4 px^-1 to a common
+scale) and scenes below ``QUARANTINE`` are quarantined.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "stack_op_replay-0.1.0"
+
+# ---------------------------------------------------------------- palette ---
+# Five block colours plus the neutral used for removal cards. Mutually well
+# separated so that a moderate per-scene jitter keeps every ink nearest to its
+# own anchor; the quarantine band is exactly where that stops holding.
+ANCHORS: dict[str, tuple[int, int, int]] = {
+    "red": (220, 30, 30),
+    "blue": (30, 60, 220),
+    "green": (20, 150, 60),
+    "orange": (245, 150, 20),
+    "purple": (140, 40, 180),
+    "gray": (130, 130, 130),
+}
+COLOR_NAMES: tuple[str, ...] = ("red", "blue", "green", "orange", "purple")
+REMOVE_COLOR = "gray"
+
+BACKGROUND = (255, 255, 255)
+OUTLINE = (25, 25, 25)
+GLYPH = (255, 255, 255)
+
+# ------------------------------------------------------------ geometry ------
+WIDTH, HEIGHT = 720, 420
+BIN_LEFT, BIN_RIGHT = 40, 200
+BIN_TOP, BIN_BOTTOM = 100, 370
+WALL = 6
+BLOCK_X0, BLOCK_X1 = 54, 186
+BLOCK_H = 30
+BLOCK_PITCH = 40
+BLOCK_BOTTOM_TOP = 328  # y of the top edge of the bottom-most block
+CARD = 46
+CARD_TOP = 150
+CARD_X0 = 250
+ARROW_Y = 250
+GAP_RANGE = (8, 22)
+
+N_BLOCKS_RANGE = (2, 4)
+N_OPS_RANGE = (4, 7)
+MAX_HEIGHT = 6
+JITTER_RANGE = (0.0, 52.0)  # L2 magnitude of the per-colour perturbation
+
+QUARANTINE = 10.0
+GAP_SCALE = 4.0
+
+
+# ------------------------------------------------------------ sampling ------
+def _jitter(rng: random.Random, base: tuple[int, int, int], mag: float) -> list[int]:
+    """Perturb one anchor by a random direction of length ``mag`` (clamped)."""
+    v = [rng.gauss(0.0, 1.0) for _ in range(3)]
+    n = math.sqrt(sum(c * c for c in v)) or 1.0
+    out = []
+    for c, d in zip(base, v):
+        out.append(int(max(12, min(243, round(c + mag * d / n)))))
+    return out
+
+
+def _anchor_clearance(color: list[int], name: str) -> float:
+    """Half the margin by which ``color`` is nearer its own anchor than any other."""
+    own = _dist(color, ANCHORS[name])
+    other = min(_dist(color, v) for k, v in ANCHORS.items() if k != name)
+    return (other - own) / 2.0
+
+
+def _dist(a, b) -> float:
+    return math.sqrt(sum((float(x) - float(y)) ** 2 for x, y in zip(a, b)))
+
+
+def _replay(blocks: list[dict], cards: list[dict]) -> tuple[list[str], bool]:
+    """Replay the ordered cards over the ordered stack (bottom to top)."""
+    stack = [b["name"] for b in sorted(blocks, key=lambda b: -b["y"])]
+    for card in sorted(cards, key=lambda c: c["x"]):
+        if card["kind"] == "push":
+            stack.append(card["name"])
+        else:
+            if not stack:
+                return stack, False
+            stack.pop()
+    return stack, bool(stack)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one scene. The answer colour is round-robined on ``seed`` so the
+    answer identity is counterbalanced against colour, and shortcut scenes are
+    rejected (see the constraint block below)."""
+    rng = random.Random(seed * 7919 + 13)
+    wanted = COLOR_NAMES[seed % len(COLOR_NAMES)]
+
+    for _ in range(4000):
+        mag = rng.uniform(*JITTER_RANGE)
+        n_blocks = rng.randint(*N_BLOCKS_RANGE)
+        blocks = []
+        for k in range(n_blocks):
+            name = rng.choice(COLOR_NAMES)
+            blocks.append(
+                {
+                    "y": BLOCK_BOTTOM_TOP - BLOCK_PITCH * k,
+                    "name": name,
+                    "color": _jitter(rng, ANCHORS[name], mag),
+                }
+            )
+
+        n_ops = rng.randint(*N_OPS_RANGE)
+        gap = rng.randint(*GAP_RANGE)
+        kinds = []
+        height = n_blocks
+        for i in range(n_ops):
+            last = i == n_ops - 1
+            # the final card is always a removal, so the answer is never simply
+            # the colour of the right-most card
+            if last or (height > 1 and rng.random() < 0.42):
+                if height <= 1:
+                    break
+                kinds.append("pop")
+                height -= 1
+            else:
+                if height >= MAX_HEIGHT:
+                    kinds.append("pop")
+                    height -= 1
+                else:
+                    kinds.append("push")
+                    height += 1
+        if len(kinds) != n_ops or kinds[-1] != "pop":
+            continue
+        if sum(k == "push" for k in kinds) < 2:
+            continue
+
+        cards = []
+        x = CARD_X0
+        for kind in kinds:
+            name = rng.choice(COLOR_NAMES) if kind == "push" else REMOVE_COLOR
+            cards.append(
+                {
+                    "x": x,
+                    "kind": kind,
+                    "name": name,
+                    "color": _jitter(rng, ANCHORS[name], mag if kind == "push" else 0.0),
+                }
+            )
+            x += CARD + gap
+        if x - gap > WIDTH - 8:
+            continue
+
+        stack, ok = _replay(blocks, cards)
+        if not ok:
+            continue
+        top = stack[-1]
+        if top != wanted:
+            continue
+
+        # shortcut blocks -------------------------------------------------
+        pushes = [c["name"] for c in cards if c["kind"] == "push"]
+        if pushes and pushes[-1] == top:
+            continue  # "answer is the last pushed colour" must fail
+        freq: dict[str, int] = {}
+        for name in [b["name"] for b in blocks] + pushes:
+            freq[name] = freq.get(name, 0) + 1
+        best = max(freq.values())
+        if freq.get(top, 0) == best and sum(v == best for v in freq.values()) == 1:
+            continue  # "answer is the most frequent colour" must fail
+
+        scene = {
+            "canvas": [WIDTH, HEIGHT],
+            "blocks": blocks,
+            "cards": cards,
+            "gap": gap,
+            "jitter": round(mag, 4),
+        }
+        return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+# ------------------------------------------------------------ rendering -----
+def render(scene: dict, supersample: int = 3) -> Image.Image:
+    """I = R(z). Pure function of the scene dict; no randomness."""
+    w, h = scene["canvas"]
+    s = supersample
+    img = Image.new("RGB", (w * s, h * s), BACKGROUND)
+    d = ImageDraw.Draw(img)
+
+    def box(x0, y0, x1, y1, fill, outline=None, width=0):
+        d.rectangle([x0 * s, y0 * s, x1 * s - 1, y1 * s - 1], fill=fill,
+                    outline=outline, width=width * s if width else 0)
+
+    # bin holding the initial stack (a U of black walls)
+    box(BIN_LEFT, BIN_TOP, BIN_LEFT + WALL, BIN_BOTTOM, OUTLINE)
+    box(BIN_RIGHT - WALL, BIN_TOP, BIN_RIGHT, BIN_BOTTOM, OUTLINE)
+    box(BIN_LEFT, BIN_BOTTOM - WALL, BIN_RIGHT, BIN_BOTTOM, OUTLINE)
+
+    for b in scene["blocks"]:
+        box(BLOCK_X0, b["y"], BLOCK_X1, b["y"] + BLOCK_H, tuple(b["color"]),
+            outline=OUTLINE, width=2)
+
+    for c in scene["cards"]:
+        x0, y0 = c["x"], CARD_TOP
+        box(x0, y0, x0 + CARD, y0 + CARD, tuple(c["color"]), outline=OUTLINE, width=2)
+        cx, cy = x0 + CARD // 2, y0 + CARD // 2
+        box(cx - 14, cy - 4, cx + 14, cy + 4, GLYPH)          # horizontal bar
+        if c["kind"] == "push":
+            box(cx - 4, cy - 14, cx + 4, cy + 14, GLYPH)      # vertical bar
+
+    # left-to-right order arrow beneath the card row
+    xs = [c["x"] for c in scene["cards"]]
+    ax0, ax1 = min(xs) + 4, max(xs) + CARD - 4
+    box(ax0, ARROW_Y, ax1 - 10, ARROW_Y + 4, OUTLINE)
+    d.polygon(
+        [(ax1 - 14) * s, (ARROW_Y - 6) * s, (ax1) * s, (ARROW_Y + 2) * s,
+         (ax1 - 14) * s, (ARROW_Y + 10) * s],
+        fill=OUTLINE,
+    )
+    return img.resize((w, h), Image.LANCZOS)
+
+
+# ------------------------------------------------------------ gold ----------
+def analytic_gold(scene: dict) -> str:
+    stack, ok = _replay(scene["blocks"], scene["cards"])
+    if not ok:
+        raise ValueError("scene empties the stack; sampler must reject it")
+    return f"{stack[-1]}|{len(stack)}"
+
+
+def margin(scene: dict) -> float:
+    inks = [(b["color"], b["name"]) for b in scene["blocks"]]
+    inks += [(c["color"], c["name"]) for c in scene["cards"]]
+    color_clearance = min(_anchor_clearance(c, n) for c, n in inks)
+    xs = sorted(c["x"] for c in scene["cards"])
+    gap_px = min(b - a - CARD for a, b in zip(xs, xs[1:])) if len(xs) > 1 else 999.0
+    return round(min(color_clearance, GAP_SCALE * gap_px), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Both lists are unordered bags of positioned items: gold sorts blocks by
+    their drawn height and cards by their drawn x. Reversing or rotating the
+    stored lists redraws a pixel-identical image and must not move the answer;
+    this catches any gold keyed to Python list position instead of geometry."""
+    out = []
+    rev = dict(scene)
+    rev["blocks"] = list(reversed(scene["blocks"]))
+    rev["cards"] = list(reversed(scene["cards"]))
+    out.append(("reverse_lists", rev))
+    rot = dict(scene)
+    rot["blocks"] = scene["blocks"][1:] + scene["blocks"][:1]
+    rot["cards"] = scene["cards"][1:] + scene["cards"][:1]
+    out.append(("rotate_lists", rot))
+    return out

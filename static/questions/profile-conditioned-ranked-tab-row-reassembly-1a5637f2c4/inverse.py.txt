@@ -1,0 +1,162 @@
+"""Independent PNG-only inverse for length-ranked row reassembly."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_ROWS = 8
+_COLS = 9
+_ROW_STARTS = (0, 0, 2, 2, 4, 4, 6, 6)
+_ORDERS = {
+    "left_chevron": (6, 4, 2, 0, 1, 3, 5, 7),
+    "right_chevron": (0, 2, 4, 6, 7, 5, 3, 1),
+    "two_rising_strokes": (0, 2, 4, 6, 1, 3, 5, 7),
+    "two_falling_strokes": (6, 4, 2, 0, 7, 5, 3, 1),
+}
+_DARKS = {(29, 48, 66), (70, 43, 91), (42, 74, 52)}
+_LIGHTS = {(218, 229, 230), (232, 222, 234), (226, 232, 213)}
+_GOLD = (226, 160, 25)
+
+
+class OracleAbstention(ValueError):
+    """Visible ranking or tile evidence is missing or ambiguous."""
+
+
+def _components(mask: np.ndarray, minimum_area: int) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[dict] = []
+    for y_value, x_value in np.argwhere(mask):
+        y, x = int(y_value), int(x_value)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(xs) >= minimum_area:
+            result.append({
+                "area": len(xs), "x": float(np.mean(xs)), "y": float(np.mean(ys)),
+                "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
+            })
+    return result
+
+
+def _cluster(values: list[float], separation: float = 9.0) -> list[float]:
+    groups: list[list[float]] = []
+    for value in sorted(values):
+        if not groups or value - groups[-1][-1] > separation:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return [float(np.mean(group)) for group in groups]
+
+
+def _source_matrix(arr: np.ndarray) -> tuple[np.ndarray, list[float]]:
+    mask = np.zeros(arr.shape[:2], dtype=bool)
+    for rgb in _DARKS | _LIGHTS:
+        mask |= np.all(arr == np.asarray(rgb, dtype=np.uint8), axis=2)
+    parts = _components(mask, minimum_area=450)
+    if len(parts) != _ROWS * _COLS:
+        raise OracleAbstention(f"need 72 separate tile faces; found {len(parts)}")
+    x_centers = _cluster([part["x"] for part in parts])
+    y_centers = _cluster([part["y"] for part in parts])
+    if len(x_centers) != _COLS or len(y_centers) != _ROWS:
+        raise OracleAbstention(
+            f"tile faces do not form an 8-by-9 lattice: {len(y_centers)} by {len(x_centers)}"
+        )
+    matrix = np.full((_ROWS, _COLS), -1, dtype=np.int8)
+    for part in parts:
+        row = int(np.argmin(np.abs(np.asarray(y_centers) - part["y"])))
+        column = int(np.argmin(np.abs(np.asarray(x_centers) - part["x"])))
+        cx, cy = int(round(part["x"])), int(round(part["y"]))
+        rgb = tuple(int(value) for value in arr[cy, cx])
+        if rgb in _DARKS:
+            value = 1
+        elif rgb in _LIGHTS:
+            value = 0
+        else:
+            raise OracleAbstention("a tile center is outside the public binary palette")
+        if matrix[row, column] != -1:
+            raise OracleAbstention("multiple tile faces map to one lattice position")
+        matrix[row, column] = value
+    if np.any(matrix < 0):
+        raise OracleAbstention("the recovered tile lattice has a missing position")
+    if not all(int(matrix[row].sum()) == 3 for row in range(_ROWS)):
+        raise OracleAbstention("every source strip must contain exactly three dark tiles")
+    return matrix, y_centers
+
+
+def _ranked_source_rows(arr: np.ndarray, row_centers: list[float]) -> list[int]:
+    gold_mask = np.all(arr == np.asarray(_GOLD, dtype=np.uint8), axis=2)
+    bars = _components(gold_mask, minimum_area=180)
+    if len(bars) != _ROWS:
+        raise OracleAbstention(f"need eight visible gold tabs; found {len(bars)}")
+    widths_by_row: dict[int, int] = {}
+    for bar in bars:
+        row = int(np.argmin(np.abs(np.asarray(row_centers) - bar["y"])))
+        if abs(row_centers[row] - bar["y"]) > 6.0:
+            raise OracleAbstention("a gold tab is not vertically bound to one tile strip")
+        if row in widths_by_row:
+            raise OracleAbstention("multiple gold tabs bind to one source strip")
+        widths_by_row[row] = int(bar["x1"] - bar["x0"] + 1)
+    if len(widths_by_row) != _ROWS:
+        raise OracleAbstention("not every source strip has one gold tab")
+    ranking = sorted(widths_by_row.items(), key=lambda item: (item[1], item[0]))
+    widths = [width for _, width in ranking]
+    if min(np.diff(widths)) < 12:
+        raise OracleAbstention("gold tab lengths do not define a visibly separated strict order")
+    return [row for row, _ in ranking]
+
+
+def _strip(strip_id: int) -> np.ndarray:
+    result = np.zeros(_COLS, dtype=np.int8)
+    start = _ROW_STARTS[int(strip_id)]
+    result[start:start + 3] = 1
+    return result
+
+
+def _template(order: tuple[int, ...]) -> np.ndarray:
+    return np.stack([_strip(strip_id) for strip_id in order], axis=0)
+
+
+def analyze_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    source, row_centers = _source_matrix(arr)
+    rank_order = _ranked_source_rows(arr, row_centers)
+    reconstructed = source[np.asarray(rank_order, dtype=int), :]
+    scores = {
+        name: int(np.count_nonzero(reconstructed != _template(order)))
+        for name, order in _ORDERS.items()
+    }
+    ranking = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    best_name, best_score = ranking[0]
+    runner_name, runner_score = ranking[1]
+    decision_margin = float(runner_score - best_score)
+    if best_score > 2 or decision_margin < 20.0:
+        raise OracleAbstention(
+            f"rank-reassembled figure is ambiguous: best={best_name}/{best_score}, "
+            f"runner={runner_name}/{runner_score}"
+        )
+    return {
+        "decision": best_name,
+        "margin": decision_margin,
+        "best_mismatches": int(best_score),
+        "runner_up": runner_name,
+        "tab_count": len(rank_order),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

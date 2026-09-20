@@ -1,0 +1,207 @@
+"""Pixel-only inverse arm for the slot-refill reveal world.
+
+Receives one rasterised PNG and the public question contract only.  It locates
+the bordered panel and the three loose slats as visible components, rectifies
+each one's lattice from its own frame, reads the three lattice tones from the
+image itself, reinserts the slats into the empty slots in the declared order,
+and names the completed skyline.  Ambiguous or incomplete evidence raises.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "slot_refill_reveal-oracle-0.1.0"
+
+CELLS = 7
+# the public answer contract: the four declared skylines, in bar heights
+DECLARED_SKYLINES: dict[str, tuple[int, ...]] = {
+    "ramp": (1, 2, 3, 4, 5, 6, 7),
+    "crest": (1, 2, 3, 4, 7, 6, 5),
+    "basin": (3, 2, 1, 4, 5, 6, 7),
+    "switchback": (3, 2, 1, 4, 7, 6, 5),
+}
+
+
+class OracleAbstention(RuntimeError):
+    """Raised when the image does not support a decision."""
+
+
+def _luma(array: np.ndarray) -> np.ndarray:
+    return array[:, :, 0] * 0.299 + array[:, :, 1] * 0.587 + array[:, :, 2] * 0.114
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    """Four-connected components of a boolean mask as (top, left, bottom, right, area)."""
+
+    height, width = mask.shape
+    seen = np.zeros_like(mask)
+    out = []
+    for y0 in range(height):
+        row = mask[y0]
+        if not row.any():
+            continue
+        for x0 in np.nonzero(row & ~seen[y0])[0]:
+            queue = deque([(y0, int(x0))])
+            seen[y0, x0] = True
+            top = bottom = y0
+            left = right = int(x0)
+            area = 0
+            while queue:
+                cy, cx = queue.popleft()
+                area += 1
+                top = min(top, cy)
+                bottom = max(bottom, cy)
+                left = min(left, cx)
+                right = max(right, cx)
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+            out.append((top, left, bottom, right, area))
+    return out
+
+
+def _frame_thickness(mask: np.ndarray, box: tuple[int, int, int, int]) -> int:
+    """Border thickness of a framed component, as the shortest ink run below its top edge.
+
+    Bars hang from the component's bottom edge, so at least one lattice column of
+    the panel leaves the top rows clear and exposes the frame alone.
+    """
+
+    top, left, bottom, right = box
+    window = mask[top : bottom + 1, left : right + 1]
+    runs = np.argmin(window, axis=0)
+    solid = window.all(axis=0)
+    runs = runs[~solid]
+    if runs.size == 0:
+        raise OracleAbstention("component exposes no border thickness")
+    thickness = int(runs.min())
+    if thickness < 2 or thickness > 12:
+        raise OracleAbstention("implausible frame thickness")
+    return thickness
+
+
+def _cell_lumas(luma: np.ndarray, box: tuple[int, int, int, int], thickness: int, columns: int):
+    top, left, bottom, right = box
+    iy0, ix0 = top + thickness, left + thickness
+    iy1, ix1 = bottom + 1 - thickness, right + 1 - thickness
+    cell_h = (iy1 - iy0) / CELLS
+    cell_w = (ix1 - ix0) / columns
+    if cell_h < 8 or cell_w < 8 or abs(cell_h - cell_w) > 1.5:
+        raise OracleAbstention("lattice does not rectify to square cells")
+    grid = np.zeros((CELLS, columns), dtype=float)
+    for row in range(CELLS):
+        for column in range(columns):
+            cy = int(iy0 + (row + 0.5) * cell_h)
+            cx = int(ix0 + (column + 0.5) * cell_w)
+            grid[row, column] = float(np.median(luma[cy - 2 : cy + 3, cx - 2 : cx + 3]))
+    return grid
+
+
+def _tone_levels(luma: np.ndarray, ink_level: float, samples: np.ndarray) -> tuple[float, float, float]:
+    paper_level = float(np.median(np.concatenate([luma[0:6, 0:6].ravel(), luma[-6:, -6:].ravel()])))
+    if paper_level - ink_level < 30.0:
+        raise OracleAbstention("ink and paper tones are not separated")
+    span = paper_level - ink_level
+    middle = [
+        value
+        for value in samples.ravel()
+        if abs(value - ink_level) > 0.22 * span and abs(value - paper_level) > 0.22 * span
+    ]
+    if not middle:
+        raise OracleAbstention("no empty-slot tone is present")
+    return ink_level, float(np.median(middle)), paper_level
+
+
+def _read_bars(grid: np.ndarray, levels: tuple[float, float, float]) -> list[object]:
+    """Per column: an integer bar height, or None when the column is an empty slot."""
+
+    ink_level, slot_level, paper_level = levels
+    out: list[object] = []
+    for column in range(grid.shape[1]):
+        classes = []
+        for row in range(CELLS):
+            value = grid[row, column]
+            distances = (abs(value - ink_level), abs(value - slot_level), abs(value - paper_level))
+            classes.append(int(np.argmin(distances)))
+        if all(item == 1 for item in classes):
+            out.append(None)
+            continue
+        if any(item == 1 for item in classes):
+            raise OracleAbstention("column mixes slot tone with bar tones")
+        height = sum(1 for item in classes if item == 0)
+        if classes[CELLS - height :] != [0] * height:
+            raise OracleAbstention("bar is not a contiguous column rising from the baseline")
+        if height < 1:
+            raise OracleAbstention("empty bar column")
+        out.append(height)
+    return out
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=float)
+    luma = _luma(array)
+    ink_level = float(np.percentile(luma, 2))
+    paper_guess = float(np.percentile(luma, 98))
+    if paper_guess - ink_level < 40.0:
+        raise OracleAbstention("image contrast is too low to segment")
+    mask = luma < ink_level + 0.28 * (paper_guess - ink_level)
+
+    panel = None
+    slats = []
+    for top, left, bottom, right, _area in _components(mask):
+        h, w = bottom - top + 1, right - left + 1
+        if h < 60:
+            continue
+        if w >= 60:
+            if panel is not None:
+                raise OracleAbstention("more than one panel-sized component")
+            if abs(h - w) > 6:
+                raise OracleAbstention("panel component is not square")
+            panel = (top, left, bottom, right)
+        else:
+            slats.append((top, left, bottom, right))
+    if panel is None:
+        raise OracleAbstention("no panel component found")
+    if len(slats) != 3:
+        raise OracleAbstention(f"expected three loose slats, found {len(slats)}")
+
+    panel_thickness = _frame_thickness(mask, panel)
+    panel_grid = _cell_lumas(luma, panel, panel_thickness, CELLS)
+    levels = _tone_levels(luma, ink_level, panel_grid)
+    columns = _read_bars(panel_grid, levels)
+    slot_columns = [index for index, value in enumerate(columns) if value is None]
+    if len(slot_columns) != 3:
+        raise OracleAbstention(f"expected three empty slots, found {len(slot_columns)}")
+
+    # the panel fixes the shared cell pitch, so each slat's own border thickness
+    # follows from its width even when its bar fills the whole column
+    cell_pitch = (panel[3] - panel[1] + 1 - 2 * panel_thickness) / CELLS
+    slat_heights = []
+    for box in sorted(slats, key=lambda item: (item[0] + item[2]) / 2.0):
+        width = box[3] - box[1] + 1
+        thickness = int(round((width - cell_pitch) / 2.0))
+        if thickness < 2 or abs(width - cell_pitch - 2 * thickness) > 1.5:
+            raise OracleAbstention("slat width is not one panel cell inside its border")
+        grid = _cell_lumas(luma, box, thickness, 1)
+        read = _read_bars(grid, levels)
+        if len(read) != 1 or read[0] is None:
+            raise OracleAbstention("a loose slat carries no bar")
+        slat_heights.append(int(read[0]))
+
+    completed = list(columns)
+    for column, height in zip(slot_columns, slat_heights):
+        completed[column] = height
+    filled = tuple(int(value) for value in completed)
+
+    scored = sorted(
+        (sum(abs(a - b) for a, b in zip(filled, heights)), name)
+        for name, heights in DECLARED_SKYLINES.items()
+    )
+    if scored[0][0] != 0 or scored[1][0] < 2:
+        raise OracleAbstention(f"completed skyline {filled} matches no declared symbol")
+    return scored[0][1]

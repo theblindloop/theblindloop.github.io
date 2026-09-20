@@ -1,0 +1,132 @@
+"""Independent pixel-only inverse arm for checkpoint-span routes."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray, minimum: int = 15) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            result.append(np.asarray(points, dtype=np.int32))
+    return result
+
+
+def _dilate(mask: np.ndarray, steps: int) -> np.ndarray:
+    grown = mask.copy()
+    for _ in range(steps):
+        padded = np.pad(grown, 1)
+        grown = (padded[1:-1, 1:-1] | padded[:-2, 1:-1] | padded[2:, 1:-1] |
+                 padded[1:-1, :-2] | padded[1:-1, 2:])
+    return grown
+
+
+def _nearest(mask: np.ndarray, center: tuple[float, float], radius: int = 20) -> tuple[int, int]:
+    cy, cx = center
+    y0, y1 = max(0, int(cy) - radius), min(mask.shape[0], int(cy) + radius + 1)
+    x0, x1 = max(0, int(cx) - radius), min(mask.shape[1], int(cx) + radius + 1)
+    ys, xs = np.nonzero(mask[y0:y1, x0:x1])
+    if not len(ys):
+        raise ValueError("marker is not attached to a dark route")
+    ys, xs = ys + y0, xs + x0
+    k = int(np.argmin((ys - cy) ** 2 + (xs - cx) ** 2))
+    return int(ys[k]), int(xs[k])
+
+
+def _labels(mask: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+    comps = _components(mask, minimum=500)
+    labels = np.full(mask.shape, -1, dtype=np.int16)
+    for index, points in enumerate(comps):
+        labels[points[:, 0], points[:, 1]] = index
+    return labels, comps
+
+
+def _distance(mask: np.ndarray, start: tuple[int, int], goal: tuple[int, int]) -> int:
+    distances = np.full(mask.shape, -1, dtype=np.int32)
+    distances[start] = 0
+    queue = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        if (y, x) == goal:
+            return int(distances[y, x])
+        next_distance = int(distances[y, x]) + 1
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if (0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1]
+                    and mask[ny, nx] and distances[ny, nx] < 0):
+                distances[ny, nx] = next_distance
+                queue.append((ny, nx))
+    raise ValueError("checkpoint pair is disconnected")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    dark = (r < 105) & (g < 105) & (b < 120)
+    cyan = ((g > 135) & (b > 145) & (b > r * 1.35) & (g > r * 1.35)
+            & (g > b * 0.72))
+    masks = {
+        "orange": (r > 170) & (g > 75) & (g < 185) & (b < 95) & (r > g * 1.25),
+        "purple": (r > 85) & (b > 135) & (g < 125) & (b > g * 1.25),
+        "blue": (b > 145) & (r < 105) & (g < 150) & (b > g * 1.25),
+    }
+
+    labels, route_components = _labels(dark)
+    if len(route_components) != 3:
+        raise ValueError("expected exactly three disconnected dark routes")
+
+    # Dilation reconnects the two visible halves of each diamond that the dark
+    # centerline passes through; separate diamonds remain far apart.
+    cyan_groups = _components(_dilate(cyan, 4), minimum=100)
+    if len(cyan_groups) != 6:
+        raise ValueError("expected exactly six cyan checkpoint diamonds")
+    centers = [(float(p[:, 0].mean()), float(p[:, 1].mean())) for p in cyan_groups]
+
+    checkpoints: dict[int, list[tuple[int, int]]] = {i: [] for i in range(3)}
+    for center in centers:
+        point = _nearest(dark, center)
+        route = int(labels[point])
+        if route < 0:
+            raise ValueError("checkpoint has no route ownership")
+        checkpoints[route].append(point)
+    if any(len(points) != 2 for points in checkpoints.values()):
+        raise ValueError("each route must own exactly two checkpoints")
+
+    terminal_for_route: dict[int, str] = {}
+    for color, mask in masks.items():
+        ys, xs = np.nonzero(mask)
+        if len(ys) < 80:
+            raise ValueError(f"missing {color} terminal")
+        center = (float(ys.mean()), float(xs.mean()))
+        route = int(labels[_nearest(dark, center)])
+        if route < 0 or route in terminal_for_route:
+            raise ValueError("terminal-to-route binding is ambiguous")
+        terminal_for_route[route] = color
+
+    spans = {}
+    for route, points in checkpoints.items():
+        component_mask = labels == route
+        spans[route] = _distance(component_mask, points[0], points[1])
+    ranked = sorted(spans, key=spans.get, reverse=True)
+    if spans[ranked[0]] - spans[ranked[1]] < 30:
+        raise ValueError("pixel route-span decision is ambiguous")
+    return terminal_for_route[ranked[0]]

@@ -1,0 +1,282 @@
+"""Scene sampler, renderer, analytic gold, margin and quarantine rule.
+
+A connected unicyclic network is embedded on a jittered lattice: exactly one
+rectilinear closed loop, plus tree branches grown outwards from it. Three
+junctions are coloured; exactly one of them sits on the loop, and the analytic
+gold is the 2-core of the drawn graph.
+"""
+
+from __future__ import annotations
+
+import heapq
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "loop_member_node-renderer-0.1.0"
+
+CANVAS = 560
+ORIGIN = 60
+PITCH = 110
+GRID = 5
+NODE_R = 13
+STROKE_W = 7
+JITTER = 9
+
+BACKGROUND = (255, 255, 255)
+STROKE_COLOR = (120, 120, 120)
+PLAIN_COLOR = (60, 60, 60)
+MARK_COLORS = {
+    "blue": (40, 90, 220),
+    "orange": (235, 140, 20),
+    "purple": (150, 60, 190),
+}
+COLOR_ORDER = ("blue", "orange", "purple")
+
+MIN_LOOP_GAP = 100.0
+MIN_NODE_GAP = 70.0
+MIN_BAR_CLEARANCE = 26.0
+
+
+# --------------------------------------------------------------------------- graph helpers
+def _adjacency(n_nodes, edges):
+    adj = {i: set() for i in range(n_nodes)}
+    for a, b in edges:
+        adj[a].add(b)
+        adj[b].add(a)
+    return adj
+
+
+def _two_core(n_nodes, edges):
+    """Iteratively strip degree<=1 vertices; the survivors form the 2-core."""
+    adj = _adjacency(n_nodes, edges)
+    alive = set(range(n_nodes))
+    changed = True
+    while changed:
+        changed = False
+        for v in sorted(alive):
+            if len(adj[v] & alive) <= 1:
+                alive.discard(v)
+                changed = True
+    return alive
+
+
+def _coloured(scene):
+    return {n["color"]: i for i, n in enumerate(scene["nodes"]) if n["color"] in MARK_COLORS}
+
+
+# --------------------------------------------------------------------------- sampling
+def _neighbours(gx, gy):
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        nx, ny = gx + dx, gy + dy
+        if 0 <= nx < GRID and 0 <= ny < GRID:
+            yield nx, ny
+
+
+def _perimeter(x0, y0, x1, y1):
+    """Lattice points of the rectangle boundary, in cyclic order."""
+    pts = []
+    for x in range(x0, x1):
+        pts.append((x, y0))
+    for y in range(y0, y1):
+        pts.append((x1, y))
+    for x in range(x1, x0, -1):
+        pts.append((x, y1))
+    for y in range(y1, y0, -1):
+        pts.append((x0, y))
+    return pts
+
+
+def _attempt(rng):
+    w = rng.randint(1, 3)
+    h = rng.randint(1, 3)
+    x0 = rng.randint(0, GRID - 1 - w)
+    y0 = rng.randint(0, GRID - 1 - h)
+    ring = _perimeter(x0, y0, x0 + w, y0 + h)
+    used = list(ring)
+    index = {p: i for i, p in enumerate(used)}
+    edges = [(index[ring[i]], index[ring[(i + 1) % len(ring)]]) for i in range(len(ring))]
+    cycle_cells = set(ring)
+
+    target = rng.randint(9, GRID * GRID - len(used))
+    added, guard = 0, 0
+    while added < target and guard < 900:
+        guard += 1
+        u = used[rng.randrange(len(used))]
+        free = [p for p in _neighbours(*u) if p not in index]
+        if not free:
+            continue
+        v = free[rng.randrange(len(free))]
+        index[v] = len(used)
+        used.append(v)
+        edges.append((index[u], index[v]))
+        added += 1
+    if len(used) < 16:
+        return None
+
+    adj = _adjacency(len(used), edges)
+    cycle_ids = {index[p] for p in cycle_cells}
+
+    # graph distance in hops to the loop
+    depth = {i: (0 if i in cycle_ids else None) for i in range(len(used))}
+    frontier = sorted(cycle_ids)
+    while frontier:
+        nxt = []
+        for u in frontier:
+            for v in sorted(adj[u]):
+                if depth[v] is None:
+                    depth[v] = depth[u] + 1
+                    nxt.append(v)
+        frontier = nxt
+    if any(d is None for d in depth.values()):
+        return None
+
+    off = [i for i in range(len(used)) if depth[i] and depth[i] >= 1 and len(adj[i]) >= 2]
+    on = sorted(cycle_ids)
+    if len(off) < 2 or not on:
+        return None
+
+    # Degree must not single out the answer at all: all three coloured
+    # junctions are given the same number of incident bars, so "most bars touch
+    # it" never has a strict maximum to exploit.
+    degrees = [2, 3]
+    rng.shuffle(degrees)
+    for d in degrees:
+        on_d = [i for i in on if len(adj[i]) == d]
+        off_d = [i for i in off if len(adj[i]) == d]
+        if not on_d or len(off_d) < 2:
+            continue
+        on_pick = on_d[rng.randrange(len(on_d))]
+        rng.shuffle(off_d)
+        return used, edges, on_pick, (off_d[0], off_d[1]), depth
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random((int(seed) * 7919 + 13) & 0x7FFFFFFF)
+    built = None
+    for _ in range(400):
+        built = _attempt(rng)
+        if built is not None:
+            break
+    if built is None:  # pragma: no cover - defensive
+        raise RuntimeError("scene sampling failed")
+    cells, edges, on_pick, off_picks, _depth = built
+
+    # Balanced answer identity: consecutive seeds cycle through the three colours.
+    on_color = COLOR_ORDER[int(seed) % 3]
+    others = [c for c in COLOR_ORDER if c != on_color]
+    rng.shuffle(others)
+    colors = {on_pick: on_color, off_picks[0]: others[0], off_picks[1]: others[1]}
+
+    nodes = []
+    for i, (gx, gy) in enumerate(cells):
+        nodes.append(
+            {
+                "gx": gx,
+                "gy": gy,
+                "x": ORIGIN + gx * PITCH + rng.randint(-JITTER, JITTER),
+                "y": ORIGIN + gy * PITCH + rng.randint(-JITTER, JITTER),
+                "color": colors.get(i, "grey"),
+            }
+        )
+    return {
+        "canvas": CANVAS,
+        "background": list(BACKGROUND),
+        "nodes": nodes,
+        "edges": [[int(a), int(b)] for a, b in edges],
+        "node_radius": NODE_R,
+        "stroke_width": STROKE_W,
+    }
+
+
+# --------------------------------------------------------------------------- gold
+def analytic_gold(scene: dict) -> str:
+    nodes, edges = scene["nodes"], scene["edges"]
+    core = _two_core(len(nodes), edges)
+    inside = [n["color"] for i, n in enumerate(nodes) if i in core and n["color"] in MARK_COLORS]
+    if len(inside) != 1:
+        raise ValueError("scene does not place exactly one coloured junction on the loop")
+    return inside[0]
+
+
+def margin(scene: dict) -> float:
+    """Pixel length of network that separates the nearest off-loop coloured
+    junction from the closed loop."""
+    nodes, edges = scene["nodes"], scene["edges"]
+    core = _two_core(len(nodes), edges)
+    adj = {i: [] for i in range(len(nodes))}
+    for a, b in edges:
+        d = math.hypot(nodes[a]["x"] - nodes[b]["x"], nodes[a]["y"] - nodes[b]["y"])
+        adj[a].append((b, d))
+        adj[b].append((a, d))
+    dist = {i: math.inf for i in range(len(nodes))}
+    heap = []
+    for i in sorted(core):
+        dist[i] = 0.0
+        heap.append((0.0, i))
+    heapq.heapify(heap)
+    while heap:
+        d, u = heapq.heappop(heap)
+        if d > dist[u] + 1e-9:
+            continue
+        for v, w in adj[u]:
+            if d + w < dist[v] - 1e-9:
+                dist[v] = d + w
+                heapq.heappush(heap, (dist[v], v))
+    outside = [
+        dist[i]
+        for i, n in enumerate(nodes)
+        if n["color"] in MARK_COLORS and i not in core
+    ]
+    return round(min(outside), 6) if outside else 0.0
+
+
+def _clearances(scene):
+    nodes, edges = scene["nodes"], scene["edges"]
+    gap = math.inf
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            gap = min(gap, math.hypot(nodes[i]["x"] - nodes[j]["x"], nodes[i]["y"] - nodes[j]["y"]))
+    clear = math.inf
+    for a, b in edges:
+        ax, ay = nodes[a]["x"], nodes[a]["y"]
+        bx, by = nodes[b]["x"], nodes[b]["y"]
+        vx, vy = bx - ax, by - ay
+        L2 = vx * vx + vy * vy
+        for k, n in enumerate(nodes):
+            if k in (a, b):
+                continue
+            t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((n["x"] - ax) * vx + (n["y"] - ay) * vy) / L2))
+            clear = min(clear, math.hypot(ax + t * vx - n["x"], ay + t * vy - n["y"]))
+    return gap, clear
+
+
+def is_quarantined(scene: dict) -> bool:
+    gap, clear = _clearances(scene)
+    return bool(margin(scene) < MIN_LOOP_GAP or gap < MIN_NODE_GAP or clear < MIN_BAR_CLEARANCE)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent aliases: every label input is painted into the raster."""
+    return []
+
+
+# --------------------------------------------------------------------------- rendering
+def render(scene: dict) -> Image.Image:
+    size = int(scene["canvas"])
+    img = Image.new("RGB", (size, size), tuple(scene["background"]))
+    draw = ImageDraw.Draw(img)
+    nodes = scene["nodes"]
+    for a, b in scene["edges"]:
+        draw.line(
+            [nodes[a]["x"], nodes[a]["y"], nodes[b]["x"], nodes[b]["y"]],
+            fill=STROKE_COLOR,
+            width=int(scene["stroke_width"]),
+        )
+    r = int(scene["node_radius"])
+    for n in nodes:
+        fill = MARK_COLORS.get(n["color"], PLAIN_COLOR)
+        draw.ellipse([n["x"] - r, n["y"] - r, n["x"] + r, n["y"] + r], fill=fill)
+    return img

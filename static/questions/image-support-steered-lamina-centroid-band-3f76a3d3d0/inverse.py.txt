@@ -1,0 +1,109 @@
+"""Independent image-only inverse arm for Lamina Centroid Band."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+class OracleError(ValueError):
+    """Raised when the raster no longer exposes a valid measurable lamina."""
+
+
+def _solid_colors(array: np.ndarray) -> list[tuple[tuple[int, int, int], int]]:
+    spread = array.max(axis=2).astype(np.int16) - array.min(axis=2).astype(np.int16)
+    eligible = (
+        (spread >= 55)
+        & (array.min(axis=2) >= 25)
+        & (array.max(axis=2) <= 235)
+    )
+    rgb = array[eligible].astype(np.uint32)
+    packed = (rgb[:, 0] << 16) | (rgb[:, 1] << 8) | rgb[:, 2]
+    colors, counts = np.unique(packed, return_counts=True)
+    rows = []
+    for color, count in zip(colors, counts):
+        value = int(color)
+        unpacked = ((value >> 16) & 255, (value >> 8) & 255, value & 255)
+        rows.append((unpacked, int(count)))
+    return sorted(rows, key=lambda item: (-item[1], item[0]))
+
+
+def _lamina_mask(
+    array: np.ndarray, colors: list[tuple[tuple[int, int, int], int]] | None = None
+) -> tuple[np.ndarray, tuple[int, int, int]]:
+    colors = _solid_colors(array) if colors is None else colors
+    if not colors or colors[0][1] < 8000:
+        raise OracleError("no substantial saturated lamina")
+    fill_rgb = colors[0][0]
+    mask = np.all(array == np.asarray(fill_rgb, dtype=np.uint8), axis=2)
+    active = np.flatnonzero(mask.any(axis=1))
+    if len(active) < 145 or np.any(np.diff(active) != 1):
+        raise OracleError("lamina vertical support is incomplete")
+    widths = []
+    for y in active:
+        xs = np.flatnonzero(mask[y])
+        span = int(xs[-1] - xs[0] + 1)
+        if len(xs) / span < 0.985:
+            raise OracleError("lamina is not row-convex")
+        widths.append(len(xs))
+    if not 145 <= int(mask.any(axis=0).sum()) <= 225:
+        raise OracleError("lamina horizontal extent is implausible")
+    if widths[0] > 75 or widths[-1] > 75:
+        raise OracleError("lamina endpoint was truncated")
+    if max(abs(b - a) for a, b in zip(widths, widths[1:])) > 8:
+        raise OracleError("lamina profile has a destructive notch")
+    return mask, fill_rgb
+
+
+def _guide_rows(
+    array: np.ndarray,
+    fill_rgb: tuple[int, int, int],
+    colors: list[tuple[tuple[int, int, int], int]] | None = None,
+) -> tuple[float, float]:
+    colors = _solid_colors(array) if colors is None else colors
+    candidates = [row for row in colors if row[0] != fill_rgb and row[1] >= 250]
+    if not candidates:
+        raise OracleError("gold guide ink is missing")
+    # The guide color is the non-lamina saturated color with the widest horizontal reach.
+    scored = []
+    for rgb, count in candidates:
+        mask = np.all(array == np.asarray(rgb, dtype=np.uint8), axis=2)
+        xs = np.flatnonzero(mask.any(axis=0))
+        span = int(xs[-1] - xs[0] + 1) if len(xs) else 0
+        scored.append((span, count, rgb, mask))
+    _, _, _, guide_mask = max(scored, key=lambda item: (item[0], item[1]))
+    row_counts = guide_mask.sum(axis=1)
+    active = np.flatnonzero(row_counts >= 45)
+    groups: list[list[int]] = []
+    for value in active:
+        if not groups or value > groups[-1][-1] + 1:
+            groups.append([int(value)])
+        else:
+            groups[-1].append(int(value))
+    groups = [group for group in groups if 3 <= len(group) <= 7]
+    if len(groups) != 2:
+        raise OracleError(f"expected two measurable guide rows, found {len(groups)}")
+    centers = tuple(float(sum(group) / len(group)) for group in groups)
+    if not 32 <= centers[1] - centers[0] <= 115:
+        raise OracleError("guide spacing is implausible")
+    return centers
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the categorical answer from RGB pixels only."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 300 or array.shape[1] < 300:
+        raise OracleError("canvas is too small")
+    colors = _solid_colors(array)
+    mask, fill_rgb = _lamina_mask(array, colors)
+    ys = np.nonzero(mask)[0].astype(np.float64)
+    center_y = float(ys.mean())
+    upper, lower = _guide_rows(array, fill_rgb, colors)
+    if min(abs(center_y - upper), abs(center_y - lower)) <= 8.0:
+        raise OracleError("centroid is raster-ambiguous at a guide")
+    if center_y < upper:
+        return "UPPER"
+    if center_y < lower:
+        return "MIDDLE"
+    return "LOWER"

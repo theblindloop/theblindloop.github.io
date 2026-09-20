@@ -1,0 +1,176 @@
+"""Independent pixel-only arm for pivot_moment_duel.
+
+Receives one PIL image and nothing else. It labels every pixel by nearest
+member of the world's fixed public palette, recovers the pivot abscissa from
+the single black pointer, decomposes each coloured column into its stack of
+equal squares, and reports the colour whose (square count) x (distance to the
+pivot) product is larger. Any structure it cannot certify -- a missing or
+asymmetric pointer, a clipped or ragged square, two stacks on the same side of
+the pivot, mismatched square sizes, hanging heights that do not agree, or equal
+products -- yields "abstain" instead of a guess.
+
+It imports numpy and Pillow only: no renderer, prompt, generator, verifier or
+analytic-gold code, and no latent scene ever reaches it.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "pivot_moment_duel-oracle-0.1.0"
+
+# The world's fixed public palette; index 1 is the pointer ink, 3 and 4 the two
+# stack colours. Grey, orange and olive are declared decoration and are read as
+# background classes here.
+_PALETTE = (
+    (244, 242, 238),  # sheet
+    (16, 16, 16),  # pointer ink
+    (150, 150, 150),  # beam / ticks
+    (28, 58, 140),  # navy
+    (186, 36, 48),  # crimson
+    (232, 150, 44),  # orange decoration
+    (138, 150, 64),  # olive decoration
+)
+_BLACK, _NAVY, _CRIMSON = 1, 3, 4
+
+_MIN_SIDE, _MAX_SIDE = 8, 30
+_MAX_SQUARES = 12
+_MIN_ARM = 40.0
+_POINTER_WIDTH = (20, 70)
+_POINTER_HEIGHT = (18, 60)
+
+ABSTAIN = "abstain"
+
+
+class _Unreadable(Exception):
+    """Raised internally when the image does not show a certifiable scene."""
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    stack = np.stack(
+        [((array - np.array(rgb, dtype=np.int32)) ** 2).sum(axis=-1) for rgb in _PALETTE],
+        axis=-1,
+    )
+    return stack.argmin(axis=-1)
+
+
+def _row_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Inclusive (first_row, last_row) blocks of consecutive occupied rows."""
+    occupied = np.flatnonzero(mask.any(axis=1))
+    if occupied.size == 0:
+        return []
+    runs = []
+    start = previous = int(occupied[0])
+    for row in occupied[1:]:
+        row = int(row)
+        if row == previous + 1:
+            previous = row
+            continue
+        runs.append((start, previous))
+        start = previous = row
+    runs.append((start, previous))
+    return runs
+
+
+def _pointer_abscissa(mask: np.ndarray) -> float:
+    """Middle of the symmetric black pointer, refusing anything else."""
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    if rows.size == 0 or cols.size == 0:
+        raise _Unreadable("no pointer ink")
+    if len(_row_runs(mask)) != 1:
+        raise _Unreadable("pointer ink is not one vertical block")
+    width = int(cols[-1] - cols[0]) + 1
+    height = int(rows[-1] - rows[0]) + 1
+    if not _POINTER_WIDTH[0] <= width <= _POINTER_WIDTH[1]:
+        raise _Unreadable("pointer width out of range")
+    if not _POINTER_HEIGHT[0] <= height <= _POINTER_HEIGHT[1]:
+        raise _Unreadable("pointer height out of range")
+    center = (float(cols[0]) + float(cols[-1])) / 2.0
+    widths = []
+    for row in range(int(rows[0]), int(rows[-1]) + 1):
+        line = np.flatnonzero(mask[row])
+        if line.size == 0:
+            raise _Unreadable("pointer has an empty row")
+        row_center = (float(line[0]) + float(line[-1])) / 2.0
+        if abs(row_center - center) > 1.0:
+            raise _Unreadable("pointer is not left-right symmetric")
+        if int(line[-1] - line[0]) + 1 != line.size:
+            raise _Unreadable("pointer row is not solid")
+        widths.append(int(line[-1] - line[0]) + 1)
+    if any(later > earlier for earlier, later in zip(widths, widths[1:])):
+        raise _Unreadable("pointer does not taper downwards")
+    return center
+
+
+def _stack(mask: np.ndarray, what: str) -> dict:
+    """Recover one hanging stack: square count, side, pitch, column middle."""
+    runs = _row_runs(mask)
+    if not runs:
+        raise _Unreadable(f"{what}: no ink")
+    if len(runs) > _MAX_SQUARES:
+        raise _Unreadable(f"{what}: too many blocks")
+    cols = np.flatnonzero(mask.any(axis=0))
+    x0, x1 = int(cols[0]), int(cols[-1])
+    side = x1 - x0 + 1
+    if not _MIN_SIDE <= side <= _MAX_SIDE:
+        raise _Unreadable(f"{what}: column width out of range")
+    for first, last in runs:
+        if last - first + 1 != side:
+            raise _Unreadable(f"{what}: a block is not square")
+        for row in range(first, last + 1):
+            line = np.flatnonzero(mask[row])
+            if line.size != side or int(line[0]) != x0 or int(line[-1]) != x1:
+                raise _Unreadable(f"{what}: a square row is clipped or ragged")
+    gaps = [runs[index + 1][0] - runs[index][1] - 1 for index in range(len(runs) - 1)]
+    if gaps and (min(gaps) < 2 or max(gaps) - min(gaps) > 1):
+        raise _Unreadable(f"{what}: squares are not evenly pitched")
+    return {
+        "count": len(runs),
+        "side": side,
+        "center": (x0 + x1) / 2.0,
+        "top": runs[0][0],
+        "gap": gaps[0] if gaps else None,
+    }
+
+
+def measure(image: Image.Image) -> dict:
+    """Pixel-only measurement of the two products (raises on unreadable input)."""
+    labels = _labels(image)
+    pivot_x = _pointer_abscissa(labels == _BLACK)
+    navy = _stack(labels == _NAVY, "navy stack")
+    crimson = _stack(labels == _CRIMSON, "crimson stack")
+    if navy["side"] != crimson["side"]:
+        raise _Unreadable("the two stacks use different square sizes")
+    if abs(navy["top"] - crimson["top"]) > 1:
+        raise _Unreadable("the two stacks do not hang from the same height")
+    if (navy["center"] < pivot_x) == (crimson["center"] < pivot_x):
+        raise _Unreadable("both stacks lie on the same side of the pivot")
+    arms = {
+        "navy": abs(navy["center"] - pivot_x),
+        "crimson": abs(crimson["center"] - pivot_x),
+    }
+    if min(arms.values()) < _MIN_ARM:
+        raise _Unreadable("a stack sits on top of the pivot")
+    products = {
+        "navy": navy["count"] * arms["navy"],
+        "crimson": crimson["count"] * arms["crimson"],
+    }
+    if products["navy"] == products["crimson"]:
+        raise _Unreadable("the two products are equal")
+    return {
+        "pivot_x": pivot_x,
+        "navy": {**navy, "arm": arms["navy"], "product": products["navy"]},
+        "crimson": {**crimson, "arm": arms["crimson"], "product": products["crimson"]},
+        "decision": "navy" if products["navy"] > products["crimson"] else "crimson",
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Larger-product colour recovered from the raster alone, or "abstain"."""
+    try:
+        return measure(image)["decision"]
+    except _Unreadable:
+        return ABSTAIN

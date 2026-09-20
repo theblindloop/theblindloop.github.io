@@ -1,0 +1,330 @@
+"""Deterministic keyed-panel renderer for state/motion concordance."""
+
+from __future__ import annotations
+
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+
+RENDERER_VERSION = "state_motion_concordance-0.1.0"
+PANEL_COUNT = 6
+IDENTITY_COUNT = 4
+SLOT_COUNT = 4
+STATE_COUNT = 3
+LABELS = ("A", "B", "C", "D")
+STATE_NAMES = ("LOW", "MID", "HIGH")
+CANVAS = (1940, 640)
+
+BACKGROUND = (248, 250, 252)
+INK = (28, 45, 58)
+MUTED = (78, 99, 112)
+OUTLINE = (152, 169, 181)
+CARD = (255, 255, 255)
+STATE_OUTLINE = (31, 52, 65)
+
+PANEL_X0 = 20
+PANEL_TOP = 210
+PANEL_WIDTH = 300
+PANEL_HEIGHT = 400
+PANEL_GAP = 8
+CARD_ORIGINS = ((8, 72), (82, 72), (156, 72), (230, 72))
+CARD_WIDTH = 64
+CARD_HEIGHT = 300
+LABEL_OFFSET = (8, 42)
+STATE_OFFSET = (35, 42)
+STATE_BOX_SIZE = 22
+STATE_KEY_XS = (430, 650, 870)
+KEY_Y = 104
+STATE_CODE_OFFSET = (32, 5)
+IDENTITY_KEY_XS = (1110, 1210, 1310, 1410)
+IDENTITY_KEY_Y = 105
+
+STATE_PALETTES = (
+    ((63, 133, 224), (237, 157, 48), (78, 177, 104)),
+    ((211, 82, 91), (59, 169, 166), (149, 99, 215)),
+    ((89, 167, 111), (225, 111, 56), (67, 123, 203)),
+    ((151, 94, 202), (69, 151, 210), (220, 145, 48)),
+    ((226, 105, 72), (86, 169, 108), (65, 135, 207)),
+)
+PANEL_TINTS = (
+    (237, 245, 249),
+    (244, 240, 249),
+    (239, 248, 240),
+    (250, 244, 235),
+    (239, 247, 247),
+    (248, 240, 244),
+)
+
+# Small bitmap glyphs are the visible identity key.  The same pixels are
+# reproduced independently in oracle.py; no text recognition is required.
+LABEL_PATTERNS: tuple[tuple[str, ...], ...] = (
+    ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
+    ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+)
+LABEL_SCALE = 3
+
+STATE_CODE_PATTERNS: tuple[tuple[str, ...], ...] = (
+    ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+)
+STATE_CODE_SCALE = 2
+
+
+def _bitmap_points(pattern: tuple[str, ...], scale: int) -> frozenset[tuple[int, int]]:
+    return frozenset(
+        (x * scale + dx, y * scale + dy)
+        for y, row in enumerate(pattern)
+        for x, value in enumerate(row)
+        if value == "1"
+        for dx in range(scale)
+        for dy in range(scale)
+    )
+
+
+LABEL_POINTS = tuple(_bitmap_points(pattern, LABEL_SCALE) for pattern in LABEL_PATTERNS)
+STATE_CODE_POINTS = tuple(
+    _bitmap_points(pattern, STATE_CODE_SCALE) for pattern in STATE_CODE_PATTERNS
+)
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    names = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ) if bold else (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    )
+    for name in names:
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size)
+    return ImageFont.load_default()
+
+
+def _draw_points(draw: ImageDraw.ImageDraw, origin: tuple[int, int], points: frozenset[tuple[int, int]]) -> None:
+    ox, oy = origin
+    for x, y in points:
+        draw.point((ox + x, oy + y), fill=INK)
+
+
+def _validate_tables(scene: dict) -> tuple[list[list[int]], list[list[int]]]:
+    raw_states = scene["states"]
+    raw_positions = scene["positions"]
+    if not isinstance(raw_states, list) or len(raw_states) != PANEL_COUNT:
+        raise ValueError("states must contain six panels")
+    if not isinstance(raw_positions, list) or len(raw_positions) != PANEL_COUNT:
+        raise ValueError("positions must contain six panels")
+    states: list[list[int]] = []
+    positions: list[list[int]] = []
+    for state_row, position_row in zip(raw_states, raw_positions):
+        if not isinstance(state_row, list) or len(state_row) != IDENTITY_COUNT:
+            raise ValueError("each state panel must contain four identities")
+        if not isinstance(position_row, list) or len(position_row) != IDENTITY_COUNT:
+            raise ValueError("each position panel must contain four identities")
+        values = [int(value) for value in state_row]
+        slots = [int(value) for value in position_row]
+        if any(value not in range(STATE_COUNT) for value in values):
+            raise ValueError("states must use LOW=0, MID=1, HIGH=2")
+        if sorted(slots) != list(range(SLOT_COUNT)):
+            raise ValueError("positions must be a slot permutation per panel")
+        states.append(values)
+        positions.append(slots)
+    return states, positions
+
+
+def _concordance_scores(scene: dict) -> list[int]:
+    states, positions = _validate_tables(scene)
+    scores = [0] * IDENTITY_COUNT
+    for label in range(IDENTITY_COUNT):
+        for panel in range(PANEL_COUNT - 1):
+            state_delta = (states[panel + 1][label] > states[panel][label]) - (
+                states[panel + 1][label] < states[panel][label]
+            )
+            move_delta = (positions[panel + 1][label] > positions[panel][label]) - (
+                positions[panel + 1][label] < positions[panel][label]
+            )
+            if state_delta == move_delta:
+                scores[label] += 1
+    return scores
+
+
+def _random_permutation(rng: random.Random) -> list[int]:
+    values = list(range(IDENTITY_COUNT))
+    rng.shuffle(values)
+    return values
+
+
+def _sample_raw(seed: int) -> tuple[list[list[int]], list[list[int]]]:
+    rng = random.Random(seed * 1_000_003 + 271)
+    positions = [_random_permutation(rng) for _ in range(PANEL_COUNT)]
+    states = [
+        [rng.randrange(STATE_COUNT) for _ in range(IDENTITY_COUNT)]
+        for _ in range(PANEL_COUNT)
+    ]
+    return states, positions
+
+
+def sample_scene(seed: int) -> dict:
+    """Return a deterministic, balanced scene with a two-count lead."""
+    seed = int(seed)
+    wanted = seed % IDENTITY_COUNT
+    logic_seed = seed
+    for attempt in range(100_000):
+        states, positions = _sample_raw(logic_seed)
+        candidate = {"states": states, "positions": positions}
+        scores = _concordance_scores(candidate)
+        ordered = sorted(scores, reverse=True)
+        if scores[wanted] == ordered[0] and ordered[0] - ordered[1] >= 2:
+            style_rng = random.Random((seed + 104_729) * 1_000_033 + 31)
+            palette = [list(color) for color in style_rng.choice(STATE_PALETTES)]
+            key_order = list(range(STATE_COUNT))
+            style_rng.shuffle(key_order)
+            tints = [list(style_rng.choice(PANEL_TINTS)) for _ in range(PANEL_COUNT)]
+            scene = {
+                "states": states,
+                "positions": positions,
+                "state_palette": palette,
+                "state_key_order": key_order,
+                "panel_tints": tints,
+            }
+            if analytic_gold(scene) != LABELS[wanted]:
+                raise AssertionError("balanced sampler selected an unexpected winner")
+            return scene
+        logic_seed += 1_000_003 + attempt * 97
+    raise RuntimeError("could not sample a unique concordance winner")
+
+
+def render(scene: dict) -> Image.Image:
+    states, positions = _validate_tables(scene)
+    palette_raw = scene["state_palette"]
+    key_order_raw = scene["state_key_order"]
+    tints_raw = scene["panel_tints"]
+    if not isinstance(palette_raw, list) or len(palette_raw) != STATE_COUNT:
+        raise ValueError("state_palette must contain three colors")
+    palette = [tuple(int(channel) for channel in color) for color in palette_raw]
+    if any(len(color) != 3 or any(channel not in range(256) for channel in color) for color in palette):
+        raise ValueError("state_palette contains an invalid RGB color")
+    key_order = [int(value) for value in key_order_raw]
+    if sorted(key_order) != list(range(STATE_COUNT)):
+        raise ValueError("state_key_order must be a permutation")
+    if not isinstance(tints_raw, list) or len(tints_raw) != PANEL_COUNT:
+        raise ValueError("panel_tints must contain six colors")
+    tints = [tuple(int(channel) for channel in color) for color in tints_raw]
+    if any(len(color) != 3 or any(channel not in range(256) for channel in color) for color in tints):
+        raise ValueError("panel_tints contains an invalid RGB color")
+
+    image = Image.new("RGB", CANVAS, BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    title_font = _font(27, bold=True)
+    section_font = _font(16, bold=True)
+    body_font = _font(13)
+    small_font = _font(12)
+    tiny_font = _font(11)
+    draw.text((24, 12), "STATE–MOTION CONCORDANCE", font=title_font, fill=INK)
+    draw.text(
+        (24, 48),
+        "Across each arrow, compare the signed state change with the signed horizontal move.",
+        font=small_font,
+        fill=MUTED,
+    )
+    draw.text((24, 82), "VISIBLE STATE KEY", font=section_font, fill=INK)
+    for key_slot, state in enumerate(key_order):
+        key_x = STATE_KEY_XS[key_slot]
+        draw.rectangle(
+            (key_x, KEY_Y, key_x + STATE_BOX_SIZE - 1, KEY_Y + STATE_BOX_SIZE - 1),
+            fill=palette[state],
+            outline=STATE_OUTLINE,
+            width=2,
+        )
+        _draw_points(draw, (key_x + STATE_CODE_OFFSET[0], KEY_Y + STATE_CODE_OFFSET[1]), STATE_CODE_POINTS[state])
+        draw.text((key_x + 54, KEY_Y + 3), STATE_NAMES[state], font=body_font, fill=INK)
+
+    draw.text((1090, 82), "VISIBLE IDENTITY KEY", font=section_font, fill=INK)
+    for label, key_x in enumerate(IDENTITY_KEY_XS):
+        _draw_points(draw, (key_x, IDENTITY_KEY_Y), LABEL_POINTS[label])
+        draw.text((key_x + 25, IDENTITY_KEY_Y + 2), LABELS[label], font=body_font, fill=INK)
+
+    for panel in range(PANEL_COUNT - 1):
+        left = PANEL_X0 + panel * (PANEL_WIDTH + PANEL_GAP) + PANEL_WIDTH + 2
+        right = PANEL_X0 + (panel + 1) * (PANEL_WIDTH + PANEL_GAP) - 2
+        y = PANEL_TOP - 18
+        draw.line((left, y, right - 8, y), fill=OUTLINE, width=2)
+        draw.polygon(((right - 8, y - 5), (right, y), (right - 8, y + 5)), fill=OUTLINE)
+
+    for panel in range(PANEL_COUNT):
+        panel_x = PANEL_X0 + panel * (PANEL_WIDTH + PANEL_GAP)
+        draw.rounded_rectangle(
+            (panel_x, PANEL_TOP, panel_x + PANEL_WIDTH, PANEL_TOP + PANEL_HEIGHT),
+            radius=12,
+            fill=tints[panel],
+            outline=OUTLINE,
+            width=2,
+        )
+        draw.text((panel_x + 16, PANEL_TOP + 13), f"P{panel + 1}", font=section_font, fill=INK)
+        draw.text((panel_x + 74, PANEL_TOP + 16), "four horizontal slots", font=tiny_font, fill=MUTED)
+        draw.line((panel_x + 14, PANEL_TOP + 48, panel_x + PANEL_WIDTH - 14, PANEL_TOP + 48), fill=OUTLINE, width=1)
+        by_slot = [0] * IDENTITY_COUNT
+        for label, slot in enumerate(positions[panel]):
+            by_slot[slot] = label
+        for slot, (slot_x, slot_y) in enumerate(CARD_ORIGINS):
+            card_x = panel_x + slot_x
+            card_y = PANEL_TOP + slot_y
+            draw.rounded_rectangle(
+                (card_x, card_y, card_x + CARD_WIDTH, card_y + CARD_HEIGHT),
+                radius=8,
+                fill=CARD,
+                outline=OUTLINE,
+                width=1,
+            )
+            draw.text((card_x + 8, card_y + 9), f"S{slot + 1}", font=tiny_font, fill=MUTED)
+            label = by_slot[slot]
+            _draw_points(draw, (card_x + LABEL_OFFSET[0], card_y + LABEL_OFFSET[1]), LABEL_POINTS[label])
+            state = states[panel][label]
+            sx = card_x + STATE_OFFSET[0]
+            sy = card_y + STATE_OFFSET[1]
+            draw.rectangle(
+                (sx, sy, sx + STATE_BOX_SIZE - 1, sy + STATE_BOX_SIZE - 1),
+                fill=palette[state],
+                outline=STATE_OUTLINE,
+                width=2,
+            )
+            draw.text((card_x + 9, card_y + 91), STATE_NAMES[state], font=tiny_font, fill=MUTED)
+            draw.line((card_x + 8, card_y + 124, card_x + CARD_WIDTH - 8, card_y + 124), fill=(218, 226, 231), width=1)
+            draw.text((card_x + 8, card_y + 143), "identity", font=tiny_font, fill=MUTED)
+            draw.text((card_x + 8, card_y + 162), "state", font=tiny_font, fill=MUTED)
+            draw.text((card_x + 8, card_y + 181), "slot", font=tiny_font, fill=MUTED)
+            draw.text((card_x + 8, card_y + 215), "track across", font=tiny_font, fill=MUTED)
+            draw.text((card_x + 8, card_y + 231), "panels", font=tiny_font, fill=MUTED)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _concordance_scores(scene)
+    ordered = sorted(scores, reverse=True)
+    winners = [label for label, score in enumerate(scores) if score == ordered[0]]
+    if len(winners) != 1 or ordered[0] - ordered[1] < 2:
+        raise ValueError("concordance scores are tied or below the two-count margin")
+    return LABELS[winners[0]]
+
+
+def margin(scene: dict) -> float:
+    ordered = sorted(_concordance_scores(scene), reverse=True)
+    return float(ordered[0] - ordered[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        ordered = sorted(_concordance_scores(scene), reverse=True)
+        return ordered[0] == ordered[1] or ordered[0] - ordered[1] < 2
+    except (KeyError, TypeError, ValueError, IndexError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No hidden render-invariant aliases are claimed."""
+    return []

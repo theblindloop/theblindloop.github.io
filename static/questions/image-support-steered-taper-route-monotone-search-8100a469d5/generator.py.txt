@@ -1,0 +1,215 @@
+"""Deterministic sampler and renderer for the monotone-taper ribbon-route world.
+
+Four solid horizontal ribbons ("routes") are drawn, one per lane. Every ribbon
+uses the *same* multiset of per-column thicknesses, the same length and the same
+end thicknesses; only the order of those thicknesses along the route differs.
+Exactly one ribbon carries them in non-increasing order, i.e. reading it from
+left to right its thickness never grows back above a thickness already seen.
+Each distractor is that same profile with two disjoint interior windows
+reversed, which creates two well separated stretches where the ribbon thickens
+again while leaving total ink, length and both end thicknesses untouched.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "taper_route_monotone_search-renderer-0.1.0"
+
+WIDTH = 560
+HEIGHT = 420
+SEGMENTS = 55
+SEGMENT_PX = 8
+ROUTE_LEN = SEGMENTS * SEGMENT_PX
+LANE_Y = (72, 156, 240, 324)
+LANE_JITTER = 6
+BACKGROUND = (241, 241, 244)
+PALETTE = (
+    (34, 52, 96),
+    (126, 34, 44),
+    (28, 84, 62),
+    (86, 46, 104),
+    (100, 74, 20),
+    (32, 76, 108),
+)
+WORDS = ("first", "second", "third", "fourth")
+QUARANTINE_MARGIN = 6.0
+
+
+# --------------------------------------------------------------------------
+# latent scene sampling
+# --------------------------------------------------------------------------
+def _base_profile(rng: random.Random, top: int, bottom: int) -> list[int]:
+    """A non-increasing integer thickness profile from ``top`` down to ``bottom``."""
+
+    drop = top - bottom
+    cuts = sorted(rng.randrange(0, drop + 1) for _ in range(SEGMENTS - 2))
+    steps = [b - a for a, b in zip([0, *cuts], [*cuts, drop])]
+    profile = [top]
+    for step in steps:
+        profile.append(profile[-1] - step)
+    return profile
+
+
+def _windows(rng: random.Random, base: list[int], bulge: int) -> list[list[int]] | None:
+    """Two disjoint interior windows whose internal drop is at least ``bulge``."""
+
+    spans = []
+    for start in range(4, SEGMENTS - 8):
+        for stop in range(start + 6, min(start + 26, SEGMENTS - 4)):
+            if base[start] - base[stop] >= bulge:
+                spans.append([start, stop])
+    rng.shuffle(spans)
+    for first in spans:
+        for second in spans:
+            if second[0] > first[1] + 4:
+                return [first, second]
+    return None
+
+
+def _reverse_windows(base: list[int], windows: list[list[int]]) -> list[int]:
+    profile = list(base)
+    for start, stop in windows:
+        profile[start : stop + 1] = profile[start : stop + 1][::-1]
+    return profile
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``."""
+
+    rng = random.Random(seed * 6151 + 17)
+    while True:
+        top = rng.choice([22, 23, 24])
+        bottom = rng.choice([5, 6])
+        bulge = rng.choice([4, 5, 6, 7, 8, 9, 10, 11, 12])
+        base = _base_profile(rng, top, bottom)
+        picks = [_windows(rng, base, bulge) for _ in range(3)]
+        if any(pick is None for pick in picks):
+            continue
+        winner = rng.randrange(4)
+        lanes = []
+        for index in range(4):
+            distractor_index = index - 1 if index > winner else index
+            windows = [] if index == winner else picks[distractor_index]
+            lanes.append(
+                {
+                    "y": LANE_Y[index] + rng.randrange(-LANE_JITTER, LANE_JITTER + 1),
+                    "x0": rng.randrange(48, WIDTH - ROUTE_LEN - 47),
+                    "amplitude": rng.randrange(3, 8),
+                    "phase": rng.randrange(0, 360),
+                    "wave": rng.randrange(3, 8),
+                    "color": index,
+                    "windows": windows,
+                }
+            )
+        colors = list(range(len(PALETTE)))
+        rng.shuffle(colors)
+        for index, lane in enumerate(lanes):
+            lane["color"] = colors[index]
+        scene = {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "segment_px": SEGMENT_PX,
+            "base_profile": base,
+            "bulge": bulge,
+            "lanes": lanes,
+        }
+        if _rises(scene)[winner] != 0:
+            continue
+        if margin(scene) <= 0:
+            continue
+        return scene
+
+
+# --------------------------------------------------------------------------
+# analytic consequences of the scene
+# --------------------------------------------------------------------------
+def lane_profile(scene: dict, lane: dict) -> list[int]:
+    """Per-segment thickness of one lane, in left-to-right order."""
+
+    return _reverse_windows(scene["base_profile"], [list(w) for w in lane["windows"]])
+
+
+def _max_rise(profile: list[int]) -> int:
+    """Largest amount by which the route thickens above an earlier thickness."""
+
+    running = profile[0]
+    best = 0
+    for value in profile:
+        running = min(running, value)
+        best = max(best, value - running)
+    return best
+
+
+def _ordered_lanes(scene: dict) -> list[dict]:
+    return sorted(scene["lanes"], key=lambda lane: (lane["y"], lane["x0"]))
+
+
+def _rises(scene: dict) -> list[int]:
+    return [_max_rise(lane_profile(scene, lane)) for lane in _ordered_lanes(scene)]
+
+
+def analytic_gold(scene: dict) -> str:
+    """Ordinal position, from the top, of the only never-thickening ribbon."""
+
+    rises = _rises(scene)
+    return WORDS[min(range(len(rises)), key=lambda i: (rises[i], i))]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin in pixels of thickness rebound."""
+
+    rises = sorted(_rises(scene))
+    return float(rises[1] - rises[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Flag scenes whose rebound gap is a finite-resolution judgement."""
+
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabelings of the latent scene."""
+
+    rotated = {**scene, "lanes": scene["lanes"][1:] + scene["lanes"][:1]}
+    swapped_windows = {
+        **scene,
+        "lanes": [
+            {**lane, "windows": lane["windows"][::-1]} for lane in scene["lanes"]
+        ],
+    }
+    return [
+        ("lane_list_rotation", rotated),
+        ("disjoint_window_list_reversal", swapped_windows),
+    ]
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    """Rasterize the scene with exact integer column thicknesses (no antialiasing)."""
+
+    height = int(scene["height"])
+    width = int(scene["width"])
+    step = int(scene["segment_px"])
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:, :] = BACKGROUND
+    for lane in scene["lanes"]:
+        profile = lane_profile(scene, lane)
+        color = PALETTE[int(lane["color"]) % len(PALETTE)]
+        for segment, thickness in enumerate(profile):
+            for offset in range(step):
+                x = int(lane["x0"]) + segment * step + offset
+                angle = (int(lane["phase"]) + x * int(lane["wave"])) % 360
+                centre = float(lane["y"]) + int(lane["amplitude"]) * float(
+                    np.sin(np.deg2rad(angle))
+                )
+                top = int(round(centre - thickness / 2.0))
+                top = max(0, min(height - thickness, top))
+                canvas[top : top + thickness, x] = color
+    return Image.fromarray(canvas, mode="RGB")

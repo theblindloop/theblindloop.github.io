@@ -1,0 +1,136 @@
+"""Independent image-only inverse for enclosed-cell search.
+
+This module does not know renderer geometry.  It segments the visible blue-gray
+grid network, finds the four frame components, samples the six-by-six cells
+relative to each recovered frame, and independently flood-fills white cells.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+FRAME_RGB = np.array([70, 105, 140], dtype=np.int16)
+LABELS = ("A", "B", "C", "D")
+GRID = 6
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[tuple[int, int, int, int, int]] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        output.append((min(xs), min(ys), max(xs), max(ys), len(xs)))
+    return output
+
+
+def _recover_frames(array: np.ndarray) -> list[tuple[int, int, int, int]]:
+    delta = array.astype(np.int16) - FRAME_RGB
+    mask = np.max(np.abs(delta), axis=2) <= 6
+    height, width = mask.shape
+    frames = []
+    for left, top, right, bottom, area in _components(mask):
+        frame_width = right - left
+        frame_height = bottom - top
+        if (
+            area > 0.002 * width * height
+            and frame_width > 0.10 * width
+            and frame_height > 0.35 * height
+            and abs(frame_width - frame_height) <= 0.03 * max(width, height)
+        ):
+            frames.append((left, top, right, bottom))
+    frames.sort(key=lambda box: box[0])
+    if len(frames) != 4:
+        raise ValueError(f"expected four visible mosaic frames, recovered {len(frames)}")
+    if any(frames[index][2] >= frames[index + 1][0] for index in range(3)):
+        raise ValueError("mosaic frames are not separable left-to-right")
+    return frames
+
+
+def _recover_panel(array: np.ndarray, frame: tuple[int, int, int, int]) -> set[tuple[int, int]]:
+    left, top, right, bottom = frame
+    step_x = (right - left) / GRID
+    step_y = (bottom - top) / GRID
+    if min(step_x, step_y) < 8 or abs(step_x - step_y) > 2:
+        raise ValueError("recovered grid cells are not square and resolvable")
+    dark: set[tuple[int, int]] = set()
+    for row in range(GRID):
+        for col in range(GRID):
+            cx = int(round(left + (col + 0.5) * step_x))
+            cy = int(round(top + (row + 0.5) * step_y))
+            radius = max(2, int(min(step_x, step_y) * 0.18))
+            patch = array[cy - radius : cy + radius + 1, cx - radius : cx + radius + 1]
+            if patch.size == 0:
+                raise ValueError("cell sample fell outside the raster")
+            luminance = float(
+                np.mean(0.2126 * patch[:, :, 0] + 0.7152 * patch[:, :, 1] + 0.0722 * patch[:, :, 2])
+            )
+            if luminance < 120.0:
+                dark.add((row, col))
+            elif luminance < 220.0:
+                raise ValueError("ambiguous cell fill")
+    if len(dark) != 16:
+        raise ValueError(f"panel has {len(dark)} dark cells instead of the declared 16")
+    return dark
+
+
+def _enclosed_count(dark: set[tuple[int, int]]) -> int:
+    white = {(row, col) for row in range(GRID) for col in range(GRID)} - dark
+    reached = {
+        cell
+        for cell in white
+        if cell[0] in (0, GRID - 1) or cell[1] in (0, GRID - 1)
+    }
+    queue = deque(sorted(reached))
+    while queue:
+        row, col = queue.popleft()
+        for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if neighbor in white and neighbor not in reached:
+                reached.add(neighbor)
+                queue.append(neighbor)
+    return len(white - reached)
+
+
+def measure_from_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    frames = _recover_frames(array)
+    panels = [_recover_panel(array, frame) for frame in frames]
+    scores = [_enclosed_count(panel) for panel in panels]
+    ordered = sorted(scores, reverse=True)
+    return {
+        "scores": scores,
+        "runner_up_margin": float(ordered[0] - ordered[1]),
+        "dark_counts": [len(panel) for panel in panels],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    measurement = measure_from_image(image)
+    scores = measurement["scores"]
+    winners = [index for index, score in enumerate(scores) if score == 1]
+    if (
+        len(winners) != 1
+        or any(score not in (0, 1) for score in scores)
+        or measurement["runner_up_margin"] < 1.0
+    ):
+        raise ValueError(f"no unique one-cell enclosure with a runner-up margin: {scores}")
+    return LABELS[winners[0]]
+

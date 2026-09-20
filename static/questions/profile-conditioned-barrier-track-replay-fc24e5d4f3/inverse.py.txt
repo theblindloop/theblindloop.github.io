@@ -1,0 +1,131 @@
+"""Scene-free pixel inverse arm for barrier_track_replay.
+
+Receives only a rendered RGB image. It re-finds the track cells, the token, the
+walls and the ordered cards, reads each card's direction from the mass balance
+of its arrow and its step count from the number of pips, then replays the moves
+under the stop-at-wall / stop-at-end rule and reports
+``"<final cell number>|<number of cards stopped early>"``.
+
+It imports no renderer, prompt, generator, verifier or gold code and never sees
+a latent scene.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "barrier_track_replay-oracle-0.1.0"
+
+_CELL_FILL = (226, 230, 236)
+_WALL = (176, 32, 48)
+_TOKEN = (24, 52, 140)
+_CARD = (250, 244, 224)
+_ARROW = (26, 120, 72)
+_PIP = (128, 48, 160)
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int], tol: int = 12) -> np.ndarray:
+    ref = np.array(rgb, dtype=np.int16)
+    return (np.abs(arr.astype(np.int16) - ref).max(axis=2) <= tol)
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[dict]:
+    """Four-connected components as dicts of area, centroid and bounding box."""
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    out: list[dict] = []
+    ys, xs = np.nonzero(mask)
+    current = 0
+    for sy, sx in zip(ys, xs):
+        if labels[sy, sx]:
+            continue
+        current += 1
+        stack = [(int(sy), int(sx))]
+        labels[sy, sx] = current
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1]:
+                    if mask[ny, nx] and not labels[ny, nx]:
+                        labels[ny, nx] = current
+                        stack.append((ny, nx))
+        if len(pix) < min_area:
+            continue
+        pa = np.array(pix, dtype=np.float64)
+        out.append(
+            {
+                "area": len(pix),
+                "cy": float(pa[:, 0].mean()),
+                "cx": float(pa[:, 1].mean()),
+                "y0": float(pa[:, 0].min()),
+                "y1": float(pa[:, 0].max()),
+                "x0": float(pa[:, 1].min()),
+                "x1": float(pa[:, 1].max()),
+            }
+        )
+    return out
+
+
+def _read_card(arr: np.ndarray, box: dict) -> tuple[int, int]:
+    y0, y1 = int(box["y0"]), int(box["y1"]) + 1
+    x0, x1 = int(box["x0"]), int(box["x1"]) + 1
+    sub = arr[y0:y1, x0:x1]
+
+    arrow = _mask(sub, _ARROW)
+    if not arrow.any():
+        raise ValueError("card has no arrow")
+    heights = arrow.sum(axis=0)
+    cols = np.nonzero(heights > 0)[0]
+    mid = (float(cols.min()) + float(cols.max())) / 2.0
+    # the solid head is much taller than the shaft, so the tall columns alone
+    # say which way the arrow points
+    head = np.nonzero(heights >= 0.6 * heights.max())[0]
+    if head.size == 0:
+        raise ValueError("card arrow has no head")
+    direction = 1 if float(head.mean()) > mid else -1
+
+    pips = _components(_mask(sub, _PIP), min_area=40)
+    if not 1 <= len(pips) <= 4:
+        raise ValueError(f"card has {len(pips)} pips")
+    return direction, len(pips)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+
+    cells = sorted(_components(_mask(arr, _CELL_FILL), min_area=600), key=lambda c: c["cx"])
+    if len(cells) < 3:
+        raise ValueError(f"found {len(cells)} track cells")
+    n = len(cells)
+    centers = [c["cx"] for c in cells]
+
+    tok = _components(_mask(arr, _TOKEN), min_area=300)
+    if len(tok) != 1:
+        raise ValueError(f"found {len(tok)} tokens")
+    pos = min(range(n), key=lambda i: abs(centers[i] - tok[0]["cx"]))
+
+    walls = set()
+    for w in _components(_mask(arr, _WALL), min_area=300):
+        gaps = [(centers[i] + centers[i + 1]) / 2.0 for i in range(n - 1)]
+        walls.add(min(range(n - 1), key=lambda g: abs(gaps[g] - w["cx"])))
+
+    cards = sorted(_components(_mask(arr, _CARD), min_area=8000), key=lambda c: c["cx"])
+    if not cards:
+        raise ValueError("no cards found")
+
+    blocked = 0
+    for box in cards:
+        direction, steps = _read_card(arr, box)
+        stopped = False
+        for _ in range(steps):
+            nxt = pos + direction
+            if nxt < 0 or nxt >= n or min(pos, nxt) in walls:
+                stopped = True
+                break
+            pos = nxt
+        if stopped:
+            blocked += 1
+
+    return f"{pos + 1}|{blocked}"

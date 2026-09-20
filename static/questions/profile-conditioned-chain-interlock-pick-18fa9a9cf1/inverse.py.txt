@@ -1,0 +1,177 @@
+"""Independent pixel-only arm for the chain-interlock world.
+
+Receives one RGB image and nothing else. It recovers the ink colours by
+frequency, fits a circle to each colour's band, locates the two places where the
+black band and a coloured band cross, reads which colour actually covers each
+crossing, and reports the coloured ring that is in front at exactly one of its
+two crossings with black.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+ORACLE_VERSION = "chain_interlock_pick-oracle-0.1.0"
+
+_MIN_SHARE = 0.0002
+_PURE_DISTANCE = 60.0
+_SAMPLE_RADIUS = 2
+
+
+def _dominant_colours(array: np.ndarray) -> list:
+    flat = array.reshape(-1, 3).astype(np.int32)
+    packed = (flat[:, 0] << 16) | (flat[:, 1] << 8) | flat[:, 2]
+    values, counts = np.unique(packed, return_counts=True)
+    keep = counts >= max(1, int(_MIN_SHARE * flat.shape[0]))
+    values, counts = values[keep], counts[keep]
+    order = np.argsort(-counts)
+    values = values[order]
+    palette: list = []
+    for packed_value in values:
+        colour = (
+            (int(packed_value) >> 16) & 255,
+            (int(packed_value) >> 8) & 255,
+            int(packed_value) & 255,
+        )
+        if any(
+            math.dist(colour, seen) < _PURE_DISTANCE for seen in palette
+        ):  # a blend of an accepted ink
+            continue
+        palette.append(colour)
+        if len(palette) == 5:
+            break
+    return palette
+
+
+def _label_map(array: np.ndarray, palette: list) -> np.ndarray:
+    """Label each pixel with the index of a near-exact palette colour, else -1."""
+    pixels = array.astype(np.float64)
+    labels = np.full(pixels.shape[:2], -1, dtype=np.int16)
+    best = np.full(pixels.shape[:2], np.inf)
+    for index, colour in enumerate(palette):
+        delta = pixels - np.array(colour, dtype=np.float64)
+        distance = np.sqrt((delta * delta).sum(axis=2))
+        take = (distance < _PURE_DISTANCE) & (distance < best)
+        best[take] = distance[take]
+        labels[take] = index
+    return labels
+
+
+def _fit_circle(ys: np.ndarray, xs: np.ndarray):
+    """Algebraic (Kasa) circle fit to a set of pixel coordinates."""
+    x = xs.astype(np.float64)
+    y = ys.astype(np.float64)
+    design = np.stack([x, y, np.ones_like(x)], axis=1)
+    rhs = x * x + y * y
+    solution, *_ = np.linalg.lstsq(design, rhs, rcond=None)
+    cx = solution[0] / 2.0
+    cy = solution[1] / 2.0
+    radius = math.sqrt(max(solution[2] + cx * cx + cy * cy, 1e-9))
+    return (cx, cy), radius
+
+
+def _intersections(c0, r0, c1, r1):
+    dx = c1[0] - c0[0]
+    dy = c1[1] - c0[1]
+    d = math.hypot(dx, dy)
+    if d <= 1e-9 or d >= r0 + r1 or d <= abs(r0 - r1):
+        return None
+    a = (r0 * r0 - r1 * r1 + d * d) / (2.0 * d)
+    h2 = r0 * r0 - a * a
+    if h2 <= 0.0:
+        return None
+    h = math.sqrt(h2)
+    xm = c0[0] + a * dx / d
+    ym = c0[1] + a * dy / d
+    return [
+        [xm - h * dy / d, ym + h * dx / d],
+        [xm + h * dy / d, ym - h * dx / d],
+    ]
+
+
+def _colour_at(labels: np.ndarray, point, wanted) -> int:
+    """Majority ink label inside a small disk around a point, or -1."""
+    height, width = labels.shape
+    cx = int(round(point[0]))
+    cy = int(round(point[1]))
+    tally = {}
+    for dy in range(-_SAMPLE_RADIUS, _SAMPLE_RADIUS + 1):
+        for dx in range(-_SAMPLE_RADIUS, _SAMPLE_RADIUS + 1):
+            if dx * dx + dy * dy > _SAMPLE_RADIUS * _SAMPLE_RADIUS:
+                continue
+            x, y = cx + dx, cy + dy
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+            label = int(labels[y, x])
+            if label in wanted:
+                tally[label] = tally.get(label, 0) + 1
+    if not tally:
+        return -1
+    best = max(tally.items(), key=lambda item: (item[1], -item[0]))
+    return best[0]
+
+
+def _name_for(rgb) -> str:
+    red, green, blue = rgb
+    if red >= green and red >= blue:
+        return "red"
+    if green >= blue:
+        return "green"
+    return "blue"
+
+
+def decision_from_image(image) -> str:
+    """Return the colour name of the coloured ring interlocked with the black ring."""
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    palette = _dominant_colours(array)
+    if len(palette) < 5:
+        return "ambiguous"
+    background_index = 0
+    background = palette[0]
+    labels = _label_map(array, palette)
+    ink_indices = [i for i in range(len(palette)) if i != background_index]
+    sizes = [(int((labels == i).sum()), i) for i in ink_indices]
+    sizes.sort(reverse=True)
+    ink_indices = [i for _, i in sizes[:4]]
+    if len(ink_indices) < 4:
+        return "ambiguous"
+
+    luminance = {
+        i: 0.299 * palette[i][0] + 0.587 * palette[i][1] + 0.114 * palette[i][2]
+        for i in ink_indices
+    }
+    black_index = min(ink_indices, key=lambda i: luminance[i])
+    coloured = [i for i in ink_indices if i != black_index]
+    if len(coloured) != 3:
+        return "ambiguous"
+    if any(abs(sum(palette[i]) - sum(background)) < 90 for i in ink_indices):
+        return "ambiguous"
+
+    fits = {}
+    for index in ink_indices:
+        ys, xs = np.nonzero(labels == index)
+        if ys.size < 400:
+            return "ambiguous"
+        fits[index] = _fit_circle(ys, xs)
+
+    wanted = set(ink_indices)
+    interlocked = []
+    for index in coloured:
+        (bc, br) = fits[black_index]
+        (cc, cr) = fits[index]
+        points = _intersections(bc, br, cc, cr)
+        if points is None:
+            return "ambiguous"
+        fronts = []
+        for point in points:
+            label = _colour_at(labels, point, wanted)
+            if label not in (black_index, index):
+                return "ambiguous"
+            fronts.append(label)
+        if fronts[0] != fronts[1]:
+            interlocked.append(index)
+    if len(interlocked) != 1:
+        return "ambiguous"
+    return _name_for(palette[interlocked[0]])

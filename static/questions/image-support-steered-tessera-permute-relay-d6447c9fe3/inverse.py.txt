@@ -1,0 +1,236 @@
+"""Independent pixel-only inverse arm for tessera_permute_relay.
+
+Receives one RGB image and nothing else.  It segments the two framed panels,
+reads the rule table (row-label discs, column dot glyphs, transition discs),
+reads the program panel (ringed starting disc plus four stacked dot glyphs),
+replays the lookup, and returns the final colour name.  It abstains by raising
+ValueError whenever the structure it requires is not unambiguously present.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "tessera_permute_relay-oracle-0.1.0"
+
+_PALETTE = (
+    ("red", (203, 45, 45)),
+    ("amber", (222, 160, 24)),
+    ("green", (34, 138, 62)),
+    ("blue", (46, 82, 198)),
+)
+_COLOUR_TOLERANCE = 40.0
+_DARK_MAX = 120
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Four-connected components of a boolean mask, via row runs."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(index: int) -> int:
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != root:
+            parent[index], index = root, parent[index]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list[tuple[int, int, int]] = []
+    row_index: list[list[int]] = []
+    for y in range(height):
+        row = mask[y]
+        current: list[int] = []
+        if row.any():
+            padded = np.concatenate(([0], row.astype(np.int8), [0]))
+            edges = np.flatnonzero(np.diff(padded))
+            for start, end in zip(edges[0::2], edges[1::2]):
+                current.append(len(runs))
+                runs.append((y, int(start), int(end)))
+                parent.append(len(parent))
+        row_index.append(current)
+        if y and current and row_index[y - 1]:
+            for a in row_index[y - 1]:
+                _, a0, a1 = runs[a]
+                for b in current:
+                    _, b0, b1 = runs[b]
+                    if b0 < a1 and a0 < b1:
+                        union(a, b)
+
+    groups: dict[int, dict] = {}
+    for index, (y, x0, x1) in enumerate(runs):
+        root = find(index)
+        entry = groups.get(root)
+        if entry is None:
+            groups[root] = {
+                "y0": y,
+                "y1": y + 1,
+                "x0": x0,
+                "x1": x1,
+                "area": x1 - x0,
+                "sx": (x0 + x1 - 1) / 2.0 * (x1 - x0),
+                "sy": float(y) * (x1 - x0),
+            }
+            continue
+        entry["y0"] = min(entry["y0"], y)
+        entry["y1"] = max(entry["y1"], y + 1)
+        entry["x0"] = min(entry["x0"], x0)
+        entry["x1"] = max(entry["x1"], x1)
+        entry["area"] += x1 - x0
+        entry["sx"] += (x0 + x1 - 1) / 2.0 * (x1 - x0)
+        entry["sy"] += float(y) * (x1 - x0)
+
+    out = []
+    for entry in groups.values():
+        entry["w"] = entry["x1"] - entry["x0"]
+        entry["h"] = entry["y1"] - entry["y0"]
+        entry["cx"] = entry["sx"] / entry["area"]
+        entry["cy"] = entry["sy"] / entry["area"]
+        out.append(entry)
+    return out
+
+
+def _cluster(values: list[float], expected: int, tolerance: float) -> list[list[int]]:
+    """Group indices whose values fall into `expected` well-separated bands."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    groups: list[list[int]] = [[order[0]]]
+    for index in order[1:]:
+        if values[index] - values[groups[-1][-1]] > tolerance:
+            groups.append([index])
+        else:
+            groups[-1].append(index)
+    if len(groups) != expected:
+        raise ValueError(f"expected {expected} bands, found {len(groups)}")
+    return groups
+
+
+def _inside(box: dict, cx: float, cy: float) -> bool:
+    return box["x0"] <= cx <= box["x1"] and box["y0"] <= cy <= box["y1"]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or min(array.shape[:2]) < 200:
+        raise ValueError("image is too small to carry two panels")
+
+    dark = np.all(array < _DARK_MAX, axis=2)
+    dark_parts = _components(dark)
+    frames = [c for c in dark_parts if c["w"] >= 110 and c["h"] >= 180]
+    if len(frames) != 2:
+        raise ValueError("did not find exactly two panel frames")
+
+    chips: list[dict] = []
+    for name, rgb in _PALETTE:
+        distance = np.linalg.norm(array - np.asarray(rgb, dtype=np.float32), axis=2)
+        for part in _components(distance < _COLOUR_TOLERANCE):
+            if part["area"] < 120 or part["w"] > 80 or part["h"] > 80:
+                continue
+            part["colour"] = name
+            chips.append(part)
+
+    pips = [
+        c
+        for c in dark_parts
+        if 5 <= c["w"] <= 18 and 5 <= c["h"] <= 18 and c["area"] >= 40
+    ]
+    rings = [c for c in dark_parts if 36 <= c["w"] <= 64 and 36 <= c["h"] <= 64]
+
+    table_frame = tape_frame = None
+    for frame in frames:
+        held = [c for c in chips if _inside(frame, c["cx"], c["cy"])]
+        if len(held) == 16:
+            if table_frame is not None:
+                raise ValueError("two candidate rule tables")
+            table_frame = frame
+        elif len(held) == 1:
+            if tape_frame is not None:
+                raise ValueError("two candidate program panels")
+            tape_frame = frame
+    if table_frame is None or tape_frame is None:
+        raise ValueError("panels do not carry the required discs")
+
+    # --- rule table -------------------------------------------------------
+    table_chips = [c for c in chips if _inside(table_frame, c["cx"], c["cy"])]
+    cell_w = table_frame["w"] / 4.0
+    cell_h = table_frame["h"] / 5.0
+    col_bands = _cluster([c["cx"] for c in table_chips], 4, cell_w * 0.5)
+    row_bands = _cluster([c["cy"] for c in table_chips], 4, cell_h * 0.5)
+    if any(len(band) != 4 for band in col_bands + row_bands):
+        raise ValueError("rule table discs are not a four-by-four arrangement")
+    column_of = {index: c for c, band in enumerate(col_bands) for index in band}
+    row_of = {index: r for r, band in enumerate(row_bands) for index in band}
+    grid = [[None] * 4 for _ in range(4)]
+    for index, chip in enumerate(table_chips):
+        grid[row_of[index]][column_of[index]] = chip["colour"]
+    if any(cell is None for row in grid for cell in row):
+        raise ValueError("rule table has an unreadable cell")
+    labels = [row[0] for row in grid]
+    if len(set(labels)) != 4:
+        raise ValueError("row labels are not four distinct colours")
+
+    header_top = min(c["cy"] for c in table_chips) - cell_h * 0.5
+    header_pips = [
+        p
+        for p in pips
+        if _inside(table_frame, p["cx"], p["cy"]) and p["cy"] < header_top
+    ]
+    if not 3 <= len(header_pips) <= 9:
+        raise ValueError("unreadable column glyph row")
+    header_bands = _cluster([p["cx"] for p in header_pips], 3, cell_w * 0.5)
+    header_centres = [
+        sum(header_pips[i]["cx"] for i in band) / len(band) for band in header_bands
+    ]
+    column_glyphs = []
+    for band, centre in zip(header_bands, header_centres):
+        matched = [
+            c
+            for c in range(4)
+            if abs(sum(table_chips[i]["cx"] for i in col_bands[c]) / 4.0 - centre) < cell_w * 0.5
+        ]
+        if len(matched) != 1 or matched[0] == 0:
+            raise ValueError("a column glyph does not sit over a transition column")
+        column_glyphs.append((matched[0], len(band)))
+    if len({count for _, count in column_glyphs}) != 3:
+        raise ValueError("column glyphs are not three different dot counts")
+
+    # --- program ----------------------------------------------------------
+    start_chip = [c for c in chips if _inside(tape_frame, c["cx"], c["cy"])][0]
+    tape_rings = [
+        r
+        for r in rings
+        if abs(r["cx"] - start_chip["cx"]) < 12 and abs(r["cy"] - start_chip["cy"]) < 12
+    ]
+    if len(tape_rings) != 1:
+        raise ValueError("the starting disc is not encircled exactly once")
+
+    step_pips = [
+        p
+        for p in pips
+        if _inside(tape_frame, p["cx"], p["cy"])
+        and p["cy"] > tape_rings[0]["y1"]
+    ]
+    if not 4 <= len(step_pips) <= 12:
+        raise ValueError("unreadable program glyph stack")
+    step_h = (tape_frame["h"] - (tape_rings[0]["y1"] - tape_frame["y0"])) / 4.0
+    step_bands = _cluster([p["cy"] for p in step_pips], 4, step_h * 0.55)
+    tape = [len(band) for band in step_bands]
+    if any(count > 3 for count in tape):
+        raise ValueError("a program glyph carries more than three dots")
+
+    # --- replay -----------------------------------------------------------
+    state = start_chip["colour"]
+    for count in tape:
+        column = [c for c, n in column_glyphs if n == count]
+        if len(column) != 1:
+            raise ValueError("program glyph does not select one column")
+        row = [r for r in range(4) if labels[r] == state]
+        if len(row) != 1:
+            raise ValueError("current colour does not select one row")
+        state = grid[row[0]][column[0]]
+    return state

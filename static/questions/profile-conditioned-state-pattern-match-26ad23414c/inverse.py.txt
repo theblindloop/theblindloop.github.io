@@ -1,0 +1,165 @@
+"""Independent pixel-only inverse for the state-pattern world.
+
+This module deliberately contains its own layout constants and does not import
+the renderer, prompt, generator, verifier, or analytic-gold code.  It recovers
+the two keyed palettes from the raster, locates each identity swatch and state
+marker in every panel, decodes the TARGET row, and compares complete sequences.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 1200
+HEIGHT = 720
+PANEL_LEFTS = (20, 260, 500, 740, 980)
+PANEL_WIDTH = 210
+PANEL_TOP = 185
+PANEL_BOTTOM = 575
+PANEL_CENTERS = (125, 365, 605, 845, 1085)
+TARGET_Y = 110
+KEY_Y = 647
+LABEL_KEY_X = (75, 150, 225, 300)
+STATE_KEY_X = (500, 580, 660)
+COLOR_TOLERANCE = 70.0
+
+
+def _key_color(arr: np.ndarray, x: int, y: int) -> tuple[int, int, int]:
+    patch = arr[max(0, y - 2) : y + 3, max(0, x - 2) : x + 3]
+    pixel = np.median(patch.reshape(-1, 3), axis=0).round().astype(int)
+    return tuple(int(value) for value in pixel)
+
+
+def _distance_mask(arr: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    delta = arr.astype(np.float32) - np.asarray(color, dtype=np.float32)
+    return np.sqrt(np.sum(delta * delta, axis=2)) <= COLOR_TOLERANCE
+
+
+def _y_clusters(mask: np.ndarray, minimum_rows: int = 2) -> list[tuple[float, float, int]]:
+    """Return (x-centroid, y-centroid, area) for separated colored marks."""
+
+    ys, xs = np.where(mask)
+    if len(ys) == 0:
+        return []
+    unique_y = np.unique(ys)
+    groups: list[list[int]] = []
+    current = [int(unique_y[0])]
+    for value in unique_y[1:]:
+        value = int(value)
+        if value - current[-1] > 5:
+            groups.append(current)
+            current = [value]
+        else:
+            current.append(value)
+    groups.append(current)
+    output = []
+    for group in groups:
+        if len(group) < minimum_rows:
+            continue
+        selected = np.isin(ys, np.asarray(group))
+        group_x = xs[selected]
+        group_y = ys[selected]
+        if len(group_x):
+            output.append((float(group_x.mean()), float(group_y.mean()), int(len(group_x))))
+    return output
+
+
+def _panel_pixels(arr: np.ndarray, panel: int) -> np.ndarray:
+    return arr[PANEL_TOP:PANEL_BOTTOM + 1, PANEL_LEFTS[panel] : PANEL_LEFTS[panel] + PANEL_WIDTH]
+
+
+def _decode_target(arr: np.ndarray, state_colors: list[tuple[int, int, int]]) -> list[int]:
+    target = []
+    for x in PANEL_CENTERS:
+        patch = arr[TARGET_Y - 8 : TARGET_Y + 9, x - 8 : x + 9]
+        values = patch.reshape(-1, 3).astype(np.float32)
+        distances = np.stack(
+            [np.sqrt(np.sum((values - np.asarray(color, dtype=np.float32)) ** 2, axis=1)) for color in state_colors],
+            axis=1,
+        )
+        nearest = distances.argmin(axis=1)
+        counts = np.bincount(nearest, minlength=3)
+        state = int(counts.argmax())
+        if int(counts[state]) < 10 or float(distances[:, state].min()) > COLOR_TOLERANCE:
+            raise ValueError("TARGET state marker is missing or unreadable")
+        target.append(state)
+    return target
+
+
+def _decode_panel(
+    arr: np.ndarray,
+    panel: int,
+    identity_colors: list[tuple[int, int, int]],
+    state_colors: list[tuple[int, int, int]],
+) -> list[int]:
+    crop = _panel_pixels(arr, panel)
+    identity_y: list[float] = []
+    for color in identity_colors:
+        clusters = _y_clusters(_distance_mask(crop, color))
+        if len(clusters) != 1 or clusters[0][2] < 100:
+            raise ValueError("identity swatch is missing or ambiguous")
+        identity_y.append(clusters[0][1] + PANEL_TOP)
+
+    state_marks: list[tuple[float, float, int]] = []
+    for state, color in enumerate(state_colors):
+        # A saturated state color can be within the broad tolerance of a few
+        # antialiased identity-edge pixels.  Real markers are hundreds of
+        # pixels; tiny edge specks are discarded before the four-marker count.
+        clusters = [
+            cluster for cluster in _y_clusters(_distance_mask(crop, color)) if cluster[2] >= 100
+        ]
+        state_marks.extend((x, y + PANEL_TOP, state) for x, y, _ in clusters)
+    if len(state_marks) != 4:
+        raise ValueError("state markers are missing or ambiguous")
+
+    output = []
+    used: set[int] = set()
+    for y in identity_y:
+        ranked = sorted(
+            ((abs(mark_y - y), index, state) for index, (_, mark_y, state) in enumerate(state_marks) if index not in used),
+            key=lambda item: item[0],
+        )
+        if not ranked or ranked[0][0] > 30.0:
+            raise ValueError("identity/state rows cannot be paired")
+        _, index, state = ranked[0]
+        used.add(index)
+        output.append(state)
+    return output
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the unique matching label using only the final raster."""
+
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        raise ValueError(f"unexpected image size {rgb.size}")
+    arr = np.asarray(rgb, dtype=np.uint8)
+    identity_colors = [_key_color(arr, x, KEY_Y) for x in LABEL_KEY_X]
+    state_colors = [_key_color(arr, x, KEY_Y) for x in STATE_KEY_X]
+    if len(set(identity_colors)) != 4 or len(set(state_colors)) != 3:
+        raise ValueError("keyed palettes are not distinct")
+
+    target = _decode_target(arr, state_colors)
+    trajectories = [[None] * 5 for _ in range(4)]
+    for panel in range(5):
+        crop = _panel_pixels(arr, panel)
+        for identity, color in enumerate(identity_colors):
+            clusters = _y_clusters(_distance_mask(crop, color))
+            if len(clusters) != 1:
+                raise ValueError("identity component could not be decoded")
+        # Decode the panel by pairing each identity swatch's y position with its
+        # nearest state marker.  This is independent of the renderer's row order.
+        decoded = _decode_panel(arr, panel, identity_colors, state_colors)
+        # _decode_panel returns identities in key order, not row order.
+        for identity, state in enumerate(decoded):
+            trajectories[identity][panel] = state
+
+    scores = [sum(a == b for a, b in zip(trajectory, target)) for trajectory in trajectories]
+    best = max(scores)
+    if best != 5 or scores.count(best) != 1:
+        raise ValueError(f"no unique exact target trajectory: {scores}")
+    return "ABCD"[scores.index(best)]

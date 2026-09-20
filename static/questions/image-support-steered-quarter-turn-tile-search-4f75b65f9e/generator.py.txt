@@ -1,0 +1,212 @@
+"""Deterministic scene sampler and raster renderer for quarter-turn tile search."""
+
+from __future__ import annotations
+
+import copy
+import random
+from collections import deque
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+GRID = 7
+CELL = 11
+INK = (18, 155, 180)
+BACKGROUND = (248, 247, 242)
+OUTLINE = (205, 207, 204)
+TEXT = (42, 45, 48)
+LABELS = ("A", "B", "C", "D")
+
+
+def _diamond() -> set[tuple[int, int]]:
+    return {
+        (row, col)
+        for row in range(GRID)
+        for col in range(GRID)
+        if abs(row - 3) + abs(col - 3) <= 3
+    }
+
+
+def _connected(cells: set[tuple[int, int]]) -> bool:
+    if not cells:
+        return False
+    seen = {next(iter(cells))}
+    queue = deque(seen)
+    while queue:
+        row, col = queue.popleft()
+        for point in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if point in cells and point not in seen:
+                seen.add(point)
+                queue.append(point)
+    return len(seen) == len(cells)
+
+
+def _full_bbox(cells: set[tuple[int, int]]) -> bool:
+    rows = {row for row, _ in cells}
+    cols = {col for _, col in cells}
+    return min(rows) == 0 and max(rows) == 6 and min(cols) == 0 and max(cols) == 6
+
+
+def _solid_slices(cells: set[tuple[int, int]]) -> bool:
+    """Reject holes, separated lobes, and thin internal gaps as cheap cues."""
+
+    for row in range(GRID):
+        values = sorted(col for r, col in cells if r == row)
+        if values and values != list(range(values[0], values[-1] + 1)):
+            return False
+    for col in range(GRID):
+        values = sorted(row for row, c in cells if c == col)
+        if values and values != list(range(values[0], values[-1] + 1)):
+            return False
+    return True
+
+
+def _rotate(cells: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    return {(col, GRID - 1 - row) for row, col in cells}
+
+
+def _mismatch(cells: set[tuple[int, int]]) -> int:
+    return len(cells.symmetric_difference(_rotate(cells)))
+
+
+def _symmetric_tiles() -> list[set[tuple[int, int]]]:
+    rows = (
+        ("0001000", "0011100", "0111110", "1111111", "0111110", "0011100", "0001000"),
+        ("0000100", "0011100", "1111110", "0111110", "0111111", "0011100", "0010000"),
+        ("0010000", "0011100", "0111111", "0111110", "1111110", "0011100", "0000100"),
+        ("0001100", "0001100", "1111100", "1111111", "0011111", "0011000", "0011000"),
+        ("0011000", "0011000", "0011111", "1111111", "1111100", "0001100", "0001100"),
+    )
+    return [_decode(list(pattern)) for pattern in rows]
+
+
+def _mutated_tile(rng: random.Random, base: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    """Move boundary cells while preserving area, connectivity, and full extent."""
+
+    for _ in range(1000):
+        cells = set(base)
+        for _ in range(rng.randint(5, 9)):
+            moved = False
+            removable = list(cells)
+            rng.shuffle(removable)
+            for old in removable:
+                reduced = cells - {old}
+                if not _connected(reduced):
+                    continue
+                additions = [
+                    point
+                    for row, col in reduced
+                    for point in (
+                        (row - 1, col),
+                        (row + 1, col),
+                        (row, col - 1),
+                        (row, col + 1),
+                    )
+                    if 0 <= point[0] < GRID and 0 <= point[1] < GRID and point not in reduced
+                ]
+                rng.shuffle(additions)
+                for new in additions:
+                    trial = reduced | {new}
+                    if _connected(trial) and _full_bbox(trial) and _solid_slices(trial):
+                        cells = trial
+                        moved = True
+                        break
+                if moved:
+                    break
+        if (
+            len(cells) == 25
+            and _full_bbox(cells)
+            and _connected(cells)
+            and _solid_slices(cells)
+            and _mismatch(cells) >= 8
+        ):
+            return cells
+    raise RuntimeError("could not sample a separated quarter-turn distractor")
+
+
+def _encode(cells: set[tuple[int, int]]) -> list[str]:
+    return ["".join("1" if (row, col) in cells else "0" for col in range(GRID)) for row in range(GRID)]
+
+
+def _decode(rows: list[str]) -> set[tuple[int, int]]:
+    return {(row, col) for row, text in enumerate(rows) for col, value in enumerate(text) if value == "1"}
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    winner = int(seed) % 4
+    global_x = rng.randint(-7, 7)
+    global_y = rng.randint(152, 276)
+    target = set(rng.choice(_symmetric_tiles()))
+    masks = [_mutated_tile(rng, target) for _ in range(4)]
+    masks[winner] = target
+    tiles = []
+    for slot in range(4):
+        cells = masks[slot]
+        quarter_turns = rng.randrange(4)
+        for _ in range(quarter_turns):
+            cells = _rotate(cells)
+        tiles.append(
+            {
+                "slot": slot,
+                "x": 35 + 116 * slot + global_x,
+                "y": global_y + rng.randint(-6, 6),
+                "mask": _encode(cells),
+            }
+        )
+    return {"width": 512, "height": 512, "tiles": tiles}
+
+
+def _scores(scene: dict) -> list[tuple[int, int]]:
+    return sorted((_mismatch(_decode(tile["mask"])), int(tile["slot"])) for tile in scene["tiles"])
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _scores(scene)
+    if len(scores) != 4 or scores[0][0] == scores[1][0]:
+        raise ValueError("scene has no unique quarter-turn winner")
+    return LABELS[scores[0][1]]
+
+
+def margin(scene: dict) -> float:
+    scores = _scores(scene)
+    return float(scores[1][0] - scores[0][0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = _scores(scene)
+    return len(scores) != 4 or scores[0][0] != 0 or scores[1][0] - scores[0][0] < 4
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["tiles"] = list(reversed(twin["tiles"]))
+    return [("reverse_nonoverlapping_draw_order", twin)]
+
+
+def render(scene: dict) -> Image.Image:
+    width = int(scene["width"])
+    height = int(scene["height"])
+    image = Image.new("RGB", (width, height), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    for tile in scene["tiles"]:
+        x0, y0 = int(tile["x"]), int(tile["y"])
+        size = GRID * CELL
+        draw.rounded_rectangle(
+            (x0 - 10, y0 - 10, x0 + size + 9, y0 + size + 31),
+            radius=7,
+            outline=OUTLINE,
+            width=2,
+        )
+        for row, text in enumerate(tile["mask"]):
+            for col, value in enumerate(text):
+                if value == "1":
+                    left = x0 + col * CELL
+                    top = y0 + row * CELL
+                    draw.rectangle((left, top, left + CELL - 1, top + CELL - 1), fill=INK)
+        label = LABELS[int(tile["slot"])]
+        label_box = draw.textbbox((0, 0), label, font=font)
+        label_width = label_box[2] - label_box[0]
+        draw.text((x0 + (size - label_width) / 2, y0 + size + 12), label, fill=TEXT, font=font)
+    return image

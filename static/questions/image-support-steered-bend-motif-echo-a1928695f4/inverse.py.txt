@@ -1,0 +1,144 @@
+"""Independent image-only recovery of the relation between two trail motifs."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for yy, xx in np.argwhere(mask):
+        y, x = int(yy), int(xx)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = [(y, x)]
+        points = []
+        while queue:
+            cy, cx = queue.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return sorted(output, key=len, reverse=True)
+
+
+def _background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (array[:3].reshape(-1, 3), array[-3:].reshape(-1, 3), array[:, :3].reshape(-1, 3), array[:, -3:].reshape(-1, 3)),
+        axis=0,
+    )
+    return np.median(border, axis=0)
+
+
+def _marker_centers(
+    array: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray]]:
+    work = array.astype(np.int16)
+    chroma = work.max(axis=2) - work.min(axis=2)
+    bright = work.max(axis=2)
+    mask = (chroma > 48) & (bright > 125)
+    all_parts = _components(mask)
+    parts = [part for part in all_parts if len(part) >= 180]
+    small_parts = [part for part in all_parts if 25 <= len(part) <= 110]
+    if len(parts) != 3:
+        raise OracleAbstention(f"expected three large colored trail markers, found {len(parts)}")
+    if len(small_parts) != 14:
+        raise OracleAbstention(f"expected fourteen small boundary beads, found {len(small_parts)}")
+    measured = []
+    for part in parts:
+        ys, xs = part[:, 0], part[:, 1]
+        height = int(ys.max() - ys.min()) + 1
+        width = int(xs.max() - xs.min()) + 1
+        fill = len(part) / float(height * width)
+        measured.append((fill, np.asarray([xs.mean(), ys.mean()], dtype=np.float64)))
+    measured.sort(key=lambda item: item[0])
+    if measured[1][0] - measured[0][0] < 0.11 or measured[2][0] - measured[1][0] < 0.10:
+        raise OracleAbstention("marker silhouettes do not distinguish diamond, round cap, and square cap")
+    diamond = measured[0][1]
+    round_cap = measured[1][1]
+    square_cap = measured[2][1]
+    small_centers = sorted(
+        (np.asarray([part[:, 1].mean(), part[:, 0].mean()], dtype=np.float64) for part in small_parts),
+        key=lambda point: float(point[0]),
+    )
+    return round_cap, diamond, square_cap, small_centers
+
+
+def _connected_foreground(array: np.ndarray, background: np.ndarray) -> None:
+    delta = np.linalg.norm(array.astype(np.float32) - background.astype(np.float32), axis=2)
+    mask = delta > 30.0
+    parts = [part for part in _components(mask) if len(part) >= 30]
+    if len(parts) != 1:
+        raise OracleAbstention(f"the required trail is interrupted into {len(parts)} pieces")
+
+
+def _fit_signs(dark: np.ndarray, markers: list[np.ndarray]) -> list[int]:
+    if len(markers) != 9:
+        raise OracleAbstention("each trail half must expose nine boundary markers")
+    gaps = np.diff([float(point[0]) for point in markers])
+    if np.any(gaps <= 18.0) or float(gaps.max() / gaps.min()) > 1.18:
+        raise OracleAbstention("boundary beads do not expose eight nearly equal-width slants")
+    signs = []
+    for index in range(8):
+        x0 = float(markers[index][0])
+        x1 = float(markers[index + 1][0])
+        lo = x0 + (x1 - x0) * 0.20
+        hi = x0 + (x1 - x0) * 0.80
+        points = np.argwhere(dark[:, max(0, int(np.floor(lo))):min(dark.shape[1], int(np.ceil(hi)) + 1)])
+        if len(points) < 45:
+            raise OracleAbstention(f"slant {index + 1} is missing")
+        ys = points[:, 0].astype(np.float64)
+        xs = points[:, 1].astype(np.float64) + max(0, int(np.floor(lo)))
+        design = np.column_stack((xs, np.ones_like(xs)))
+        slope = float(np.linalg.lstsq(design, ys, rcond=None)[0][0])
+        if abs(slope) < 0.38:
+            raise OracleAbstention(f"slant {index + 1} is too nearly horizontal")
+        signs.append(1 if slope > 0.0 else -1)
+    return signs
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 120 or array.shape[1] < 240:
+        raise OracleAbstention("unsupported raster")
+    background = _background(array)
+    _connected_foreground(array, background)
+    round_cap, diamond, square_cap, small = _marker_centers(array)
+    if not (round_cap[0] < diamond[0] < square_cap[0]):
+        raise OracleAbstention("trail markers are not in the declared round-diamond-square order")
+    left_span = diamond[0] - round_cap[0]
+    right_span = square_cap[0] - diamond[0]
+    if abs(left_span - right_span) > 0.06 * (square_cap[0] - round_cap[0]):
+        raise OracleAbstention("diamond does not split the trail into equal-width halves")
+    if square_cap[0] - round_cap[0] < 0.72 * array.shape[1]:
+        raise OracleAbstention("trail does not span enough of the image")
+
+    luminance = array.astype(np.float32).mean(axis=2)
+    chroma = array.max(axis=2).astype(np.int16) - array.min(axis=2).astype(np.int16)
+    dark = (luminance < 105.0) & (chroma < 45)
+    if not (small[6][0] < diamond[0] < small[7][0]):
+        raise OracleAbstention("small boundary beads do not flank the central diamond")
+    all_markers = [round_cap, *small[:7], diamond, *small[7:], square_cap]
+    first = _fit_signs(dark, all_markers[:9])
+    second = _fit_signs(dark, all_markers[8:])
+    if second == first:
+        return "same"
+    if second == [-value for value in first]:
+        return "opposite"
+    raise OracleAbstention("the two slope-sign motifs are neither equal nor exact opposites")

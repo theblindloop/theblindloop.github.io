@@ -1,0 +1,114 @@
+"""Pixel-only inverse arm: recover the mouth-bulge decision from the PNG alone.
+
+Receives a PIL image and nothing else. Imports no renderer, prompt, generator,
+verifier, or gold code, and never sees latent scene data.
+
+Method: segment the dark marks, label connected components, take the widest
+component as the mouth stroke and the remaining two as the eyes, fit the mouth's
+chord by principal axis, and compare the mouth centroid's offset from that chord
+against the direction of the eye pair. Abstains when the marks are missing,
+ambiguous, or the offset is within the pixel-scale tolerance.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+DARK_LUMA = 110.0        # features are dark; head fill and background are light
+MIN_COMPONENT_PX = 40    # ignore antialiasing specks
+ABSTAIN_PROJ_PX = 1.6    # pixel-scale tolerance on the bulge offset
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Label 8-connected components with an iterative flood fill."""
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pix: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            y0, y1 = max(0, y - 1), min(h - 1, y + 1)
+            x0, x1 = max(0, x - 1), min(w - 1, x + 1)
+            for ny in range(y0, y1 + 1):
+                for nx in range(x0, x1 + 1):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pix) >= MIN_COMPONENT_PX:
+            out.append(np.asarray(pix, dtype=np.float64))
+    return out
+
+
+def _extent(pix: np.ndarray) -> float:
+    dy = pix[:, 0].max() - pix[:, 0].min()
+    dx = pix[:, 1].max() - pix[:, 1].min()
+    return float(np.hypot(dx, dy))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return "toward", "away", or "abstain" from pixels alone."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    luma = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    comps = _components(luma < DARK_LUMA)
+    if len(comps) != 3:
+        return "abstain"
+
+    comps.sort(key=_extent)
+    mouth = comps[-1]
+    eyes = comps[:2]
+    # The mouth must be unambiguously the long stroke.
+    if _extent(mouth) < 1.8 * _extent(eyes[-1]):
+        return "abstain"
+    if abs(len(eyes[0]) - len(eyes[1])) > 0.6 * max(len(eyes[0]), len(eyes[1])):
+        return "abstain"
+
+    pts = mouth[:, ::-1]                       # (x, y)
+    centroid = pts.mean(axis=0)
+    centred = pts - centroid
+    # Principal axis approximates the chord direction of an arc stroke.
+    _, _, vt = np.linalg.svd(centred, full_matrices=False)
+    axis = vt[0]
+    t = centred @ axis
+    lo, hi = np.quantile(t, 0.04), np.quantile(t, 0.96)
+    end_a = pts[t <= lo].mean(axis=0)
+    end_b = pts[t >= hi].mean(axis=0)
+    chord_mid = 0.5 * (end_a + end_b)
+
+    eye_mid = np.stack([e[:, ::-1].mean(axis=0) for e in eyes]).mean(axis=0)
+    to_eyes = eye_mid - chord_mid
+    norm = float(np.hypot(*to_eyes))
+    if norm < 1e-6:
+        return "abstain"
+    to_eyes = to_eyes / norm
+
+    bulge = centroid - chord_mid
+    proj = float(bulge @ to_eyes)
+    if abs(proj) < ABSTAIN_PROJ_PX:
+        return "abstain"
+    return "toward" if proj > 0 else "away"
+
+
+def decision_margin_from_image(image: Image.Image) -> float:
+    """Diagnostic pixel-side margin (unsigned bulge offset, px)."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    luma = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    comps = _components(luma < DARK_LUMA)
+    if len(comps) != 3:
+        return 0.0
+    comps.sort(key=_extent)
+    pts = comps[-1][:, ::-1]
+    centroid = pts.mean(axis=0)
+    centred = pts - centroid
+    _, _, vt = np.linalg.svd(centred, full_matrices=False)
+    t = centred @ vt[0]
+    lo, hi = np.quantile(t, 0.04), np.quantile(t, 0.96)
+    chord_mid = 0.5 * (pts[t <= lo].mean(axis=0) + pts[t >= hi].mean(axis=0))
+    return float(np.hypot(*(centroid - chord_mid)))

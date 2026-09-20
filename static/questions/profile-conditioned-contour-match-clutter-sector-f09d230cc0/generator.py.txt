@@ -1,0 +1,244 @@
+"""Reference-contour-in-clutter search world.
+
+A dark reference polyline (an open contour) is drawn inside a grey box at the
+top of the image. Below, thin grey divider lines split the image into four
+sectors (top-left, top-right, bottom-left, bottom-right). Every sector holds
+the same number of small dark contour fragments (the "clutter"). Exactly one
+sector contains one contour that is a pixel-exact copy of the reference contour
+(the target); every other contour in every sector is a differently shaped
+fragment. The decision is the sector that contains the exact reference contour.
+
+All rendering is deterministic. The scene stores only the reference polyline
+and the per-sector contour fragments that are actually drawn; analytic gold
+derives the winning sector by scanning those drawn fragments for the one whose
+shape equals the reference shape, with no hidden answer field.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+SIZE = 512
+BG = (255, 255, 255)
+SEG = (25, 25, 25)
+GRAY = (196, 196, 196)
+
+STEP = 12
+RADIUS = 1
+
+REF_BOX = (160, 20, 352, 150)
+GRID_Y = 160
+GRID_X = 256
+GRID_H = 336
+
+SECTORS = ("TL", "TR", "BL", "BR")
+SECTOR_REGIONS = {
+    "TL": (0, GRID_Y, GRID_X, GRID_H),
+    "TR": (GRID_X, GRID_Y, SIZE, GRID_H),
+    "BL": (0, GRID_H, GRID_X, SIZE),
+    "BR": (GRID_X, GRID_H, SIZE, SIZE),
+}
+
+N_CTR = 6
+PAD = 14
+QUARANTINE_THRESH = 0.62
+
+
+def _walk(anchor: tuple[int, int], segments: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    x, y = anchor
+    pts = [(x, y)]
+    for dx, dy in segments:
+        x += dx
+        y += dy
+        pts.append((int(x), int(y)))
+    return pts
+
+
+def _normalize(verts: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    x0, y0 = verts[0]
+    return tuple((int(x - x0), int(y - y0)) for x, y in verts)
+
+
+def _random_shape(rng: np.random.Generator, n_seg: int, forbidden: tuple) -> list[tuple[int, int]]:
+    # Diagonal (+-S,+-S) fragments: their direction differs from the
+    # axis-aligned staircase reference, so a fragment rarely overlaps much of
+    # the reference shape, keeping the runner-up margin large.
+    while True:
+        segs = []
+        for _ in range(n_seg):
+            sx = int(rng.integers(0, 2)) * 2 - 1
+            sy = int(rng.integers(0, 2)) * 2 - 1
+            segs.append((sx * STEP, sy * STEP))
+        pts = _walk((0, 0), segs)
+        if _normalize(pts) != forbidden:
+            return pts
+
+
+def _shape_bbox(verts: list[tuple[int, int]]) -> tuple[int, int, int, int]:
+    xs = [p[0] for p in verts]
+    ys = [p[1] for p in verts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _brush(arr: np.ndarray, pts: list[tuple[int, int]], r: int) -> None:
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        xa = max(0, min(x0, x1) - r - 1)
+        xb = min(SIZE, max(x0, x1) + r + 2)
+        ya = max(0, min(y0, y1) - r - 1)
+        yb = min(SIZE, max(y0, y1) + r + 2)
+        if xb <= xa or yb <= ya:
+            continue
+        sub = arr[ya:yb, xa:xb]
+        ys, xs = np.ogrid[: sub.shape[0], : sub.shape[1]]
+        X = (xs + xa).astype(np.float64)
+        Y = (ys + ya).astype(np.float64)
+        dx = x1 - x0
+        dy = y1 - y0
+        l2 = dx * dx + dy * dy
+        t = np.clip(((X - x0) * dx + (Y - y0) * dy) / l2, 0.0, 1.0)
+        px = x0 + t * dx
+        py = y0 + t * dy
+        d2 = (X - px) ** 2 + (Y - py) ** 2
+        sub |= d2 <= r * r
+
+
+def _sample_scene(rng: np.random.Generator) -> dict:
+    # Reference shape: a fixed, recognizable rightward staircase.
+    ref_segments = [(STEP, 0), (0, STEP), (STEP, 0), (0, STEP), (STEP, 0)]
+    ref_anchor = (210, 60)
+    ref_verts = _walk(ref_anchor, ref_segments)
+    ref_norm = _normalize(ref_verts)
+
+    winner = SECTORS[int(rng.integers(0, len(SECTORS)))]
+
+    sectors = []
+    for sector in SECTORS:
+        x0, y0, x1, y1 = SECTOR_REGIONS[sector]
+        placed_bboxes = []
+        contours = []
+        n = N_CTR
+        for i in range(n):
+            is_target = sector == winner and i == 0
+            if is_target:
+                # The target is the reference shape translated into this sector.
+                bx0, by0, bx1, by1 = _shape_bbox(ref_verts)
+                w = bx1 - bx0
+                h = by1 - by0
+                ax = int(rng.integers(x0 + PAD, x1 - PAD - w + 1))
+                ay = int(rng.integers(y0 + PAD, y1 - PAD - h + 1))
+                verts = [(x + ax - bx0, y + ay - by0) for x, y in ref_verts]
+            else:
+                verts = None
+            for _try in range(400):
+                if is_target:
+                    candidate = verts
+                else:
+                    candidate = _random_shape(rng, int(rng.integers(4, 7)), ref_norm)
+                    bx0, by0, bx1, by1 = _shape_bbox(candidate)
+                    w = bx1 - bx0
+                    h = by1 - by0
+                    ax = int(rng.integers(x0 + PAD, x1 - PAD - w + 1))
+                    ay = int(rng.integers(y0 + PAD, y1 - PAD - h + 1))
+                    candidate = [(x + ax - bx0, y + ay - by0) for x, y in candidate]
+                bx0, by0, bx1, by1 = _shape_bbox(candidate)
+                ok = True
+                for (px0, py0, px1, py1) in placed_bboxes:
+                    if not (bx1 + 8 < px0 or px1 + 8 < bx0 or by1 + 8 < py0 or py1 + 8 < by0):
+                        ok = False
+                        break
+                if ok:
+                    break
+            placed_bboxes.append(_shape_bbox(candidate))
+            contours.append(candidate)
+        sectors.append({"sector": sector, "contours": contours})
+
+    return {"reference": ref_verts, "sectors": sectors}
+
+
+def sample_scene(seed: int) -> dict:
+    return _sample_scene(np.random.default_rng(seed))
+
+
+def render(scene: dict) -> Image.Image:
+    arr = np.empty((SIZE, SIZE, 3), dtype=np.uint8)
+    arr[:] = BG
+    mask = np.zeros((SIZE, SIZE), dtype=bool)
+
+    _brush(mask, scene["reference"], RADIUS)
+
+    for sd in scene["sectors"]:
+        for contour in sd["contours"]:
+            _brush(mask, contour, RADIUS)
+
+    arr[mask] = SEG
+
+    # Grey reference box border.
+    x0, y0, x1, y1 = REF_BOX
+    arr[y0, x0:x1] = GRAY
+    arr[y1 - 1, x0:x1] = GRAY
+    arr[y0:y1, x0] = GRAY
+    arr[y0:y1, x1 - 1] = GRAY
+    # Grey divider lines.
+    arr[GRID_Y, :] = GRAY
+    arr[:, GRID_X] = GRAY
+    arr[GRID_H, :] = GRAY
+    return Image.fromarray(arr, "RGB")
+
+
+def _mask_for_verts(verts: list[tuple[int, int]]) -> np.ndarray | None:
+    mask = np.zeros((SIZE, SIZE), dtype=bool)
+    _brush(mask, verts, RADIUS)
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
+        return None
+    return mask[ys.min(): ys.max() + 1, xs.min(): xs.max() + 1]
+
+
+def _coverage(ref: np.ndarray, other: np.ndarray) -> float:
+    rh, rw = ref.shape
+    oh, ow = other.shape
+    h = min(rh, oh)
+    w = min(rw, ow)
+    ref_total = float(ref.sum())
+    if ref_total == 0:
+        return 0.0
+    inter = float(np.logical_and(ref[:h, :w], other[:h, :w]).sum())
+    return inter / ref_total
+
+
+def _decision(scene: dict) -> tuple[str, float]:
+    ref_mask = _mask_for_verts(scene["reference"])
+    winner = None
+    best_non_target = 0.0
+    for sd in scene["sectors"]:
+        sector = sd["sector"]
+        for contour in sd["contours"]:
+            if _normalize(contour) == _normalize(scene["reference"]):
+                winner = sector
+            else:
+                cm = _mask_for_verts(contour)
+                if cm is not None:
+                    best_non_target = max(best_non_target, _coverage(ref_mask, cm))
+    if winner is None:
+        winner = "TL"
+    return winner, 1.0 - best_non_target
+
+
+def analytic_gold(scene: dict) -> str:
+    sector, _ = _decision(scene)
+    return sector
+
+
+def margin(scene: dict) -> float:
+    _, m = _decision(scene)
+    return m
+
+
+def is_quarantined(scene: dict) -> bool:
+    _, m = _decision(scene)
+    return bool(m < QUARANTINE_THRESH)
+
+
+def latent_symmetries(scene: dict) -> list:
+    return []

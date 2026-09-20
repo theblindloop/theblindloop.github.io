@@ -1,0 +1,165 @@
+"""Independent image-only inverse for dual phase-register concordance."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 768
+HEIGHT = 512
+PANEL_FILL = np.asarray((237, 242, 246), dtype=np.float32)
+PHASE_COUNT = 3
+
+
+class PixelOracleError(ValueError):
+    """The raster does not expose one unique complete replay."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not dy and not dx:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        found.append(np.asarray(points, dtype=np.int32))
+    return found
+
+
+def _recover_panels(array: np.ndarray) -> list[tuple[int, int, int, int]]:
+    distance = np.linalg.norm(array.astype(np.float32) - PANEL_FILL, axis=2)
+    mask = distance <= 14.0
+    candidates: list[tuple[int, int, int, int, int]] = []
+    for points in _components(mask):
+        ys, xs = points[:, 0], points[:, 1]
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        area = len(points)
+        if 220 <= width <= 270 and 380 <= height <= 430 and area >= 30000:
+            candidates.append((x0, y0, width, height, area))
+    if len(candidates) != 2:
+        raise PixelOracleError(f"expected two complete register panels, found {len(candidates)}")
+    candidates.sort(key=lambda item: item[0])
+    if candidates[1][0] - (candidates[0][0] + candidates[0][2]) < 130:
+        raise PixelOracleError("register panels are merged or too close")
+    if max(item[2] for item in candidates) - min(item[2] for item in candidates) > 8:
+        raise PixelOracleError("register panel widths disagree")
+    if max(item[3] for item in candidates) - min(item[3] for item in candidates) > 8:
+        raise PixelOracleError("register panel heights disagree")
+    median_area = float(np.median([item[4] for item in candidates]))
+    if any(abs(item[4] - median_area) / median_area > 0.22 for item in candidates):
+        raise PixelOracleError("one register panel is materially erased")
+    return [(x0, y0, width, height) for x0, y0, width, height, _ in candidates]
+
+
+def _recover_initial(array: np.ndarray, panel: tuple[int, int, int, int]) -> int:
+    x0, y0, width, height = panel
+    # Only accent-colored pixels occur in the start-phase ring. Text, borders,
+    # and operation glyphs are intentionally achromatic.
+    crop = array[y0 : y0 + 128, x0 : x0 + width]
+    spread = crop.astype(np.int16).max(axis=2) - crop.astype(np.int16).min(axis=2)
+    mask = (spread >= 45) & (crop.max(axis=2) >= 120)
+    rings: list[tuple[float, float, int, int]] = []
+    for points in _components(mask):
+        ys, xs = points[:, 0], points[:, 1]
+        box_width = int(xs.max() - xs.min() + 1)
+        box_height = int(ys.max() - ys.min() + 1)
+        if 35 <= box_width <= 75 and 35 <= box_height <= 75 and len(points) >= 80:
+            rings.append((float(xs.mean()), float(ys.mean()), box_width, box_height))
+    if len(rings) != 1:
+        raise PixelOracleError(f"expected one colored start ring, found {len(rings)}")
+    center_x, center_y, box_width, box_height = rings[0]
+    if abs(center_y - 91.0) > 14.0:
+        raise PixelOracleError("start ring is not in the phase row")
+    expected = np.asarray((58.0, 130.0, 202.0), dtype=np.float64)
+    phase = int(np.argmin(np.abs(expected - center_x)))
+    if abs(float(expected[phase]) - center_x) > 24.0:
+        raise PixelOracleError("start phase is unresolved")
+    return phase
+
+
+def _recover_operations(array: np.ndarray, panel: tuple[int, int, int, int]) -> list[str]:
+    x0, y0, width, height = panel
+    operations: list[str] = []
+    for index in range(5):
+        # The crop excludes the card border and its step number, leaving only
+        # the central operation glyph. Its shape is classified from pixels.
+        # The panel-fill bounds begin three pixels inside the drawn panel;
+        # compensate for that inset when locating each card center.
+        center_y = y0 + 167 + index * 49
+        left = x0 + 157
+        right = x0 + 215
+        top = center_y - 14
+        bottom = center_y + 15
+        crop = array[top:bottom, left:right]
+        gray = crop.astype(np.float32).mean(axis=2)
+        mask = gray < 190.0
+        points = np.argwhere(mask)
+        if len(points) < 80:
+            raise PixelOracleError(f"operation {index + 1} is missing")
+        ys, xs = points[:, 0], points[:, 1]
+        box_width = int(xs.max() - xs.min() + 1)
+        box_height = int(ys.max() - ys.min() + 1)
+        if box_width <= 31 and box_height >= 20 and box_height <= 31:
+            operations.append("S")
+            continue
+        if box_width < 28 or box_height > 29:
+            raise PixelOracleError(f"operation {index + 1} shape is ambiguous")
+        expected_center = (x0 + 180) - left
+        offset = float(xs.mean() - expected_center)
+        if offset > 0.8:
+            operations.append("A")
+        elif offset < -0.8:
+            operations.append("R")
+        else:
+            raise PixelOracleError(f"operation {index + 1} direction is ambiguous")
+    return operations
+
+
+def _replay(initial: int, operations: list[str]) -> int:
+    phase = int(initial)
+    for operation in operations:
+        if operation == "A":
+            phase = (phase + 1) % PHASE_COUNT
+        elif operation == "R":
+            phase = (phase - 1) % PHASE_COUNT
+        elif operation == "S":
+            if phase == 1:
+                phase = 2
+            elif phase == 2:
+                phase = 1
+        else:
+            raise PixelOracleError("unknown operation")
+    return phase
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover yes/no from the raster without scene or renderer access."""
+
+    if image.size != (WIDTH, HEIGHT):
+        raise PixelOracleError(f"unexpected raster size {image.size}")
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    panels = _recover_panels(array)
+    finals = []
+    for panel in panels:
+        initial = _recover_initial(array, panel)
+        operations = _recover_operations(array, panel)
+        finals.append(_replay(initial, operations))
+    return "yes" if finals[0] == finals[1] else "no"

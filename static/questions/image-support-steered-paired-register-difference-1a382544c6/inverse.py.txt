@@ -1,0 +1,183 @@
+"""Independent pixel-only inverse for paired-register difference.
+
+This module deliberately duplicates only public raster constants.  It receives
+the final RGB image, segments visible frame and notch fiducials, rotates each
+cropped register into notch-up-left orientation, samples corresponding cells,
+and classifies the resulting difference bitmap.  It never receives a scene or
+imports the renderer, prompts, generator, verifier, or analytic gold.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+TILE_SIDE = 148
+GRID_SIZE = 8
+CELL_SIZE = 12
+INNER_OFFSET = 26
+FRAME_PALETTE = np.asarray(((47, 103, 142), (106, 71, 139), (44, 119, 91)), dtype=float)
+NOTCH_PALETTE = np.asarray(((216, 165, 60), (190, 91, 54)), dtype=float)
+
+TEMPLATES = {
+    "ring": np.asarray(
+        [
+            [0, 0, 1, 1, 1, 1, 0, 0],
+            [0, 1, 1, 0, 0, 1, 1, 0],
+            [1, 1, 0, 0, 0, 0, 1, 1],
+            [1, 1, 0, 0, 0, 0, 1, 1],
+            [1, 1, 0, 0, 0, 0, 1, 1],
+            [1, 1, 0, 0, 0, 0, 1, 1],
+            [0, 1, 1, 0, 0, 1, 1, 0],
+            [0, 0, 1, 1, 1, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    ),
+    "cross": np.asarray(
+        [
+            [1, 0, 0, 1, 1, 0, 0, 1],
+            [0, 0, 0, 1, 1, 0, 0, 0],
+            [0, 0, 0, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [0, 0, 0, 1, 1, 0, 0, 0],
+            [0, 0, 0, 1, 1, 0, 0, 0],
+            [1, 0, 0, 1, 1, 0, 0, 1],
+        ],
+        dtype=np.uint8,
+    ),
+}
+
+
+def _near_palette(array: np.ndarray, palette: np.ndarray, threshold: float) -> np.ndarray:
+    distances = np.linalg.norm(
+        array[..., None, :].astype(float) - palette[None, None, :, :], axis=-1
+    )
+    return np.min(distances, axis=-1) <= threshold
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(points) >= 12:
+            components.append(np.asarray(points, dtype=float))
+    return components
+
+
+def _find_register_crops(array: np.ndarray) -> list[np.ndarray]:
+    frame_mask = _near_palette(array, FRAME_PALETTE, 62.0)
+    candidates = []
+    for component in _components(frame_mask):
+        y0, x0 = component.min(axis=0)
+        y1, x1 = component.max(axis=0)
+        box_w = x1 - x0 + 1.0
+        box_h = y1 - y0 + 1.0
+        # The visible square border has a roughly 139 px core bbox.  A dark
+        # raster block can sit near a frame colour in RGB space, so reject
+        # smaller square cell clusters rather than mistaking them for a tile.
+        if box_w >= 120.0 and box_h >= 120.0 and 0.88 <= box_w / box_h <= 1.12:
+            candidates.append(component)
+    if len(candidates) != 2:
+        raise ValueError("expected two visible register frames")
+    crops: list[np.ndarray] = []
+    for component in sorted(candidates, key=lambda item: (item[:, 1].mean(), item[:, 0].mean())):
+        # Use the geometric bbox center rather than the component centroid:
+        # a frame-colour threshold can also capture a nearby dark cell and
+        # skew the latter by several pixels.
+        y0, x0 = component.min(axis=0)
+        y1, x1 = component.max(axis=0)
+        left = int(round((x0 + x1) / 2.0)) - (TILE_SIDE // 2 - 1)
+        top = int(round((y0 + y1) / 2.0)) - (TILE_SIDE // 2 - 1)
+        if left < 0 or top < 0 or left + TILE_SIDE > array.shape[1] or top + TILE_SIDE > array.shape[0]:
+            raise ValueError("register frame is clipped")
+        crop = array[top : top + TILE_SIDE, left : left + TILE_SIDE].copy()
+        if crop.shape[:2] != (TILE_SIDE, TILE_SIDE):
+            raise ValueError("register crop is incomplete")
+        crops.append(crop)
+    return crops
+
+
+def _notch_corner(crop: np.ndarray) -> str:
+    # Keep the threshold below the nearest soft dark-tone blend; the notch
+    # itself retains a large exact-colour core after downsampling.
+    mask = _near_palette(crop, NOTCH_PALETTE, 65.0)
+    components = _components(mask)
+    if not components:
+        raise ValueError("gold corner notch is missing")
+    component = max(components, key=len)
+    cy, cx = component.mean(axis=0)
+    if len(component) < 18 or not (4.0 < cx < TILE_SIDE - 4.0 and 4.0 < cy < TILE_SIDE - 4.0):
+        raise ValueError("corner notch is not measurable")
+    horizontal = "left" if cx < TILE_SIDE / 2.0 else "right"
+    vertical = "top" if cy < TILE_SIDE / 2.0 else "bottom"
+    return vertical + horizontal
+
+
+def _canonicalize(crop: np.ndarray) -> np.ndarray:
+    corner = _notch_corner(crop)
+    if corner == "topleft":
+        return crop
+    if corner == "topright":
+        return np.rot90(crop, 1)
+    if corner == "bottomleft":
+        return np.rot90(crop, 3)
+    if corner == "bottomright":
+        return np.rot90(crop, 2)
+    raise ValueError("unknown notch corner")
+
+
+def _cell_means(crop: np.ndarray) -> np.ndarray:
+    values = []
+    # The central 6x6 pixels stay away from cell borders and the outer frame.
+    for row in range(GRID_SIZE):
+        for col in range(GRID_SIZE):
+            y0 = INNER_OFFSET + row * CELL_SIZE + 3
+            y1 = INNER_OFFSET + (row + 1) * CELL_SIZE - 3
+            x0 = INNER_OFFSET + col * CELL_SIZE + 3
+            x1 = INNER_OFFSET + (col + 1) * CELL_SIZE - 3
+            patch = crop[y0:y1, x0:x1]
+            if patch.shape[:2] != (6, 6):
+                raise ValueError("cell raster is incomplete")
+            values.append(patch.astype(float).mean(axis=(0, 1)))
+    return np.asarray(values, dtype=float)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the symbol from the final PNG alone."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    crops = _find_register_crops(array)
+    aligned = [_canonicalize(crop) for crop in crops]
+    first = _cell_means(aligned[0])
+    second = _cell_means(aligned[1])
+    differences = np.linalg.norm(first - second, axis=1)
+    observed = (differences >= 28.0).astype(np.uint8).reshape(GRID_SIZE, GRID_SIZE)
+    scores = {
+        name: 1.0 - float(np.mean(np.abs(observed.astype(int) - template.astype(int))))
+        for name, template in TEMPLATES.items()
+    }
+    ranking = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if ranking[0][1] - ranking[1][1] < 0.18:
+        raise ValueError("paired difference template margin is ambiguous")
+    return ranking[0][0]

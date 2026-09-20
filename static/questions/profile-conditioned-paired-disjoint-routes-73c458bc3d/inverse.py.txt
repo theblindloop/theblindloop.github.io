@@ -1,0 +1,219 @@
+"""Independent pixel-only inverse arm for paired disjoint routing.
+
+This module knows only the public raster vocabulary: five junction colors,
+dark orthogonal links, and a 4x4 arrangement.  It recovers junction centroids,
+infers rows and columns, samples every possible inter-junction link, and solves
+the two-path vertex-disjointness predicate on the recovered graph.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_GRID = 4
+_PALETTES = (
+    {
+        "neutral": (174, 181, 192),
+        "green": (25, 158, 92),
+        "purple": (146, 82, 190),
+        "blue": (35, 118, 207),
+        "orange": (232, 128, 31),
+    },
+    {
+        "neutral": (188, 181, 168),
+        "green": (18, 145, 82),
+        "purple": (133, 72, 178),
+        "blue": (25, 105, 192),
+        "orange": (219, 111, 24),
+    },
+)
+
+
+def _components(mask: np.ndarray) -> list[tuple[float, float, int]]:
+    """Return centroids and areas of exact-color cores using 4-connectivity."""
+
+    work = mask.copy()
+    found: list[tuple[float, float, int]] = []
+    height, width = work.shape
+    while work.any():
+        first = np.argwhere(work)[0]
+        start = (int(first[0]), int(first[1]))
+        queue = deque([start])
+        work[start] = False
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            xs.append(x)
+            ys.append(y)
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and work[yy, xx]:
+                    work[yy, xx] = False
+                    queue.append((yy, xx))
+        if len(xs) >= 80:
+            found.append((float(np.mean(xs)), float(np.mean(ys)), len(xs)))
+    return found
+
+
+def _select_palette(arr: np.ndarray) -> dict[str, tuple[int, int, int]]:
+    scores = []
+    for palette in _PALETTES:
+        score = 0
+        for color in palette.values():
+            score += int(np.all(arr == np.asarray(color, dtype=np.uint8), axis=2).sum())
+        scores.append(score)
+    index = int(np.argmax(scores))
+    if scores[index] < 1000:
+        raise ValueError("junction color evidence is absent or badly corrupted")
+    return _PALETTES[index]
+
+
+def _cluster_axis(values: list[float]) -> list[float]:
+    groups: list[list[float]] = []
+    for value in sorted(values):
+        if not groups or value - float(np.mean(groups[-1])) > 30.0:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    if len(groups) != _GRID or any(len(group) != _GRID for group in groups):
+        raise ValueError("the raster does not contain a clean 4x4 junction lattice")
+    centers = [float(np.mean(group)) for group in groups]
+    if min(np.diff(centers)) < 70.0:
+        raise ValueError("junction columns or rows are not safely separated")
+    return centers
+
+
+def _recover_nodes(arr: np.ndarray) -> tuple[dict[int, tuple[float, float]], dict[str, int]]:
+    palette = _select_palette(arr)
+    colored_points: list[tuple[float, float, str]] = []
+    for role, color in palette.items():
+        mask = np.all(arr == np.asarray(color, dtype=np.uint8), axis=2)
+        for cx, cy, _area in _components(mask):
+            colored_points.append((cx, cy, role))
+    if len(colored_points) != _GRID * _GRID:
+        raise ValueError(f"expected 16 visible junctions, recovered {len(colored_points)}")
+
+    x_centers = _cluster_axis([point[0] for point in colored_points])
+    y_centers = _cluster_axis([point[1] for point in colored_points])
+    nodes: dict[int, tuple[float, float]] = {}
+    terminals: dict[str, int] = {}
+    occupied: set[int] = set()
+    for cx, cy, role in colored_points:
+        col = int(np.argmin([abs(cx - value) for value in x_centers]))
+        row = int(np.argmin([abs(cy - value) for value in y_centers]))
+        node = row * _GRID + col
+        if node in occupied:
+            raise ValueError("two color components map to one junction")
+        occupied.add(node)
+        nodes[node] = (cx, cy)
+        if role != "neutral":
+            if role in terminals:
+                raise ValueError(f"terminal color {role} appears more than once")
+            terminals[role] = node
+    if set(terminals) != {"green", "purple", "blue", "orange"}:
+        raise ValueError("all four terminal colors must appear exactly once")
+    return nodes, terminals
+
+
+def _dark_fraction(arr: np.ndarray, left: tuple[float, float], right: tuple[float, float]) -> float:
+    """Measure the protected center strip between two neighboring disks."""
+
+    x1, y1 = left
+    x2, y2 = right
+    dark = np.max(arr, axis=2) < 105
+    inset = 23
+    half_width = 2
+    if abs(y1 - y2) < 8.0:
+        lo = int(round(min(x1, x2))) + inset
+        hi = int(round(max(x1, x2))) - inset
+        mid = int(round((y1 + y2) / 2.0))
+        strip = dark[mid - half_width : mid + half_width + 1, lo:hi]
+    elif abs(x1 - x2) < 8.0:
+        lo = int(round(min(y1, y2))) + inset
+        hi = int(round(max(y1, y2))) - inset
+        mid = int(round((x1 + x2) / 2.0))
+        strip = dark[lo:hi, mid - half_width : mid + half_width + 1]
+    else:
+        raise ValueError("candidate neighbors are not orthogonally aligned")
+    if strip.size < 100:
+        raise ValueError("inter-junction evidence strip is unexpectedly small")
+    return float(strip.mean())
+
+
+def _recover_edges(arr: np.ndarray, nodes: dict[int, tuple[float, float]]) -> list[tuple[int, int]]:
+    edges: list[tuple[int, int]] = []
+    for row in range(_GRID):
+        for col in range(_GRID):
+            node = row * _GRID + col
+            if col + 1 < _GRID:
+                right = node + 1
+                fraction = _dark_fraction(arr, nodes[node], nodes[right])
+                if 0.25 < fraction < 0.75:
+                    raise ValueError("horizontal link evidence is ambiguous")
+                if fraction >= 0.75:
+                    edges.append((node, right))
+            if row + 1 < _GRID:
+                below = node + _GRID
+                fraction = _dark_fraction(arr, nodes[node], nodes[below])
+                if 0.25 < fraction < 0.75:
+                    raise ValueError("vertical link evidence is ambiguous")
+                if fraction >= 0.75:
+                    edges.append((node, below))
+    if len(edges) < 10 or len(edges) > 22:
+        raise ValueError(f"recovered implausible link count {len(edges)}")
+    return edges
+
+
+def _can_connect(adjacency: list[set[int]], start: int, goal: int, blocked: set[int]) -> bool:
+    if start in blocked or goal in blocked:
+        return False
+    pending = [start]
+    visited = {start}
+    for node in pending:
+        if node == goal:
+            return True
+        for neighbor in adjacency[node]:
+            if neighbor not in blocked and neighbor not in visited:
+                visited.add(neighbor)
+                pending.append(neighbor)
+    return False
+
+
+def _solve(edges: list[tuple[int, int]], terminals: dict[str, int]) -> bool:
+    adjacency = [set() for _ in range(_GRID * _GRID)]
+    for left, right in edges:
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+    start = terminals["green"]
+    goal = terminals["purple"]
+    blue = terminals["blue"]
+    orange = terminals["orange"]
+    reserved = {blue, orange}
+
+    stack: list[tuple[int, tuple[int, ...]]] = [(start, (start,))]
+    while stack:
+        node, path = stack.pop()
+        if node == goal:
+            if _can_connect(adjacency, blue, orange, set(path)):
+                return True
+            continue
+        used = set(path)
+        for neighbor in adjacency[node]:
+            if neighbor not in used and neighbor not in reserved:
+                stack.append((neighbor, path + (neighbor,)))
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the yes/no decision from RGB pixels and no latent state."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 300 or arr.shape[1] < 300:
+        raise ValueError("image is too small for this public question world")
+    nodes, terminals = _recover_nodes(arr)
+    edges = _recover_edges(arr, nodes)
+    return "yes" if _solve(edges, terminals) else "no"

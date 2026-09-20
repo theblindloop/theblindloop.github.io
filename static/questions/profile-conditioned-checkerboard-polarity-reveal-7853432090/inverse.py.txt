@@ -1,0 +1,127 @@
+"""Independent pixel-only inverse for the checkerboard reveal."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+SYMBOLS = ("arch", "fork", "knot", "stair")
+BASE_LEVEL = 128.0
+BLUR_RADIUS = 3
+
+
+def _segments(symbol: str) -> tuple[tuple[tuple[float, float], tuple[float, float]], ...]:
+    if symbol == "arch":
+        points = ((0.25, 0.72), (0.28, 0.56), (0.37, 0.43), (0.50, 0.38),
+                  (0.63, 0.43), (0.72, 0.56), (0.75, 0.72))
+        return tuple(zip(points[:-1], points[1:]))
+    if symbol == "fork":
+        return (
+            ((0.50, 0.74), (0.50, 0.46)),
+            ((0.50, 0.47), (0.30, 0.28)),
+            ((0.50, 0.47), (0.70, 0.28)),
+        )
+    if symbol == "knot":
+        return (
+            ((0.33, 0.33), (0.67, 0.67)),
+            ((0.67, 0.33), (0.33, 0.67)),
+        )
+    if symbol == "stair":
+        points = ((0.27, 0.72), (0.27, 0.58), (0.43, 0.58), (0.43, 0.43),
+                  (0.59, 0.43), (0.59, 0.28), (0.75, 0.28))
+        return tuple(zip(points[:-1], points[1:]))
+    raise ValueError(symbol)
+
+
+def _colored_components(mask: np.ndarray) -> list[tuple[float, float]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    centers: list[tuple[float, float]] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= 20:
+            values = np.asarray(points, dtype=np.float64)
+            centers.append((float(values[:, 1].mean()), float(values[:, 0].mean())))
+    return centers
+
+
+def _crop_tile(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    saturation = arr.max(axis=2).astype(np.int16) - arr.min(axis=2).astype(np.int16)
+    centers = _colored_components(saturation > 55)
+    if len(centers) != 4:
+        raise ValueError(f"expected four corner fiducials, found {len(centers)}")
+    xs = [point[0] for point in centers]
+    ys = [point[1] for point in centers]
+    x0 = int(round(min(xs) + 10.0))
+    y0 = int(round(min(ys) + 10.0))
+    x1 = int(round(max(xs) - 9.0))
+    y1 = int(round(max(ys) - 9.0))
+    if x1 - x0 != y1 - y0 or not (120 <= x1 - x0 <= 190):
+        raise ValueError(f"fiducials do not bracket one square: {(x0, y0, x1, y1)}")
+    return arr[y0:y1, x0:x1, 0].astype(np.float32)
+
+
+def _box_mean(data: np.ndarray) -> np.ndarray:
+    radius = BLUR_RADIUS
+    padded = np.pad(data, ((radius, radius), (radius, radius)), mode="edge")
+    result = np.zeros_like(data, dtype=np.float32)
+    for dy in range(2 * radius + 1):
+        for dx in range(2 * radius + 1):
+            result += padded[dy : dy + data.shape[0], dx : dx + data.shape[1]]
+    return result / float((2 * radius + 1) ** 2)
+
+
+def _mask(symbol: str, size: int) -> np.ndarray:
+    yy, xx = np.indices((size, size), dtype=np.float32)
+    nx, ny = xx / float(size - 1), yy / float(size - 1)
+    best = np.full((size, size), np.inf, dtype=np.float32)
+    for (x1, y1), (x2, y2) in _segments(symbol):
+        vx, vy = x2 - x1, y2 - y1
+        denom = vx * vx + vy * vy
+        t = np.clip(((nx - x1) * vx + (ny - y1) * vy) / denom, 0.0, 1.0)
+        dx = nx - (x1 + t * vx)
+        dy = ny - (y1 + t * vy)
+        best = np.minimum(best, dx * dx + dy * dy)
+    return (best <= 0.026**2).astype(np.float32)
+
+
+def _fit_score(observed: np.ndarray, template: np.ndarray) -> float:
+    observed_flat = observed.reshape(-1)
+    template_flat = template.reshape(-1)
+    observed_centered = observed_flat - float(observed_flat.mean())
+    template_centered = template_flat - float(template_flat.mean())
+    denominator = float(np.dot(template_centered, template_centered))
+    if denominator <= 1e-9:
+        return float("-inf")
+    slope = float(np.dot(template_centered, observed_centered)) / denominator
+    residual = observed_centered - slope * template_centered
+    return -float(np.mean(residual * residual))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Find fiducials, undo the alternating polarity, average, and classify."""
+    tile = _crop_tile(image)
+    yy, xx = np.indices(tile.shape, dtype=np.int16)
+    first_sign = 1.0 if float(tile[0, 0]) >= BASE_LEVEL else -1.0
+    parity = np.where((xx + yy) % 2 == 0, first_sign, -first_sign)
+    demodulated = BASE_LEVEL + (tile - BASE_LEVEL) * parity
+    smoothed = _box_mean(demodulated)
+    scores = {
+        symbol: _fit_score(smoothed, _box_mean(_mask(symbol, tile.shape[0])))
+        for symbol in SYMBOLS
+    }
+    return max(scores, key=scores.get)

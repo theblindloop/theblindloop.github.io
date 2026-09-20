@@ -1,0 +1,316 @@
+"""Latent scene sampling, rendering, analytic gold and margin for wall_hop_nearest.
+
+The world draws a family of closed black rings that never touch or cross, so the
+rings form a nesting forest, and four coloured dots painted in white areas.  The
+cost of travelling between two dots is the smallest number of rings a journey
+must step over, which for non-crossing closed curves equals the size of the
+symmetric difference of the two sets of enclosing rings.  Gold ranks the three
+candidate dots by that cost.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS = (720, 560)
+BACKGROUND = "#ffffff"
+INK_COLOR = "#101010"
+INK_WIDTH = 5
+DOT_RADIUS = 9
+SUPERSAMPLE = 3
+BORDER_CLEAR = 16.0
+RING_GAP = 12.0
+DOT_CLEAR = 7.0
+TANGENT_CLEAR = 9.0
+DOT_SEPARATION = 46.0
+RANK_UNIT = 12.0
+QUARANTINE_MARGIN = 6.0
+CANDIDATE_COLORS = ("red", "blue", "orange")
+DOT_RGB = {
+    "green": (23, 146, 43),
+    "red": (216, 27, 27),
+    "blue": (31, 79, 216),
+    "orange": (229, 138, 0),
+}
+
+
+def _r4(value: float) -> float:
+    return round(float(value), 4)
+
+
+def _ring_gap(a: dict, b: dict) -> float:
+    """Signed white gap between two ring strokes; negative when they interfere."""
+
+    d = math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"])
+    half = INK_WIDTH / 2.0
+    nested = abs(a["r"] - b["r"]) - d - INK_WIDTH
+    apart = d - a["r"] - b["r"] - INK_WIDTH
+    if d < abs(a["r"] - b["r"]):
+        return nested
+    if d > a["r"] + b["r"]:
+        return apart
+    return -abs(half)
+
+
+def _dot_ring_clear(dot: dict, ring: dict) -> float:
+    d = math.hypot(dot["x"] - ring["cx"], dot["y"] - ring["cy"])
+    return abs(d - ring["r"]) - INK_WIDTH / 2.0 - DOT_RADIUS
+
+
+def _tangent_clear(dot: dict, ring: dict) -> float:
+    """Clearance of the four axis rays from grazing a ring tangentially."""
+
+    dx = abs(dot["x"] - ring["cx"])
+    dy = abs(dot["y"] - ring["cy"])
+    return min(abs(dy - ring["r"]), abs(dx - ring["r"])) - INK_WIDTH / 2.0
+
+
+def _enclosing(rings: list[dict], x: float, y: float) -> frozenset[int]:
+    return frozenset(
+        index
+        for index, ring in enumerate(rings)
+        if math.hypot(x - ring["cx"], y - ring["cy"]) < ring["r"]
+    )
+
+
+def _sample_rings(rng: random.Random) -> list[dict] | None:
+    width, height = CANVAS
+    rings: list[dict] = []
+
+    def fits(candidate: dict) -> bool:
+        if candidate["cx"] - candidate["r"] < BORDER_CLEAR:
+            return False
+        if candidate["cy"] - candidate["r"] < BORDER_CLEAR:
+            return False
+        if candidate["cx"] + candidate["r"] > width - BORDER_CLEAR:
+            return False
+        if candidate["cy"] + candidate["r"] > height - BORDER_CLEAR:
+            return False
+        return all(_ring_gap(candidate, other) >= RING_GAP for other in rings)
+
+    for _ in range(rng.choice([2, 2, 3])):
+        for _attempt in range(120):
+            radius = rng.uniform(92.0, 168.0)
+            candidate = {
+                "cx": rng.uniform(BORDER_CLEAR + radius, width - BORDER_CLEAR - radius),
+                "cy": rng.uniform(BORDER_CLEAR + radius, height - BORDER_CLEAR - radius),
+                "r": radius,
+            }
+            if fits(candidate):
+                rings.append(candidate)
+                break
+    if len(rings) < 2:
+        return None
+
+    frontier = [(index, 1) for index in range(len(rings))]
+    while frontier:
+        parent_index, depth = frontier.pop(0)
+        if depth >= 3:
+            continue
+        parent = rings[parent_index]
+        for _child in range(rng.choice([0, 1, 1, 2, 2, 3])):
+            for _attempt in range(90):
+                radius = parent["r"] * rng.uniform(0.24, 0.46)
+                if radius < 27.0:
+                    continue
+                span = parent["r"] - radius - RING_GAP - INK_WIDTH
+                if span <= 4.0:
+                    continue
+                angle = rng.uniform(0.0, 2.0 * math.pi)
+                reach = span * math.sqrt(rng.random())
+                candidate = {
+                    "cx": parent["cx"] + reach * math.cos(angle),
+                    "cy": parent["cy"] + reach * math.sin(angle),
+                    "r": radius,
+                }
+                if fits(candidate):
+                    rings.append(candidate)
+                    frontier.append((len(rings) - 1, depth + 1))
+                    break
+    return rings
+
+
+def _sample_points(rng: random.Random, rings: list[dict]) -> dict[frozenset[int], list[dict]]:
+    width, height = CANVAS
+    rooms: dict[frozenset[int], list[dict]] = {}
+    for _ in range(900):
+        point = {
+            "x": rng.uniform(BORDER_CLEAR + DOT_RADIUS, width - BORDER_CLEAR - DOT_RADIUS),
+            "y": rng.uniform(BORDER_CLEAR + DOT_RADIUS, height - BORDER_CLEAR - DOT_RADIUS),
+        }
+        ok = True
+        for ring in rings:
+            if _dot_ring_clear(point, ring) < DOT_CLEAR:
+                ok = False
+                break
+            if _tangent_clear(point, ring) < TANGENT_CLEAR:
+                ok = False
+                break
+        if not ok:
+            continue
+        rooms.setdefault(_enclosing(rings, point["x"], point["y"]), []).append(point)
+    return rooms
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one deterministic latent scene."""
+
+    rng = random.Random(int(seed) * 7919 + 13)
+    want_nearest = rng.random() < (1.0 / 3.0)
+    want_depth_trap = rng.random() < 0.6
+    for geometry_attempt in range(60):
+        relaxed = geometry_attempt >= 45
+        rings = _sample_rings(rng)
+        if rings is None:
+            continue
+        rooms = _sample_points(rng, rings)
+        keys = sorted(rooms, key=lambda room: (len(room), sorted(room)))
+        if len(keys) < 4:
+            continue
+        for _choice in range(600):
+            picked = rng.sample(keys, 4)
+            green_room, *cand_rooms = picked
+            costs = [len(green_room ^ room) for room in cand_rooms]
+            if len(set(costs)) != 3 or min(costs) < 1:
+                continue
+            order = sorted(range(3), key=lambda slot: costs[slot])
+            winner = order[0]
+            if not relaxed:
+                depths = [len(room) for room in cand_rooms]
+                trap = any(
+                    depths[slot] < depths[winner] for slot in range(3) if slot != winner
+                )
+                if trap != want_depth_trap:
+                    continue
+            green = rng.choice(rooms[green_room])
+            slots = [rng.choice(rooms[room]) for room in cand_rooms]
+            if any(
+                math.hypot(a["x"] - b["x"], a["y"] - b["y"]) < DOT_SEPARATION
+                for i, a in enumerate([green] + slots)
+                for b in ([green] + slots)[i + 1 :]
+            ):
+                continue
+            reach = [math.hypot(green["x"] - p["x"], green["y"] - p["y"]) for p in slots]
+            nearest = min(range(3), key=lambda slot: reach[slot])
+            if not relaxed and (nearest == winner) != want_nearest:
+                continue
+            palette = list(CANDIDATE_COLORS)
+            rng.shuffle(palette)
+            dots = [{"color": "green", "x": _r4(green["x"]), "y": _r4(green["y"])}]
+            for slot in range(3):
+                dots.append(
+                    {
+                        "color": palette[slot],
+                        "x": _r4(slots[slot]["x"]),
+                        "y": _r4(slots[slot]["y"]),
+                    }
+                )
+            rng.shuffle(dots)
+            return {
+                "canvas": list(CANVAS),
+                "background": BACKGROUND,
+                "ink_color": INK_COLOR,
+                "ink_width": INK_WIDTH,
+                "dot_radius": DOT_RADIUS,
+                "supersample": SUPERSAMPLE,
+                "rings": [
+                    {"cx": _r4(ring["cx"]), "cy": _r4(ring["cy"]), "r": _r4(ring["r"])}
+                    for ring in rings
+                ],
+                "dots": dots,
+            }
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    """Render the latent scene to RGB pixels."""
+
+    width, height = (int(scene["canvas"][0]), int(scene["canvas"][1]))
+    scale = int(scene["supersample"])
+    image = Image.new("RGB", (width * scale, height * scale), scene["background"])
+    draw = ImageDraw.Draw(image)
+    for ring in scene["rings"]:
+        cx, cy, r = float(ring["cx"]), float(ring["cy"]), float(ring["r"])
+        draw.ellipse(
+            [
+                (cx - r) * scale,
+                (cy - r) * scale,
+                (cx + r) * scale,
+                (cy + r) * scale,
+            ],
+            outline=scene["ink_color"],
+            width=int(scene["ink_width"]) * scale,
+        )
+    radius = float(scene["dot_radius"])
+    for dot in scene["dots"]:
+        x, y = float(dot["x"]), float(dot["y"])
+        draw.ellipse(
+            [
+                (x - radius) * scale,
+                (y - radius) * scale,
+                (x + radius) * scale,
+                (y + radius) * scale,
+            ],
+            fill=DOT_RGB[dot["color"]],
+        )
+    return image.resize((width, height), Image.LANCZOS).convert("RGB")
+
+
+def _costs(scene: dict) -> dict[str, int]:
+    rings = scene["rings"]
+    by_color = {dot["color"]: dot for dot in scene["dots"]}
+    green = by_color["green"]
+    green_set = _enclosing(rings, float(green["x"]), float(green["y"]))
+    costs = {}
+    for color in CANDIDATE_COLORS:
+        dot = by_color[color]
+        other = _enclosing(rings, float(dot["x"]), float(dot["y"]))
+        costs[color] = len(green_set ^ other)
+    return costs
+
+
+def analytic_gold(scene: dict) -> str:
+    """Candidate colours ordered by increasing ring-crossing cost from green."""
+
+    costs = _costs(scene)
+    return "|".join(sorted(CANDIDATE_COLORS, key=lambda color: (costs[color], color)))
+
+
+def margin(scene: dict) -> float:
+    """Min-composition of the rank gap and every decisive white clearance, in px."""
+
+    costs = sorted(_costs(scene).values())
+    rank_gap = min(costs[1] - costs[0], costs[2] - costs[1])
+    values = [RANK_UNIT * float(rank_gap)]
+    rings = scene["rings"]
+    for index, ring in enumerate(rings):
+        for other in rings[index + 1 :]:
+            values.append(_ring_gap(ring, other))
+    for dot in scene["dots"]:
+        for ring in rings:
+            values.append(_dot_ring_clear(dot, ring))
+            values.append(_tangent_clear(dot, ring))
+    return round(float(min(values)), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabelings of the bookkeeping order of rings and dots."""
+
+    reversed_rings = dict(scene)
+    reversed_rings["rings"] = list(reversed(scene["rings"]))
+    rotated_rings = dict(scene)
+    rotated_rings["rings"] = list(scene["rings"][1:]) + list(scene["rings"][:1])
+    rotated_dots = dict(scene)
+    rotated_dots["dots"] = list(scene["dots"][1:]) + list(scene["dots"][:1])
+    return [
+        ("reversed_ring_order", reversed_rings),
+        ("rotated_ring_order", rotated_rings),
+        ("rotated_dot_order", rotated_dots),
+    ]

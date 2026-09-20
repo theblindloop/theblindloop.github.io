@@ -1,0 +1,214 @@
+"""Pixel-only inverse arm for the fold-net opposite-face world.
+
+Input is the rendered PNG and the public question contract only. No renderer,
+prompt, generator, verifier or analytic-gold code is imported and no latent
+scene data is accepted. The arm segments the large square tiles, groups the six
+that are joined edge to edge into the net, folds that net into a cube by rolling
+a die across its squares, and only then reads the colour of the face opposite
+the dotted one. It abstains by raising when the picture does not satisfy the
+contract.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "foldnet_face_opposite_bind-oracle-0.1.0"
+
+# Colour names and the dot marker are part of the public question contract.
+NAMED_COLOURS = {
+    "red": (198, 42, 38),
+    "orange": (226, 124, 20),
+    "yellow": (222, 196, 32),
+    "green": (46, 140, 58),
+    "blue": (38, 86, 190),
+    "purple": (126, 52, 166),
+}
+MARK_RGB = (250, 250, 252)
+
+MIN_TILE_AREA = 500  # large tiles vs. the much smaller decorative squares
+_DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+
+class Abstain(Exception):
+    """Raised when the picture does not present a readable fold-net scene."""
+
+
+def _components(mask: np.ndarray) -> list:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        pixels = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy, dx in _DIRS:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        out.append(pixels)
+    return out
+
+
+def _tiles(array: np.ndarray) -> list:
+    """Large, solid, square colour patches, in one common size.
+
+    A large colour patch that is not a solid square is clutter rather than a
+    tile, and so is a solid square of the wrong size. Both are dropped instead
+    of forcing an abstention, so that damage far from the net never decides the
+    answer; damage to the net itself still removes one of its squares and is
+    caught downstream.
+    """
+    found = []
+    for name, rgb in NAMED_COLOURS.items():
+        mask = np.all(array == np.array(rgb, dtype=np.uint8), axis=-1)
+        if not mask.any():
+            continue
+        for pixels in _components(mask):
+            if len(pixels) < MIN_TILE_AREA:
+                continue
+            ys = [p[0] for p in pixels]
+            xs = [p[1] for p in pixels]
+            y0, y1 = min(ys), max(ys)
+            x0, x1 = min(xs), max(xs)
+            height = y1 - y0 + 1
+            width = x1 - x0 + 1
+            if abs(height - width) > 1:
+                continue
+            if len(pixels) < 0.72 * height * width:
+                continue
+            found.append({"x": x0, "y": y0, "size": max(height, width), "colour": name})
+
+    if len(found) < 6:
+        raise Abstain("fewer than six large square tiles are visible")
+    counts: dict = {}
+    for tile in found:
+        counts[tile["size"]] = counts.get(tile["size"], 0) + 1
+    size = max(sorted(counts), key=lambda value: counts[value])
+    tiles = [tile for tile in found if abs(tile["size"] - size) <= 1]
+    if len(tiles) < 6:
+        raise Abstain("fewer than six large square tiles share one size")
+    return sorted(tiles, key=lambda tile: (tile["y"], tile["x"]))
+
+
+def _net_group(tiles: list, size: int) -> list:
+    parent = list(range(len(tiles)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, left in enumerate(tiles):
+        for j in range(i + 1, len(tiles)):
+            right = tiles[j]
+            dx = right["x"] - left["x"]
+            dy = right["y"] - left["y"]
+            joined = (abs(dx) == size and dy == 0) or (abs(dy) == size and dx == 0)
+            if joined:
+                a, b = find(i), find(j)
+                if a != b:
+                    parent[a] = b
+
+    groups: dict = {}
+    for index in range(len(tiles)):
+        groups.setdefault(find(index), []).append(index)
+    big = [members for members in groups.values() if len(members) > 1]
+    if len(big) != 1 or len(big[0]) != 6:
+        raise Abstain("there is not exactly one connected piece of six tiles")
+    return [tiles[index] for index in big[0]]
+
+
+def _roll(state: dict, dr: int, dc: int) -> dict:
+    new = dict(state)
+    if (dr, dc) == (-1, 0):
+        new["bottom"], new["north"], new["top"], new["south"] = (
+            state["north"], state["top"], state["south"], state["bottom"],
+        )
+    elif (dr, dc) == (1, 0):
+        new["bottom"], new["south"], new["top"], new["north"] = (
+            state["south"], state["top"], state["north"], state["bottom"],
+        )
+    elif (dr, dc) == (0, 1):
+        new["bottom"], new["east"], new["top"], new["west"] = (
+            state["east"], state["top"], state["west"], state["bottom"],
+        )
+    else:
+        new["bottom"], new["west"], new["top"], new["east"] = (
+            state["west"], state["top"], state["east"], state["bottom"],
+        )
+    return new
+
+
+def _fold(cells: set) -> dict:
+    start = min(cells)
+    seen = {start: {"bottom": 0, "top": 1, "north": 2, "south": 3, "east": 4, "west": 5}}
+    faces = {start: 0}
+    queue = deque([start])
+    while queue:
+        cell = queue.popleft()
+        state = seen[cell]
+        for dr, dc in _DIRS:
+            nxt = (cell[0] + dr, cell[1] + dc)
+            if nxt not in cells:
+                continue
+            rolled = _roll(state, dr, dc)
+            if nxt in seen:
+                if seen[nxt]["bottom"] != rolled["bottom"]:
+                    raise Abstain("the six squares do not fold into a cube")
+                continue
+            seen[nxt] = rolled
+            faces[nxt] = rolled["bottom"]
+            queue.append(nxt)
+    if len(faces) != 6 or len(set(faces.values())) != 6:
+        raise Abstain("the six squares do not fold into a cube")
+    return faces
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tiles = _tiles(array)
+    counts: dict = {}
+    for tile in tiles:
+        counts[tile["size"]] = counts.get(tile["size"], 0) + 1
+    size = max(sorted(counts), key=lambda value: counts[value])
+    net = _net_group(tiles, size)
+
+    x0 = min(tile["x"] for tile in net)
+    y0 = min(tile["y"] for tile in net)
+    grid = {}
+    for tile in net:
+        dx = tile["x"] - x0
+        dy = tile["y"] - y0
+        if dx % size or dy % size:
+            raise Abstain("the joined squares do not sit on one lattice")
+        grid[(dy // size, dx // size)] = tile
+    if len(grid) != 6:
+        raise Abstain("two joined squares share a lattice slot")
+
+    dots = np.all(array == np.array(MARK_RGB, dtype=np.uint8), axis=-1)
+    marked = []
+    for cell, tile in grid.items():
+        patch = dots[tile["y"] : tile["y"] + size, tile["x"] : tile["x"] + size]
+        if int(patch.sum()) >= 20:
+            marked.append(cell)
+    if int(dots.sum()) == 0 or len(marked) != 1:
+        raise Abstain("the dotted face is missing or not unique")
+
+    faces = _fold(set(grid))
+    wanted = faces[marked[0]] ^ 1
+    for cell, face in faces.items():
+        if face == wanted:
+            return grid[cell]["colour"]
+    raise Abstain("no face is opposite the dotted face")

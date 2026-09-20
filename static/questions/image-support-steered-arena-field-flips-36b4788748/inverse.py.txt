@@ -1,0 +1,120 @@
+"""Independent pixel-only inverse arm for arena_field_flips.
+
+Receives only the final RGB image. Reads the single connected arena outline
+colour (initial state), counts the red toggle dots located on the arena
+interior, and returns the final tracked state. It must never import the
+renderer, prompts, generator, verifier, or any analytic-gold/scene code.
+
+When the arena is damaged by evidence erasure (an interior hole), or when the
+initial-state outline cannot be read, the oracle abstains by raising.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ARENA = np.array([125, 125, 140])
+BG = np.array([255, 255, 255])
+TOGGLE = np.array([210, 40, 50])
+OUT_OFF = np.array([40, 80, 220])
+OUT_ON = np.array([235, 150, 30])
+
+SHRINK = 26
+DS = 4  # downsampling factor for red-component and hole analysis
+
+
+def _near(pixel: np.ndarray, target: np.ndarray, tol: int = 60) -> bool:
+    return bool(np.abs(pixel.astype(int) - target.astype(int)).sum() <= tol)
+
+
+def _components(mask2d: np.ndarray) -> int:
+    hs, ws = mask2d.shape
+    visited = np.zeros_like(mask2d, dtype=bool)
+    count = 0
+    for py in range(hs):
+        for px in range(ws):
+            if not mask2d[py, px] or visited[py, px]:
+                continue
+            count += 1
+            stack = [(py, px)]
+            visited[py, px] = True
+            while stack:
+                cy, cx = stack.pop()
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < hs and 0 <= nx < ws and mask2d[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+    return count
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    h, w = arr.shape[:2]
+
+    dist_to_white = np.abs(arr - BG).sum(axis=2)
+    white = dist_to_white <= 60
+    dist_to_arena = np.abs(arr - ARENA).sum(axis=2)
+    arena = dist_to_arena <= 90
+    dist_to_toggle = np.abs(arr - TOGGLE).sum(axis=2)
+    red = dist_to_toggle <= 90
+
+    # Enclosed interior white hole => the connected arena is damaged (abstain).
+    bh, bw = 64, 64
+    block = white[: bh * (h // bh), : bw * (w // bh)].reshape(bh, h // bh, bw, w // bw).any(axis=(1, 3))
+    visited = np.zeros_like(block, dtype=bool)
+    stack = []
+    for gy in range(bh):
+        for gx in range(bw):
+            if gy in (0, bh - 1) or gx in (0, bw - 1):
+                if block[gy, gx] and not visited[gy, gx]:
+                    visited[gy, gx] = True
+                    stack.append((gy, gx))
+    while stack:
+        cy, cx = stack.pop()
+        for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+            if 0 <= ny < bh and 0 <= nx < bw and block[ny, nx] and not visited[ny, nx]:
+                visited[ny, nx] = True
+                stack.append((ny, nx))
+    enclosed = (block & ~visited).any()
+    if enclosed:
+        raise ValueError("abstain: connected arena is damaged by evidence erasure")
+
+    ys, xs = np.nonzero(arena)
+    if len(xs) < 400:
+        raise ValueError("abstain: no arena present")
+    bx0, bx1 = int(xs.min()), int(xs.max())
+    by0, by1 = int(ys.min()), int(ys.max())
+
+    # Read initial state from the perimeter outline colour (distributed read).
+    samples = []
+    for t in np.linspace(0.15, 0.85, 7):
+        x = int(bx0 + (bx1 - bx0) * t)
+        if 0 <= x < w and 0 <= by0 - 5 < h:
+            samples.append(arr[by0 - 5, x])
+        if 0 <= x < w and 0 <= by1 + 5 < h:
+            samples.append(arr[by1 + 5, x])
+        y = int(by0 + (by1 - by0) * t)
+        if 0 <= y < h and 0 <= bx0 - 5 < w:
+            samples.append(arr[y, bx0 - 5])
+        if 0 <= y < h and 0 <= bx1 + 5 < w:
+            samples.append(arr[y, bx1 + 5])
+    on = sum(bool(_near(p, OUT_ON, 120)) for p in samples)
+    off = sum(bool(_near(p, OUT_OFF, 120)) for p in samples)
+    if on == 0 and off == 0:
+        raise ValueError("abstain: initial-state outline is unreadable")
+    s0 = 1 if on > off else (0 if off > on else 1 if samples and _near(samples[0], OUT_ON, 120) else 0)
+
+    # Count red toggle dots on the arena interior (decoys lie outside it).
+    ix0, iy0 = max(0, bx0 + SHRINK), max(0, by0 + SHRINK)
+    ix1, iy1 = min(w, bx1 - SHRINK), min(h, by1 - SHRINK)
+    interior_red = np.zeros_like(red)
+    if ix0 < ix1 and iy0 < iy1:
+        interior_red[iy0:iy1, ix0:ix1] = red[iy0:iy1, ix0:ix1]
+    dr = interior_red[: (h // DS) * DS, : (w // DS) * DS].reshape(
+        h // DS, DS, w // DS, DS
+    ).any(axis=(1, 3))
+    r_count = _components(dr)
+
+    final = (s0 + (r_count % 2)) % 2
+    return "yes" if final == 1 else "no"

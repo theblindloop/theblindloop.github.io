@@ -1,0 +1,402 @@
+"""Scene sampling, RGB rendering, analytic gold and margins for loop_shortcut_dot.
+
+A single closed grey loop is drawn as a simple star-shaped polygon.  Four dots
+sit on the loop: a green dot, a red dot, and one blue and one orange dot, with
+exactly one of the two coloured dots on each of the two ways round the loop
+between green and red.  The decision is which coloured dot lies on the shorter
+of the two ways, where "shorter" is measured along the drawn loop.
+
+The mechanism is metric route selection on a cycle: connectivity alone is not
+enough, because both ways round join green to red.  Sampling decorrelates the
+answer from two cheap cues -- the coloured dot nearer to green in straight-line
+picture distance, and the coloured dot lying on the way round with fewer
+corners -- each of which agrees with the answer in about half of all scenes.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "loop_shortcut_dot-renderer-0.1.0"
+
+CANVAS = 640
+SUPERSAMPLE = 2
+CENTER = (320.0, 320.0)
+R_MIN = 96.0
+R_MAX = 262.0
+MIN_ANGLE_GAP_DEG = 23.0
+MIN_INTERIOR_ANGLE_DEG = 72.0
+MIN_EDGE_CLEARANCE = 34.0
+
+STROKE = 7
+DOT_RADIUS = 9
+
+BACKGROUND = (255, 255, 255)
+LOOP = (95, 95, 95)
+DOT_COLORS = {
+    "green": (25, 160, 60),
+    "red": (215, 40, 40),
+    "blue": (35, 95, 225),
+    "orange": (245, 140, 20),
+}
+DRAW_ORDER = ("blue", "orange", "green", "red")
+CHOICE_COLORS = ("blue", "orange")
+
+MIN_VERTEX_ARC_CLEARANCE = 45.0
+MIN_DOT_ARC_SEPARATION = 90.0
+MIN_ARC_FRACTION = 0.16
+QUARANTINE_MARGIN = 100.0
+CLEAR_MARGIN = 130.0
+NEAR_BOUNDARY_MARGIN_RANGE = (55.0, 92.0)
+
+
+# --------------------------------------------------------------------------
+# polygon geometry helpers (pure functions of the scene record)
+# --------------------------------------------------------------------------
+def _vertices(scene: dict) -> list[tuple[float, float]]:
+    return [(float(x), float(y)) for x, y in scene["vertices"]]
+
+
+def _edge_table(verts: list[tuple[float, float]]) -> tuple[list[float], float]:
+    """Cumulative arc length at each vertex plus the total perimeter."""
+    cum = [0.0]
+    n = len(verts)
+    for i in range(n):
+        a, b = verts[i], verts[(i + 1) % n]
+        cum.append(cum[-1] + math.dist(a, b))
+    return cum, cum[-1]
+
+
+def _point_at(verts: list[tuple[float, float]], cum: list[float], t: float) -> tuple[float, float]:
+    total = cum[-1]
+    t = t % total
+    n = len(verts)
+    for i in range(n):
+        if cum[i] <= t <= cum[i + 1]:
+            a, b = verts[i], verts[(i + 1) % n]
+            seg = cum[i + 1] - cum[i]
+            f = 0.0 if seg <= 0 else (t - cum[i]) / seg
+            return (a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1]))
+    return verts[0]
+
+
+def _forward_gap(t_from: float, t_to: float, total: float) -> float:
+    return (t_to - t_from) % total
+
+
+def _arc_lengths(scene: dict) -> tuple[float, float]:
+    """(length of the way green->red that runs in increasing t, the other way)."""
+    verts = _vertices(scene)
+    _, total = _edge_table(verts)
+    m = scene["markers"]
+    forward = _forward_gap(float(m["green"]), float(m["red"]), total)
+    return forward, total - forward
+
+
+def _on_forward_arc(scene: dict, name: str) -> bool:
+    verts = _vertices(scene)
+    _, total = _edge_table(verts)
+    m = scene["markers"]
+    forward = _forward_gap(float(m["green"]), float(m["red"]), total)
+    return _forward_gap(float(m["green"]), float(m[name]), total) < forward
+
+
+def _seg_point_distance(p, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    vx, vy = bx - ax, by - ay
+    denom = vx * vx + vy * vy
+    if denom <= 1e-9:
+        return math.dist(p, a)
+    f = ((px - ax) * vx + (py - ay) * vy) / denom
+    f = max(0.0, min(1.0, f))
+    return math.dist(p, (ax + f * vx, ay + f * vy))
+
+
+def _seg_seg_distance(a1, a2, b1, b2) -> float:
+    return min(
+        _seg_point_distance(a1, b1, b2),
+        _seg_point_distance(a2, b1, b2),
+        _seg_point_distance(b1, a1, a2),
+        _seg_point_distance(b2, a1, a2),
+    )
+
+
+def _min_nonadjacent_edge_clearance(verts: list[tuple[float, float]]) -> float:
+    n = len(verts)
+    best = float("inf")
+    for i in range(n):
+        for j in range(i + 1, n):
+            if j == i or (j - i) % n == 1 or (i - j) % n == 1:
+                continue
+            d = _seg_seg_distance(verts[i], verts[(i + 1) % n], verts[j], verts[(j + 1) % n])
+            best = min(best, d)
+    return best
+
+
+def _interior_angles_deg(verts: list[tuple[float, float]]) -> list[float]:
+    n = len(verts)
+    out = []
+    for i in range(n):
+        a, b, c = verts[(i - 1) % n], verts[i], verts[(i + 1) % n]
+        v1 = (a[0] - b[0], a[1] - b[1])
+        v2 = (c[0] - b[0], c[1] - b[1])
+        n1 = math.hypot(*v1)
+        n2 = math.hypot(*v2)
+        if n1 <= 1e-9 or n2 <= 1e-9:
+            out.append(0.0)
+            continue
+        cosv = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)))
+        out.append(math.degrees(math.acos(cosv)))
+    return out
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _sample_polygon(rng: random.Random) -> list[tuple[float, float]] | None:
+    n = rng.randint(8, 11)
+    if n * MIN_ANGLE_GAP_DEG > 350.0:
+        return None
+    slack = 360.0 - n * MIN_ANGLE_GAP_DEG
+    cuts = sorted(rng.random() for _ in range(n - 1))
+    parts = []
+    prev = 0.0
+    for c in cuts + [1.0]:
+        parts.append((c - prev) * slack)
+        prev = c
+    gaps = [MIN_ANGLE_GAP_DEG + p for p in parts]
+    theta0 = rng.uniform(0.0, 360.0)
+    angles = []
+    acc = theta0
+    for g in gaps:
+        angles.append(acc)
+        acc += g
+    verts = []
+    for a in angles:
+        r = rng.uniform(R_MIN, R_MAX)
+        rad = math.radians(a)
+        verts.append((CENTER[0] + r * math.cos(rad), CENTER[1] + r * math.sin(rad)))
+    if min(_interior_angles_deg(verts)) < MIN_INTERIOR_ANGLE_DEG:
+        return None
+    if _min_nonadjacent_edge_clearance(verts) < MIN_EDGE_CLEARANCE:
+        return None
+    lo = DOT_RADIUS + STROKE
+    for x, y in verts:
+        if not (lo < x < CANVAS - lo and lo < y < CANVAS - lo):
+            return None
+    return verts
+
+
+def _vertex_clear(t: float, cum: list[float], total: float) -> bool:
+    for c in cum[:-1]:
+        if min(abs(t - c), total - abs(t - c)) < MIN_VERTEX_ARC_CLEARANCE:
+            return False
+    return True
+
+
+def _place_markers(rng, verts, cum, total, want_near_boundary, want_nearer_is_answer, want_fewer_is_answer):
+    """Pick the four arc positions and the colour assignment, or return None."""
+    if want_near_boundary:
+        gap_lo, gap_hi = NEAR_BOUNDARY_MARGIN_RANGE
+    else:
+        gap_lo, gap_hi = CLEAR_MARGIN, max(CLEAR_MARGIN + 1.0, (1.0 - 2.0 * MIN_ARC_FRACTION) * total)
+    for _ in range(1200):
+        t_green = rng.uniform(0.0, total)
+        gap = rng.uniform(gap_lo, gap_hi)
+        forward = (total - gap) / 2.0 if rng.random() < 0.5 else (total + gap) / 2.0
+        if not (MIN_ARC_FRACTION * total <= forward <= (1.0 - MIN_ARC_FRACTION) * total):
+            continue
+        t_red = (t_green + forward) % total
+        back = total - forward
+        if not (_vertex_clear(t_green, cum, total) and _vertex_clear(t_red, cum, total)):
+            continue
+        # one coloured dot strictly inside each of the two ways round
+        pad = MIN_DOT_ARC_SEPARATION
+        if forward < 2 * pad + 20 or back < 2 * pad + 20:
+            continue
+        t_fwd = (t_green + rng.uniform(pad, forward - pad)) % total
+        t_bwd = (t_red + rng.uniform(pad, back - pad)) % total
+        if not (_vertex_clear(t_fwd, cum, total) and _vertex_clear(t_bwd, cum, total)):
+            continue
+        short_is_forward = forward < back
+        on_short = t_fwd if short_is_forward else t_bwd
+        on_long = t_bwd if short_is_forward else t_fwd
+        short_color = rng.choice(CHOICE_COLORS)
+        long_color = "orange" if short_color == "blue" else "blue"
+        markers = {
+            "green": t_green,
+            "red": t_red,
+            short_color: on_short,
+            long_color: on_long,
+        }
+        answer = short_color
+
+        # cheap-cue polarities, drawn independently so each cue agrees with the
+        # answer in about half of all scenes
+        g_xy = _point_at(verts, cum, t_green)
+        d_blue = math.dist(g_xy, _point_at(verts, cum, markers["blue"]))
+        d_orange = math.dist(g_xy, _point_at(verts, cum, markers["orange"]))
+        if abs(d_blue - d_orange) < 25.0:
+            continue
+        nearer = "blue" if d_blue < d_orange else "orange"
+        if (nearer == answer) != want_nearer_is_answer:
+            continue
+
+        fwd_corners = sum(
+            1 for c in cum[:-1] if _forward_gap(t_green, c, total) < forward
+        )
+        bwd_corners = len(cum) - 1 - fwd_corners
+        short_corners = fwd_corners if short_is_forward else bwd_corners
+        long_corners = bwd_corners if short_is_forward else fwd_corners
+        if short_corners == long_corners:
+            continue
+        fewer_corner_color = short_color if short_corners < long_corners else long_color
+        if want_fewer_is_answer is not None and (fewer_corner_color == answer) != want_fewer_is_answer:
+            continue
+
+        return markers
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    want_near_boundary = (seed % 8) == 3
+    # The two cheap-cue polarities are drawn once per scene and held fixed while
+    # the geometry is resampled, so that the harder polarity cannot be silently
+    # traded away by rejection sampling; the corner-cue polarity is relaxed last.
+    want_nearer_is_answer = rng.random() < 0.5
+    want_fewer_is_answer = rng.random() < 0.5
+    for attempt in range(400):
+        fewer = want_fewer_is_answer if attempt < 300 else None
+        verts = _sample_polygon(rng)
+        if verts is None:
+            continue
+        cum, total = _edge_table(verts)
+        markers = _place_markers(
+            rng, verts, cum, total, want_near_boundary, want_nearer_is_answer, fewer
+        )
+        if markers is None:
+            continue
+        return {
+            "canvas": CANVAS,
+            "background": list(BACKGROUND),
+            "center": list(CENTER),
+            "vertices": [[round(x, 4), round(y, 4)] for x, y in verts],
+            "markers": {k: round(v, 4) for k, v in sorted(markers.items())},
+            "stroke_width": STROKE,
+            "dot_radius": DOT_RADIUS,
+            "loop_color": list(LOOP),
+            "dot_colors": {k: list(v) for k, v in sorted(DOT_COLORS.items())},
+            "seed": int(seed),
+        }
+    raise RuntimeError(f"sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    s = SUPERSAMPLE
+    size = int(scene["canvas"]) * s
+    img = Image.new("RGB", (size, size), tuple(scene["background"]))
+    draw = ImageDraw.Draw(img)
+    verts = _vertices(scene)
+    cum, _ = _edge_table(verts)
+    n = len(verts)
+    w = int(scene["stroke_width"]) * s
+    loop = tuple(scene["loop_color"])
+    for i in range(n):
+        a = verts[i]
+        b = verts[(i + 1) % n]
+        if (b[0], b[1]) < (a[0], a[1]):  # canonical endpoint order: the raster
+            a, b = b, a                  # must not depend on traversal direction
+        draw.line([(a[0] * s, a[1] * s), (b[0] * s, b[1] * s)], fill=loop, width=w)
+    r = w / 2.0
+    for x, y in verts:  # round the joints so corners have no notch
+        draw.ellipse([x * s - r, y * s - r, x * s + r, y * s + r], fill=loop)
+    dr = float(scene["dot_radius"]) * s
+    for name in DRAW_ORDER:
+        t = float(scene["markers"][name])
+        x, y = _point_at(verts, cum, t)
+        color = tuple(scene["dot_colors"][name])
+        draw.ellipse([x * s - dr, y * s - dr, x * s + dr, y * s + dr], fill=color)
+    if s != 1:
+        img = img.resize((int(scene["canvas"]), int(scene["canvas"])), Image.BOX)
+    return img
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine, symmetries
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    """Colour of the dot lying on the shorter way round from green to red."""
+    forward, backward = _arc_lengths(scene)
+    short_is_forward = forward < backward
+    for name in CHOICE_COLORS:
+        if _on_forward_arc(scene, name) == short_is_forward:
+            return name
+    raise ValueError("scene does not place exactly one coloured dot per way round")
+
+
+def margin(scene: dict) -> float:
+    """Pixels by which the longer way round exceeds the shorter one."""
+    forward, backward = _arc_lengths(scene)
+    return abs(forward - backward)
+
+
+def is_quarantined(scene: dict) -> bool:
+    if margin(scene) < QUARANTINE_MARGIN:
+        return True
+    verts = _vertices(scene)
+    if _min_nonadjacent_edge_clearance(verts) < MIN_EDGE_CLEARANCE:
+        return True
+    if min(_interior_angles_deg(verts)) < MIN_INTERIOR_ANGLE_DEG:
+        return True
+    cum, total = _edge_table(verts)
+    ts = [float(v) for v in scene["markers"].values()]
+    for i in range(len(ts)):
+        for j in range(i + 1, len(ts)):
+            d = abs(ts[i] - ts[j])
+            if min(d, total - d) < MIN_DOT_ARC_SEPARATION - 1e-6:
+                return True
+    for t in ts:
+        if not _vertex_clear(t, cum, total):
+            return True
+    return False
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical reparameterisations of the same drawn loop.
+
+    Both transforms redescribe the identical raster with a different latent
+    record: the vertex list is rewritten and every marker arc coordinate is
+    remapped onto the new parameterisation.  The analytic label must not move.
+    """
+    verts = _vertices(scene)
+    n = len(verts)
+    _, total = _edge_table(verts)
+    out: list[tuple[str, dict]] = []
+
+    shift = max(1, n // 3)
+    rotated = verts[shift:] + verts[:shift]
+    cut = _edge_table(verts)[0][shift]
+    rot = dict(scene)
+    rot["vertices"] = [[round(x, 4), round(y, 4)] for x, y in rotated]
+    rot["markers"] = {
+        k: round((float(v) - cut) % total, 4) for k, v in sorted(scene["markers"].items())
+    }
+    out.append(("cyclic_reparameterization", rot))
+
+    reversed_verts = [verts[0]] + verts[1:][::-1]
+    rev = dict(scene)
+    rev["vertices"] = [[round(x, 4), round(y, 4)] for x, y in reversed_verts]
+    rev["markers"] = {
+        k: round((total - float(v)) % total, 4) for k, v in sorted(scene["markers"].items())
+    }
+    out.append(("orientation_reversal", rev))
+    return out

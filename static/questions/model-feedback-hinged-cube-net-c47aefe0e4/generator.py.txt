@@ -1,0 +1,220 @@
+"""Deterministic cube-net scene sampler and Pillow renderer."""
+
+from __future__ import annotations
+
+import copy
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 900, 700
+CELL = 112
+BG = (247, 245, 239)
+EDGE = (91, 99, 112)
+MARK = (18, 20, 24)
+PALETTE = {
+    "red": (211, 73, 69),
+    "blue": (54, 111, 184),
+    "green": (61, 145, 91),
+    "amber": (230, 166, 42),
+    "violet": (139, 85, 174),
+    "cyan": (42, 164, 181),
+}
+LABELS = tuple(PALETTE)
+SIDES = ("N", "E", "S", "W")
+STEP = {"N": (-1, 0), "E": (0, 1), "S": (1, 0), "W": (0, -1)}
+
+
+def _neg(v):
+    return tuple(-x for x in v)
+
+
+def _fold(frame, side):
+    """Carry (east, south, normal) across one outward 90-degree hinge."""
+    east, south, normal = frame
+    if side == "E":
+        return (_neg(normal), south, east)
+    if side == "W":
+        return (normal, south, _neg(east))
+    if side == "N":
+        return (east, normal, _neg(south))
+    if side == "S":
+        return (east, _neg(normal), south)
+    raise ValueError(side)
+
+
+def _anchor_frame(up_side):
+    # world axes: +x right, +y up, +z toward viewer
+    return {
+        "N": ((1, 0, 0), (0, -1, 0), (0, 0, 1)),
+        "E": ((0, 1, 0), (1, 0, 0), (0, 0, 1)),
+        "S": ((-1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        "W": ((0, -1, 0), (-1, 0, 0), (0, 0, 1)),
+    }[up_side]
+
+
+def _frames(coords, anchor, up_side):
+    coords = set(coords)
+    frames = {anchor: _anchor_frame(up_side)}
+    queue = deque([anchor])
+    while queue:
+        here = queue.popleft()
+        r, c = here
+        for side, (dr, dc) in STEP.items():
+            there = (r + dr, c + dc)
+            if there not in coords:
+                continue
+            proposed = _fold(frames[here], side)
+            if there in frames and frames[there] != proposed:
+                raise ValueError("inconsistent fold cycle")
+            if there not in frames:
+                frames[there] = proposed
+                queue.append(there)
+    if len(frames) != 6 or len({f[2] for f in frames.values()}) != 6:
+        raise ValueError("not a cube net")
+    return frames
+
+
+def _graph_distance(coords, start, goal):
+    coords = set(coords)
+    queue = deque([(start, 0)])
+    seen = {start}
+    while queue:
+        here, distance = queue.popleft()
+        if here == goal:
+            return distance
+        for dr, dc in STEP.values():
+            nxt = (here[0] + dr, here[1] + dc)
+            if nxt in coords and nxt not in seen:
+                seen.add(nxt)
+                queue.append((nxt, distance + 1))
+    raise ValueError("disconnected net")
+
+
+def _random_valid_net(rng):
+    for _ in range(20000):
+        cells = {(0, 0)}
+        while len(cells) < 6:
+            r, c = rng.choice(sorted(cells))
+            dr, dc = rng.choice(tuple(STEP.values()))
+            cells.add((r + dr, c + dc))
+        min_r = min(r for r, _ in cells)
+        min_c = min(c for _, c in cells)
+        norm = sorted((r - min_r, c - min_c) for r, c in cells)
+        try:
+            _frames(norm, norm[0], "N")
+        except ValueError:
+            continue
+        return norm
+    raise RuntimeError("could not sample a cube net")
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    for _ in range(5000):
+        coords = _random_valid_net(rng)
+        anchor = rng.choice(coords)
+        up_side = rng.choice(SIDES)
+        frames = _frames(coords, anchor, up_side)
+        right = next(pos for pos, frame in frames.items() if frame[2] == (1, 0, 0))
+        if _graph_distance(coords, anchor, right) < 2:
+            continue
+        colors = list(LABELS)
+        rng.shuffle(colors)
+        faces = [
+            {"r": int(pos[0]), "c": int(pos[1]), "color": color}
+            for pos, color in zip(coords, colors)
+        ]
+        rows = max(r for r, _ in coords) + 1
+        cols = max(c for _, c in coords) + 1
+        base_x = (WIDTH - cols * CELL) // 2
+        base_y = (HEIGHT - rows * CELL) // 2
+        offset = [base_x + rng.randint(-22, 22), base_y + rng.randint(-18, 18)]
+        anchor_color = next(f["color"] for f in faces if (f["r"], f["c"]) == anchor)
+        scene = {
+            "faces": faces,
+            "anchor_color": anchor_color,
+            "up_side": up_side,
+            "offset": offset,
+        }
+        if not is_quarantined(scene):
+            return scene
+    raise RuntimeError("could not sample a hard valid scene")
+
+
+def _scene_map(scene):
+    return {(int(f["r"]), int(f["c"])): str(f["color"]) for f in scene["faces"]}
+
+
+def analytic_gold(scene: dict) -> str:
+    face_map = _scene_map(scene)
+    if set(face_map.values()) != set(LABELS) or len(face_map) != 6:
+        raise ValueError("faces must use each color exactly once")
+    anchor = next((pos for pos, color in face_map.items() if color == scene["anchor_color"]), None)
+    if anchor is None:
+        raise ValueError("anchor color absent")
+    frames = _frames(face_map, anchor, str(scene["up_side"]))
+    target = next(pos for pos, frame in frames.items() if frame[2] == (1, 0, 0))
+    return face_map[target]
+
+
+def margin(scene: dict) -> float:
+    face_map = _scene_map(scene)
+    anchor = next(pos for pos, color in face_map.items() if color == scene["anchor_color"])
+    frames = _frames(face_map, anchor, str(scene["up_side"]))
+    target = next(pos for pos, frame in frames.items() if frame[2] == (1, 0, 0))
+    return float(_graph_distance(face_map, anchor, target) * CELL)
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        face_map = _scene_map(scene)
+        if len(face_map) != 6 or set(face_map.values()) != set(LABELS):
+            return True
+        anchor = next(pos for pos, color in face_map.items() if color == scene["anchor_color"])
+        frames = _frames(face_map, anchor, str(scene["up_side"]))
+        target = next(pos for pos, frame in frames.items() if frame[2] == (1, 0, 0))
+        return _graph_distance(face_map, anchor, target) < 2
+    except Exception:
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    altered = copy.deepcopy(scene)
+    altered["faces"] = list(reversed(altered["faces"]))
+    return [("reverse_face_record_order", altered)]
+
+
+def render(scene: dict) -> Image.Image:
+    scale = 3
+    image = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), BG)
+    draw = ImageDraw.Draw(image)
+    ox, oy = map(int, scene["offset"])
+    inset = 4
+    for face in scene["faces"]:
+        x0 = ox + int(face["c"]) * CELL
+        y0 = oy + int(face["r"]) * CELL
+        box = tuple(v * scale for v in (x0, y0, x0 + CELL, y0 + CELL))
+        draw.rectangle(box, fill=PALETTE[str(face["color"])], outline=EDGE, width=5 * scale)
+        # Pale inset keeps the square boundary crisp without adding semantics.
+        ibox = tuple(v * scale for v in (x0 + inset, y0 + inset, x0 + CELL - inset, y0 + CELL - inset))
+        draw.rectangle(ibox, outline=(255, 255, 255), width=1 * scale)
+
+    anchor = next(f for f in scene["faces"] if f["color"] == scene["anchor_color"])
+    cx = ox + int(anchor["c"]) * CELL + CELL // 2
+    cy = oy + int(anchor["r"]) * CELL + CELL // 2
+    dx, dy = {"N": (0, -1), "E": (1, 0), "S": (0, 1), "W": (-1, 0)}[str(scene["up_side"])]
+    start = (cx, cy)
+    tip = (cx + dx * 43, cy + dy * 43)
+    draw.line(tuple(v * scale for p in (start, tip) for v in p), fill=MARK, width=7 * scale)
+    px, py = -dy, dx
+    head = [
+        (tip[0], tip[1]),
+        (tip[0] - dx * 15 + px * 10, tip[1] - dy * 15 + py * 10),
+        (tip[0] - dx * 15 - px * 10, tip[1] - dy * 15 - py * 10),
+    ]
+    draw.polygon([(x * scale, y * scale) for x, y in head], fill=MARK)
+    rr = 11
+    draw.ellipse(tuple(v * scale for v in (cx - rr, cy - rr, cx + rr, cy + rr)), fill=MARK)
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)

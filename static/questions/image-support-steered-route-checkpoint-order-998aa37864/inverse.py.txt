@@ -1,0 +1,133 @@
+"""Independent pixel-only inverse for directed checkpoint order.
+
+This module intentionally shares no renderer code or scene representation.  It
+segments a final PNG by a fixed public palette, downsamples the connected
+foreground, and measures shortest grid distance from the visible purple start
+to each checkpoint.  A complete start-to-terminal component is required before
+the decision is returned; destructive route erasures therefore abstain.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ROUTE_PALETTE = np.asarray(
+    [[32, 59, 85], [41, 69, 92], [33, 75, 77], [59, 64, 91]], dtype=np.float32
+)
+ORANGE = np.asarray([214, 106, 47], dtype=np.float32)
+TEAL = np.asarray([25, 141, 137], dtype=np.float32)
+START = np.asarray([123, 75, 179], dtype=np.float32)
+TERMINAL = np.asarray([118, 132, 143], dtype=np.float32)
+ROUTE_TOLERANCE = 48.0
+# Purple and terminal gray are close enough in RGB that a broad common
+# tolerance would merge their masks.  Native-resolution fills leave ample
+# headroom at this tighter threshold.
+MARKER_TOLERANCE = 52.0
+MIN_MARKER_PIXELS = 55
+MIN_FOREGROUND_CELLS = 250
+GRID_FACTOR = 2
+
+
+def _palette_mask(array: np.ndarray, palette: np.ndarray, tolerance: float) -> np.ndarray:
+    if palette.ndim == 1:
+        distances = np.linalg.norm(array - palette.reshape(1, 1, 3), axis=2)
+        return distances <= tolerance
+    distances = np.stack(
+        [np.linalg.norm(array - color.reshape(1, 1, 3), axis=2) for color in palette],
+        axis=0,
+    )
+    return distances.min(axis=0) <= tolerance
+
+
+def _downsample(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    if height % GRID_FACTOR or width % GRID_FACTOR:
+        raise ValueError("image dimensions are not divisible by the inverse grid")
+    return mask.reshape(
+        height // GRID_FACTOR, GRID_FACTOR, width // GRID_FACTOR, GRID_FACTOR
+    ).any(axis=(1, 3))
+
+
+def _centroid(mask: np.ndarray) -> tuple[float, float]:
+    points = np.argwhere(mask)
+    if len(points) < MIN_MARKER_PIXELS:
+        raise ValueError("a required colored marker is absent or too small")
+    mean = points.mean(axis=0)
+    return float(mean[0]), float(mean[1])
+
+
+def _shortest_distances(mask: np.ndarray, source: np.ndarray) -> np.ndarray:
+    """Return 8-connected unit distances from all source cells."""
+
+    height, width = mask.shape
+    distances = np.full((height, width), -1, dtype=np.int32)
+    queue: deque[tuple[int, int]] = deque()
+    source_points = np.argwhere(source & mask)
+    if len(source_points) < 2:
+        raise ValueError("start marker is disconnected from the route")
+    for y, x in source_points:
+        iy, ix = int(y), int(x)
+        if distances[iy, ix] < 0:
+            distances[iy, ix] = 0
+            queue.append((iy, ix))
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distances[y, x]) + 1
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and distances[ny, nx] < 0:
+                    distances[ny, nx] = next_distance
+                    queue.append((ny, nx))
+    return distances
+
+
+def _minimum_reachable(distances: np.ndarray, target: np.ndarray) -> int:
+    values = distances[target]
+    values = values[values >= 0]
+    if len(values) == 0:
+        raise ValueError("route does not reach every required marker")
+    return int(values.min())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover orange/teal firstness from the PNG only."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.shape[:2] != (512, 512):
+        raise ValueError("unexpected canvas size")
+    route = _palette_mask(array, ROUTE_PALETTE, ROUTE_TOLERANCE)
+    orange = _palette_mask(array, ORANGE, MARKER_TOLERANCE)
+    teal = _palette_mask(array, TEAL, MARKER_TOLERANCE)
+    start = _palette_mask(array, START, MARKER_TOLERANCE)
+    terminal = _palette_mask(array, TERMINAL, MARKER_TOLERANCE)
+    if int(orange.sum()) < MIN_MARKER_PIXELS or int(teal.sum()) < MIN_MARKER_PIXELS:
+        raise ValueError("both checkpoint ticks are required")
+    if int(start.sum()) < MIN_MARKER_PIXELS or int(terminal.sum()) < MIN_MARKER_PIXELS:
+        raise ValueError("start and terminal markers are required")
+
+    foreground = route | orange | teal | start | terminal
+    small_foreground = _downsample(foreground)
+    small_start = _downsample(start)
+    small_terminal = _downsample(terminal)
+    small_orange = _downsample(orange)
+    small_teal = _downsample(teal)
+    if int(small_foreground.sum()) < MIN_FOREGROUND_CELLS:
+        raise ValueError("route foreground is absent or too small")
+    distances = _shortest_distances(small_foreground, small_start)
+    d_terminal = _minimum_reachable(distances, small_terminal)
+    d_orange = _minimum_reachable(distances, small_orange)
+    d_teal = _minimum_reachable(distances, small_teal)
+    if d_terminal <= max(d_orange, d_teal) + 4:
+        raise ValueError("terminal is not beyond both checkpoints")
+
+    # The certified scene margin is much larger than the grid quantization.  A
+    # small equal-distance band still abstains rather than guessing.
+    if abs(d_orange - d_teal) < 5:
+        raise ValueError("checkpoint order is unresolved at raster scale")
+    return "orange" if d_orange < d_teal else "teal"

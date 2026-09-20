@@ -1,0 +1,257 @@
+"""Latent-scene sampling and RGB rendering for unpaired_mirror_dot.
+
+A scene is a field of identical dots whose *positions* are mirror-symmetric
+about one straight line that is never drawn -- except for a single dot that has
+no mirror partner. Four dots carry the four answer colours; the unpaired dot is
+one of them. Dot count, dot size, total ink, the colour multiset and the axis
+pose are sampled independently of the answer, so the answer lives only in the
+global reflection structure of the whole point set.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "unpaired_mirror_dot-renderer-0.1.0"
+
+WIDTH = 640
+HEIGHT = 640
+N_PAIRS = 8
+N_DOTS = 2 * N_PAIRS + 1  # 17 in every scene, for every answer
+SUPERSAMPLE = 3
+
+COLOUR_NAMES = ("red", "orange", "green", "blue")
+COLOUR_RGB = {
+    "red": (198, 32, 44),
+    "orange": (226, 132, 18),
+    "green": (22, 140, 64),
+    "blue": (32, 72, 198),
+}
+
+BORDER = 30.0
+AXIS_CLEARANCE = 32.0  # no dot sits on the mirror line, so none is self-paired
+SEPARATION_FACTOR = 3.4
+SEPARATION_PAD = 10.0
+MIN_MARGIN_PX = 20.0  # rejection floor for the runner-up colour
+QUARANTINE_PX = 14.0  # below this the runner-up colour is not visibly separated
+
+
+# --------------------------------------------------------------------------
+# The global reflection score used by the analytic gold.
+# --------------------------------------------------------------------------
+def _reflection_scores(points: np.ndarray, coloured: list[int]) -> list[float]:
+    """For each coloured dot, the best leave-it-out mirror residual, in px.
+
+    Every perpendicular bisector of a pair of dots is a candidate mirror line
+    (a true mirror line is exactly the bisector of any of its pairs). For a
+    candidate line and a nominated exception dot, the residual is the worst
+    distance from a reflected non-exception dot to the nearest non-exception
+    dot. The nominated dot that admits a near-zero residual is the unpaired one.
+    """
+    P = np.asarray(points, dtype=np.float64)
+    n = P.shape[0]
+    rows, cols = np.triu_indices(n, 1)
+    delta = P[cols] - P[rows]
+    length = np.hypot(delta[:, 0], delta[:, 1])
+    keep = length > 1e-9
+    delta = delta[keep]
+    length = length[keep]
+    mid = (P[rows[keep]] + P[cols[keep]]) / 2.0
+    # direction of the bisector: perpendicular to the segment it bisects
+    axis = np.stack([-delta[:, 1], delta[:, 0]], axis=1) / length[:, None]
+
+    offset = P[None, :, :] - mid[:, None, :]
+    parallel = (offset * axis[:, None, :]).sum(axis=-1)[:, :, None] * axis[:, None, :]
+    mirrored = mid[:, None, :] + 2.0 * parallel - offset
+    dist = np.linalg.norm(mirrored[:, :, None, :] - P[None, None, :, :], axis=-1)
+
+    scores: list[float] = []
+    for index in coloured:
+        masked = dist.copy()
+        masked[:, :, index] = np.inf
+        nearest = masked.min(axis=-1)
+        nearest[:, index] = -np.inf
+        scores.append(float(nearest.max(axis=-1).min()))
+    return scores
+
+
+def _dot_arrays(scene: dict) -> tuple[np.ndarray, list[int], list[str]]:
+    points = np.asarray([[float(d[0]), float(d[1])] for d in scene["dots"]], dtype=np.float64)
+    coloured = [i for i, d in enumerate(scene["dots"]) if d[2] != "grey"]
+    names = [str(scene["dots"][i][2]) for i in coloured]
+    return points, coloured, names
+
+
+def _ranked(scene: dict) -> list[tuple[float, str]]:
+    points, coloured, names = _dot_arrays(scene)
+    scores = _reflection_scores(points, coloured)
+    return sorted(zip(scores, names))
+
+
+# --------------------------------------------------------------------------
+# Sampling
+# --------------------------------------------------------------------------
+def _reflect(point, origin, direction):
+    vx = point[0] - origin[0]
+    vy = point[1] - origin[1]
+    dot = vx * direction[0] + vy * direction[1]
+    return (
+        origin[0] + 2.0 * dot * direction[0] - vx,
+        origin[1] + 2.0 * dot * direction[1] - vy,
+    )
+
+
+def _axis_distance(point, origin, direction) -> float:
+    vx = point[0] - origin[0]
+    vy = point[1] - origin[1]
+    return abs(vx * direction[1] - vy * direction[0])
+
+
+def _inside(point, radius) -> bool:
+    return (
+        BORDER + radius <= point[0] <= WIDTH - BORDER - radius
+        and BORDER + radius <= point[1] <= HEIGHT - BORDER - radius
+    )
+
+
+def _place(rng, placed, origin, direction, radius, mirrored: bool):
+    """Try to add one dot (plus its mirror partner when requested)."""
+    clearance = SEPARATION_FACTOR * radius + SEPARATION_PAD
+    for _ in range(400):
+        point = (
+            rng.uniform(BORDER + radius, WIDTH - BORDER - radius),
+            rng.uniform(BORDER + radius, HEIGHT - BORDER - radius),
+        )
+        if _axis_distance(point, origin, direction) < AXIS_CLEARANCE:
+            continue
+        new = [point]
+        if mirrored:
+            twin = _reflect(point, origin, direction)
+            if not _inside(twin, radius):
+                continue
+            new.append(twin)
+        if any(math.dist(a, b) < clearance for a in new for b in placed):
+            continue
+        if mirrored and math.dist(new[0], new[1]) < clearance:
+            continue
+        return new
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from an integer seed."""
+    rng = random.Random(seed)
+    answer = COLOUR_NAMES[seed % len(COLOUR_NAMES)]
+    background = tuple(rng.randint(238, 250) for _ in range(3))
+    grey_level = rng.randint(96, 138)
+    radius = float(rng.randint(8, 11))
+
+    for _ in range(200):
+        theta = rng.uniform(0.0, math.pi)
+        direction = (math.cos(theta), math.sin(theta))
+        origin = (
+            rng.uniform(WIDTH * 0.38, WIDTH * 0.62),
+            rng.uniform(HEIGHT * 0.38, HEIGHT * 0.62),
+        )
+        placed: list[tuple[float, float]] = []
+        pairs: list[tuple[int, int]] = []
+        ok = True
+        for _ in range(N_PAIRS):
+            new = _place(rng, placed, origin, direction, radius, True)
+            if new is None:
+                ok = False
+                break
+            pairs.append((len(placed), len(placed) + 1))
+            placed.extend(new)
+        if not ok:
+            continue
+        extra = _place(rng, placed, origin, direction, radius, False)
+        if extra is None:
+            continue
+        odd_index = len(placed)
+        placed.extend(extra)
+
+        roles = ["grey"] * len(placed)
+        roles[odd_index] = answer
+        others = [name for name in COLOUR_NAMES if name != answer]
+        rng.shuffle(others)
+        for name, pair in zip(others, rng.sample(pairs, len(others))):
+            roles[pair[rng.randrange(2)]] = name
+
+        order = list(range(len(placed)))
+        rng.shuffle(order)
+        dots = [[placed[i][0], placed[i][1], roles[i]] for i in order]
+        scene = {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "bg_color": list(background),
+            "grey_color": [grey_level, grey_level, grey_level],
+            "palette": {name: list(COLOUR_RGB[name]) for name in COLOUR_NAMES},
+            "dot_radius": radius,
+            "dots": dots,
+        }
+        ranked = _ranked(scene)
+        if ranked[0][1] != answer:
+            continue
+        if ranked[1][0] - ranked[0][0] >= MIN_MARGIN_PX:
+            return scene
+    raise RuntimeError(f"could not sample a mirror field for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# Rendering and gold
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    """Paint identical supersampled dots; nothing marks the mirror line."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    radius = float(scene["dot_radius"])
+    scale = SUPERSAMPLE
+    canvas = Image.new("RGB", (width * scale, height * scale), tuple(scene["bg_color"]))
+    brush = ImageDraw.Draw(canvas)
+    for x, y, role in scene["dots"]:
+        colour = (
+            tuple(scene["grey_color"])
+            if role == "grey"
+            else tuple(scene["palette"][role])
+        )
+        brush.ellipse(
+            [
+                round((float(x) - radius) * scale),
+                round((float(y) - radius) * scale),
+                round((float(x) + radius) * scale) - 1,
+                round((float(y) + radius) * scale) - 1,
+            ],
+            fill=colour,
+        )
+    return canvas.resize((width, height), Image.BOX)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour of the one dot with no mirror partner, from the dot set alone."""
+    return _ranked(scene)[0][1]
+
+
+def margin(scene: dict) -> float:
+    """One-sided margin: the runner-up colour's best mirror residual, in px."""
+    ranked = _ranked(scene)
+    return float(ranked[1][0] - ranked[0][0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Flag scenes whose runner-up colour is not visibly separated."""
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Pixel-identical relabelings of the unordered, identically painted dots."""
+    dots = list(scene["dots"])
+    rotated = dict(scene)
+    rotated["dots"] = dots[5:] + dots[:5]
+    reversed_scene = dict(scene)
+    reversed_scene["dots"] = list(reversed(dots))
+    return [("dot_list_rotation", rotated), ("dot_list_reversal", reversed_scene)]

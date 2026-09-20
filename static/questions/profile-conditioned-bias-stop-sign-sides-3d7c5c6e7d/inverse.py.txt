@@ -1,0 +1,150 @@
+"""Pixel-only inverse for the number of straight sides on the STOP sign.
+
+The oracle receives only a raster.  It separates the single saturated red
+region from the pale background and white lettering, constructs a convex hull
+from observed mask extrema, and independently compares the observed radial
+boundary with regular six- through ten-sided polygon fits.  It neither imports
+nor knows the renderer geometry.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _red_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = arr[..., 0], arr[..., 1], arr[..., 2]
+    mask = (red > 125) & (red - green > 70) & (red - blue > 55)
+    if int(mask.sum()) < 22000:
+        raise OracleAbstention("no large red sign region")
+    ys, xs = np.nonzero(mask)
+    h, w = mask.shape
+    if xs.min() < 20 or ys.min() < 20 or xs.max() >= w - 20 or ys.max() >= h - 20:
+        raise OracleAbstention("sign is clipped or too close to the raster edge")
+    return mask
+
+
+def _extreme_points(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Collect boundary evidence without treating internal white marks as edges."""
+    points: set[tuple[int, int]] = set()
+    ys = np.flatnonzero(mask.any(axis=1))
+    for y in ys:
+        xs = np.flatnonzero(mask[y])
+        points.add((int(xs[0]), int(y)))
+        points.add((int(xs[-1]), int(y)))
+    xs = np.flatnonzero(mask.any(axis=0))
+    for x in xs:
+        rows = np.flatnonzero(mask[:, x])
+        points.add((int(x), int(rows[0])))
+        points.add((int(x), int(rows[-1])))
+    return sorted(points)
+
+
+def _convex_hull(points: list[tuple[int, int]]) -> list[tuple[float, float]]:
+    if len(points) < 3:
+        raise OracleAbstention("insufficient boundary evidence")
+
+    def cross(o: tuple[int, int], a: tuple[int, int], b: tuple[int, int]) -> int:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[int, int]] = []
+    for point in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[int, int]] = []
+    for point in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 6:
+        raise OracleAbstention("degenerate convex hull")
+    return [(float(x), float(y)) for x, y in hull]
+
+
+def _polygon_centroid(hull: list[tuple[float, float]]) -> tuple[float, float]:
+    """Area centroid of the measured outer hull, independent of internal letters."""
+    twice_area = 0.0
+    x_sum = 0.0
+    y_sum = 0.0
+    for index, point in enumerate(hull):
+        following = hull[(index + 1) % len(hull)]
+        cross = point[0] * following[1] - following[0] * point[1]
+        twice_area += cross
+        x_sum += (point[0] + following[0]) * cross
+        y_sum += (point[1] + following[1]) * cross
+    if abs(twice_area) < 1.0:
+        raise OracleAbstention("degenerate hull area")
+    return x_sum / (3.0 * twice_area), y_sum / (3.0 * twice_area)
+
+
+def _radial_profile(mask: np.ndarray, center: tuple[float, float], bins: int = 720) -> np.ndarray:
+    ys, xs = np.nonzero(mask)
+    dx = xs.astype(np.float64) - center[0]
+    dy = ys.astype(np.float64) - center[1]
+    radii = np.hypot(dx, dy)
+    angles = (np.arctan2(dy, dx) + 2.0 * math.pi) % (2.0 * math.pi)
+    indices = np.floor(angles * bins / (2.0 * math.pi)).astype(np.int64) % bins
+    profile = np.zeros(bins, dtype=np.float64)
+    np.maximum.at(profile, indices, radii)
+    known = np.flatnonzero(profile > 0)
+    if len(known) < bins * 0.75:
+        raise OracleAbstention("outer contour is too sparse")
+    extended_x = np.concatenate((known - bins, known, known + bins))
+    extended_y = np.concatenate((profile[known], profile[known], profile[known]))
+    return np.interp(np.arange(bins), extended_x, extended_y)
+
+
+def _fit_residuals(profile: np.ndarray) -> dict[int, float]:
+    """Fit scale and rotation independently for each public answer candidate."""
+    angles = 2.0 * math.pi * np.arange(len(profile)) / len(profile)
+    residuals: dict[int, float] = {}
+    for sides in range(6, 11):
+        period = 2.0 * math.pi / sides
+        best = float("inf")
+        # Phase step is below 0.4 degrees even for the six-sided candidate.
+        for phase in np.linspace(0.0, period, 181, endpoint=False):
+            side_normal = phase + math.pi / sides
+            delta = (angles - side_normal + math.pi / sides) % period - math.pi / sides
+            unit_profile = math.cos(math.pi / sides) / np.cos(delta)
+            radius = float(np.dot(profile, unit_profile) / np.dot(unit_profile, unit_profile))
+            residual = float(np.sqrt(np.mean((profile - radius * unit_profile) ** 2)))
+            best = min(best, residual)
+        residuals[sides] = best
+    return residuals
+
+
+def _measure(image: Image.Image) -> tuple[int, float]:
+    mask = _red_mask(image)
+    hull = _convex_hull(_extreme_points(mask))
+    profile = _radial_profile(mask, _polygon_centroid(hull))
+    residuals = _fit_residuals(profile)
+    ranked = sorted(residuals.items(), key=lambda item: item[1])
+    winner, best = ranked[0]
+    runner_up = ranked[1][1]
+    decision_margin = runner_up - best
+    if best > 1.25 or decision_margin < 1.5 or runner_up < best * 3.0:
+        raise OracleAbstention(
+            f"ambiguous polygon fit: best={best:.3f}, runner_up={runner_up:.3f}"
+        )
+    return winner, decision_margin
+
+
+def decision_from_image(image: Image.Image) -> str:
+    decision, _ = _measure(image)
+    return str(decision)
+
+
+def decision_margin_from_image(image: Image.Image) -> float:
+    """Return the winning-vs-runner-up residual gap measured from pixels."""
+    _, decision_margin = _measure(image)
+    return decision_margin

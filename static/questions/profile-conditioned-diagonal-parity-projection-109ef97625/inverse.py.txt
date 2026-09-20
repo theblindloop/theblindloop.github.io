@@ -1,0 +1,144 @@
+"""Independent PNG-only inverse for the diagonal parity projection world."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+SOURCE_N = 13
+RESULT_N = 5
+EXPECTED_SOURCE_DARK = 57
+EXPECTED_REFERENCE_DARK = 9
+MIN_MARGIN = 6
+
+
+class OracleAbstention(ValueError):
+    """Raised when visible fiducials or transformed evidence are ambiguous."""
+
+
+def _luminance(pixels: np.ndarray) -> np.ndarray:
+    values = pixels.astype(np.float32)
+    return 0.2126 * values[..., 0] + 0.7152 * values[..., 1] + 0.0722 * values[..., 2]
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    if len(values) == 0:
+        return []
+    groups: list[tuple[int, int]] = []
+    start = previous = int(values[0])
+    for raw in values[1:]:
+        value = int(raw)
+        if value != previous + 1:
+            groups.append((start, previous))
+            start = value
+        previous = value
+    groups.append((start, previous))
+    return groups
+
+
+def _sample_patch(luma: np.ndarray, x: float, y: float, radius: int = 2) -> float:
+    ix, iy = int(round(x)), int(round(y))
+    if ix - radius < 0 or iy - radius < 0 or ix + radius >= luma.shape[1] or iy + radius >= luma.shape[0]:
+        raise OracleAbstention("cell sample lies outside the raster")
+    return float(np.median(luma[iy - radius : iy + radius + 1, ix - radius : ix + radius + 1]))
+
+
+def _sample_grid(
+    luma: np.ndarray,
+    box: tuple[int, int, int, int],
+    size: int,
+    border: int,
+) -> np.ndarray:
+    xmin, ymin, xmax, ymax = box
+    width = xmax - xmin + 1 - 2 * border
+    height = ymax - ymin + 1 - 2 * border
+    if width < size * 10 or height < size * 10 or abs(width - height) > 3:
+        raise OracleAbstention("framed grid geometry is malformed")
+    mask = np.zeros((size, size), dtype=bool)
+    for row in range(size):
+        for column in range(size):
+            x = xmin + border + (column + 0.5) * width / size
+            y = ymin + border + (row + 0.5) * height / size
+            mask[row, column] = _sample_patch(luma, x, y) < 145.0
+    return mask
+
+
+def _source_mask(arr: np.ndarray, luma: np.ndarray) -> np.ndarray:
+    cyan = (arr[..., 0] < 70) & (arr[..., 1] > 130) & (arr[..., 2] > 160)
+    ys, xs = np.nonzero(cyan)
+    if len(xs) < 2500:
+        raise OracleAbstention("cyan source frame is missing")
+    box = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+    recovered = _sample_grid(luma, box, SOURCE_N, 6)
+    if int(recovered.sum()) != EXPECTED_SOURCE_DARK:
+        raise OracleAbstention(
+            f"source has {int(recovered.sum())} dark tiles, expected {EXPECTED_SOURCE_DARK}"
+        )
+    return recovered
+
+
+def _reference_masks(arr: np.ndarray, luma: np.ndarray) -> list[np.ndarray]:
+    coral = (
+        (arr[..., 0] > 190)
+        & (arr[..., 1] < 110)
+        & (arr[..., 2] > 90)
+        & (arr[..., 2] < 165)
+    )
+    x_runs = [(a, b) for a, b in _runs(np.flatnonzero(coral.any(axis=0))) if b - a > 80]
+    y_runs = [(a, b) for a, b in _runs(np.flatnonzero(coral.any(axis=1))) if b - a > 80]
+    if len(x_runs) != 2 or len(y_runs) != 2:
+        raise OracleAbstention(
+            f"expected a 2-by-2 array of reference frames, found {len(x_runs)} by {len(y_runs)}"
+        )
+    references: list[np.ndarray] = []
+    for ymin, ymax in sorted(y_runs):
+        for xmin, xmax in sorted(x_runs):
+            crop_count = int(coral[ymin : ymax + 1, xmin : xmax + 1].sum())
+            if crop_count < 1500:
+                raise OracleAbstention("a visible reference frame is incomplete")
+            mask = _sample_grid(luma, (xmin, ymin, xmax, ymax), RESULT_N, 5)
+            if int(mask.sum()) != EXPECTED_REFERENCE_DARK:
+                raise OracleAbstention("a reference glyph violates the equal-ink construction")
+            references.append(mask)
+    if len({mask.tobytes() for mask in references}) != 4:
+        raise OracleAbstention("reference glyphs are not distinct")
+    return references
+
+
+def _project(source: np.ndarray) -> np.ndarray:
+    bits: list[bool] = []
+    for index in range(2 * SOURCE_N - 1):
+        difference = (SOURCE_N - 1) - index
+        count = 0
+        for row in range(SOURCE_N):
+            column = row - difference
+            if 0 <= column < SOURCE_N:
+                count += int(source[row, column])
+        bits.append(bool(count % 2))
+    return np.array(bits, dtype=bool).reshape(RESULT_N, RESULT_N)
+
+
+def analyze_image(image: Image.Image) -> tuple[str, float, tuple[int, ...]]:
+    """Return (A-D decision, runner-up margin, four visible Hamming scores)."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or min(arr.shape[:2]) < 128:
+        raise OracleAbstention("unsupported raster")
+    luma = _luminance(arr)
+    source = _source_mask(arr, luma)
+    references = _reference_masks(arr, luma)
+    projected = _project(source)
+    if int(projected.sum()) != EXPECTED_REFERENCE_DARK:
+        raise OracleAbstention("projected detector glyph violates the balanced construction")
+    scores = tuple(int(np.count_nonzero(projected != reference)) for reference in references)
+    order = sorted(range(4), key=lambda index: (scores[index], index))
+    margin = float(scores[order[1]] - scores[order[0]])
+    if scores[order[0]] > 2 or margin < MIN_MARGIN:
+        raise OracleAbstention(
+            f"ambiguous detector glyph: best={scores[order[0]]}, margin={margin:g}"
+        )
+    return "ABCD"[order[0]], margin, scores
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the answer using only raster pixels and the public transform rule."""
+    return analyze_image(image)[0]

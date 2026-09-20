@@ -1,0 +1,157 @@
+"""Independent image-only inverse for paired interval centering."""
+
+from __future__ import annotations
+
+from typing import Iterable
+
+import numpy as np
+from PIL import Image
+
+_TARGETS = (
+    np.array([226.0, 158.0, 34.0]),
+    np.array([128.0, 82.0, 190.0]),
+)
+_LABELS = {
+    "P": np.array([54.0, 102.0, 190.0]),
+    "Q": np.array([213.0, 94.0, 56.0]),
+}
+_TARGET_TOLERANCE = 38.0
+_LABEL_TOLERANCE = 24.0
+_MIN_TARGET_AREA = 250
+_MAX_TARGET_AREA = 2200
+_MIN_LABEL_AREA = 250
+_MAX_LABEL_AREA = 1800
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    points = {tuple(int(value) for value in point) for point in np.argwhere(mask)}
+    found: list[list[tuple[int, int]]] = []
+    while points:
+        seed = points.pop()
+        stack = [seed]
+        component = [seed]
+        while stack:
+            y, x = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    neighbour = (y + dy, x + dx)
+                    if neighbour in points:
+                        points.remove(neighbour)
+                        stack.append(neighbour)
+                        component.append(neighbour)
+        found.append(component)
+    return found
+
+
+def _centroid(component: Iterable[tuple[int, int]]) -> tuple[float, float, int]:
+    values = list(component)
+    if not values:
+        raise ValueError("empty component")
+    ys = np.asarray([value[0] for value in values], dtype=np.float64)
+    xs = np.asarray([value[1] for value in values], dtype=np.float64)
+    return float(xs.mean()), float(ys.mean()), len(values)
+
+
+def _label_centers(array: np.ndarray) -> dict[str, tuple[float, float]]:
+    centers: dict[str, tuple[float, float]] = {}
+    for name, color in _LABELS.items():
+        mask = np.linalg.norm(array.astype(np.float64) - color, axis=2) <= _LABEL_TOLERANCE
+        candidates = []
+        for component in _components(mask):
+            x, y, area = _centroid(component)
+            if _MIN_LABEL_AREA <= area <= _MAX_LABEL_AREA:
+                candidates.append((x, y))
+        if len(candidates) != 1:
+            raise ValueError(f"expected one visible {name} card label, found {len(candidates)}")
+        centers[name] = candidates[0]
+    if abs(centers["P"][0] - centers["Q"][0]) < 120.0:
+        raise ValueError("the two labeled cards are not spatially separated")
+    return centers
+
+
+def _target_centers(array: np.ndarray) -> list[tuple[float, float]]:
+    centers: list[tuple[float, float]] = []
+    for color in _TARGETS:
+        mask = np.linalg.norm(array.astype(np.float64) - color, axis=2) <= _TARGET_TOLERANCE
+        candidates = []
+        for component in _components(mask):
+            x, y, area = _centroid(component)
+            if _MIN_TARGET_AREA <= area <= _MAX_TARGET_AREA:
+                candidates.append((x, y))
+        if len(candidates) != 1:
+            raise ValueError(f"expected one visible target of palette color, found {len(candidates)}")
+        centers.append(candidates[0])
+    if abs(centers[0][0] - centers[1][0]) < 120.0:
+        raise ValueError("the two target diamonds are not spatially separated")
+    return centers
+
+
+def _card_interval(
+    array: np.ndarray, label_center: tuple[float, float]
+) -> tuple[float, float, float]:
+    """Recover the horizontal ruler row and its two outer endpoint ticks."""
+    height, width = array.shape[:2]
+    chip_x, chip_y = label_center
+    x0 = max(0, int(round(chip_x - 38.0)))
+    x1 = min(width, int(round(chip_x + 230.0)))
+    y0 = max(0, int(round(chip_y + 42.0)))
+    y1 = min(height, int(round(chip_y + 286.0)))
+    crop = array[y0:y1, x0:x1].astype(np.float64)
+    channel_range = crop.max(axis=2) - crop.min(axis=2)
+    neutral_dark = (crop.max(axis=2) < 165.0) & (channel_range < 54.0)
+    row_counts = neutral_dark.sum(axis=1)
+    if not len(row_counts):
+        raise ValueError("card has no guide pixels")
+    line_row = int(np.argmax(row_counts))
+    if int(row_counts[line_row]) < 65:
+        raise ValueError("interval baseline is incomplete")
+    global_y = y0 + line_row
+
+    band_top = max(0, line_row - 34)
+    band_bottom = min(neutral_dark.shape[0], line_row + 35)
+    column_counts = neutral_dark[band_top:band_bottom].sum(axis=0)
+    peak_columns = np.flatnonzero(column_counts >= 17)
+    if len(peak_columns) == 0:
+        raise ValueError("interval endpoint ticks are missing")
+    groups: list[list[int]] = []
+    for column in peak_columns.tolist():
+        if not groups or column > groups[-1][-1] + 1:
+            groups.append([column])
+        else:
+            groups[-1].append(column)
+    centers = [x0 + sum(group) / len(group) for group in groups if len(group) <= 16]
+    if len(centers) < 2:
+        raise ValueError("fewer than two endpoint ticks recovered")
+    lo, hi = min(centers), max(centers)
+    if hi - lo < 82.0:
+        raise ValueError("interval endpoint separation is too small")
+    return float(lo), float(hi), float(global_y)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return P or Q from only the final RGB raster, abstaining on ambiguity."""
+    if not isinstance(image, Image.Image):
+        raise TypeError("decision_from_image expects a PIL image")
+    array = np.asarray(image.convert("RGB"))
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected an RGB raster")
+    label_centers = _label_centers(array)
+    target_centers = _target_centers(array)
+
+    cards = []
+    for label, label_center in label_centers.items():
+        lo, hi, ruler_y = _card_interval(array, label_center)
+        nearby = [point for point in target_centers if abs(point[0] - label_center[0]) < 150.0]
+        if len(nearby) != 1:
+            raise ValueError(f"could not bind one target to card {label}")
+        target_x = nearby[0][0]
+        score = abs(target_x - (lo + hi) / 2.0) / (hi - lo)
+        if not (0.0 <= score < 0.49) or abs(nearby[0][1] - ruler_y) < 40.0:
+            raise ValueError(f"target or interval for card {label} is ambiguous")
+        cards.append((score, label))
+    if len(cards) != 2 or abs(cards[0][0] - cards[1][0]) < 0.055:
+        raise ValueError("paired centering comparison is too close to call")
+    cards.sort(key=lambda item: item[0])
+    return cards[0][1]

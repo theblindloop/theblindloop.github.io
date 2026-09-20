@@ -1,0 +1,139 @@
+"""Independent pixel-only inverse arm for state_travel_distance.
+
+Receives only the final PNG. From the raster alone it:
+  1. detects the four ordered panel frames by their gray border outline;
+  2. within each panel, locates the red, green, and blue markers by colour
+     segmentation and records each marker's horizontal site index;
+  3. orders the panels left to right and computes each marker's travelled
+     distance as the sum of the absolute site steps between consecutive panels;
+  4. reports the colour with the greatest total travel.
+
+No latent scene, renderer, prompt, generator, verifier, or gold code is
+accessed; the marker lanes and the nine-site geometry are part of the public
+question contract that any solver must use to read the image.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BORDER = (120, 120, 120)
+BG = (255, 255, 255)
+SITES = 9
+SITE_MARGIN = 25
+SITE_STEP = 20
+MIN_PANEL_AREA = 300
+
+COLOR_NAMES = ["red", "green", "blue"]
+COLORS = {
+    "red": (220, 40, 40),
+    "green": (40, 170, 80),
+    "blue": (40, 80, 220),
+}
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected four-panel structure."""
+
+
+def _mask_equal(arr: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    r, g, b = color
+    return (arr[:, :, 0] == r) & (arr[:, :, 1] == g) & (arr[:, :, 2] == b)
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points) -> tuple[int, int, int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _centroid(mask: np.ndarray, y0: int, y1: int, x0: int, x1: int):
+    sub = mask[y0:y1, x0:x1]
+    ys, xs = np.nonzero(sub)
+    if len(ys) == 0:
+        return None
+    return int(np.mean(xs)) + x0
+
+
+def _marker_site(arr: np.ndarray, box, color) -> int | None:
+    bx0, by0, bx1, by1 = box
+    x0 = max(0, bx0 + 3)
+    y0 = max(0, by0 + 3)
+    x1 = min(arr.shape[1], bx1 - 3)
+    y1 = min(arr.shape[0], by1 - 3)
+    mask = np.zeros((arr.shape[0], arr.shape[1]), dtype=bool)
+    mask[y0:y1, x0:x1] = _mask_equal(arr[y0:y1, x0:x1], color)
+    comps = _components(mask)
+    if not comps:
+        return None
+    largest = max(comps, key=len)
+    if len(largest) < 8:
+        return None
+    cm = _centroid(mask, y0, y1, x0, x1)
+    idx = round((cm - (bx0 + SITE_MARGIN)) / SITE_STEP)
+    if not (0 <= idx < SITES):
+        return None
+    return idx
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    panels = []
+    for comp in _components(_mask_equal(arr, BORDER)):
+        if len(comp) < MIN_PANEL_AREA:
+            continue
+        panels.append(_bbox(comp))
+    panels = sorted({p for p in panels}, key=lambda p: p[0])
+    if len(panels) < 4:
+        raise UnreadableImageError(f"found {len(panels)} panel frames; expected 4")
+
+    travel: dict[str, list[int]] = {name: [] for name in COLOR_NAMES}
+    for box in panels[:4]:
+        for name in COLOR_NAMES:
+            site = _marker_site(arr, box, COLORS[name])
+            if site is None:
+                raise UnreadableImageError(f"marker {name} not located in a panel")
+            travel[name].append(site)
+
+    dists = {
+        name: sum(abs(travel[name][i + 1] - travel[name][i]) for i in range(3))
+        for name in COLOR_NAMES
+    }
+    best = max(dists, key=lambda name: dists[name])
+    dists_sorted = sorted(dists.values(), reverse=True)
+    if len(dists_sorted) < 2 or dists_sorted[0] - dists_sorted[1] < 2:
+        raise UnreadableImageError("travelled-distance winner is not clearly defined")
+    return best

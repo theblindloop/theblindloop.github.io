@@ -1,0 +1,129 @@
+"""Independent image-only inverse arm for the chain step-up decision."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+_BLACK = np.array((28, 31, 36), dtype=np.int16)
+_PALETTE = {
+    "green": np.array((20, 150, 82), dtype=np.int16),
+    "purple": np.array((137, 70, 190), dtype=np.int16),
+    "red": np.array((220, 55, 65), dtype=np.int16),
+    "blue": np.array((45, 105, 210), dtype=np.int16),
+    "orange": np.array((235, 140, 35), dtype=np.int16),
+}
+_TERMINALS = {"red", "blue", "orange"}
+
+
+def _mask_near(arr: np.ndarray, rgb: np.ndarray, tolerance: int = 8) -> np.ndarray:
+    delta = arr.astype(np.int32) - rgb.astype(np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _nodes_from_pixels(arr: np.ndarray) -> list[dict]:
+    nodes = []
+    for name, rgb in _PALETTE.items():
+        coordinates = np.argwhere(_mask_near(arr, rgb))
+        # Every same-colored disk is separated by much more than its 34-pixel
+        # diameter. Greedily remove the full local blob around one rim pixel;
+        # this is an image measurement, not a panel-coordinate lookup.
+        while len(coordinates):
+            anchor = coordinates[0]
+            local = np.sum((coordinates - anchor) ** 2, axis=1) <= 40**2
+            component = coordinates[local]
+            coordinates = coordinates[~local]
+            if len(component) < 500:
+                raise ValueError(f"unexpected small {name} ink component")
+            nodes.append(
+                {
+                    "x": float(component[:, 1].mean()),
+                    "y": float(component[:, 0].mean()),
+                    "color": name,
+                }
+            )
+    starts = sum(node["color"] == "green" for node in nodes)
+    waypoints = sum(node["color"] == "purple" for node in nodes)
+    terminals = sum(node["color"] in _TERMINALS for node in nodes)
+    if (starts, waypoints, terminals) != (3, 9, 3):
+        raise ValueError(f"expected 3 starts, 9 waypoints, 3 terminals; found {(starts, waypoints, terminals)}")
+    return nodes
+
+
+def _graph_from_pixels(arr: np.ndarray, nodes: list[dict]) -> dict[int, set[int]]:
+    adjacency = {index: set() for index in range(len(nodes))}
+    edges = set()
+    black = _mask_near(arr, _BLACK)
+    near_black = black.copy()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if not (dy or dx):
+                continue
+            shifted = np.zeros_like(black)
+            y_dst = slice(max(dy, 0), black.shape[0] + min(dy, 0))
+            x_dst = slice(max(dx, 0), black.shape[1] + min(dx, 0))
+            y_src = slice(max(-dy, 0), black.shape[0] + min(-dy, 0))
+            x_src = slice(max(-dx, 0), black.shape[1] + min(-dx, 0))
+            shifted[y_dst, x_dst] = black[y_src, x_src]
+            near_black |= shifted
+    for left in range(len(nodes)):
+        for right in range(left + 1, len(nodes)):
+            a, b = nodes[left], nodes[right]
+            distance = math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+            if not 50.0 < distance < 220.0:
+                continue
+            count = max(20, int(distance - 44.0))
+            t = np.linspace(22.0 / distance, 1.0 - 22.0 / distance, count)
+            xx = np.rint(a["x"] + t * (b["x"] - a["x"])).astype(int)
+            yy = np.rint(a["y"] + t * (b["y"] - a["y"])).astype(int)
+            if float(near_black[yy, xx].mean()) >= 0.96:
+                edges.add((left, right))
+    if len(edges) != 12:
+        raise ValueError(f"expected 12 visible links, found {len(edges)}")
+    for left, right in edges:
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+    return adjacency
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the answer without scene state, metadata, or renderer code."""
+    arr = np.asarray(image.convert("RGB"))
+    nodes = _nodes_from_pixels(arr)
+    adjacency = _graph_from_pixels(arr, nodes)
+    starts = [index for index, node in enumerate(nodes) if node["color"] == "green"]
+    scored = []
+    visited_nodes = set()
+    for start in starts:
+        order = [start]
+        previous = None
+        current = start
+        while True:
+            choices = [value for value in adjacency[current] if value != previous]
+            if nodes[current]["color"] in _TERMINALS:
+                if choices:
+                    raise ValueError("terminal is not a chain endpoint")
+                break
+            if len(choices) != 1:
+                raise ValueError("visible route is not a unique chain")
+            previous, current = current, choices[0]
+            if current in order:
+                raise ValueError("cycle encountered in a chain panel")
+            order.append(current)
+        if len(order) != 5:
+            raise ValueError(f"expected five nodes per chain, found {len(order)}")
+        visited_nodes.update(order)
+        lengths = []
+        for left, right in zip(order, order[1:]):
+            a, b = nodes[left], nodes[right]
+            lengths.append(math.hypot(a["x"] - b["x"], a["y"] - b["y"]))
+        score = max(lengths[index + 1] - lengths[index] for index in range(3))
+        scored.append((score, nodes[order[-1]]["color"]))
+    if len(visited_nodes) != len(nodes):
+        raise ValueError("not every visible node belongs to a START chain")
+    scored.sort(reverse=True)
+    if scored[0][0] - scored[1][0] < 8.0:
+        raise ValueError("top two raster route scores are ambiguous")
+    return scored[0][1]

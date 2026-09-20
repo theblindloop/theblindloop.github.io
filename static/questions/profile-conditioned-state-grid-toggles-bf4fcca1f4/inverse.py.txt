@@ -1,0 +1,183 @@
+"""Independent pixel-only inverse arm for the row/column grid state tracker.
+
+Receives only the final PNG. From the raster alone it:
+  1. finds the 3x3 grid panel (the largest grey outline) and the orange ring
+     that marks the target cell, recovering the target's row and column;
+  2. reads the target cell's initial fill state (solid dark vs hollow) at the
+     ring centre;
+  3. finds the three grey operator boxes read left to right and, inside each,
+     reads the coloured disk by its colour (red = row toggle, blue = column
+     toggle) and its slot (left / middle / right = index 1 / 2 / 3);
+  4. replays the operators from the ringed start cell and returns the final
+     fill state.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+GRID_BORDER = (190, 190, 190)
+INK = (35, 35, 35)
+RING = (240, 150, 20)
+ROW_COLOR = (205, 40, 40)
+COL_COLOR = (45, 70, 210)
+
+PALETTE = [BG, GRID_BORDER, INK, RING, ROW_COLOR, COL_COLOR]
+_BG, _BRD, _INK, _RING, _ROW, _COL = range(6)
+
+WINDOW = 2
+CELLS = 3
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected grid + operator structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """8-connected components of a boolean mask; returns sorted index pairs."""
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points):
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _average(points):
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+
+def _cell_fill(labels: np.ndarray, cx: int, cy: int) -> int:
+    h, w = labels.shape
+    y0 = max(0, cy - WINDOW)
+    y1 = min(h, cy + WINDOW + 1)
+    x0 = max(0, cx - WINDOW)
+    x1 = min(w, cx + WINDOW + 1)
+    win = labels[y0:y1, x0:x1]
+    ink = int((win == _INK).sum())
+    bg = int((win == _BG).sum())
+    if ink > bg:
+        return 1
+    if bg > ink:
+        return 0
+    raise UnreadableImageError("target cell fill is ambiguous at its centre")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+    h, w = labels.shape
+
+    gray_pts = _components(labels == _BRD)
+    if not gray_pts:
+        raise UnreadableImageError("no grey structure found")
+    gray_boxes = [_bbox(p) for p in gray_pts]
+    gray_boxes = [b for b in gray_boxes if _bbox_good(b)]
+
+    panel = max(gray_boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+    panel_x0, panel_y0, panel_x1, panel_y1 = panel
+
+    ring_pts = _components(labels == _RING)
+    if not ring_pts:
+        raise UnreadableImageError("no target ring found")
+    ring_pts = max(ring_pts, key=len)
+    rcx, rcy = _average(ring_pts)
+
+    cell_w = (panel_x1 - panel_x0) / CELLS
+    cell_h = (panel_y1 - panel_y0) / CELLS
+    if cell_w <= 0 or cell_h <= 0:
+        raise UnreadableImageError("invalid grid cell size")
+    c0 = int((rcx - panel_x0) / cell_w)
+    r0 = int((rcy - panel_y0) / cell_h)
+    c0 = max(0, min(CELLS - 1, c0))
+    r0 = max(0, min(CELLS - 1, r0))
+    cell_cx = int(panel_x0 + cell_w * (c0 + 0.5))
+    cell_cy = int(panel_y0 + cell_h * (r0 + 0.5))
+
+    start = _cell_fill(labels, cell_cx, cell_cy)
+
+    boxes = [
+        b
+        for b in gray_boxes
+        if b[1] > panel_y1 - 4 and (b[3] - b[1]) > 8 and (b[2] - b[0]) > 8
+    ]
+    boxes.sort(key=lambda b: b[0])
+    if len(boxes) < CELLS:
+        raise UnreadableImageError(f"found {len(boxes)} operator boxes; expected {CELLS}")
+
+    disks = []
+    for cls, axis in ((_ROW, "row"), (_COL, "col")):
+        for pts in _components(labels == cls):
+            if len(pts) < 8:
+                continue
+            dx, dy = _average(pts)
+            disks.append((axis, dx, dy))
+    if len(disks) != CELLS:
+        raise UnreadableImageError(f"found {len(disks)} operator disks; expected {CELLS}")
+
+    ops = []
+    for b in boxes[:CELLS]:
+        bx0, by0, bx1, by1 = b
+        bw = bx1 - bx0
+        inner = [d for d in disks if bx0 - 2 <= d[1] <= bx1 + 2 and by0 - 2 <= d[2] <= by1 + 2]
+        if not inner:
+            raise UnreadableImageError("operator box has no disk")
+        axis, dx, dy = inner[0]
+        slot = int((dx - bx0) / (bw / CELLS))
+        slot = max(0, min(CELLS - 1, slot))
+        ops.append((axis, slot))
+
+    state = start
+    for axis, index in ops:
+        hit = (axis == "row" and index == r0) or (axis == "col" and index == c0)
+        if hit:
+            state = 1 - state
+    return "filled" if state == 1 else "outline"
+
+
+def _bbox_good(b):
+    ox, oy, ox1, oy1 = b
+    return (ox1 - ox) > 6 and (oy1 - oy) > 6

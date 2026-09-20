@@ -1,0 +1,206 @@
+"""Deterministic projective-window scene sampler and raster renderer."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 480, 420
+GRID = 17
+SYMBOLS = ("circle", "triangle", "plus", "x")
+QUARANTINE_MARGIN = 0.20
+AA = 3
+
+MARKERS = {
+    "tl": (220, 35, 145),
+    "tr": (245, 185, 20),
+    "br": (45, 95, 220),
+    "bl": (30, 170, 85),
+}
+
+PALETTES = (
+    {"bg": [247, 244, 236], "cell": [238, 241, 238], "ink": [28, 31, 36], "grid": [125, 135, 139], "noise": [190, 178, 205], "clutter": [[214, 104, 70], [92, 92, 112]]},
+    {"bg": [241, 247, 249], "cell": [248, 244, 232], "ink": [38, 29, 51], "grid": [116, 132, 141], "noise": [170, 194, 198], "clutter": [[205, 90, 104], [104, 88, 78]]},
+    {"bg": [247, 242, 248], "cell": [235, 244, 239], "ink": [22, 38, 34], "grid": [132, 123, 139], "noise": [199, 180, 158], "clutter": [[196, 91, 55], [86, 105, 119]]},
+)
+
+
+def _distance_to_segment(xx: np.ndarray, yy: np.ndarray, a: tuple[float, float], b: tuple[float, float]) -> np.ndarray:
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    t = np.clip(((xx - ax) * vx + (yy - ay) * vy) / (vx * vx + vy * vy), 0.0, 1.0)
+    return np.hypot(xx - (ax + t * vx), yy - (ay + t * vy))
+
+
+def _templates() -> dict[str, np.ndarray]:
+    yy, xx = np.mgrid[:GRID, :GRID]
+    c = 8
+    radius = np.hypot(xx - c, yy - c)
+    circle = (radius >= 5.0) & (radius <= 6.5)
+    tri_distance = np.minimum.reduce([
+        _distance_to_segment(xx, yy, (8, 2), (2, 14)),
+        _distance_to_segment(xx, yy, (2, 14), (14, 14)),
+        _distance_to_segment(xx, yy, (14, 14), (8, 2)),
+    ])
+    triangle = tri_distance <= 0.9
+    plus = (((np.abs(xx - c) <= 1) & (np.abs(yy - c) <= 6)) |
+            ((np.abs(yy - c) <= 1) & (np.abs(xx - c) <= 6)))
+    cross = (((np.abs((xx - c) - (yy - c)) <= 1) |
+              (np.abs((xx - c) + (yy - c)) <= 1)) &
+             (np.abs(xx - c) <= 6) & (np.abs(yy - c) <= 6))
+    plus[c, c] = False
+    cross[c, c] = False
+    masks = {"circle": circle, "triangle": triangle, "plus": plus, "x": cross}
+    assert {int(mask.sum()) for mask in masks.values()} == {68}
+    return masks
+
+
+TEMPLATES = _templates()
+
+
+def _noisy_mask(scene: dict) -> np.ndarray:
+    mask = TEMPLATES[scene["symbol"]].copy()
+    for off, on in scene["cell_noise"]:
+        oy, ox = off
+        ny, nx = on
+        mask[oy, ox] = False
+        mask[ny, nx] = True
+    return mask
+
+
+def _homography(src: list[tuple[float, float]], dst: list[tuple[float, float]]) -> np.ndarray:
+    rows = []
+    rhs = []
+    for (x, y), (u, v) in zip(src, dst, strict=True):
+        rows.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
+        rows.append([0, 0, 0, x, y, 1, -v * x, -v * y])
+        rhs.extend([u, v])
+    h = np.linalg.solve(np.asarray(rows, dtype=float), np.asarray(rhs, dtype=float))
+    return np.append(h, 1.0).reshape(3, 3)
+
+
+def _project(h: np.ndarray, x: float, y: float) -> tuple[float, float]:
+    q = h @ np.array([x, y, 1.0])
+    return float(q[0] / q[2]), float(q[1] / q[2])
+
+
+def _cross(a: list[float], b: list[float], c: list[float]) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _valid_quad(q: list[list[float]]) -> bool:
+    signs = [_cross(q[i], q[(i + 1) % 4], q[(i + 2) % 4]) for i in range(4)]
+    edges = [math.dist(q[i], q[(i + 1) % 4]) for i in range(4)]
+    return min(signs) > 2500 and min(edges) > 105
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    symbol = SYMBOLS[int(seed) % len(SYMBOLS)]
+    for _ in range(100):
+        tx, ty = rng.uniform(-12, 12), rng.uniform(-10, 10)
+        if rng.randrange(2) == 0:
+            quad = [
+                [rng.uniform(165, 205) + tx, rng.uniform(45, 76) + ty],
+                [rng.uniform(285, 325) + tx, rng.uniform(70, 112) + ty],
+                [rng.uniform(375, 430) + tx, rng.uniform(320, 378) + ty],
+                [rng.uniform(45, 105) + tx, rng.uniform(286, 356) + ty],
+            ]
+        else:
+            quad = [
+                [rng.uniform(45, 102) + tx, rng.uniform(46, 104) + ty],
+                [rng.uniform(372, 430) + tx, rng.uniform(72, 132) + ty],
+                [rng.uniform(280, 326) + tx, rng.uniform(318, 378) + ty],
+                [rng.uniform(162, 207) + tx, rng.uniform(286, 348) + ty],
+            ]
+        if _valid_quad(quad):
+            break
+    else:
+        raise RuntimeError("could not sample a stable projective window")
+
+    base = TEMPLATES[symbol]
+    on_cells = list(zip(*np.nonzero(base), strict=True))
+    off_cells = list(zip(*np.nonzero(~base), strict=True))
+    rng.shuffle(on_cells)
+    rng.shuffle(off_cells)
+    flips = 1 + rng.randrange(6)
+    cell_noise = [[[int(y), int(x)], [int(ny), int(nx)]] for (y, x), (ny, nx) in zip(on_cells[:flips], off_cells[:flips], strict=True)]
+
+    clutter = []
+    for side in ("left", "right"):
+        for idx in range(3):
+            x = rng.uniform(20, 62) if side == "left" else rng.uniform(425, 462)
+            y = rng.uniform(54, 365)
+            clutter.append({"x": round(x, 3), "y": round(y, 3), "r": round(rng.uniform(7, 16), 3), "kind": (idx + rng.randrange(2)) % 2, "color": idx % 2})
+
+    return {
+        "symbol": symbol,
+        "quad": [[round(x, 4), round(y, 4)] for x, y in quad],
+        "palette": copy.deepcopy(PALETTES[rng.randrange(len(PALETTES))]),
+        "clutter": clutter,
+        "cell_noise": cell_noise,
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["symbol"])
+
+
+def margin(scene: dict) -> float:
+    observed = _noisy_mask(scene)
+    scores = sorted((1.0 - float(np.mean(observed != mask)) for mask in TEMPLATES.values()), reverse=True)
+    return round(scores[0] - scores[1], 12)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []
+
+
+def render(scene: dict) -> Image.Image:
+    palette = scene["palette"]
+    scale = AA
+    image = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), tuple(palette["bg"]))
+    draw = ImageDraw.Draw(image)
+
+    for item in scene["clutter"]:
+        x, y, r = item["x"] * scale, item["y"] * scale, item["r"] * scale
+        color = tuple(palette["clutter"][item["color"]])
+        if item["kind"] == 0:
+            draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=3 * scale)
+        else:
+            draw.polygon([(x, y - r), (x - r, y + r), (x + r, y + r)], outline=color, width=3 * scale)
+
+    quad = [[x * scale, y * scale] for x, y in scene["quad"]]
+    hom = _homography([(0, 0), (1, 0), (1, 1), (0, 1)], [tuple(p) for p in quad])
+    mask = _noisy_mask(scene)
+    noise_targets = {tuple(pair[1]) for pair in scene["cell_noise"]}
+    for row in range(GRID):
+        for col in range(GRID):
+            corners = [
+                _project(hom, col / GRID, row / GRID),
+                _project(hom, (col + 1) / GRID, row / GRID),
+                _project(hom, (col + 1) / GRID, (row + 1) / GRID),
+                _project(hom, col / GRID, (row + 1) / GRID),
+            ]
+            fill = tuple(palette["ink"] if mask[row, col] else palette["cell"])
+            if (row, col) in noise_targets and mask[row, col]:
+                fill = tuple(palette["ink"])
+            draw.polygon(corners, fill=fill, outline=tuple(palette["grid"]), width=max(1, scale))
+
+    qtuples = [tuple(p) for p in quad]
+    draw.line(qtuples + [qtuples[0]], fill=(20, 174, 196), width=4 * scale, joint="curve")
+    for key, point in zip(("tl", "tr", "br", "bl"), quad, strict=True):
+        x, y = point
+        radius = 9 * scale
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=MARKERS[key], outline=(255, 255, 255), width=2 * scale)
+
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)

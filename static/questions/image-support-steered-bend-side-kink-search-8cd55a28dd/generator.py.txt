@@ -1,0 +1,298 @@
+"""Renderer and analytic gold for the bend-side kink world.
+
+One thin thread is folded into eight straight runs (alternating horizontal and
+vertical) and confined to a small randomly placed inset of a large plain canvas.
+Walking the thread from whichever bare end lies further to the left, each of the
+seven corners bears to one side or the other. Exactly one of turns two to six
+bears the opposite way from *both* of its neighbouring turns; every other
+candidate turn agrees with at least one neighbour.
+
+Only the sequence of bend sides decides the answer. Run lengths, ink total,
+colour, canvas position and the background specks are randomised and carry no
+information about the winner.
+
+Everything is drawn with integer rectangles and no antialiasing.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "bend_side_kink_search-renderer-0.1.0"
+
+WIDTH = 600
+HEIGHT = 460
+BACKGROUNDS = (
+    (238, 238, 234),
+    (232, 235, 240),
+    (240, 236, 228),
+)
+INKS = (
+    (24, 28, 36),
+    (30, 60, 110),
+    (120, 30, 40),
+    (28, 90, 70),
+    (90, 40, 110),
+)
+STROKE_HALF = 1            # the drawn thread is three pixels thick
+RUN_COUNT = 8
+CORNER_COUNT = RUN_COUNT - 1
+MIN_RUN = 16
+MAX_RUN = 36
+MAX_SPAN_X = 134           # the thread stays inside a small local inset
+MAX_SPAN_Y = 120
+MIN_SPAN = 74              # ... that is still clearly larger than a marker blob
+CANVAS_MARGIN = 26
+MIN_SELF_CLEARANCE = 11    # non-adjacent runs never come close to touching
+MIN_END_DX = 14            # the two bare ends are unambiguously left and right
+CLEAR_SPECKS = 26          # keeps stray specks off the thread component
+QUARANTINE_MARGIN = 13.0
+
+WORDS = ("second", "third", "fourth", "fifth", "sixth")
+FIRST_CANDIDATE_TURN = 2   # turns two to six can carry the kink
+CANDIDATE_TURNS = tuple(range(FIRST_CANDIDATE_TURN, FIRST_CANDIDATE_TURN + len(WORDS)))
+
+_DIRS = ((1, 0), (0, 1), (-1, 0), (0, -1))
+
+
+# ---------------------------------------------------------------- bend signs
+def _isolated_turns(signs: tuple[int, ...]) -> tuple[int, ...]:
+    """Candidate turns (1-based) that bear opposite to both neighbouring turns."""
+
+    out = []
+    for turn in CANDIDATE_TURNS:
+        index = turn - 1
+        if signs[index] != signs[index - 1] and signs[index] != signs[index + 1]:
+            out.append(turn)
+    return tuple(out)
+
+
+def _sign_pool() -> dict[int, tuple[tuple[int, ...], ...]]:
+    """All bend-sign sequences with exactly one isolated candidate turn."""
+
+    pool: dict[int, list[tuple[int, ...]]] = {turn: [] for turn in CANDIDATE_TURNS}
+    for signs in itertools.product((-1, 1), repeat=CORNER_COUNT):
+        isolated = _isolated_turns(signs)
+        if len(isolated) == 1:
+            pool[isolated[0]].append(signs)
+    return {turn: tuple(seqs) for turn, seqs in pool.items()}
+
+
+_SIGN_POOL = _sign_pool()
+
+
+def _rotate(direction: tuple[int, int], sign: int) -> tuple[int, int]:
+    dx, dy = direction
+    return (-dy, dx) if sign > 0 else (dy, -dx)
+
+
+def _walk_signs(dirs: list[tuple[int, int]]) -> tuple[int, ...]:
+    signs = []
+    for index in range(len(dirs) - 1):
+        (ax, ay), (bx, by) = dirs[index], dirs[index + 1]
+        signs.append(1 if ax * by - ay * bx > 0 else -1)
+    return tuple(signs)
+
+
+# ---------------------------------------------------------------- geometry
+def _polyline(first_dir: tuple[int, int], signs: tuple[int, ...], lengths: list[int]):
+    dirs = [first_dir]
+    for sign in signs:
+        dirs.append(_rotate(dirs[-1], sign))
+    points = [(0, 0)]
+    for index in range(RUN_COUNT):
+        dx, dy = dirs[index]
+        x, y = points[-1]
+        points.append((x + dx * lengths[index], y + dy * lengths[index]))
+    return points, dirs
+
+
+def _centreline(points) -> list[tuple[int, int]]:
+    pixels = []
+    for index in range(len(points) - 1):
+        (x1, y1), (x2, y2) = points[index], points[index + 1]
+        if y1 == y2:
+            step = 1 if x2 > x1 else -1
+            pixels.extend((x, y1) for x in range(x1, x2 + step, step))
+        else:
+            step = 1 if y2 > y1 else -1
+            pixels.extend((x1, y) for y in range(y1, y2 + step, step))
+    return pixels
+
+
+def _self_clear(points) -> bool:
+    """No two non-adjacent runs come within ``MIN_SELF_CLEARANCE`` pixels."""
+
+    runs = []
+    for index in range(len(points) - 1):
+        runs.append(_centreline([points[index], points[index + 1]]))
+    for i in range(len(runs)):
+        for j in range(i + 2, len(runs)):
+            for (x1, y1) in runs[i]:
+                for (x2, y2) in runs[j]:
+                    if (x1 - x2) ** 2 + (y1 - y2) ** 2 < MIN_SELF_CLEARANCE ** 2:
+                        return False
+    return True
+
+
+def _scores(signs: tuple[int, ...], lengths: list[int]) -> dict[int, float]:
+    """Same-side support of every candidate turn, in pixels of corner offset."""
+
+    offsets = {}
+    for turn in range(1, CORNER_COUNT + 1):
+        a, b = lengths[turn - 1], lengths[turn]
+        offsets[turn] = a * b / math.hypot(a, b)
+    out = {}
+    for turn in CANDIDATE_TURNS:
+        total = 0.0
+        for other in (turn - 1, turn + 1):
+            if signs[other - 1] == signs[turn - 1]:
+                total += offsets[other]
+        out[turn] = total
+    return out
+
+
+# ---------------------------------------------------------------- sampling
+def sample_scene(seed: int) -> dict:
+    """Deterministic scene; the kink turn is balanced across consecutive seeds."""
+
+    rng = random.Random(seed * 7919 + 13)
+    target = CANDIDATE_TURNS[seed % len(CANDIDATE_TURNS)]
+    for _ in range(4000):
+        build_signs = rng.choice(_SIGN_POOL[target])
+        first_dir = _DIRS[rng.randrange(len(_DIRS))]
+        lengths = [rng.randrange(MIN_RUN, MAX_RUN + 1) for _ in range(RUN_COUNT)]
+        points, dirs = _polyline(first_dir, build_signs, lengths)
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        span_x, span_y = max(xs) - min(xs), max(ys) - min(ys)
+        if span_x > MAX_SPAN_X or span_y > MAX_SPAN_Y:
+            continue
+        if max(span_x, span_y) < MIN_SPAN:
+            continue
+        if abs(points[0][0] - points[-1][0]) < MIN_END_DX:
+            continue
+        if not _self_clear(points):
+            continue
+        # walk order: start from the bare end that lies further to the left
+        if points[0][0] > points[-1][0]:
+            points = points[::-1]
+            dirs = [(-dx, -dy) for dx, dy in dirs[::-1]]
+            lengths = lengths[::-1]
+        signs = _walk_signs(dirs)
+        isolated = _isolated_turns(signs)
+        if len(isolated) != 1:
+            continue
+        origin_x = rng.randrange(CANVAS_MARGIN, WIDTH - CANVAS_MARGIN - span_x + 1)
+        origin_y = rng.randrange(CANVAS_MARGIN, HEIGHT - CANVAS_MARGIN - span_y + 1)
+        shift_x, shift_y = origin_x - min(xs), origin_y - min(ys)
+        vertices = [[x + shift_x, y + shift_y] for x, y in points]
+        scene = {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "vertices": vertices,
+            "color": rng.randrange(len(INKS)),
+            "background": rng.randrange(len(BACKGROUNDS)),
+            "specks": _sample_specks(rng, vertices),
+        }
+        if analytic_gold(scene) != WORDS[target - FIRST_CANDIDATE_TURN]:
+            continue
+        return scene
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+def _sample_specks(rng: random.Random, vertices) -> list[list[int]]:
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    lo_x, hi_x = min(xs) - CLEAR_SPECKS, max(xs) + CLEAR_SPECKS
+    lo_y, hi_y = min(ys) - CLEAR_SPECKS, max(ys) + CLEAR_SPECKS
+    specks: list[list[int]] = []
+    wanted = rng.randrange(5, 10)
+    for _ in range(3000):
+        if len(specks) >= wanted:
+            break
+        x = rng.randrange(CANVAS_MARGIN // 2, WIDTH - CANVAS_MARGIN // 2)
+        y = rng.randrange(CANVAS_MARGIN // 2, HEIGHT - CANVAS_MARGIN // 2)
+        if lo_x <= x <= hi_x and lo_y <= y <= hi_y:
+            continue
+        if any((x - sx) ** 2 + (y - sy) ** 2 < 20 ** 2 for sx, sy in specks):
+            continue
+        specks.append([x, y])
+    return specks
+
+
+# ---------------------------------------------------------------- gold
+def _walk_state(scene: dict):
+    points = [(int(x), int(y)) for x, y in scene["vertices"]]
+    dirs = []
+    lengths = []
+    for index in range(len(points) - 1):
+        (x1, y1), (x2, y2) = points[index], points[index + 1]
+        dx, dy = x2 - x1, y2 - y1
+        length = abs(dx) + abs(dy)
+        lengths.append(length)
+        dirs.append((dx // length, dy // length))
+    if points[0][0] > points[-1][0]:
+        dirs = [(-dx, -dy) for dx, dy in dirs[::-1]]
+        lengths = lengths[::-1]
+    return _walk_signs(dirs), lengths
+
+
+def analytic_gold(scene: dict) -> str:
+    signs, _ = _walk_state(scene)
+    isolated = _isolated_turns(signs)
+    if len(isolated) != 1:
+        raise ValueError("scene has no unique kink turn")
+    return WORDS[isolated[0] - FIRST_CANDIDATE_TURN]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up same-side support, in pixels of corner offset."""
+
+    signs, lengths = _walk_state(scene)
+    scores = _scores(signs, lengths)
+    winner = _isolated_turns(signs)[0]
+    return float(min(score for turn, score in scores.items() if turn != winner))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Latent rewrites that keep the raster identical and the gold unchanged."""
+
+    specks = scene["specks"]
+    out: list[tuple[str, dict]] = []
+    if len(specks) >= 2:
+        out.append(("specks_reversed", {**scene, "specks": specks[::-1]}))
+        out.append(("specks_rotated", {**scene, "specks": specks[1:] + specks[:1]}))
+    return out
+
+
+# ---------------------------------------------------------------- rendering
+def render(scene: dict) -> Image.Image:
+    array = np.zeros((int(scene["height"]), int(scene["width"]), 3), dtype=np.uint8)
+    array[:, :] = np.array(BACKGROUNDS[int(scene["background"]) % len(BACKGROUNDS)], dtype=np.uint8)
+    ink = np.array(INKS[int(scene["color"]) % len(INKS)], dtype=np.uint8)
+    points = [(int(x), int(y)) for x, y in scene["vertices"]]
+
+    for index in range(len(points) - 1):
+        (x1, y1), (x2, y2) = points[index], points[index + 1]
+        if y1 == y2:
+            array[y1 - STROKE_HALF : y1 + STROKE_HALF + 1, min(x1, x2) : max(x1, x2) + 1] = ink
+        else:
+            array[min(y1, y2) : max(y1, y2) + 1, x1 - STROKE_HALF : x1 + STROKE_HALF + 1] = ink
+    for x, y in points:
+        array[y - STROKE_HALF : y + STROKE_HALF + 1, x - STROKE_HALF : x + STROKE_HALF + 1] = ink
+
+    for sx, sy in scene["specks"]:
+        sx, sy = int(sx), int(sy)
+        array[sy - STROKE_HALF : sy + STROKE_HALF + 1, sx - STROKE_HALF : sx + STROKE_HALF + 1] = ink
+
+    return Image.fromarray(array, mode="RGB")

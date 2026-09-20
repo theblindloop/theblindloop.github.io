@@ -1,0 +1,173 @@
+"""Scene-free pixel oracle.
+
+Receives only a rendered PNG.  It segments the junction discs, the black ring
+and the gray bar ink, rebuilds the link graph by testing which pairs of discs are
+joined by an unbroken bar, deletes the ringed junction, and counts the connected
+pieces that remain.  It imports no renderer, prompt, generator, verifier or
+analytic-gold code and never sees a latent scene.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "hub_removal_pieces-oracle-0.1.0"
+ABSTAIN = "unknown"
+
+_NODE_RGB = (58, 58, 58)
+_STROKE_RGB = (150, 150, 150)
+_RING_RGB = (0, 0, 0)
+_TOL = 12
+
+_MIN_DISC_AREA = 300
+_MIN_RING_AREA = 120
+_ALLOWED_ANSWERS = ("1", "2", "3")
+
+
+def _mask(arr: np.ndarray, rgb) -> np.ndarray:
+    return (np.abs(arr.astype(np.int16) - np.array(rgb, dtype=np.int16)).max(axis=2) <= _TOL)
+
+
+def _blobs(mask: np.ndarray, min_area: int) -> list[dict]:
+    """8-connected components of a boolean mask, as area/centroid records."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), dtype=bool)
+    out: list[dict] = []
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if seen[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        seen[y0, x0] = True
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pix) >= min_area:
+            arr = np.array(pix, dtype=np.float64)
+            out.append(
+                {
+                    "area": len(pix),
+                    "cy": float(arr[:, 0].mean()),
+                    "cx": float(arr[:, 1].mean()),
+                    "radius": float(np.sqrt(len(pix) / np.pi)),
+                }
+            )
+    return out
+
+
+def _dilate(mask: np.ndarray) -> np.ndarray:
+    out = mask.copy()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            out |= np.roll(np.roll(mask, dy, axis=0), dx, axis=1)
+    return out
+
+
+def _point_segment_distance(px, py, ax, ay, bx, by) -> float:
+    vx, vy = bx - ax, by - ay
+    denom = vx * vx + vy * vy
+    t = 0.0 if denom == 0 else max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / denom))
+    return float(np.hypot(px - (ax + t * vx), py - (ay + t * vy)))
+
+
+def _components(nodes: list[int], edges: list[tuple[int, int]], removed=None) -> int:
+    alive = [v for v in nodes if v != removed]
+    adj = {v: [] for v in alive}
+    for a, b in edges:
+        if a == removed or b == removed or a not in adj or b not in adj:
+            continue
+        adj[a].append(b)
+        adj[b].append(a)
+    seen: set[int] = set()
+    count = 0
+    for v in alive:
+        if v in seen:
+            continue
+        count += 1
+        stack = [v]
+        seen.add(v)
+        while stack:
+            for w in adj[stack.pop()]:
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+    return count
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3:
+        return ABSTAIN
+
+    node_mask = _mask(arr, _NODE_RGB)
+    stroke_mask = _mask(arr, _STROKE_RGB)
+    ring_mask = _mask(arr, _RING_RGB)
+
+    discs = _blobs(node_mask, _MIN_DISC_AREA)
+    if len(discs) < 4 or len(discs) > 64:
+        return ABSTAIN
+    rings = _blobs(ring_mask, _MIN_RING_AREA)
+    if len(rings) != 1:
+        return ABSTAIN
+
+    ink = _dilate(stroke_mask | node_mask | ring_mask)
+    h, w = ink.shape
+    centres = [(d["cx"], d["cy"]) for d in discs]
+    radius = float(np.median([d["radius"] for d in discs]))
+    if not (6.0 <= radius <= 60.0):
+        return ABSTAIN
+
+    edges: list[tuple[int, int]] = []
+    for i in range(len(centres)):
+        for j in range(i + 1, len(centres)):
+            ax, ay = centres[i]
+            bx, by = centres[j]
+            length = float(np.hypot(bx - ax, by - ay))
+            if length <= 2 * radius + 4:
+                return ABSTAIN  # touching discs: the graph is not readable
+            blocked = any(
+                _point_segment_distance(cx, cy, ax, ay, bx, by) < radius
+                for k, (cx, cy) in enumerate(centres)
+                if k not in (i, j)
+            )
+            if blocked:
+                continue
+            start = (radius + 3.0) / length
+            steps = max(4, int(length))
+            covered = True
+            for s in range(steps + 1):
+                t = start + (1.0 - 2.0 * start) * (s / steps)
+                x = int(round(ax + t * (bx - ax)))
+                y = int(round(ay + t * (by - ay)))
+                if not (0 <= x < w and 0 <= y < h) or not ink[y, x]:
+                    covered = False
+                    break
+            if covered:
+                edges.append((i, j))
+
+    ids = list(range(len(centres)))
+    if _components(ids, edges) != 1:
+        return ABSTAIN
+
+    rx, ry = rings[0]["cx"], rings[0]["cy"]
+    ranked = sorted(ids, key=lambda k: np.hypot(centres[k][0] - rx, centres[k][1] - ry))
+    hub = ranked[0]
+    if np.hypot(centres[hub][0] - rx, centres[hub][1] - ry) > radius:
+        return ABSTAIN
+    if np.hypot(centres[ranked[1]][0] - rx, centres[ranked[1]][1] - ry) < 2 * radius:
+        return ABSTAIN
+
+    degree = sum(1 for a, b in edges if hub in (a, b))
+    if degree != 4:
+        return ABSTAIN
+
+    pieces = str(_components(ids, edges, removed=hub))
+    return pieces if pieces in _ALLOWED_ANSWERS else ABSTAIN

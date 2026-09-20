@@ -1,0 +1,350 @@
+"""Renderer, analytic gold and margins for the chiral reference-match world.
+
+A reference glyph is shown in a box at the top of the image.  Four panels below
+it each hold one glyph of the same construction family, drawn at a random
+rotation.  Exactly one panel holds a rotated-only copy of the reference glyph.
+One other panel holds the mirror image of the reference (the lure) and the two
+remaining panels hold different glyphs of the family.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 720
+HEIGHT = 560
+SPLIT_Y = 200
+BAND_TOP = SPLIT_Y + 4
+PANEL_COUNT = 4
+PANEL_WIDTH = WIDTH // PANEL_COUNT
+DIVIDER = 3
+SUPERSAMPLE = 3
+
+REF_CENTER = (WIDTH // 2, 100)
+REF_BOX = (200, 164)
+PANEL_SCALE = 0.62
+REF_SCALES = (0.46, 0.50, 0.54)
+
+ARM_GRID = tuple(float(v) for v in range(-55, 56, 5))
+ANGLE_GRID = tuple(float(a) for a in range(0, 360, 5))
+
+MIN_CHIRALITY = 18.0
+MIN_SHAPE_PARAM_GAP = 25.0
+MIN_PAIR_PARAM_GAP = 20.0
+MARGIN_FLOOR = 2.0
+QUARANTINE_MARGIN = 3.0
+
+SIGNATURE_BINS = 360
+
+# (background, structure, glyph)
+PALETTES = (
+    ((246, 244, 238), (176, 176, 172), (36, 44, 92)),
+    ((238, 243, 246), (168, 174, 178), (94, 30, 36)),
+    ((243, 240, 246), (174, 170, 180), (28, 74, 52)),
+    ((245, 245, 240), (170, 172, 168), (66, 38, 96)),
+)
+
+ANSWERS = ("panel-1", "panel-2", "panel-3", "panel-4")
+
+
+# ---------------------------------------------------------------- geometry
+
+
+def prototype(arm_left: float, arm_right: float) -> list:
+    """Vertices of the glyph: a pointed spine with one arm on each side.
+
+    The glyph is mirror symmetric exactly when ``arm_left == arm_right``; the
+    two arm heights are what makes it left- or right-handed.
+    """
+    half = 16.0
+    return [
+        (0.0, -95.0),
+        (18.0, -80.0),
+        (18.0, arm_right - half),
+        (72.0, arm_right - half),
+        (72.0, arm_right + half),
+        (18.0, arm_right + half),
+        (18.0, 80.0),
+        (-18.0, 80.0),
+        (-18.0, arm_left + half),
+        (-72.0, arm_left + half),
+        (-72.0, arm_left - half),
+        (-18.0, arm_left - half),
+        (-18.0, -80.0),
+    ]
+
+
+def _placed(points: list, angle: float, mirror: bool, scale: float, center: tuple) -> list:
+    radians = math.radians(angle % 360.0)
+    cos_a = math.cos(radians)
+    sin_a = math.sin(radians)
+    out = []
+    for x, y in points:
+        px = -x if mirror else x
+        out.append(
+            (
+                center[0] + scale * (px * cos_a - y * sin_a),
+                center[1] + scale * (px * sin_a + y * cos_a),
+            )
+        )
+    return out
+
+
+def _polygon_centroid(points: list) -> tuple:
+    area = 0.0
+    cx = 0.0
+    cy = 0.0
+    count = len(points)
+    for index in range(count):
+        x0, y0 = points[index]
+        x1, y1 = points[(index + 1) % count]
+        cross = x0 * y1 - x1 * y0
+        area += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    area *= 0.5
+    return (cx / (6.0 * area), cy / (6.0 * area))
+
+
+def analytic_signature(points: list, mirror: bool = False) -> list:
+    """Outer radius of the polygon as a function of angle, from its centroid.
+
+    This is the continuous counterpart of what the pixel arm measures, and is
+    used only for scene-level margins, never for the pixel decision.
+    """
+    verts = [(-x, y) if mirror else (x, y) for x, y in points]
+    cx, cy = _polygon_centroid(verts)
+    radii = []
+    count = len(verts)
+    for index in range(SIGNATURE_BINS):
+        theta = 2.0 * math.pi * index / SIGNATURE_BINS
+        ux = math.cos(theta)
+        uy = math.sin(theta)
+        best = 0.0
+        for edge in range(count):
+            ax, ay = verts[edge]
+            bx, by = verts[(edge + 1) % count]
+            ex = bx - ax
+            ey = by - ay
+            denom = ux * ey - uy * ex
+            if abs(denom) < 1e-12:
+                continue
+            rx = ax - cx
+            ry = ay - cy
+            t = (rx * ey - ry * ex) / denom
+            s = (rx * uy - ry * ux) / denom
+            if t > best and -1e-9 <= s <= 1.0 + 1e-9:
+                best = t
+        radii.append(best)
+    scale = math.sqrt(sum(r * r for r in radii) / SIGNATURE_BINS)
+    return [r / scale for r in radii]
+
+
+def signature_distance(first: list, second: list) -> float:
+    """Rotation-invariant mismatch in [0, 1]: 0 means congruent by rotation."""
+    left = np.asarray(first, dtype=np.float64)
+    right = np.asarray(second, dtype=np.float64)
+    correlation = np.real(
+        np.fft.irfft(np.fft.rfft(left) * np.conj(np.fft.rfft(right)), SIGNATURE_BINS)
+    )
+    best = float(correlation.max()) / float(np.linalg.norm(left) * np.linalg.norm(right))
+    return max(0.0, 1.0 - best)
+
+
+# ---------------------------------------------------------------- sampling
+
+
+def _sample_arms(rng: random.Random) -> tuple:
+    while True:
+        left = rng.choice(ARM_GRID)
+        right = rng.choice(ARM_GRID)
+        if abs(left - right) >= MIN_CHIRALITY:
+            return (left, right)
+
+
+def _param_gap(first: tuple, second: tuple) -> float:
+    return abs(first[0] - second[0]) + abs(first[1] - second[1])
+
+
+def _distance_percent(base: list, arms: tuple, mirror: bool) -> float:
+    return signature_distance(base, analytic_signature(prototype(*arms), mirror=mirror)) * 100.0
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+
+    # The mirror lure is the hardest distractor, so the reference glyph is
+    # resampled until its own mirror image is separated by the margin floor.
+    while True:
+        reference_arms = _sample_arms(rng)
+        base = analytic_signature(prototype(*reference_arms))
+        if _distance_percent(base, reference_arms, True) >= MARGIN_FLOOR:
+            break
+    mirrored_arms = (reference_arms[1], reference_arms[0])
+
+    others = []
+    while len(others) < 2:
+        candidate = _sample_arms(rng)
+        if _param_gap(candidate, reference_arms) < MIN_SHAPE_PARAM_GAP:
+            continue
+        if _param_gap(candidate, mirrored_arms) < MIN_SHAPE_PARAM_GAP:
+            continue
+        if any(_param_gap(candidate, done) < MIN_PAIR_PARAM_GAP for done in others):
+            continue
+        if min(
+            _distance_percent(base, candidate, False),
+            _distance_percent(base, candidate, True),
+        ) < MARGIN_FLOOR:
+            continue
+        others.append(candidate)
+
+    target = seed % PANEL_COUNT
+    remaining = [index for index in range(PANEL_COUNT) if index != target]
+    rng.shuffle(remaining)
+    lure = remaining[0]
+
+    angles = rng.sample(ANGLE_GRID, PANEL_COUNT + 1)
+    panels = []
+    other_index = 0
+    for index in range(PANEL_COUNT):
+        if index == target:
+            arms = reference_arms
+            mirror = False
+            role = "copy"
+        elif index == lure:
+            arms = reference_arms
+            mirror = True
+            role = "mirror"
+        else:
+            arms = others[other_index]
+            other_index += 1
+            mirror = bool(rng.getrandbits(1))
+            role = "other"
+        panels.append(
+            {
+                "arm_left": arms[0],
+                "arm_right": arms[1],
+                "angle": angles[index],
+                "mirror": mirror,
+                "role": role,
+            }
+        )
+
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "palette": rng.randrange(len(PALETTES)),
+        "reference": {
+            "arm_left": reference_arms[0],
+            "arm_right": reference_arms[1],
+            "angle": angles[PANEL_COUNT],
+            "scale": rng.choice(REF_SCALES),
+        },
+        "panels": panels,
+    }
+
+
+# ---------------------------------------------------------------- rendering
+
+
+def render(scene: dict) -> Image.Image:
+    background, structure, glyph = PALETTES[int(scene["palette"]) % len(PALETTES)]
+    factor = SUPERSAMPLE
+    width = int(scene["width"])
+    height = int(scene["height"])
+    image = Image.new("RGB", (width * factor, height * factor), background)
+    draw = ImageDraw.Draw(image)
+
+    def rect(x0, y0, x1, y1, fill):
+        draw.rectangle(
+            [x0 * factor, y0 * factor, x1 * factor - 1, y1 * factor - 1], fill=fill
+        )
+
+    rect(0, SPLIT_Y, width, SPLIT_Y + DIVIDER, structure)
+    for index in range(1, PANEL_COUNT):
+        x = index * PANEL_WIDTH
+        rect(x, BAND_TOP, x + DIVIDER, height, structure)
+
+    box_x = REF_CENTER[0] - REF_BOX[0] // 2
+    box_y = REF_CENTER[1] - REF_BOX[1] // 2
+    rect(box_x, box_y, box_x + REF_BOX[0], box_y + DIVIDER, structure)
+    rect(box_x, box_y + REF_BOX[1] - DIVIDER, box_x + REF_BOX[0], box_y + REF_BOX[1], structure)
+    rect(box_x, box_y, box_x + DIVIDER, box_y + REF_BOX[1], structure)
+    rect(box_x + REF_BOX[0] - DIVIDER, box_y, box_x + REF_BOX[0], box_y + REF_BOX[1], structure)
+
+    reference = scene["reference"]
+    points = prototype(float(reference["arm_left"]), float(reference["arm_right"]))
+    placed = _placed(points, float(reference["angle"]), False, float(reference["scale"]), REF_CENTER)
+    draw.polygon([(x * factor, y * factor) for x, y in placed], fill=glyph)
+
+    band_center = (BAND_TOP + height) // 2
+    for index, panel in enumerate(scene["panels"]):
+        center = (index * PANEL_WIDTH + PANEL_WIDTH // 2, band_center)
+        points = prototype(float(panel["arm_left"]), float(panel["arm_right"]))
+        placed = _placed(points, float(panel["angle"]), bool(panel["mirror"]), PANEL_SCALE, center)
+        draw.polygon([(x * factor, y * factor) for x, y in placed], fill=glyph)
+
+    return image.resize((width, height), Image.LANCZOS)
+
+
+# ---------------------------------------------------------------- labels
+
+
+def analytic_gold(scene: dict) -> str:
+    for index, panel in enumerate(scene["panels"]):
+        if panel["role"] == "copy":
+            return ANSWERS[index]
+    raise ValueError("scene has no reference copy")
+
+
+def margin(scene: dict) -> float:
+    """Runner-up margin: signature distance from the reference to its nearest
+    non-answer panel glyph, in percent of the normalised signature scale."""
+    reference = scene["reference"]
+    base = analytic_signature(
+        prototype(float(reference["arm_left"]), float(reference["arm_right"]))
+    )
+    worst = None
+    for panel in scene["panels"]:
+        if panel["role"] == "copy":
+            continue
+        other = analytic_signature(
+            prototype(float(panel["arm_left"]), float(panel["arm_right"])),
+            mirror=bool(panel["mirror"]),
+        )
+        distance = signature_distance(base, other) * 100.0
+        if worst is None or distance < worst:
+            worst = distance
+    return round(float(worst), 9)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Label-preserving latent aliases that leave the raster byte-identical."""
+    turned = json_clone(scene)
+    turned["reference"]["angle"] = float(turned["reference"]["angle"]) + 360.0
+    for panel in turned["panels"]:
+        panel["angle"] = float(panel["angle"]) + 360.0
+
+    recoloured = json_clone(scene)
+    recoloured["palette"] = int(recoloured["palette"]) + len(PALETTES)
+
+    return [
+        ("angles_plus_full_turn", turned),
+        ("palette_index_plus_period", recoloured),
+    ]
+
+
+def json_clone(scene: dict):
+    if isinstance(scene, dict):
+        return {key: json_clone(value) for key, value in scene.items()}
+    if isinstance(scene, list):
+        return [json_clone(value) for value in scene]
+    return scene

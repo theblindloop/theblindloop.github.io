@@ -1,0 +1,142 @@
+"""Independent pixel-only inverse for paired endpoint-conditioned tree paths.
+
+The inverse segments the two bright centerline networks and four colored endpoint
+rings from the final raster. It binds one blue and one orange marker to each
+network, then measures their shortest 4-neighbor path through the segmented
+centerline graph. It imports no scene, renderer, prompt, generator, or gold code.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "paired-tree-trip-length-oracle-0.1.0"
+
+_CENTER_COLORS = np.asarray(((45, 194, 167), (55, 205, 232)), dtype=np.int32)
+_BLUE_COLORS = np.asarray(((37, 99, 235), (42, 98, 190)), dtype=np.int32)
+_ORANGE_COLORS = np.asarray(((234, 88, 12), (226, 116, 43)), dtype=np.int32)
+
+
+class OracleAbstention(ValueError):
+    """Raised when a raster does not expose two intact supported route trees."""
+
+
+def _near_any(array: np.ndarray, colors: np.ndarray, radius: int = 20) -> np.ndarray:
+    delta = array.astype(np.int32)[:, :, None, :] - colors[None, None, :, :]
+    distance = np.sum(delta * delta, axis=3, dtype=np.int32)
+    return distance.min(axis=2) <= radius * radius
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        seen[sy, sx] = True
+        queue = deque(((sy, sx),))
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= minimum:
+            groups.append(np.asarray(points, dtype=np.int16))
+    return groups
+
+
+def _ring_centers(mask: np.ndarray, name: str) -> list[tuple[float, float]]:
+    groups = _components(mask, minimum=120)
+    if len(groups) != 2:
+        raise OracleAbstention(f"expected two intact {name} endpoint rings, found {len(groups)}")
+    centers = [(float(group[:, 1].mean()), float(group[:, 0].mean())) for group in groups]
+    centers.sort(key=lambda point: point[1])
+    if centers[1][1] - centers[0][1] < 180:
+        raise OracleAbstention(f"{name} rings do not occupy separate route maps")
+    return centers
+
+
+def _component_mask(shape: tuple[int, int], points: np.ndarray) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    mask[points[:, 0], points[:, 1]] = True
+    return mask
+
+
+def _nearest(points: np.ndarray, center: tuple[float, float]) -> tuple[int, int]:
+    cx, cy = center
+    distances = (points[:, 1].astype(np.float32) - cx) ** 2 + (
+        points[:, 0].astype(np.float32) - cy
+    ) ** 2
+    y, x = points[int(np.argmin(distances))]
+    if float(distances.min()) > 8.0 * 8.0:
+        raise OracleAbstention("an endpoint ring is detached from its cyan centerline")
+    return int(y), int(x)
+
+
+def _graph_distance(mask: np.ndarray, start: tuple[int, int], goal: tuple[int, int]) -> int:
+    height, width = mask.shape
+    distance = np.full(mask.shape, -1, dtype=np.int32)
+    distance[start] = 0
+    queue = deque((start,))
+    while queue:
+        y, x = queue.popleft()
+        if (y, x) == goal:
+            return int(distance[y, x])
+        next_distance = int(distance[y, x]) + 1
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and distance[ny, nx] < 0:
+                distance[ny, nx] = next_distance
+                queue.append((ny, nx))
+    raise OracleAbstention("colored endpoints are not connected through one centerline tree")
+
+
+def _measure(image: Image.Image) -> tuple[int, int]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape[:2] != (512, 512):
+        raise OracleAbstention(f"unexpected raster size {array.shape[:2]}")
+    blue = _ring_centers(_near_any(array, _BLUE_COLORS), "blue")
+    orange = _ring_centers(_near_any(array, _ORANGE_COLORS), "orange")
+    groups = _components(_near_any(array, _CENTER_COLORS, radius=18), minimum=100)
+    if len(groups) != 2:
+        raise OracleAbstention(f"expected two intact cyan networks, found {len(groups)}")
+    groups.sort(key=lambda points: float(points[:, 0].mean()))
+
+    measured: list[int] = []
+    for index, points in enumerate(groups):
+        count = len(points)
+        span_x = int(points[:, 1].max()) - int(points[:, 1].min())
+        span_y = int(points[:, 0].max()) - int(points[:, 0].min())
+        if not 920 <= count <= 1250:
+            raise OracleAbstention(f"route-map {index} has unsupported centerline ink {count}")
+        if not 175 <= span_x <= 195 or not 45 <= span_y <= 86:
+            raise OracleAbstention(
+                f"route-map {index} has unsupported span {(span_x, span_y)}"
+            )
+        if abs(float(points[:, 0].mean()) - blue[index][1]) > 24:
+            raise OracleAbstention("blue ring is not bound to its expected route map")
+        if abs(float(points[:, 0].mean()) - orange[index][1]) > 24:
+            raise OracleAbstention("orange ring is not bound to its expected route map")
+        mask = _component_mask(array.shape[:2], points)
+        start = _nearest(points, blue[index])
+        finish = _nearest(points, orange[index])
+        distance = _graph_distance(mask, start, finish)
+        if not 205 <= distance <= 275:
+            raise OracleAbstention(f"route-map {index} has unsupported path length {distance}")
+        measured.append(distance)
+    return measured[0], measured[1]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    top, bottom = _measure(image)
+    if abs(top - bottom) < 20:
+        raise OracleAbstention(f"pixel geodesics are too close to compare: {(top, bottom)}")
+    return "top" if top > bottom else "bottom"

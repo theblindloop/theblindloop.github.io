@@ -1,0 +1,201 @@
+"""Deterministic scene sampling and rendering for a global matching world."""
+
+from __future__ import annotations
+
+import math
+import random
+from functools import lru_cache
+
+from PIL import Image, ImageDraw
+
+
+WIDTH, HEIGHT = 640, 480
+DOT_RADIUS = 9
+DOT_COLOR = (24, 28, 34)
+BAR_COLOR = (112, 116, 124)
+
+
+def _points(scene: dict) -> list[tuple[float, float]]:
+    return [(float(x), float(y)) for x, y in scene["points"]]
+
+
+def _bar_length(scene: dict) -> float:
+    x1, _y, x2 = scene["bar"]
+    return float(x2) - float(x1)
+
+
+def _distances(points: list[tuple[float, float]]) -> list[list[float]]:
+    n = len(points)
+    values = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = math.hypot(points[i][0] - points[j][0], points[i][1] - points[j][1])
+            values[i][j] = values[j][i] = d
+    return values
+
+
+def _adjacency(points: list[tuple[float, float]], threshold: float) -> list[int]:
+    distances = _distances(points)
+    masks = [0] * len(points)
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            if distances[i][j] < threshold:
+                masks[i] |= 1 << j
+                masks[j] |= 1 << i
+    return masks
+
+
+def _is_connected(masks: list[int]) -> bool:
+    seen = 1
+    frontier = 1
+    while frontier:
+        bit = frontier & -frontier
+        frontier ^= bit
+        vertex = bit.bit_length() - 1
+        new = masks[vertex] & ~seen
+        seen |= new
+        frontier |= new
+    return seen == (1 << len(masks)) - 1
+
+
+def _has_perfect_matching(masks: list[int]) -> bool:
+    full = (1 << len(masks)) - 1
+
+    @lru_cache(maxsize=None)
+    def solve(remaining: int) -> bool:
+        if remaining == 0:
+            return True
+        first_bit = remaining & -remaining
+        first = first_bit.bit_length() - 1
+        partners = masks[first] & remaining & ~first_bit
+        while partners:
+            partner_bit = partners & -partners
+            partners ^= partner_bit
+            if solve(remaining ^ first_bit ^ partner_bit):
+                return True
+        return False
+
+    return solve(full)
+
+
+def _decision(points: list[tuple[float, float]], threshold: float) -> str:
+    return "yes" if _has_perfect_matching(_adjacency(points, threshold)) else "no"
+
+
+def _critical_threshold(points: list[tuple[float, float]]) -> float:
+    distances = sorted(
+        _distances(points)[i][j]
+        for i in range(len(points))
+        for j in range(i + 1, len(points))
+    )
+    for value in distances:
+        if _decision(points, value + 1e-7) == "yes":
+            return value
+    raise RuntimeError("an even complete graph must have a perfect matching")
+
+
+def _edge_count(masks: list[int]) -> int:
+    return sum(mask.bit_count() for mask in masks) // 2
+
+
+def sample_scene(seed: int) -> dict:
+    """Search randomized point fields for a balanced, well-separated decision."""
+
+    rng = random.Random(int(seed) ^ 0x5A17C9E3)
+    wanted = "yes" if int(seed) % 2 else "no"
+    visible_threshold = (108, 116, 124, 132)[(int(seed) // 2) % 4]
+
+    for _attempt in range(20000):
+        raw: list[tuple[float, float]] = []
+        while len(raw) < 10:
+            point = (rng.uniform(-1.0, 1.0), rng.uniform(-0.72, 0.72))
+            if all(math.hypot(point[0] - x, point[1] - y) > 0.16 for x, y in raw):
+                raw.append(point)
+
+        pair_values = sorted(
+            _distances(raw)[i][j] for i in range(10) for j in range(i + 1, 10)
+        )
+        thresholds = [(a + b) / 2.0 for a, b in zip(pair_values, pair_values[1:]) if b - a > 0.018]
+        rng.shuffle(thresholds)
+        angle = rng.uniform(0.0, 2.0 * math.pi)
+        cosine, sine = math.cos(angle), math.sin(angle)
+
+        for threshold in thresholds:
+            scale = visible_threshold / threshold
+            transformed = []
+            for x, y in raw:
+                rx = scale * (cosine * x - sine * y)
+                ry = scale * (sine * x + cosine * y)
+                transformed.append((rx, ry))
+            extent_x = max(x for x, _ in transformed) - min(x for x, _ in transformed)
+            extent_y = max(y for _, y in transformed) - min(y for _, y in transformed)
+            if extent_x > 510 or extent_y > 330:
+                continue
+            center_x = 320 + rng.randint(-24, 24)
+            center_y = 218 + rng.randint(-16, 16)
+            points = [
+                [int(round(center_x + x)), int(round(center_y + y))]
+                for x, y in transformed
+            ]
+            if any(x < 28 or x > 612 or y < 28 or y > 405 for x, y in points):
+                continue
+            point_pairs = [(float(x), float(y)) for x, y in points]
+            masks = _adjacency(point_pairs, float(visible_threshold))
+            if not _is_connected(masks):
+                continue
+            edges = _edge_count(masks)
+            degrees = [mask.bit_count() for mask in masks]
+            if not 10 <= edges <= 18 or max(degrees) > 6:
+                continue
+            if _decision(point_pairs, float(visible_threshold)) != wanted:
+                continue
+            all_distances = [
+                _distances(point_pairs)[i][j] for i in range(10) for j in range(i + 1, 10)
+            ]
+            clearance = min(abs(value - visible_threshold) for value in all_distances)
+            critical_gap = abs(_critical_threshold(point_pairs) - visible_threshold)
+            if clearance < 5.0 or critical_gap < 8.0:
+                continue
+            bar_x1 = int(round(320 - visible_threshold / 2))
+            bar_x2 = bar_x1 + visible_threshold
+            return {"points": points, "bar": [bar_x1, 448, bar_x2]}
+
+    raise RuntimeError(f"could not sample a robust {wanted!r} scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), (250, 249, 246))
+    draw = ImageDraw.Draw(image)
+    x1, y, x2 = [int(value) for value in scene["bar"]]
+    draw.line((x1, y, x2, y), fill=BAR_COLOR, width=7)
+    for x, y in _points(scene):
+        box = (x - DOT_RADIUS, y - DOT_RADIUS, x + DOT_RADIUS, y + DOT_RADIUS)
+        draw.ellipse(box, fill=DOT_COLOR)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return _decision(_points(scene), _bar_length(scene))
+
+
+def margin(scene: dict) -> float:
+    points = _points(scene)
+    threshold = _bar_length(scene)
+    return abs(threshold - _critical_threshold(points))
+
+
+def is_quarantined(scene: dict) -> bool:
+    points = _points(scene)
+    threshold = _bar_length(scene)
+    distances = _distances(points)
+    clearance = min(
+        abs(distances[i][j] - threshold)
+        for i in range(len(points))
+        for j in range(i + 1, len(points))
+    )
+    return margin(scene) < 6.0 or clearance < 4.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = {"points": list(reversed(scene["points"])), "bar": list(scene["bar"])}
+    return [("reverse_unlabeled_point_order", twin)]

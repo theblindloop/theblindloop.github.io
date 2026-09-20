@@ -1,0 +1,168 @@
+"""Image-only inverse arm for the relay trace board.
+
+The module intentionally has no access to scene data or candidate-world code.
+It discovers colored/gray port components, groups them into visible columns,
+then chooses the best-supported of all port permutations in each panel.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "gray": (173, 180, 188),
+    "green": (31, 160, 88),
+    "red": (220, 64, 64),
+    "blue": (55, 110, 220),
+    "orange": (238, 142, 38),
+}
+INK = np.array((25, 29, 35), dtype=np.float32)
+
+
+@dataclass(frozen=True)
+class Port:
+    x: float
+    y: float
+    color: str
+    area: int
+
+
+@dataclass(frozen=True)
+class Measurement:
+    decision: str
+    margin: float
+    panel_margins: tuple[float, ...]
+    mappings: tuple[tuple[int, int, int], ...]
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, float, float]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[tuple[int, float, float]] = []
+    for y0, x0 in np.argwhere(mask):
+        if seen[y0, x0]:
+            continue
+        queue = deque([(int(y0), int(x0))])
+        seen[y0, x0] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            xs.append(x)
+            ys.append(y)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        # Port interiors contribute about 300 core pixels. Thin antialiased
+        # trace edges can momentarily resemble gray, but remain much smaller.
+        if 200 <= len(xs) <= 900:
+            found.append((len(xs), float(np.mean(xs)), float(np.mean(ys))))
+    return found
+
+
+def _find_ports(arr: np.ndarray) -> list[Port]:
+    colors = list(PALETTE)
+    refs = np.array([PALETTE[name] for name in colors], dtype=np.float32)
+    distances = np.linalg.norm(arr[:, :, None, :] - refs[None, None, :, :], axis=3)
+    labels = distances.argmin(axis=2)
+    close = distances.min(axis=2) < 48.0
+    ports: list[Port] = []
+    for index, name in enumerate(colors):
+        for area, x, y in _components(close & (labels == index)):
+            ports.append(Port(x=x, y=y, color=name, area=area))
+    if len(ports) < 9:
+        raise ValueError(f"only {len(ports)} visible ports were recovered")
+    return ports
+
+
+def _group_columns(ports: list[Port]) -> list[list[Port]]:
+    radii = [math.sqrt(port.area / math.pi) for port in ports]
+    threshold = max(28.0, 3.2 * float(np.median(radii)))
+    groups: list[list[Port]] = []
+    for port in sorted(ports, key=lambda item: item.x):
+        if not groups or port.x - float(np.mean([p.x for p in groups[-1]])) > threshold:
+            groups.append([port])
+        else:
+            groups[-1].append(port)
+    groups = [sorted(group, key=lambda item: item.y) for group in groups]
+    if len(groups) < 3 or any(len(group) != 3 for group in groups):
+        raise ValueError(f"port geometry is not a three-row relay: {[len(g) for g in groups]}")
+    return groups
+
+
+def _line_support(black: np.ndarray, left: Port, right: Port) -> float:
+    # Exclude marker interiors and seek nearby core-ink at each raster sample.
+    values: list[float] = []
+    height, width = black.shape
+    for t in np.linspace(0.13, 0.87, 121):
+        x = int(round(left.x + t * (right.x - left.x)))
+        y = int(round(left.y + t * (right.y - left.y)))
+        x0, x1 = max(0, x - 2), min(width, x + 3)
+        y0, y1 = max(0, y - 2), min(height, y + 3)
+        values.append(float(black[y0:y1, x0:x1].any()))
+    return float(np.mean(values))
+
+
+def _decode_panel(black: np.ndarray, left: list[Port], right: list[Port]) -> tuple[tuple[int, int, int], float]:
+    support = np.array(
+        [[_line_support(black, left[source], right[target]) for target in range(3)] for source in range(3)]
+    )
+    scored: list[tuple[float, tuple[int, int, int]]] = []
+    for mapping in itertools.permutations(range(3)):
+        score = float(sum(support[source, mapping[source]] for source in range(3)) / 3.0)
+        scored.append((score, mapping))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    best_score, best_mapping = scored[0]
+    runner_score = scored[1][0]
+    margin = 100.0 * (best_score - runner_score)
+    if best_score < 0.78 or margin < 10.0:
+        raise ValueError(
+            f"ambiguous panel: best support={best_score:.3f}, runner-up margin={margin:.2f}"
+        )
+    return best_mapping, margin
+
+
+def measure(image: Image.Image) -> Measurement:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    ports = _find_ports(arr)
+    columns = _group_columns(ports)
+    black = np.linalg.norm(arr - INK[None, None, :], axis=2) < 70.0
+
+    first_colors = [port.color for port in columns[0]]
+    if first_colors.count("green") != 1:
+        raise ValueError("the first port column does not contain one green start")
+    final_colors = [port.color for port in columns[-1]]
+    if sorted(final_colors) != ["blue", "orange", "red"]:
+        raise ValueError(f"terminal palette is incomplete: {final_colors}")
+
+    mappings: list[tuple[int, int, int]] = []
+    margins: list[float] = []
+    for left, right in zip(columns, columns[1:]):
+        mapping, panel_margin = _decode_panel(black, left, right)
+        mappings.append(mapping)
+        margins.append(panel_margin)
+
+    row = first_colors.index("green")
+    for mapping in mappings:
+        row = mapping[row]
+    return Measurement(
+        decision=final_colors[row],
+        margin=min(margins),
+        panel_margins=tuple(margins),
+        mappings=tuple(mappings),
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure(image).decision

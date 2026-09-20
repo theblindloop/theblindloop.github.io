@@ -1,0 +1,174 @@
+"""Pixel-only inverse arm for stencil_cell_color_binding.
+
+Receives one rasterised image and nothing else: no scene, no renderer, no
+prompts, no analytic gold. It finds the four black panel frames, recovers each
+panel's own 4x4 cell lattice from its frame alone, reads the stencil's marked
+row/column positions, reads each colour grid's cell colours, solves the
+cross-panel assignment, and only then reports the bound colour. Returns
+"abstain" whenever the evidence is missing or does not single out one grid.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ABSTAIN = "abstain"
+GRID_N = 4
+N_MARKS = 4
+LETTERS = ("A", "B", "C")
+
+_FRAME = (0, 0, 0)
+_FRAME_TOLERANCE = 40
+_MARK_REFERENCE = (60, 60, 60)
+_MARK_TOLERANCE = 34
+_COLOR_ANCHORS = {
+    "red": (200, 40, 40),
+    "blue": (45, 80, 200),
+    "green": (40, 150, 60),
+    "orange": (235, 150, 20),
+}
+_COLOR_TOLERANCE = 60
+_MIN_FRAME_AREA = 900
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Bounding boxes of 4-connected true regions, via an explicit stack."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    boxes: list[tuple[int, int, int, int]] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        min_y = max_y = start_y
+        min_x = max_x = start_x
+        while stack:
+            y, x = stack.pop()
+            if y < min_y:
+                min_y = y
+            if y > max_y:
+                max_y = y
+            if x < min_x:
+                min_x = x
+            if x > max_x:
+                max_x = x
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        boxes.append((min_x, min_y, max_x, max_y))
+    return boxes
+
+
+def _frame_thickness(mask: np.ndarray, box: tuple[int, int, int, int]) -> int:
+    """Frame stroke width measured on the panel's own top edge."""
+    x0, y0, x1, y1 = box
+    column = (x0 + x1) // 2
+    thickness = 0
+    for y in range(y0, min(y1, y0 + 12) + 1):
+        if mask[y, column]:
+            thickness += 1
+        else:
+            break
+    return thickness
+
+
+def _cell_samples(image: np.ndarray, box: tuple[int, int, int, int], stroke: int):
+    """Median colour of a small patch at each of the sixteen cell centres."""
+    x0, y0, x1, y1 = box
+    left = x0 + stroke
+    top = y0 + stroke
+    span_x = (x1 - stroke) - left + 1
+    span_y = (y1 - stroke) - top + 1
+    if span_x < 4 * GRID_N or span_y < 4 * GRID_N:
+        return None
+    cell_x = span_x / GRID_N
+    cell_y = span_y / GRID_N
+    samples = []
+    for row in range(GRID_N):
+        for col in range(GRID_N):
+            cx = int(round(left + cell_x * (col + 0.5)))
+            cy = int(round(top + cell_y * (row + 0.5)))
+            patch = image[cy - 1 : cy + 2, cx - 1 : cx + 2].reshape(-1, 3)
+            if patch.size == 0:
+                return None
+            samples.append(np.median(patch.astype(np.int16), axis=0))
+    return samples
+
+
+def _classify(sample: np.ndarray) -> str | None:
+    best_name = None
+    best_distance = None
+    for name, anchor in _COLOR_ANCHORS.items():
+        distance = float(np.abs(sample - np.array(anchor, dtype=np.int16)).max())
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_name = name
+    if best_distance is None or best_distance > _COLOR_TOLERANCE:
+        return None
+    return best_name
+
+
+def _is_mark(sample: np.ndarray) -> bool:
+    reference = np.array(_MARK_REFERENCE, dtype=np.int16)
+    return bool(np.abs(sample - reference).max() <= _MARK_TOLERANCE)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover `LETTER|colour` from pixels alone, or abstain."""
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    frame = np.array(_FRAME, dtype=np.int16)
+    distance = np.abs(pixels.astype(np.int16) - frame).max(axis=2)
+    mask = distance <= _FRAME_TOLERANCE
+
+    boxes = [
+        box
+        for box in _components(mask)
+        if (box[2] - box[0] + 1) * (box[3] - box[1] + 1) >= _MIN_FRAME_AREA
+        and (box[2] - box[0]) > 8
+        and (box[3] - box[1]) > 8
+    ]
+    if len(boxes) != 4:
+        return ABSTAIN
+
+    boxes.sort(key=lambda box: box[1])
+    key_box = boxes[0]
+    grid_boxes = sorted(boxes[1:], key=lambda box: box[0])
+    if key_box[3] >= min(box[1] for box in grid_boxes):
+        return ABSTAIN
+
+    key_stroke = _frame_thickness(mask, key_box)
+    if key_stroke < 1 or key_stroke > 8:
+        return ABSTAIN
+    key_samples = _cell_samples(pixels, key_box, key_stroke)
+    if key_samples is None:
+        return ABSTAIN
+    marked = [index for index, sample in enumerate(key_samples) if _is_mark(sample)]
+    if len(marked) != N_MARKS:
+        return ABSTAIN
+
+    winners: list[tuple[str, str]] = []
+    for position, box in enumerate(grid_boxes):
+        stroke = _frame_thickness(mask, box)
+        if stroke < 1 or stroke > 8:
+            return ABSTAIN
+        samples = _cell_samples(pixels, box, stroke)
+        if samples is None:
+            return ABSTAIN
+        names = [_classify(sample) for sample in samples]
+        if any(name is None for name in names):
+            return ABSTAIN
+        counts = {anchor: names.count(anchor) for anchor in _COLOR_ANCHORS}
+        if sorted(counts.values()) != [4, 4, 4, 4]:
+            return ABSTAIN
+        readout = {names[index] for index in marked}
+        if len(readout) == 1:
+            winners.append((LETTERS[position], next(iter(readout))))
+
+    if len(winners) != 1:
+        return ABSTAIN
+    letter, color = winners[0]
+    return f"{letter}|{color}"

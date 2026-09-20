@@ -1,0 +1,335 @@
+"""Renderer, analytic gold and margin for ``mitten_rack_overlap``.
+
+Two identical dark grey racks stand far apart, one near the left image edge and
+one near the right.  Each rack hangs two to five mittens; every mitten is the
+same shape and size and carries one flat colour, and no rack repeats a colour.
+The decision is how many colours hang on *both* racks, i.e. the cardinality of
+the intersection of the two racks' colour sets.  Loose mittens on the floor
+between the racks are nuisance marks and never enter the answer.
+
+The canonical prior under test is the matched-pair convention: mittens come in
+pairs, so the shared count is read off as the size of the smaller rack.  It is
+recorded for analysis and never used as gold.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "mitten_rack_overlap-renderer-0.1.0"
+
+W, H = 660, 470
+BG = (255, 255, 255)
+RACK = (64, 64, 64)
+STROKE = 5
+RACK_W, RACK_H = 176, 228
+RACK_X0 = (24, 460)
+COL_DX = (52, 124)
+ROW_DY = (42, 114, 186)
+SLOTS: tuple[tuple[int, int], ...] = tuple(
+    (cx, cy) for cy in ROW_DY for cx in COL_DX
+)
+
+BODY_HW, BODY_HH = 15, 20
+THUMB = 16
+BOX_BACK, BOX_FRONT, BOX_V = 16, 25, 21
+
+MITTEN_COLOURS: dict[str, tuple[int, int, int]] = {
+    "amber": (236, 150, 18),
+    "azure": (30, 80, 196),
+    "crimson": (206, 28, 44),
+    "cyan": (46, 186, 214),
+    "lime": (150, 205, 40),
+    "olive": (98, 134, 26),
+    "rose": (238, 110, 170),
+    "teal": (0, 138, 128),
+    "violet": (132, 44, 172),
+}
+COLOUR_NAMES: tuple[str, ...] = tuple(sorted(MITTEN_COLOURS))
+
+MIN_COLOUR_DIST = 120.0
+QUARANTINE_MARGIN = 5.0
+TIGHT_MARGIN = 12.0
+
+FLOOR_X = (236, 415)
+FLOOR_Y = (48, 422)
+
+
+# --------------------------------------------------------------------------
+# geometry helpers (shared with verify.py; the pixel arm sees none of this)
+# --------------------------------------------------------------------------
+def mitten_centre(rack: dict, mt: dict) -> tuple[float, float]:
+    cx, cy = SLOTS[mt["slot"]]
+    return (rack["x0"] + cx + mt["dx"], rack["y0"] + cy + mt["dy"])
+
+
+def mitten_box(cx: float, cy: float, flip: bool) -> tuple[float, float, float, float]:
+    back, front = (BOX_FRONT, BOX_BACK) if flip else (BOX_BACK, BOX_FRONT)
+    return (cx - back, cy - BOX_V, cx + front, cy + BOX_V)
+
+
+def rack_box(rack: dict) -> tuple[float, float, float, float]:
+    return (
+        float(rack["x0"]),
+        float(rack["y0"]),
+        float(rack["x0"] + RACK_W - 1),
+        float(rack["y0"] + RACK_H - 1),
+    )
+
+
+def rack_inner(rack: dict) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = rack_box(rack)
+    return (x0 + STROKE, y0 + STROKE, x1 - STROKE, y1 - STROKE)
+
+
+def all_mittens(scene: dict) -> list[tuple[str, float, float, bool, str]]:
+    """(kind, cx, cy, flip, colour) for every drawn mitten."""
+    out: list[tuple[str, float, float, bool, str]] = []
+    for ri, rack in enumerate(scene["racks"]):
+        for mt in rack["mittens"]:
+            cx, cy = mitten_centre(rack, mt)
+            out.append((f"rack{ri}", cx, cy, bool(mt["flip"]), mt["colour"]))
+    for fl in scene["floor"]:
+        out.append(("floor", float(fl["x"]), float(fl["y"]), bool(fl["flip"]), fl["colour"]))
+    return out
+
+
+def _sep(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    xg = max(a[0] - b[2], b[0] - a[2])
+    yg = max(a[1] - b[3], b[1] - a[3])
+    return max(xg, yg)
+
+
+def _colour_dist(a: str, b: str) -> float:
+    ca, cb = MITTEN_COLOURS[a], MITTEN_COLOURS[b]
+    return float(sum((int(u) - int(v)) ** 2 for u, v in zip(ca, cb))) ** 0.5
+
+
+def min_colour_dist(names) -> float:
+    names = sorted(set(names))
+    if len(names) < 2:
+        return 255.0 * 3 ** 0.5
+    return min(
+        _colour_dist(names[i], names[j])
+        for i in range(len(names))
+        for j in range(i + 1, len(names))
+    )
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _pick_colours(rng: random.Random, k: int):
+    for _ in range(80):
+        pick = rng.sample(COLOUR_NAMES, k)
+        if k < 2 or min_colour_dist(pick) >= MIN_COLOUR_DIST:
+            return pick
+    return None
+
+
+def _draft(rng: random.Random, tight: bool):
+    shared = rng.choices([0, 1, 2, 3], weights=[12, 30, 34, 24])[0]
+    lo_min = 2 if shared == 0 else 0
+    left_only = rng.randint(lo_min, min(3, 5 - shared))
+    right_only = rng.randint(lo_min, min(3, 5 - shared))
+    n_left, n_right = shared + left_only, shared + right_only
+    if not (2 <= n_left <= 5 and 2 <= n_right <= 5):
+        return None
+    total = shared + left_only + right_only
+    if total > 6:
+        return None
+    picked = _pick_colours(rng, total)
+    if picked is None:
+        return None
+
+    both = picked[:shared]
+    l_names = both + picked[shared : shared + left_only]
+    r_names = both + picked[shared + left_only :]
+    rng.shuffle(l_names)
+    rng.shuffle(r_names)
+
+    jx = 6
+    jy = 6 if tight else 3
+    racks = []
+    for side, names in enumerate((l_names, r_names)):
+        slots = sorted(rng.sample(range(len(SLOTS)), len(names)))
+        rng.shuffle(slots)
+        racks.append(
+            {
+                "x0": RACK_X0[side],
+                "y0": rng.randint(30, H - 30 - RACK_H),
+                "mittens": [
+                    {
+                        "slot": slots[i],
+                        "colour": names[i],
+                        "dx": rng.randint(-jx, jx),
+                        "dy": rng.randint(-jy, jy),
+                        "flip": bool(rng.getrandbits(1)),
+                    }
+                    for i in range(len(names))
+                ],
+            }
+        )
+
+    floor: list[dict] = []
+    for _ in range(rng.choices([0, 1, 2, 3], weights=[20, 30, 30, 20])[0]):
+        for _try in range(40):
+            x = rng.randint(*FLOOR_X)
+            y = rng.randint(*FLOOR_Y)
+            flip = bool(rng.getrandbits(1))
+            box = mitten_box(x, y, flip)
+            if all(_sep(box, mitten_box(f["x"], f["y"], f["flip"])) >= 14 for f in floor):
+                floor.append({"x": x, "y": y, "colour": rng.choice(COLOUR_NAMES), "flip": flip})
+                break
+
+    scene = {
+        "width": W,
+        "height": H,
+        "racks": racks,
+        "floor": floor,
+        "tight": bool(tight),
+    }
+    decision = analytic_gold(scene)
+    prior_raw = min(len(l_names), len(r_names))
+    scene["canonical_prior_raw"] = int(prior_raw)
+    scene["canonical_prior_answer"] = str(min(prior_raw, 3))
+    scene["variant"] = "control" if scene["canonical_prior_answer"] == decision else "counterfactual"
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed) * 1000003 + 17)
+    tight = rng.random() < 0.3
+    for _ in range(600):
+        scene = _draft(rng, tight)
+        if scene is None:
+            continue
+        m = margin(scene)
+        if tight:
+            if QUARANTINE_MARGIN <= m < TIGHT_MARGIN:
+                return scene
+        elif m >= TIGHT_MARGIN:
+            return scene
+    for _ in range(600):
+        scene = _draft(rng, tight)
+        if scene is not None and margin(scene) >= QUARANTINE_MARGIN:
+            scene["tight"] = margin(scene) < TIGHT_MARGIN
+            return scene
+    raise RuntimeError(f"sampler exhausted for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine, aliases
+# --------------------------------------------------------------------------
+def rack_colour_sets(scene: dict) -> tuple[set, set]:
+    return tuple(  # type: ignore[return-value]
+        {mt["colour"] for mt in rack["mittens"]} for rack in scene["racks"]
+    )
+
+
+def analytic_gold(scene: dict) -> str:
+    left, right = rack_colour_sets(scene)
+    return str(len(left & right))
+
+
+def margin(scene: dict) -> float:
+    marks = all_mittens(scene)
+    boxes = [mitten_box(cx, cy, flip) for _k, cx, cy, flip, _c in marks]
+    terms: list[float] = []
+
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            terms.append(_sep(boxes[i], boxes[j]) - 10.0)
+
+    for ri, rack in enumerate(scene["racks"]):
+        ix0, iy0, ix1, iy1 = rack_inner(rack)
+        for mt in rack["mittens"]:
+            cx, cy = mitten_centre(rack, mt)
+            bx0, by0, bx1, by1 = mitten_box(cx, cy, bool(mt["flip"]))
+            terms.append(min(bx0 - ix0, by0 - iy0, ix1 - bx1, iy1 - by1) - 6.0)
+
+    rboxes = [rack_box(r) for r in scene["racks"]]
+    for fl in scene["floor"]:
+        fbox = mitten_box(float(fl["x"]), float(fl["y"]), bool(fl["flip"]))
+        for rb in rboxes:
+            terms.append(_sep(fbox, rb) - 20.0)
+
+    for box in boxes + rboxes:
+        terms.append(min(box[0], box[1], (W - 1) - box[2], (H - 1) - box[3]) - 12.0)
+
+    terms.append(_sep(rboxes[0], rboxes[1]) - 60.0)
+    used = [c for _k, _x, _y, _f, c in marks if _k != "floor"]
+    terms.append((min_colour_dist(used) - 105.0) / 1.5)
+    return round(float(min(terms)), 4)
+
+
+def margin_bin(value: float) -> str:
+    if value < QUARANTINE_MARGIN:
+        return "boundary"
+    if value < TIGHT_MARGIN:
+        return "tight"
+    return "clear"
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Declared latent aliases: byte-identical raster, unchanged gold."""
+    out: list[tuple[str, dict]] = []
+
+    swapped = dict(scene)
+    swapped["racks"] = [scene["racks"][1], scene["racks"][0]]
+    out.append(("swap_rack_record_order", swapped))
+
+    for ri in (0, 1):
+        rack = scene["racks"][ri]
+        if len(rack["mittens"]) >= 2:
+            alt = dict(scene)
+            racks = [dict(r) for r in scene["racks"]]
+            racks[ri]["mittens"] = list(reversed(rack["mittens"]))
+            alt["racks"] = racks
+            out.append((f"permute_rack{ri}_hanging_order", alt))
+
+    if len(scene["floor"]) >= 2:
+        alt = dict(scene)
+        alt["floor"] = list(reversed(scene["floor"]))
+        out.append(("permute_floor_listing_order", alt))
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _mitten(draw: ImageDraw.ImageDraw, cx: float, cy: float, colour, flip: bool) -> None:
+    draw.rounded_rectangle(
+        [cx - BODY_HW, cy - BODY_HH, cx + BODY_HW, cy + BODY_HH], radius=13, fill=colour
+    )
+    if flip:
+        draw.ellipse([cx - BODY_HW - 9, cy - 6, cx - BODY_HW + THUMB - 9, cy - 6 + THUMB], fill=colour)
+    else:
+        draw.ellipse([cx + BODY_HW - 7, cy - 6, cx + BODY_HW + THUMB - 7, cy - 6 + THUMB], fill=colour)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BG)
+    draw = ImageDraw.Draw(image)
+    for rack in scene["racks"]:
+        x0, y0, x1, y1 = rack_box(rack)
+        draw.rectangle([x0, y0, x1, y1], outline=RACK, width=STROKE)
+    for rack in scene["racks"]:
+        for mt in rack["mittens"]:
+            cx, cy = mitten_centre(rack, mt)
+            _mitten(draw, cx, cy, MITTEN_COLOURS[mt["colour"]], bool(mt["flip"]))
+    for fl in scene["floor"]:
+        _mitten(
+            draw,
+            float(fl["x"]),
+            float(fl["y"]),
+            MITTEN_COLOURS[fl["colour"]],
+            bool(fl["flip"]),
+        )
+    return image

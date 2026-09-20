@@ -1,0 +1,251 @@
+"""Image-only oracle for loop_shortcut_dot.
+
+Receives the final PNG and nothing else.  It classifies every inked pixel into
+the loop colour or one of the four dot colours, takes the centroid of each dot,
+and then walks the drawn loop directly in the raster: from the green dot it
+marches along the ink with a fixed step, at every step choosing the outgoing
+ink direction that best continues the current heading.  The walk goes once
+round the loop and records the along-loop distance at which it passes the red,
+blue and orange dots.  The way round from green to red with the smaller
+along-loop distance is the shorter one, and the answer is the coloured dot that
+was passed on it.  Returns "unknown" when a dot is missing, the walk fails to
+close, or the two ways round are too close in length to separate.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "loop_shortcut_dot-oracle-0.1.0"
+
+ABSTAIN = "unknown"
+
+_LOOP = (95, 95, 95)
+_DOTS = {
+    "green": (25, 160, 60),
+    "red": (215, 40, 40),
+    "blue": (35, 95, 225),
+    "orange": (245, 140, 20),
+}
+_WHITE = (255, 255, 255)
+
+_INK_LEVEL = 205
+_MIN_DOT_PIXELS = 60
+_STEP = 13.0
+_BAND = 1.7
+_SPLIT_GAP_DEG = 20.0
+_MIN_HEADING_SEPARATION = 0.20
+_MIN_FORWARD_DOT = -0.85
+_HIT_RADIUS = 11.0
+_MIN_LENGTH_GAP = 30.0
+
+
+def _masks(arr: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    ink = arr.min(axis=2) < _INK_LEVEL
+    palette = [("loop", _LOOP), ("white", _WHITE)] + sorted(_DOTS.items())
+    stack = np.stack(
+        [np.abs(arr.astype(np.int32) - np.array(c, dtype=np.int32)).sum(axis=2) for _, c in palette],
+        axis=0,
+    )
+    best = stack.argmin(axis=0)
+    out: dict[str, np.ndarray] = {}
+    for idx, (name, _) in enumerate(palette):
+        if name in _DOTS:
+            out[name] = ink & (best == idx)
+    return ink, out
+
+
+def _largest_component_centroid(mask: np.ndarray) -> tuple[float, float] | None:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < _MIN_DOT_PIXELS:
+        return None
+    pixels = set(zip(xs.tolist(), ys.tolist()))
+    best: list[tuple[int, int]] = []
+    while pixels:
+        seed = pixels.pop()
+        comp = [seed]
+        stack = [seed]
+        while stack:
+            x, y = stack.pop()
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    p = (x + dx, y + dy)
+                    if p in pixels:
+                        pixels.discard(p)
+                        comp.append(p)
+                        stack.append(p)
+        if len(comp) > len(best):
+            best = comp
+    if len(best) < _MIN_DOT_PIXELS:
+        return None
+    xs2 = sum(p[0] for p in best) / len(best)
+    ys2 = sum(p[1] for p in best) / len(best)
+    return (xs2, ys2)
+
+
+def _annulus_offsets(step: float) -> list[tuple[int, int, float]]:
+    lo, hi = step - _BAND, step + _BAND
+    out = []
+    rad = int(math.ceil(hi)) + 1
+    for dy in range(-rad, rad + 1):
+        for dx in range(-rad, rad + 1):
+            d = math.hypot(dx, dy)
+            if lo <= d <= hi:
+                out.append((dx, dy, math.atan2(dy, dx)))
+    return out
+
+
+_STEP_LADDER = (13.0, 11.0, 16.0, 9.0)
+_OFFSETS_BY_STEP = {st: _annulus_offsets(st) for st in _STEP_LADDER}
+_OFFSETS = _OFFSETS_BY_STEP[_STEP]
+
+
+def _directions(ink: np.ndarray, p: tuple[float, float], step: float = _STEP) -> list[tuple[float, float]]:
+    h, w = ink.shape
+    px, py = int(round(p[0])), int(round(p[1]))
+    angles = []
+    for dx, dy, ang in _OFFSETS_BY_STEP[step]:
+        x, y = px + dx, py + dy
+        if 0 <= x < w and 0 <= y < h and ink[y, x]:
+            angles.append(ang)
+    if not angles:
+        return []
+    angles.sort()
+    gap = math.radians(_SPLIT_GAP_DEG)
+    groups: list[list[float]] = [[angles[0]]]
+    for a in angles[1:]:
+        if a - groups[-1][-1] > gap:
+            groups.append([a])
+        else:
+            groups[-1].append(a)
+    if len(groups) > 1 and (angles[0] + 2 * math.pi) - angles[-1] <= gap:
+        groups[0] = groups.pop() + groups[0]
+    dirs = []
+    for g in groups:
+        cx = sum(math.cos(a) for a in g)
+        cy = sum(math.sin(a) for a in g)
+        norm = math.hypot(cx, cy)
+        if norm > 1e-6:
+            dirs.append((cx / norm, cy / norm))
+    return dirs
+
+
+_CENTER_OFFSETS = [
+    (dx, dy)
+    for dy in range(-4, 5)
+    for dx in range(-4, 5)
+    if math.hypot(dx, dy) <= 4.0
+]
+
+
+def _recenter(ink: np.ndarray, p: tuple[float, float], d: tuple[float, float]) -> tuple[float, float]:
+    """Slide the walker sideways onto the local centre of the stroke."""
+    h, w = ink.shape
+    px, py = int(round(p[0])), int(round(p[1]))
+    sx = sy = 0.0
+    n = 0
+    for dx, dy in _CENTER_OFFSETS:
+        x, y = px + dx, py + dy
+        if 0 <= x < w and 0 <= y < h and ink[y, x]:
+            sx += x
+            sy += y
+            n += 1
+    if n == 0:
+        return p
+    ex, ey = sx / n - p[0], sy / n - p[1]
+    along = ex * d[0] + ey * d[1]
+    return (p[0] + ex - along * d[0], p[1] + ey - along * d[1])
+
+
+def _walk(ink: np.ndarray, start: tuple[float, float], heading: tuple[float, float], step: float = _STEP):
+    """March once round the loop; return (total length, list of (length, point))."""
+    p = (float(start[0]), float(start[1]))
+    d = heading
+    total = 0.0
+    trace = [(0.0, p)]
+    for _ in range(4000):
+        dirs = _directions(ink, p, step)
+        if len(dirs) < 2:
+            return None, trace
+        scored = sorted(((u[0] * d[0] + u[1] * d[1], u) for u in dirs), key=lambda z: z[0])
+        best_dot, best = scored[-1]
+        # on a simple loop exactly two ink directions leave any point: the one we
+        # came from (dot near -1) and the continuation.  Take the continuation.
+        if best_dot < _MIN_FORWARD_DOT or best_dot - scored[0][0] < _MIN_HEADING_SEPARATION:
+            return None, trace
+        p = (p[0] + step * best[0], p[1] + step * best[1])
+        d = best
+        p = _recenter(ink, p, d)
+        total += step
+        trace.append((total, p))
+        if total > 10 * step and math.dist(p, start) < step * 1.2:
+            return total, trace
+    return None, trace
+
+
+def _arrival(trace, target: tuple[float, float]) -> float | None:
+    best_t, best_d = None, float("inf")
+    for t, p in trace:
+        d = math.dist(p, target)
+        if d < best_d:
+            best_d, best_t = d, t
+    if best_d > _HIT_RADIUS:
+        return None
+    return best_t
+
+
+def decision_from_image(image) -> str:
+    if not isinstance(image, Image.Image):
+        return ABSTAIN
+    arr = np.array(image.convert("RGB"))
+    if arr.ndim != 3:
+        return ABSTAIN
+    ink, dot_masks = _masks(arr)
+    centers: dict[str, tuple[float, float]] = {}
+    for name, mask in dot_masks.items():
+        c = _largest_component_centroid(mask)
+        if c is None:
+            return ABSTAIN
+        centers[name] = c
+
+    # try the walk at several marching scales and from either way round the
+    # loop; a single scale can stall on a tight corner of a thin stroke.
+    perimeter = trace = step = None
+    for candidate_step in _STEP_LADDER:
+        starts = _directions(ink, centers["green"], candidate_step)
+        if len(starts) != 2:
+            continue
+        for heading in starts:
+            per, tr = _walk(ink, centers["green"], heading, candidate_step)
+            if per is not None and per > 0:
+                perimeter, trace, step = per, tr, candidate_step
+                break
+        if perimeter is not None:
+            break
+    if perimeter is None:
+        return ABSTAIN
+
+    t_red = _arrival(trace, centers["red"])
+    t_blue = _arrival(trace, centers["blue"])
+    t_orange = _arrival(trace, centers["orange"])
+    if t_red is None or t_blue is None or t_orange is None:
+        return ABSTAIN
+    if t_red <= step or t_red >= perimeter - step:
+        return ABSTAIN
+
+    forward = t_red
+    backward = perimeter - t_red
+    if abs(forward - backward) < _MIN_LENGTH_GAP:
+        return ABSTAIN
+
+    on_forward = {"blue": t_blue < t_red, "orange": t_orange < t_red}
+    if on_forward["blue"] == on_forward["orange"]:
+        return ABSTAIN
+    short_is_forward = forward < backward
+    for name in ("blue", "orange"):
+        if on_forward[name] == short_is_forward:
+            return name
+    return ABSTAIN

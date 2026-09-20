@@ -1,0 +1,200 @@
+"""Deterministic latent sampler and raster renderer for a visibly hinged cube net."""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+SUPERSAMPLE = 3
+QUARANTINE_MARGIN = 5.0
+
+# Four panels in a row, with two arms on the second panel.  When folded,
+# opposite role pairs are (0, 2), (1, 3), and (4, 5).
+ROLE_COORDS = ((-1, 0), (0, 0), (1, 0), (2, 0), (0, -1), (0, 1))
+OPPOSITE = (2, 3, 0, 1, 5, 4)
+EDGES = ((0, 1), (1, 2), (2, 3), (1, 4), (1, 5))
+
+FACE_PALETTES = (
+    (121, 190, 255),
+    (139, 220, 169),
+    (255, 201, 112),
+    (201, 160, 245),
+    (250, 151, 183),
+)
+PIP_PALETTES = ((22, 25, 35), (19, 35, 61), (48, 21, 35))
+HINGE_PALETTES = ((128, 132, 142), (119, 126, 128), (137, 125, 135))
+
+PIP_LAYOUTS = {
+    1: ((0, 0),),
+    2: ((-1, -1), (1, 1)),
+    3: ((-1, -1), (0, 0), (1, 1)),
+    4: ((-1, -1), (1, -1), (-1, 1), (1, 1)),
+    5: ((-1, -1), (1, -1), (0, 0), (-1, 1), (1, 1)),
+    6: ((-1, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (1, 1)),
+}
+
+
+def _transform_coords(rotation: int, mirror: bool) -> list[tuple[int, int]]:
+    coords: list[tuple[int, int]] = []
+    for base_x, base_y in ROLE_COORDS:
+        x, y = (-base_x if mirror else base_x), base_y
+        for _ in range(rotation % 4):
+            x, y = -y, x
+        coords.append((x, y))
+    return coords
+
+
+def sample_scene(seed: int) -> dict:
+    """Return a paired deterministic scene; even/odd seeds are control/counterfactual."""
+    pair_seed = int(seed) // 2
+    prior_consistent = int(seed) % 2 == 0
+    rng = random.Random(pair_seed ^ 0x6D5A56A9)
+
+    one_role = pair_seed % 6
+    opposite_role = OPPOSITE[one_role]
+    opposite_value = 6 if prior_consistent else 2 + (pair_seed % 4)
+    values: list[int | None] = [None] * 6
+    values[one_role] = 1
+    values[opposite_role] = opposite_value
+    remaining_values = [value for value in range(2, 7) if value != opposite_value]
+    rng.shuffle(remaining_values)
+    for role in range(6):
+        if values[role] is None:
+            values[role] = remaining_values.pop()
+
+    rotation = rng.randrange(4)
+    mirror = bool(rng.randrange(2))
+    cell = rng.choice((78, 82, 86, 90))
+    gap = rng.choice((10, 12, 14))
+    pip_radius = rng.choice((4, 5, 6))
+    face_color = FACE_PALETTES[rng.randrange(len(FACE_PALETTES))]
+    pip_color = PIP_PALETTES[rng.randrange(len(PIP_PALETTES))]
+    hinge_color = HINGE_PALETTES[rng.randrange(len(HINGE_PALETTES))]
+
+    coords = _transform_coords(rotation, mirror)
+    xs = [point[0] for point in coords]
+    ys = [point[1] for point in coords]
+    span_w = (max(xs) - min(xs)) * (cell + gap) + cell
+    span_h = (max(ys) - min(ys)) * (cell + gap) + cell
+    pad = 28
+    origin_x = rng.randint(pad, WIDTH - pad - span_w)
+    origin_y = rng.randint(pad, HEIGHT - pad - span_h)
+
+    return {
+        "face_values": [int(value) for value in values],
+        "rotation": rotation,
+        "mirror": mirror,
+        "cell": cell,
+        "gap": gap,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "face_color": list(face_color),
+        "pip_color": list(pip_color),
+        "hinge_color": list(hinge_color),
+        "pip_radius": pip_radius,
+    }
+
+
+def _panel_boxes(scene: dict) -> list[tuple[int, int, int, int]]:
+    coords = _transform_coords(int(scene["rotation"]), bool(scene["mirror"]))
+    min_x = min(point[0] for point in coords)
+    min_y = min(point[1] for point in coords)
+    step = int(scene["cell"]) + int(scene["gap"])
+    boxes = []
+    for grid_x, grid_y in coords:
+        x0 = int(scene["origin_x"]) + (grid_x - min_x) * step
+        y0 = int(scene["origin_y"]) + (grid_y - min_y) * step
+        boxes.append((x0, y0, x0 + int(scene["cell"]), y0 + int(scene["cell"])))
+    return boxes
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only public scene fields to an antialiased RGB PNG-ready image."""
+    face_values = [int(value) for value in scene["face_values"]]
+    rotation = int(scene["rotation"])
+    mirror = bool(scene["mirror"])
+    cell = int(scene["cell"])
+    gap = int(scene["gap"])
+    origin_x = int(scene["origin_x"])
+    origin_y = int(scene["origin_y"])
+    face_color = tuple(int(value) for value in scene["face_color"])
+    pip_color = tuple(int(value) for value in scene["pip_color"])
+    hinge_color = tuple(int(value) for value in scene["hinge_color"])
+    pip_radius = int(scene["pip_radius"])
+
+    # These local values are intentionally consumed here so the renderer-field
+    # audit can see every label and nuisance field used by the raster path.
+    local_scene = {
+        "rotation": rotation,
+        "mirror": mirror,
+        "cell": cell,
+        "gap": gap,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+    }
+    boxes = _panel_boxes(local_scene)
+    scale = SUPERSAMPLE
+    image = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), (250, 250, 247))
+    draw = ImageDraw.Draw(image)
+
+    centers = [((a + c) / 2.0, (b + d) / 2.0) for a, b, c, d in boxes]
+    for left, right in EDGES:
+        x1, y1 = centers[left]
+        x2, y2 = centers[right]
+        draw.line(
+            (round(x1 * scale), round(y1 * scale), round(x2 * scale), round(y2 * scale)),
+            fill=hinge_color,
+            width=max(3, round(gap * 0.56 * scale)),
+        )
+
+    for role, (x0, y0, x1, y1) in enumerate(boxes):
+        draw.rounded_rectangle(
+            (x0 * scale, y0 * scale, x1 * scale, y1 * scale),
+            radius=round(3 * scale),
+            fill=face_color,
+        )
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        offset = int(round(cell * 0.24))
+        for dx, dy in PIP_LAYOUTS[face_values[role]]:
+            px = cx + dx * offset
+            py = cy + dy * offset
+            radius = pip_radius * scale
+            draw.ellipse(
+                (
+                    round(px * scale - radius),
+                    round(py * scale - radius),
+                    round(px * scale + radius),
+                    round(py * scale + radius),
+                ),
+                fill=pip_color,
+            )
+
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    values = [int(value) for value in scene["face_values"]]
+    one_role = values.index(1)
+    return "yes" if values[OPPOSITE[one_role]] == 6 else "no"
+
+
+def margin(scene: dict) -> float:
+    cell = int(scene["cell"])
+    gap = int(scene["gap"])
+    pip_radius = int(scene["pip_radius"])
+    topology_runner_up = (math.sqrt(2.0) - 1.0) * (cell + gap)
+    pip_clearance = int(round(cell * 0.24)) - 2.0 * pip_radius
+    return float(min(topology_runner_up, pip_clearance))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

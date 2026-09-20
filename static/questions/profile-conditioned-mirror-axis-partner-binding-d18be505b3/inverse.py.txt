@@ -1,0 +1,141 @@
+"""Independent pixel-only arm for mirror_axis_partner_binding.
+
+This module receives a rendered RGB image and nothing else. It never imports the
+renderer, the prompt module, the generator, the verifier or any analytic gold,
+and it never sees a latent scene. It reconstructs the mirror axis from the black
+line pixels, locates the gray squares and the coloured disks as connected colour
+regions, reflects every disk centroid across the recovered axis, solves the
+reflection assignment against the square centroids, and reports the colour of
+the disk whose reflected centre has no square on it. Ambiguous or malformed
+rasters return "abstain".
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "mirror_axis_partner_binding-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+
+# Named answer set declared by the public question contract.
+PALETTE = {
+    "red": (214, 38, 38),
+    "blue": (36, 68, 214),
+    "green": (26, 146, 58),
+    "orange": (242, 148, 16),
+    "purple": (138, 46, 190),
+}
+
+_DARK = 70  # every channel below this counts as line ink
+_GRAY_CENTER = 110
+_GRAY_TOL = 34
+_NEUTRAL_TOL = 14
+_COLOR_TOL = 78.0
+_MIN_BLOB = 240
+_MIN_LINE_PIXELS = 400
+_MIN_UNMATCHED = 10.0
+_MIN_SEPARATION = 8.0
+
+
+def _components(mask: np.ndarray, min_size: int) -> list[tuple[float, float, int]]:
+    """Label 4-connected regions and return (cx, cy, size) for the big ones."""
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    out: list[tuple[float, float, int]] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= min_size:
+            sy = sum(pixel[0] for pixel in pixels)
+            sx = sum(pixel[1] for pixel in pixels)
+            out.append((sx / len(pixels), sy / len(pixels), len(pixels)))
+    return out
+
+
+def _fit_axis(mask: np.ndarray):
+    """Total-least-squares fit of the line ink: returns (point, unit normal)."""
+    ys, xs = np.nonzero(mask)
+    if xs.size < _MIN_LINE_PIXELS:
+        return None
+    points = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+    mean = points.mean(axis=0)
+    centred = points - mean
+    _, singular, vectors = np.linalg.svd(centred, full_matrices=False)
+    if singular.size < 2 or singular[0] <= 0.0:
+        return None
+    # A straight stroke is strongly anisotropic; a blob or a corrupted raster is not.
+    if singular[1] / singular[0] > 0.12:
+        return None
+    direction = vectors[0]
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+    norm = float(np.hypot(normal[0], normal[1]))
+    if norm == 0.0:
+        return None
+    return mean, normal / norm
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Pixel-only decision: colour of the disk with no mirrored partner."""
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float64)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        return ABSTAIN
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+
+    dark = (red < _DARK) & (green < _DARK) & (blue < _DARK)
+    axis = _fit_axis(dark)
+    if axis is None:
+        return ABSTAIN
+    origin, normal = axis
+
+    spread = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+    gray = (
+        (spread <= _NEUTRAL_TOL)
+        & (np.abs(red - _GRAY_CENTER) <= _GRAY_TOL)
+        & (np.abs(green - _GRAY_CENTER) <= _GRAY_TOL)
+        & (np.abs(blue - _GRAY_CENTER) <= _GRAY_TOL)
+    )
+    squares = _components(gray, _MIN_BLOB)
+    if len(squares) != 5:
+        return ABSTAIN
+
+    disks: list[tuple[str, float, float]] = []
+    for name, reference in PALETTE.items():
+        distance = np.sqrt(
+            (red - reference[0]) ** 2 + (green - reference[1]) ** 2 + (blue - reference[2]) ** 2
+        )
+        blobs = _components(distance <= _COLOR_TOL, _MIN_BLOB)
+        if len(blobs) != 1:
+            return ABSTAIN
+        disks.append((name, blobs[0][0], blobs[0][1]))
+    if len(disks) != 5:
+        return ABSTAIN
+
+    ranked: list[tuple[float, str]] = []
+    for name, cx, cy in disks:
+        offset = (cx - origin[0]) * normal[0] + (cy - origin[1]) * normal[1]
+        mx = cx - 2.0 * offset * normal[0]
+        my = cy - 2.0 * offset * normal[1]
+        nearest = min(math.hypot(mx - sx, my - sy) for sx, sy, _ in squares)
+        ranked.append((nearest, name))
+    ranked.sort(key=lambda item: -item[0])
+
+    if ranked[0][0] < _MIN_UNMATCHED:
+        return ABSTAIN
+    if ranked[0][0] - ranked[1][0] < _MIN_SEPARATION:
+        return ABSTAIN
+    return ranked[0][1]

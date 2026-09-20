@@ -1,0 +1,300 @@
+"""Scene sampling, rendering, analytic gold and margin for twin_glyph_panel.
+
+Every panel shows four flat coloured glyphs drawn from two outline families,
+two glyphs per family. In exactly one panel a family contributes two glyphs at
+the *same* orientation, so those two glyphs are exact translated copies of one
+another and differ only in position and fill colour. Everywhere else the two
+glyphs of a family stand at visibly different orientations. The decision is the
+panel holding the exact twin, and the margin is the gap in translation-aligned
+overlap between that twin pair and the best-matching pair anywhere else.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# ------------------------------------------------------------------ layout --
+PANELS = 5
+GLYPHS_PER_PANEL = 4
+OUTER = 14
+PANEL_W = 180
+PANEL_H = 206
+PANEL_GAP = 12
+CANVAS_W = 2 * OUTER + PANELS * PANEL_W + (PANELS - 1) * PANEL_GAP
+CANVAS_H = 2 * OUTER + PANEL_H
+BOX = 72
+JITTER = 5
+TOP_PAD = 18
+SLOT_W = PANEL_W // 2
+SLOT_H = (PANEL_H - TOP_PAD) // 2
+
+BACKGROUND = (255, 255, 255)
+FRAME = (150, 150, 150)
+LABEL = (120, 120, 120)
+
+PALETTES = [
+    [(198, 40, 40), (21, 101, 192), (46, 125, 50), (109, 76, 165)],
+    [(191, 54, 12), (2, 119, 189), (56, 118, 29), (136, 14, 79)],
+    [(183, 28, 28), (13, 71, 161), (27, 94, 32), (69, 90, 180)],
+]
+
+# Unit-square outlines. All are chiral and rotationally asymmetric, so a
+# quarter turn is always a visible change of pose.
+SHAPES = {
+    "ell": [(0.0, 0.0), (0.36, 0.0), (0.36, 0.64), (1.0, 0.64), (1.0, 1.0), (0.0, 1.0)],
+    "tee": [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (1.0, 0.34),
+        (0.67, 0.34),
+        (0.67, 1.0),
+        (0.33, 1.0),
+        (0.33, 0.34),
+        (0.0, 0.34),
+    ],
+    "arrow": [(0.0, 0.30), (0.55, 0.30), (0.55, 0.0), (1.0, 0.5), (0.55, 1.0), (0.55, 0.70), (0.0, 0.70)],
+    "flag": [(0.0, 0.0), (0.22, 0.0), (0.22, 1.0), (0.0, 1.0), (0.0, 0.62), (0.9, 0.62), (0.9, 0.16), (0.22, 0.16)],
+    "step": [(0.0, 0.0), (0.5, 0.0), (0.5, 0.45), (1.0, 0.45), (1.0, 1.0), (0.55, 1.0), (0.55, 0.55), (0.0, 0.55)],
+    "hook": [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.66, 1.0), (0.66, 0.32), (0.34, 0.32), (0.34, 0.72), (0.0, 0.72)],
+}
+SHAPE_IDS = sorted(SHAPES)
+ORIENTATIONS = (0, 90, 180, 270)
+TARGET_AREA = 1750.0
+
+TWIN_OVERLAP = 100.0
+PAIR_OVERLAP_MAX = 72.0
+QUARANTINE_MARGIN = 20.0
+
+
+def json_clone(value):
+    return json.loads(json.dumps(value))
+
+
+# ------------------------------------------------------------- glyph masks --
+def _polygon_points(shape_id: str, orientation: int) -> list:
+    raw = SHAPES[shape_id]
+    area = abs(
+        sum(
+            raw[i][0] * raw[(i + 1) % len(raw)][1] - raw[(i + 1) % len(raw)][0] * raw[i][1]
+            for i in range(len(raw))
+        )
+    ) / 2.0
+    scale = math.sqrt(TARGET_AREA / area)
+    cx = sum(p[0] for p in raw) / len(raw)
+    cy = sum(p[1] for p in raw) / len(raw)
+    theta = math.radians(orientation)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    moved = []
+    for x, y in raw:
+        dx, dy = (x - cx) * scale, (y - cy) * scale
+        moved.append((dx * cos_t - dy * sin_t, dx * sin_t + dy * cos_t))
+    min_x = min(p[0] for p in moved)
+    min_y = min(p[1] for p in moved)
+    max_x = max(p[0] for p in moved)
+    max_y = max(p[1] for p in moved)
+    off_x = (BOX - (max_x - min_x)) / 2.0 - min_x
+    off_y = (BOX - (max_y - min_y)) / 2.0 - min_y
+    return [(round(x + off_x, 3), round(y + off_y, 3)) for x, y in moved]
+
+
+_MASK_CACHE: dict = {}
+
+
+def glyph_mask(shape_id: str, orientation: int) -> np.ndarray:
+    key = (shape_id, orientation)
+    if key not in _MASK_CACHE:
+        image = Image.new("L", (BOX, BOX), 0)
+        ImageDraw.Draw(image).polygon(_polygon_points(shape_id, orientation), fill=255)
+        _MASK_CACHE[key] = np.asarray(image) > 0
+    return _MASK_CACHE[key]
+
+
+SHIFT = 6
+PAD = SHIFT + 2
+
+
+def _padded(mask: np.ndarray, dy: int = 0, dx: int = 0) -> np.ndarray:
+    """Mask placed in a padded canvas, translated by (dy, dx) without clipping."""
+    out = np.zeros((BOX + 2 * PAD, BOX + 2 * PAD), dtype=bool)
+    out[PAD + dy : PAD + dy + BOX, PAD + dx : PAD + dx + BOX] = mask
+    return out
+
+
+def pose_overlap(pose_a: tuple, pose_b: tuple) -> float:
+    """Best translation-aligned overlap of two glyph poses, in percent."""
+    if pose_a == pose_b:
+        return TWIN_OVERLAP
+    key = ("ov", pose_a, pose_b)
+    if key in _MASK_CACHE:
+        return _MASK_CACHE[key]
+    mask_a = _padded(glyph_mask(*pose_a))
+    mask_b = glyph_mask(*pose_b)
+    best = 0.0
+    for dy in range(-SHIFT, SHIFT + 1):
+        for dx in range(-SHIFT, SHIFT + 1):
+            moved = _padded(mask_b, dy, dx)
+            union = np.count_nonzero(mask_a | moved)
+            if union:
+                best = max(best, np.count_nonzero(mask_a & moved) / union)
+    value = round(100.0 * float(best), 6)
+    _MASK_CACHE[key] = value
+    _MASK_CACHE[("ov", pose_b, pose_a)] = value
+    return value
+
+
+# ---------------------------------------------------------------- sampling --
+def _panel_poses(rng: random.Random, twin: bool) -> list:
+    """Two outline families, two glyphs each; twin panels repeat one pose."""
+    for _ in range(400):
+        shape_a, shape_b = rng.sample(SHAPE_IDS, 2)
+        if twin:
+            pose = (shape_a, rng.choice(ORIENTATIONS))
+            first = [pose, pose]
+        else:
+            o1, o2 = rng.sample(ORIENTATIONS, 2)
+            first = [(shape_a, o1), (shape_a, o2)]
+        o3, o4 = rng.sample(ORIENTATIONS, 2)
+        second = [(shape_b, o3), (shape_b, o4)]
+        poses = first + second
+        ok = True
+        for i in range(4):
+            for j in range(i + 1, 4):
+                if poses[i] == poses[j] and not (twin and {i, j} == {0, 1}):
+                    ok = False
+                elif poses[i] != poses[j] and pose_overlap(poses[i], poses[j]) > PAIR_OVERLAP_MAX:
+                    ok = False
+        if ok:
+            rng.shuffle(poses)
+            return poses
+    raise RuntimeError("panel pose sampling failed")
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 6079 + 17)
+    target = seed % PANELS
+    palette = rng.randrange(len(PALETTES))
+    panels = []
+    for index in range(PANELS):
+        poses = _panel_poses(rng, twin=index == target)
+        colours = list(range(GLYPHS_PER_PANEL))
+        rng.shuffle(colours)
+        slots = [0, 1, 2, 3]
+        rng.shuffle(slots)
+        glyphs = []
+        for pose, colour, slot in zip(poses, colours, slots):
+            glyphs.append(
+                {
+                    "shape": pose[0],
+                    "orientation": pose[1],
+                    "colour": colour,
+                    "slot": slot,
+                    "dx": rng.randint(-JITTER, JITTER),
+                    "dy": rng.randint(-JITTER, JITTER),
+                }
+            )
+        panels.append({"glyphs": glyphs})
+    return {
+        "canvas": [CANVAS_W, CANVAS_H],
+        "palette": palette,
+        "panels": panels,
+    }
+
+
+# ------------------------------------------------------- analytic decision --
+def _poses(glyphs: list) -> list:
+    """Glyph records reduced to the two label-bearing fields: family and turn."""
+    return [(record["shape"], int(record["orientation"])) for record in glyphs]
+
+
+def _best_overlap(poses: list) -> float:
+    best = 0.0
+    for i in range(len(poses)):
+        for j in range(i + 1, len(poses)):
+            best = max(best, pose_overlap(poses[i], poses[j]))
+    return best
+
+
+def _ranked(scene: dict) -> list:
+    ranked = []
+    for index, panel in enumerate(scene["panels"]):
+        ranked.append((_best_overlap(_poses(panel["glyphs"])), index))
+    ranked.sort(reverse=True)
+    return ranked
+
+
+def analytic_gold(scene: dict) -> str:
+    return f"panel-{_ranked(scene)[0][1] + 1}"
+
+
+def margin(scene: dict) -> float:
+    ranked = _ranked(scene)
+    return round(ranked[0][0] - ranked[1][0], 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Declared pixel-identical latent aliases that must preserve the answer."""
+    period = json_clone(scene)
+    period["palette"] = scene["palette"] + len(PALETTES)
+
+    reordered = json_clone(scene)
+    for panel in reordered["panels"]:
+        panel["glyphs"] = list(reversed(panel["glyphs"]))
+
+    swapped = json_clone(reordered)
+    for panel in swapped["panels"]:
+        panel["glyphs"][0], panel["glyphs"][2] = panel["glyphs"][2], panel["glyphs"][0]
+
+    return [
+        ("palette_period", period),
+        ("glyph_record_reversal", reordered),
+        ("glyph_record_swap", swapped),
+    ]
+
+
+# ----------------------------------------------------------------- drawing --
+def _panel_origin(index: int) -> tuple:
+    return OUTER + index * (PANEL_W + PANEL_GAP), OUTER
+
+
+def _glyph_origin(panel_index: int, glyph: dict) -> tuple:
+    left, top = _panel_origin(panel_index)
+    slot = int(glyph["slot"])
+    cell_x = left + (slot % 2) * SLOT_W
+    cell_y = top + TOP_PAD + (slot // 2) * SLOT_H
+    return (
+        cell_x + (SLOT_W - BOX) // 2 + int(glyph["dx"]),
+        cell_y + (SLOT_H - BOX) // 2 + int(glyph["dy"]),
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    width, height = scene["canvas"]
+    image = Image.new("RGB", (width, height), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    palette = PALETTES[int(scene["palette"]) % len(PALETTES)]
+    font = ImageFont.load_default()
+    pixels = np.asarray(image).copy()
+    for index, panel in enumerate(scene["panels"]):
+        for glyph in panel["glyphs"]:
+            mask = glyph_mask(glyph["shape"], int(glyph["orientation"]))
+            ox, oy = _glyph_origin(index, glyph)
+            region = pixels[oy : oy + BOX, ox : ox + BOX]
+            region[mask] = palette[int(glyph["colour"]) % len(palette)]
+    image = Image.fromarray(pixels)
+    draw = ImageDraw.Draw(image)
+    for index in range(PANELS):
+        left, top = _panel_origin(index)
+        draw.rectangle(
+            [left, top, left + PANEL_W - 1, top + PANEL_H - 1], outline=FRAME, width=2
+        )
+        draw.text((left + 7, top + 5), str(index + 1), fill=LABEL, font=font)
+    return image

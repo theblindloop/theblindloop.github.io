@@ -1,0 +1,134 @@
+"""Independent image-only inverse for the predictive-delta emblem."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+SYMBOLS = ("loop", "spear", "wave", "crown")
+
+
+def _marker_centers(colored: np.ndarray) -> list[tuple[float, float]]:
+    height, width = colored.shape
+    seen = np.zeros_like(colored, dtype=bool)
+    centers: list[tuple[float, float]] = []
+    for y, x in np.argwhere(colored):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and colored[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= 25:
+            values = np.asarray(points, dtype=np.float64)
+            centers.append((float(values[:, 1].mean()), float(values[:, 0].mean())))
+    if len(centers) != 4:
+        raise ValueError(f"expected four colored fiducials, found {len(centers)}")
+    return centers
+
+
+def _crop_square(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    saturation = array.max(axis=2).astype(np.int16) - array.min(axis=2).astype(np.int16)
+    centers = _marker_centers(saturation > 55)
+    xs = [point[0] for point in centers]
+    ys = [point[1] for point in centers]
+    x0 = int(round(min(xs) + 10.0))
+    y0 = int(round(min(ys) + 10.0))
+    x1 = int(round(max(xs) - 9.0))
+    y1 = int(round(max(ys) - 9.0))
+    if x1 - x0 != y1 - y0 or not (180 <= x1 - x0 <= 270):
+        raise ValueError(f"fiducials do not bracket one square: {(x0, y0, x1, y1)}")
+    return array[y0:y1, x0:x1, 0].astype(np.float32)
+
+
+def _integrate_rows(tile: np.ndarray) -> np.ndarray:
+    restored = np.empty_like(tile, dtype=np.float32)
+    restored[:, 0] = tile[:, 0]
+    for column in range(1, tile.shape[1]):
+        restored[:, column] = restored[:, column - 1] + tile[:, column] - 128.0
+    return restored
+
+
+def _mean9(array: np.ndarray) -> np.ndarray:
+    padded = np.pad(array, ((4, 4), (4, 4)), mode="edge")
+    cumulative = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    return (
+        cumulative[9:, 9:]
+        - cumulative[:-9, 9:]
+        - cumulative[9:, :-9]
+        + cumulative[:-9, :-9]
+    ) / 81.0
+
+
+def _segment_distance(
+    x: np.ndarray,
+    y: np.ndarray,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> np.ndarray:
+    x0, y0 = start
+    x1, y1 = end
+    vx, vy = x1 - x0, y1 - y0
+    denominator = vx * vx + vy * vy
+    t = ((x - x0) * vx + (y - y0) * vy) / denominator
+    t = np.clip(t, 0.0, 1.0)
+    return np.hypot(x - (x0 + t * vx), y - (y0 + t * vy))
+
+
+def _symbol_mask(symbol: str, size: int) -> np.ndarray:
+    center = (size - 1) / 2.0
+    yy, xx = np.indices((size, size), dtype=np.float32)
+    x = (xx - center) / (size / 2.0)
+    y = (yy - center) / (size / 2.0)
+    if symbol == "loop":
+        radius = np.hypot(x, y)
+        mask = (radius >= 0.32) & (radius <= 0.49)
+    elif symbol == "spear":
+        half_width = np.clip((y + 0.64) * 0.78, 0.0, 0.43)
+        tip = (y >= -0.64) & (y <= -0.08) & (np.abs(x) <= half_width)
+        shaft = (np.abs(x) <= 0.075) & (y >= -0.08) & (y <= 0.58)
+        mask = tip | shaft
+    elif symbol == "wave":
+        curve = 0.24 * np.sin(2.15 * np.pi * x)
+        mask = (np.abs(y - curve) <= 0.075) & (np.abs(x) <= 0.78)
+    elif symbol == "crown":
+        left_outer = _segment_distance(x, y, (-0.62, 0.42), (-0.38, -0.30)) < 0.075
+        left_inner = _segment_distance(x, y, (-0.38, -0.30), (0.0, 0.22)) < 0.075
+        right_inner = _segment_distance(x, y, (0.0, 0.22), (0.38, -0.30)) < 0.075
+        right_outer = _segment_distance(x, y, (0.38, -0.30), (0.62, 0.42)) < 0.075
+        base = _segment_distance(x, y, (-0.62, 0.42), (0.62, 0.42)) < 0.075
+        mask = left_outer | left_inner | right_inner | right_outer | base
+    else:
+        raise ValueError(f"unknown symbol: {symbol}")
+    return mask & (np.abs(x) < 0.86) & (np.abs(y) < 0.86)
+
+
+def _score(observed: np.ndarray, template: np.ndarray) -> float:
+    flat_observed = observed.reshape(-1)
+    flat_template = template.reshape(-1)
+    design = np.stack((np.ones_like(flat_template), flat_template), axis=1)
+    coefficients, _, _, _ = np.linalg.lstsq(design, flat_observed, rcond=None)
+    residual = flat_observed - design @ coefficients
+    return -float(np.mean(residual * residual))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Locate fiducials, integrate the residual rows, smooth, and classify by templates."""
+    tile = _crop_square(image)
+    restored = _mean9(_integrate_rows(tile))
+    edge = 18
+    observed = restored[edge:-edge, edge:-edge]
+    scores = {
+        symbol: _score(observed, _symbol_mask(symbol, tile.shape[0])[edge:-edge, edge:-edge].astype(np.float32))
+        for symbol in SYMBOLS
+    }
+    return max(scores, key=scores.get)

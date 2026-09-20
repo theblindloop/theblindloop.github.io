@@ -1,0 +1,168 @@
+"""Independent PNG-only graph extractor for four_link_terminal.
+
+This module intentionally imports no renderer, prompt, generator, verifier, latent
+scene, or gold code. It classifies visible fills, measures their component
+centroids, infers black straight-line adjacency, and runs breadth-first search.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+TARGET_HOPS = 4
+
+REFERENCES = {
+    "background": [(250, 249, 245), (247, 250, 252), (255, 250, 242)],
+    "ink": [(38, 50, 56), (48, 52, 59), (32, 42, 53)],
+    "neutral": [(234, 223, 190), (220, 231, 220), (238, 224, 199)],
+    "green": [(40, 163, 92), (33, 140, 87), (54, 166, 106)],
+    "red": [(223, 70, 80), (201, 75, 85), (226, 85, 94)],
+    "blue": [(52, 127, 213), (53, 110, 183), (67, 127, 208)],
+    "orange": [(238, 139, 44), (215, 122, 37), (237, 150, 60)],
+}
+NODE_KINDS = ("neutral", "green", "red", "blue", "orange")
+
+
+class PixelGraphError(ValueError):
+    pass
+
+
+def _labels(image: Image.Image) -> tuple[np.ndarray, list[str]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    names = list(REFERENCES)
+    scores = []
+    for name in names:
+        refs = np.asarray(REFERENCES[name], dtype=np.int32)
+        delta = array[:, :, None, :] - refs[None, None, :, :]
+        scores.append(np.min(np.sum(delta * delta, axis=3), axis=2))
+    return np.argmin(np.stack(scores, axis=2), axis=2), names
+
+
+def _components(mask: np.ndarray, minimum: int = 70) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        pixels = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            output.append(np.asarray(pixels, dtype=np.float64))
+    return output
+
+
+def _node_centers(label_map: np.ndarray, names: list[str]) -> list[dict]:
+    nodes = []
+    for kind in NODE_KINDS:
+        index = names.index(kind)
+        components = []
+        for component in _components(label_map == index):
+            y_span = float(component[:, 0].max() - component[:, 0].min() + 1)
+            x_span = float(component[:, 1].max() - component[:, 1].min() + 1)
+            aspect = max(x_span, y_span) / min(x_span, y_span)
+            # Node interiors are compact ~20 px disks. Thin antialiased line/text
+            # fragments can fall near a palette hue but are not node candidates.
+            if len(component) >= 180 and min(x_span, y_span) >= 14 and aspect <= 1.45:
+                components.append(component)
+        expected = None if kind == "neutral" else 1
+        if expected is not None and len(components) != expected:
+            raise PixelGraphError(f"expected one {kind} node, found {len(components)}")
+        for component in components:
+            y = float(component[:, 0].mean())
+            x = float(component[:, 1].mean())
+            radius = math.sqrt(len(component) / math.pi) + 3.0
+            nodes.append({"kind": kind, "x": x, "y": y, "radius": radius})
+    if not 8 <= len(nodes) <= 20:
+        raise PixelGraphError(f"implausible node count {len(nodes)}")
+    return nodes
+
+
+def _point_segment_distance(px: float, py: float, a: dict, b: dict) -> tuple[float, float]:
+    vx, vy = b["x"] - a["x"], b["y"] - a["y"]
+    denom = vx * vx + vy * vy
+    t = ((px - a["x"]) * vx + (py - a["y"]) * vy) / denom
+    t_clip = max(0.0, min(1.0, t))
+    qx, qy = a["x"] + t_clip * vx, a["y"] + t_clip * vy
+    return math.hypot(px - qx, py - qy), t
+
+
+def _has_edge(a_index: int, b_index: int, nodes: list[dict], ink: np.ndarray) -> bool:
+    a, b = nodes[a_index], nodes[b_index]
+    dx, dy = b["x"] - a["x"], b["y"] - a["y"]
+    length = math.hypot(dx, dy)
+    if length < 35.0:
+        return False
+    for index, other in enumerate(nodes):
+        if index in (a_index, b_index):
+            continue
+        distance, t = _point_segment_distance(other["x"], other["y"], a, b)
+        if 0.08 < t < 0.92 and distance < other["radius"] + 1.0:
+            return False
+    trim = max(a["radius"], b["radius"]) + 2.0
+    if length <= 2.2 * trim:
+        return False
+    samples = max(20, int(length - 2 * trim))
+    ts = np.linspace(trim / length, 1.0 - trim / length, samples)
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    hits = []
+    height, width = ink.shape
+    for t in ts:
+        cx, cy = a["x"] + t * dx, a["y"] + t * dy
+        present = False
+        for offset in (-2.0, -1.0, 0.0, 1.0, 2.0):
+            x = int(round(cx + offset * nx))
+            y = int(round(cy + offset * ny))
+            if 0 <= x < width and 0 <= y < height and ink[y, x]:
+                present = True
+                break
+        hits.append(present)
+    return float(np.mean(hits)) >= 0.88
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the unique four-hop terminal color from final pixels alone."""
+    label_map, names = _labels(image)
+    nodes = _node_centers(label_map, names)
+    ink = label_map == names.index("ink")
+    adjacency = {index: [] for index in range(len(nodes))}
+    for left in range(len(nodes)):
+        for right in range(left + 1, len(nodes)):
+            if _has_edge(left, right, nodes, ink):
+                adjacency[left].append(right)
+                adjacency[right].append(left)
+    roots = [index for index, node in enumerate(nodes) if node["kind"] == "green"]
+    if len(roots) != 1:
+        raise PixelGraphError("green start is not unique")
+    distances = {roots[0]: 0}
+    queue = deque(roots)
+    while queue:
+        here = queue.popleft()
+        for nxt in adjacency[here]:
+            if nxt not in distances:
+                distances[nxt] = distances[here] + 1
+                queue.append(nxt)
+    matches = [
+        node["kind"] for index, node in enumerate(nodes)
+        if node["kind"] in ("red", "blue", "orange") and distances.get(index) == TARGET_HOPS
+    ]
+    if len(matches) != 1:
+        terminal_distances = {
+            node["kind"]: distances.get(index) for index, node in enumerate(nodes)
+            if node["kind"] in ("red", "blue", "orange")
+        }
+        raise PixelGraphError(f"four-hop terminal is not unique: {terminal_distances}")
+    return matches[0]

@@ -1,0 +1,239 @@
+"""Scene-free pixel oracle for the stairpush_corridor_replay world.
+
+This module receives only a rendered RGB image and the public rules of the
+question. It never imports the renderer, prompts, generator, verifier or any
+analytic gold, and it never sees latent scene data. It recovers the corridor
+cells, orders them along the single connected chain starting from the capped
+end, reads each floor pip, locates the shover and the crates, and replays the
+shoving walk itself before naming the tint of the resting cell.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "stairpush_corridor_replay-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+STEP_CAP = 40
+
+_TINTS = {
+    "red": (247, 205, 205),
+    "green": (205, 240, 210),
+    "blue": (205, 220, 247),
+    "yellow": (250, 240, 195),
+}
+_PIP = (0, 0, 0)
+_CRATE = (110, 70, 35)
+_SHOVER = (200, 30, 30)
+_WHITE = (255, 255, 255)
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    return (arr[:, :, 0] == rgb[0]) & (arr[:, :, 1] == rgb[1]) & (arr[:, :, 2] == rgb[2])
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out: list[dict] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) < min_area:
+            continue
+        pys = [p[0] for p in pixels]
+        pxs = [p[1] for p in pixels]
+        out.append(
+            {
+                "area": len(pixels),
+                "y0": min(pys),
+                "y1": max(pys),
+                "x0": min(pxs),
+                "x1": max(pxs),
+                "cy": (min(pys) + max(pys)) / 2.0,
+                "cx": (min(pxs) + max(pxs)) / 2.0,
+            }
+        )
+    return out
+
+
+def _cells(arr: np.ndarray) -> list[dict] | None:
+    cells: list[dict] = []
+    for name, rgb in _TINTS.items():
+        for comp in _components(_mask(arr, rgb), 700):
+            side_y = comp["y1"] - comp["y0"] + 1
+            side_x = comp["x1"] - comp["x0"] + 1
+            if not (30 <= side_y <= 70 and 30 <= side_x <= 70):
+                return None
+            comp["tint"] = name
+            cells.append(comp)
+    if len(cells) < 6:
+        return None
+    return cells
+
+
+def _chain(cells: list[dict]) -> list[list[int]] | None:
+    count = len(cells)
+    dists = []
+    for i in range(count):
+        best = None
+        for j in range(count):
+            if i == j:
+                continue
+            d = abs(cells[i]["cx"] - cells[j]["cx"]) + abs(cells[i]["cy"] - cells[j]["cy"])
+            best = d if best is None else min(best, d)
+        if best is None:
+            return None
+        dists.append(best)
+    pitch = float(np.median(dists))
+    if pitch <= 8:
+        return None
+    adj: list[list[int]] = [[] for _ in range(count)]
+    for i in range(count):
+        for j in range(i + 1, count):
+            dx = abs(cells[i]["cx"] - cells[j]["cx"])
+            dy = abs(cells[i]["cy"] - cells[j]["cy"])
+            near = (dx <= 4 and abs(dy - pitch) <= 5) or (dy <= 4 and abs(dx - pitch) <= 5)
+            if near:
+                adj[i].append(j)
+                adj[j].append(i)
+    return adj
+
+
+def _order(cells: list[dict], adj: list[list[int]], head: int) -> list[int] | None:
+    if len(adj[head]) != 1:
+        return None
+    order = [head]
+    prev = -1
+    cur = head
+    while True:
+        nxt = [k for k in adj[cur] if k != prev]
+        if len(nxt) > 1:
+            return None
+        if not nxt:
+            break
+        prev, cur = cur, nxt[0]
+        order.append(cur)
+        if len(order) > len(cells):
+            return None
+    if len(order) != len(cells):
+        return None
+    return order
+
+
+def _pip_state(arr: np.ndarray, cell: dict) -> int | None:
+    top = cell["y0"] - 4
+    bottom = cell["y0"] + (cell["y1"] - cell["y0"]) // 2
+    left = cell["x0"] - 2
+    right = cell["x1"] + 2
+    window = arr[max(top, 0) : bottom, max(left, 0) : right]
+    dark = _mask(window, _PIP)
+    ys, xs = np.nonzero(dark)
+    if ys.size < 20:
+        return None
+    my = int(round((ys.min() + ys.max()) / 2.0))
+    mx = int(round((xs.min() + xs.max()) / 2.0))
+    if dark[my, mx]:
+        return 1
+    patch = window[my, mx]
+    if tuple(int(v) for v in patch) == _WHITE:
+        return 0
+    return None
+
+
+def _cell_of(cells: list[dict], cy: float, cx: float) -> int | None:
+    for index, cell in enumerate(cells):
+        if cell["y0"] - 3 <= cy <= cell["y1"] + 3 and cell["x0"] - 3 <= cx <= cell["x1"] + 3:
+            return index
+    return None
+
+
+def decision_from_image(image: Image.Image) -> str:
+    try:
+        return _decide(np.asarray(image.convert("RGB"), dtype=np.int16))
+    except Exception:  # pragma: no cover - abstention path
+        return ABSTAIN
+
+
+def _decide(arr: np.ndarray) -> str:
+    cells = _cells(arr)
+    if cells is None:
+        return ABSTAIN
+    adj = _chain(cells)
+    if adj is None:
+        return ABSTAIN
+    ends = [i for i in range(len(cells)) if len(adj[i]) == 1]
+    if len(ends) != 2 or any(len(a) not in (1, 2) for a in adj):
+        return ABSTAIN
+
+    dark = _components(_mask(arr, _PIP), 60)
+    caps = [c for c in dark if c["area"] >= 220 and (c["y1"] - c["y0"]) >= 30]
+    if len(caps) != 1:
+        return ABSTAIN
+    cap = caps[0]
+    head = min(ends, key=lambda i: abs(cells[i]["cx"] - cap["cx"]) + abs(cells[i]["cy"] - cap["cy"]))
+
+    order = _order(cells, adj, head)
+    if order is None:
+        return ABSTAIN
+
+    pips: list[int] = []
+    for index in order:
+        state = _pip_state(arr, cells[index])
+        if state is None:
+            return ABSTAIN
+        pips.append(state)
+
+    shovers = _components(_mask(arr, _SHOVER), 150)
+    if len(shovers) != 1:
+        return ABSTAIN
+    start_cell = _cell_of(cells, shovers[0]["cy"], shovers[0]["cx"])
+    if start_cell is None or start_cell not in order:
+        return ABSTAIN
+    start = order.index(start_cell)
+
+    crates: set[int] = set()
+    for comp in _components(_mask(arr, _CRATE), 120):
+        found = _cell_of(cells, comp["cy"], comp["cx"])
+        if found is None or found not in order:
+            return ABSTAIN
+        crates.add(order.index(found))
+    if not crates or start in crates:
+        return ABSTAIN
+
+    total = len(order)
+    occupied = set(crates)
+    pos = start
+    rested = False
+    for _ in range(STEP_CAP + 1):
+        step = 1 if pips[pos] else -1
+        nxt = pos + step
+        if nxt < 0 or nxt >= total:
+            rested = True
+            break
+        if nxt in occupied:
+            beyond = nxt + step
+            if beyond < 0 or beyond >= total or beyond in occupied:
+                rested = True
+                break
+            occupied.discard(nxt)
+            occupied.add(beyond)
+        pos = nxt
+    if not rested:
+        return ABSTAIN
+    return str(cells[order[pos]]["tint"])

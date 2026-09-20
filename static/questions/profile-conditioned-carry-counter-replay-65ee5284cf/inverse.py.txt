@@ -1,0 +1,151 @@
+"""Scene-free pixel inverse arm for carry_counter_replay.
+
+Receives one rasterised PNG and nothing else.  From the image alone it:
+
+1. finds the magenta ring and so the queried counter's horizontal position;
+2. finds the four coloured top bars, which fix the counters' positions and give
+   each counter its colour identity;
+3. counts, for each counter, how many separated shaded blocks it starts with;
+4. reads the card row left to right, matching each card's coloured square to a
+   top-bar colour and counting that card's black dots;
+5. replays the steps with the same overflow-and-carry rule and reports the
+   queried counter's final reading.
+
+It imports no renderer, prompt, generator, verifier or analytic-gold code and
+never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "carry_counter_replay-oracle@2.0.0"
+
+_RING = (200, 0, 190)
+_SHADED = (38, 58, 120)
+_BLACK = (0, 0, 0)
+_TOL = 12
+_N_CELLS = 4
+
+
+def _mask(arr: np.ndarray, rgb) -> np.ndarray:
+    diff = np.abs(arr.astype(np.int16) - np.array(rgb, dtype=np.int16))
+    return (diff <= _TOL).all(axis=2)
+
+
+def _components(mask: np.ndarray, min_size: int = 12) -> list[tuple[float, float, int]]:
+    """Four-connected blobs as (cx, cy, size)."""
+    seen = np.zeros(mask.shape, dtype=bool)
+    out: list[tuple[float, float, int]] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pts = []
+        while stack:
+            y, x = stack.pop()
+            pts.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1]:
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pts) >= min_size:
+            ay = sum(p[0] for p in pts) / len(pts)
+            ax = sum(p[1] for p in pts) / len(pts)
+            out.append((ax, ay, len(pts)))
+    return out
+
+
+def _mean_rgb(arr: np.ndarray, mask: np.ndarray, cx: float, cy: float, r: int = 4):
+    y0, y1 = int(cy) - r, int(cy) + r + 1
+    x0, x1 = int(cx) - r, int(cx) + r + 1
+    patch = arr[max(0, y0) : y1, max(0, x0) : x1].reshape(-1, 3)
+    return patch.mean(axis=0)
+
+
+def _step(fills: list[int], i: int) -> None:
+    if fills[i] < _N_CELLS:
+        fills[i] += 1
+        return
+    fills[i] = 0
+    if i > 0:
+        _step(fills, i - 1)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    h, w, _ = arr.shape
+
+    ring = _mask(arr, _RING)
+    if not ring.any():
+        return "abstain"
+    rys, rxs = np.nonzero(ring)
+    ring_cx = (int(rxs.min()) + int(rxs.max())) / 2.0
+    ring_top, ring_bot = int(rys.min()), int(rys.max())
+
+    # chromatic ink: coloured top bars and coloured card squares, never the ring,
+    # the shaded cells, the grey arrow, the cell outlines or the card outlines
+    a = arr.astype(np.int16)
+    chroma = (a.max(axis=2) - a.min(axis=2)) > 45
+    chroma &= ~ring
+    chroma &= ~_mask(arr, _SHADED)
+
+    blobs = _components(chroma, min_size=40)
+    headers = sorted([b for b in blobs if b[1] < ring_top], key=lambda b: b[0])
+    swatches = sorted([b for b in blobs if b[1] > ring_bot], key=lambda b: b[0])
+    if len(headers) < 2 or not swatches:
+        return "abstain"
+
+    header_rgb = [_mean_rgb(arr, chroma, bx, by, 3) for bx, by, _ in headers]
+    header_x = [b[0] for b in headers]
+
+    # counter half-width from the spacing of the top bars
+    if len(header_x) >= 2:
+        pitch = min(header_x[i + 1] - header_x[i] for i in range(len(header_x) - 1))
+    else:  # pragma: no cover - guarded above
+        pitch = 40.0
+    half = max(4, int(pitch * 0.25))
+
+    shaded = _mask(arr, _SHADED)
+    header_bot = int(max(np.nonzero(chroma[: int(ring_top)].any(axis=1))[0])) if chroma[: int(ring_top)].any() else 0
+    starts = []
+    for hx in header_x:
+        lo, hi = max(0, int(hx) - half), min(w - 1, int(hx) + half)
+        band = shaded[header_bot + 1 : ring_top, lo : hi + 1]
+        if band.size == 0:
+            starts.append(0)
+            continue
+        on = band.mean(axis=1) >= 0.6
+        blocks, prev = 0, False
+        for v in on:
+            if v and not prev:
+                blocks += 1
+            prev = bool(v)
+        starts.append(blocks)
+
+    # cards, left to right, with their target colour and their dot count
+    black = _mask(arr, _BLACK)
+    black[: ring_bot + 1, :] = False
+    dots = _components(black, min_size=12)
+
+    cards = []
+    for sx, sy, _ in swatches:
+        rgb = _mean_rgb(arr, chroma, sx, sy, 3)
+        target = int(np.argmin([float(((rgb - hr) ** 2).sum()) for hr in header_rgb]))
+        steps = sum(1 for dx, dy, _ in dots if abs(dx - sx) <= pitch * 0.4 and dy > sy)
+        if steps == 0:
+            return "abstain"
+        cards.append((sx, target, steps))
+    cards.sort(key=lambda c: c[0])
+
+    fills = list(starts)
+    for _, target, steps in cards:
+        for _ in range(steps):
+            _step(fills, target)
+
+    query = int(np.argmin([abs(hx - ring_cx) for hx in header_x]))
+    return str(fills[query])

@@ -1,0 +1,129 @@
+"""Independent pixel-only arm for zip_tooth_doubles.
+
+Receives one RGB image and nothing else: no latent scene, no renderer, no
+prompt or gold code. It segments the single strongly chromatic component,
+locates the straight tape spine inside it as the run of rows that span the
+component end to end, treats the leftover ink as the teeth, and walks the teeth
+in spine order counting neighbours that lie on the same side of the spine.
+Abstains whenever the strip cannot be walked unambiguously.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+CHROMA_THRESHOLD = 46
+MIN_COMPONENT_PIXELS = 150
+MIN_TOOTH_PIXELS = 9
+MIN_TEETH = 4
+MAX_TEETH = 14
+MIN_TOOTH_GAP = 3
+MAX_SPINE_THICKNESS = 9
+SPINE_RUN_FRACTION = 0.55
+ABSTAIN = "abstain"
+MAX_BREAKS = 3
+
+
+def _chromatic_points(image: Image.Image) -> list[tuple[int, int]]:
+    rgb = image.convert("RGB")
+    array = np.asarray(rgb).astype(np.int16)
+    chroma = array.max(axis=2) - array.min(axis=2)
+    ys, xs = np.nonzero(chroma >= CHROMA_THRESHOLD)
+    return [(int(x), int(y)) for x, y in zip(xs, ys)]
+
+
+def _blobs_from_points(points: list[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    remaining = set(points)
+    blobs: list[list[tuple[int, int]]] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        blob = [start]
+        while stack:
+            x, y = stack.pop()
+            for neighbour in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if neighbour in remaining:
+                    remaining.discard(neighbour)
+                    stack.append(neighbour)
+                    blob.append(neighbour)
+        blobs.append(blob)
+    return blobs
+
+
+def _longest_run(values: list[int]) -> int:
+    if not values:
+        return 0
+    values = sorted(values)
+    best = run = 1
+    for previous, current in zip(values, values[1:]):
+        run = run + 1 if current == previous + 1 else 1
+        best = max(best, run)
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    points_all = _chromatic_points(image)
+    if not points_all:
+        return ABSTAIN
+    blobs = [blob for blob in _blobs_from_points(points_all) if len(blob) >= MIN_COMPONENT_PIXELS]
+    if len(blobs) != 1:
+        return ABSTAIN
+    blob = blobs[0]
+
+    xs = [p[0] for p in blob]
+    ys = [p[1] for p in blob]
+    span_x = max(xs) - min(xs)
+    span_y = max(ys) - min(ys)
+    if min(span_x, span_y) < 6 or max(span_x, span_y) < 30:
+        return ABSTAIN
+    # Normalise so u runs along the long axis of the strip.
+    if span_x >= span_y:
+        points = [(x, y) for x, y in blob]
+    else:
+        points = [(y, x) for x, y in blob]
+    long_span = max(p[0] for p in points) - min(p[0] for p in points) + 1
+
+    by_line: dict[int, list[int]] = {}
+    for u, v in points:
+        by_line.setdefault(v, []).append(u)
+    spine_lines = sorted(
+        v for v, us in by_line.items() if _longest_run(us) >= SPINE_RUN_FRACTION * long_span
+    )
+    if not spine_lines:
+        return ABSTAIN
+    if len(spine_lines) > MAX_SPINE_THICKNESS:
+        return ABSTAIN
+    if spine_lines[-1] - spine_lines[0] != len(spine_lines) - 1:
+        return ABSTAIN
+    spine_center = (spine_lines[0] + spine_lines[-1]) / 2.0
+    spine_set = set(spine_lines)
+
+    teeth_points = [(u, v) for u, v in points if v not in spine_set]
+    if not teeth_points:
+        return ABSTAIN
+    teeth = _blobs_from_points(teeth_points)
+    if not (MIN_TEETH <= len(teeth) <= MAX_TEETH):
+        return ABSTAIN
+
+    readings = []
+    for tooth in teeth:
+        if len(tooth) < MIN_TOOTH_PIXELS:
+            return ABSTAIN
+        us = [p[0] for p in tooth]
+        vs = [p[1] for p in tooth]
+        centre = sum(us) / len(us)
+        mean_v = sum(vs) / len(vs)
+        if abs(mean_v - spine_center) < 1.0:
+            return ABSTAIN
+        readings.append((centre, min(us), max(us), 1 if mean_v > spine_center else -1))
+    readings.sort()
+
+    for left, right in zip(readings, readings[1:]):
+        if right[1] - left[2] - 1 < MIN_TOOTH_GAP:
+            return ABSTAIN
+
+    breaks = sum(1 for left, right in zip(readings, readings[1:]) if left[3] == right[3])
+    if breaks > MAX_BREAKS:
+        return ABSTAIN
+    return str(breaks)

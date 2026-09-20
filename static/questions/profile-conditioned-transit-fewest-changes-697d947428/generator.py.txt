@@ -1,0 +1,381 @@
+"""Scene sampler, renderer, analytic gold and margin for transit_fewest_changes.
+
+A scene is a small transit map: four coloured lines, each a simple path over a
+jittered 4x3 lattice of stations, drawn with globally disjoint edges. Stations
+are filled discs painted on top of the strokes; one station is green (origin)
+and one is red (destination). The decision is the smallest number of line
+changes needed to travel from the green station to the red station, where a
+change is possible only at a station served by both lines.
+
+Everything that moves the label is painted: the label reads only the station
+sets of the four lines and which stations carry the green and red discs.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "transit_fewest_changes-renderer-0.1.0"
+
+CANVAS = (660, 500)
+BACKGROUND = (255, 255, 255)
+STATION_COLOR = (35, 35, 35)
+ORIGIN_COLOR = (35, 150, 60)
+DESTINATION_COLOR = (215, 40, 40)
+LINE_COLORS = {
+    "blue": (25, 85, 215),
+    "orange": (235, 145, 20),
+    "purple": (150, 55, 195),
+    "teal": (20, 155, 150),
+}
+LINE_NAMES = ("blue", "orange", "purple", "teal")
+
+ROWS, COLS = 3, 4
+BASE_X, BASE_Y = 100, 110
+STEP_X, STEP_Y = 150, 135
+JITTER = 24
+STATION_R = 13
+STROKE_W = 9
+
+QUARANTINE_GAP = 26.0
+MIN_GAP = 14.0
+STROKE_CLEARANCE = 12.0
+STATION_CLEARANCE = 18.0
+MIN_VERTEX_ANGLE = 68.0
+
+
+# --------------------------------------------------------------------------- #
+# lattice helpers
+# --------------------------------------------------------------------------- #
+def _lattice_edges() -> list[tuple[int, int]]:
+    edges = []
+    for r in range(ROWS):
+        for c in range(COLS):
+            n = r * COLS + c
+            if c + 1 < COLS:
+                edges.append((n, n + 1))
+            if r + 1 < ROWS:
+                edges.append((n, n + COLS))
+    return edges
+
+
+def _neighbours() -> dict[int, list[int]]:
+    adj: dict[int, list[int]] = {n: [] for n in range(ROWS * COLS)}
+    for a, b in _lattice_edges():
+        adj[a].append(b)
+        adj[b].append(a)
+    return adj
+
+
+def _sample_paths(rng: random.Random, n_lines: int, path_edges: int):
+    """Sample `n_lines` edge-disjoint simple lattice paths of `path_edges` edges."""
+    adj = _neighbours()
+    used: set[frozenset[int]] = set()
+    paths: list[list[int]] = []
+    for _ in range(n_lines):
+        best = None
+        for _try in range(60):
+            start = rng.randrange(ROWS * COLS)
+            path = [start]
+            ok = True
+            for _step in range(path_edges):
+                here = path[-1]
+                options = [
+                    m
+                    for m in adj[here]
+                    if m not in path and frozenset((here, m)) not in used
+                ]
+                if not options:
+                    ok = False
+                    break
+                path.append(rng.choice(options))
+            if ok:
+                best = path
+                break
+        if best is None:
+            return None
+        for i in range(len(best) - 1):
+            used.add(frozenset((best[i], best[i + 1])))
+        paths.append(best)
+    return paths
+
+
+# --------------------------------------------------------------------------- #
+# decision rule
+# --------------------------------------------------------------------------- #
+def _min_changes(line_stations: list[frozenset[int]], green: int, red: int,
+                 merged: tuple[int, int] | None = None) -> int | None:
+    """Fewest line changes from `green` to `red`; None when unreachable.
+
+    A traveller riding a line can alight at any station of that line, so the
+    journey is a chain of lines in which consecutive lines share a station.
+    `merged` optionally identifies two stations treated as one, which is what
+    happens visually if two discs were to touch.
+    """
+    def stations(i: int) -> frozenset[int]:
+        s = line_stations[i]
+        if merged is not None and (merged[0] in s or merged[1] in s):
+            return s | frozenset(merged)
+        return s
+
+    start = [i for i in range(len(line_stations)) if green in stations(i)]
+    goal = {i for i in range(len(line_stations)) if red in stations(i)}
+    if not start or not goal:
+        return None
+    dist = {i: 0 for i in start}
+    queue = deque(start)
+    while queue:
+        i = queue.popleft()
+        if i in goal:
+            return dist[i]
+        for j in range(len(line_stations)):
+            if j in dist:
+                continue
+            if stations(i) & stations(j):
+                dist[j] = dist[i] + 1
+                queue.append(j)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# geometry helpers
+# --------------------------------------------------------------------------- #
+def _seg_point(p, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    vx, vy = bx - ax, by - ay
+    L = vx * vx + vy * vy
+    t = 0.0 if L == 0 else max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / L))
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _seg_seg(a, b, c, d) -> float:
+    return min(
+        _seg_point(a, c, d), _seg_point(b, c, d),
+        _seg_point(c, a, b), _seg_point(d, a, b),
+    )
+
+
+def _dist(p, q) -> float:
+    return math.hypot(p[0] - q[0], p[1] - q[1])
+
+
+def _edges_of(scene: dict) -> list[tuple[int, int]]:
+    out = []
+    for line in scene["lines"]:
+        path = line["path"]
+        for i in range(len(path) - 1):
+            out.append((path[i], path[i + 1]))
+    return out
+
+
+def _geometry_ok(scene: dict) -> bool:
+    pts = {n: tuple(scene["nodes"][n]) for n in scene["stations"]}
+    r, w = scene["station_r"], scene["stroke_w"]
+    edges = _edges_of(scene)
+    joined = {frozenset(e) for e in edges}
+    for u in scene["stations"]:
+        for v in scene["stations"]:
+            if u >= v:
+                continue
+            gap = _dist(pts[u], pts[v]) - 2 * r
+            if frozenset((u, v)) in joined:
+                if gap < 4 * r:
+                    return False
+            elif gap < MIN_GAP:
+                return False
+    for a, b in edges:
+        for n in scene["stations"]:
+            if n in (a, b):
+                continue
+            if _seg_point(pts[n], pts[a], pts[b]) < r + w / 2 + STATION_CLEARANCE:
+                return False
+    for i, (a, b) in enumerate(edges):
+        for c, d in edges[i + 1:]:
+            if {a, b} & {c, d}:
+                continue
+            if _seg_seg(pts[a], pts[b], pts[c], pts[d]) < w + STROKE_CLEARANCE:
+                return False
+    incident: dict[int, list[int]] = {n: [] for n in scene["stations"]}
+    for a, b in edges:
+        incident[a].append(b)
+        incident[b].append(a)
+    for n, others in incident.items():
+        for i, p in enumerate(others):
+            for q in others[i + 1:]:
+                v1 = (pts[p][0] - pts[n][0], pts[p][1] - pts[n][1])
+                v2 = (pts[q][0] - pts[n][0], pts[q][1] - pts[n][1])
+                cos = (v1[0] * v2[0] + v1[1] * v2[1]) / (
+                    math.hypot(*v1) * math.hypot(*v2))
+                if math.degrees(math.acos(max(-1.0, min(1.0, cos)))) < MIN_VERTEX_ANGLE:
+                    return False
+    for n in scene["stations"]:
+        x, y = pts[n]
+        if not (r + 6 <= x <= CANVAS[0] - r - 6 and r + 6 <= y <= CANVAS[1] - r - 6):
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    target = ["1", "2", "3"][seed % 3]
+    tight = (seed // 3) % 4 == 0
+
+    for _attempt in range(4000):
+        paths = _sample_paths(rng, 4, 3)
+        if paths is None:
+            continue
+        line_stations = [frozenset(p) for p in paths]
+        stations = sorted(set().union(*line_stations))
+        if len(stations) < 8:
+            continue
+
+        pairs = [
+            (g, d)
+            for g in stations
+            for d in stations
+            if g != d and str(_min_changes(line_stations, g, d)) == target
+        ]
+        if not pairs:
+            continue
+        green, red = rng.choice(pairs)
+
+        nodes = []
+        for n in range(ROWS * COLS):
+            r_i, c_i = divmod(n, COLS)
+            nodes.append([
+                float(BASE_X + c_i * STEP_X + rng.uniform(-JITTER, JITTER)),
+                float(BASE_Y + r_i * STEP_Y + rng.uniform(-JITTER, JITTER)),
+            ])
+
+        joined = {frozenset(e) for e in _edges_of({"lines": [{"path": p} for p in paths]})}
+        gold = int(target)
+        relevant = [
+            (u, v)
+            for u in stations
+            for v in stations
+            if u < v
+            and frozenset((u, v)) not in joined
+            and _dist(nodes[u], nodes[v]) < 230
+            and _min_changes(line_stations, green, red, merged=(u, v)) != gold
+        ]
+        if not relevant:
+            continue
+        pu, pv = rng.choice(relevant)
+
+        want = rng.uniform(15.0, 30.0) if tight else rng.uniform(34.0, 120.0)
+        cur = _dist(nodes[pu], nodes[pv]) - 2 * STATION_R
+        if want < cur:
+            shift = (cur - want) / 2.0
+            ux, uy = nodes[pu]
+            vx, vy = nodes[pv]
+            L = math.hypot(vx - ux, vy - uy)
+            dx, dy = (vx - ux) / L, (vy - uy) / L
+            nodes[pu] = [ux + dx * shift, uy + dy * shift]
+            nodes[pv] = [vx - dx * shift, vy - dy * shift]
+
+        lines = [
+            {"name": name, "path": list(path)}
+            for name, path in zip(rng.sample(LINE_NAMES, 4), paths)
+        ]
+        scene = {
+            "canvas": list(CANVAS),
+            "background": list(BACKGROUND),
+            "nodes": [[round(x, 3), round(y, 3)] for x, y in nodes],
+            "stations": stations,
+            "lines": lines,
+            "green_station": green,
+            "red_station": red,
+            "station_r": STATION_R,
+            "stroke_w": STROKE_W,
+            "pinch": [pu, pv],
+        }
+        if not _geometry_ok(scene):
+            continue
+        return scene
+    raise RuntimeError(f"sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------- #
+# gold, margin, quarantine
+# --------------------------------------------------------------------------- #
+def _line_stations(scene: dict) -> list[frozenset[int]]:
+    return [frozenset(line["path"]) for line in scene["lines"]]
+
+
+def analytic_gold(scene: dict) -> str:
+    n = _min_changes(_line_stations(scene), scene["green_station"], scene["red_station"])
+    if n is None:
+        raise ValueError("destination unreachable")
+    return str(n)
+
+
+def margin(scene: dict) -> float:
+    """Smallest disc-to-disc gap whose closure would change the answer.
+
+    Two discs that touch read as a single interchange station, which shortens
+    the chain of lines; the answer therefore flips exactly when such a gap
+    closes, and this is the visible boundary quantity.
+    """
+    ls = _line_stations(scene)
+    gold = analytic_gold(scene)
+    nodes = scene["nodes"]
+    joined = {frozenset(e) for e in _edges_of(scene)}
+    best = float(min(CANVAS))
+    for i, u in enumerate(scene["stations"]):
+        for v in scene["stations"][i + 1:]:
+            if frozenset((u, v)) in joined:
+                continue
+            merged = _min_changes(ls, scene["green_station"], scene["red_station"],
+                                  merged=(u, v))
+            if str(merged) == gold:
+                continue
+            best = min(best, _dist(nodes[u], nodes[v]) - 2 * scene["station_r"])
+    return round(float(best), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_GAP)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: every label input is painted (see candidate.json)."""
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def render(scene: dict) -> Image.Image:
+    w, h = scene["canvas"]
+    img = Image.new("RGB", (w, h), tuple(scene["background"]))
+    draw = ImageDraw.Draw(img)
+    nodes = [tuple(p) for p in scene["nodes"]]
+    sw = scene["stroke_w"]
+
+    for line in scene["lines"]:
+        color = LINE_COLORS[line["name"]]
+        path = line["path"]
+        for i in range(len(path) - 1):
+            a, b = nodes[path[i]], nodes[path[i + 1]]
+            draw.line([a, b], fill=color, width=sw)
+
+    r = scene["station_r"]
+    for n in scene["stations"]:
+        x, y = nodes[n]
+        if n == scene["green_station"]:
+            fill = ORIGIN_COLOR
+        elif n == scene["red_station"]:
+            fill = DESTINATION_COLOR
+        else:
+            fill = STATION_COLOR
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=fill)
+    return img

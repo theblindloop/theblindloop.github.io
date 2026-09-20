@@ -1,0 +1,161 @@
+"""Pixel-only inverse arm: segment pads and arms, then walk the two hops.
+
+Receives a PIL image and nothing else.  No renderer, prompt, generator,
+verifier or analytic-gold import, and no latent scene input.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_PALETTE = {
+    "gray": (140, 143, 148),
+    "orange": (233, 124, 30),
+    "purple": (126, 58, 180),
+    "teal": (20, 145, 145),
+    "mark": (32, 34, 40),
+}
+_TOL = 40
+_MIN_PAD_AREA = 400
+_MIN_ARM_AREA = 100
+_ALIGN_TOL = 16.0
+_TOUCH_SLACK = 3
+
+UNDETERMINED = "undetermined"
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    diff = arr.astype(np.int32) - np.array(rgb, dtype=np.int32)
+    return (np.abs(diff).sum(axis=2) <= _TOL)
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[dict]:
+    """Four-connected components with bounding boxes and centres."""
+
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) < min_area:
+            continue
+        arr = np.array(pixels)
+        y0, x0 = arr.min(axis=0).tolist()
+        y1, x1 = arr.max(axis=0).tolist()
+        out.append(
+            {
+                "area": len(pixels),
+                "box": (x0, y0, x1, y1),
+                "center": ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+            }
+        )
+    return out
+
+
+def _box_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    dx = max(a[0] - b[2], b[0] - a[2], 0)
+    dy = max(a[1] - b[3], b[1] - a[3], 0)
+    return float(max(dx, dy))
+
+
+def _hop(origin: dict, direction: tuple[int, int], pads: list[dict]) -> dict | None:
+    """First pad whose centre lies in `direction` and is aligned with the axis."""
+
+    sx, sy = direction
+    ox, oy = origin["center"]
+    best = None
+    best_along = None
+    for pad in pads:
+        if pad is origin:
+            continue
+        px, py = pad["center"]
+        along = (px - ox) * sx + (py - oy) * sy
+        perp = abs((px - ox) * sy - (py - oy) * sx)
+        if along <= 0 or perp > _ALIGN_TOL:
+            continue
+        if best_along is None or along < best_along:
+            best = pad
+            best_along = along
+        elif abs(along - best_along) < 1.0:
+            return None  # two equally near aligned pads: ambiguous
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.array(image.convert("RGB"))
+
+    gray = _components(_mask(arr, _PALETTE["gray"]), _MIN_PAD_AREA)
+    orange = _components(_mask(arr, _PALETTE["orange"]), _MIN_PAD_AREA)
+    purple = _components(_mask(arr, _PALETTE["purple"]), _MIN_PAD_AREA)
+    arms = _components(_mask(arr, _PALETTE["teal"]), _MIN_ARM_AREA)
+    marks = _components(_mask(arr, _PALETTE["mark"]), 40)
+
+    if len(orange) != 1 or len(purple) != 1 or len(arms) != 2 or len(marks) != 1:
+        return UNDETERMINED
+    for pad in gray + orange + purple:
+        pad["kind"] = "pad"
+    orange[0]["color"] = "orange"
+    purple[0]["color"] = "purple"
+    for pad in gray:
+        pad["color"] = "gray"
+    pads = gray + orange + purple
+    if len(pads) < 4:
+        return UNDETERMINED
+
+    # the dark mark sits strictly inside exactly one gray pad: the entry pad
+    mx, my = marks[0]["center"]
+    entry_hits = [
+        pad
+        for pad in gray
+        if pad["box"][0] < mx < pad["box"][2] and pad["box"][1] < my < pad["box"][3]
+    ]
+    if len(entry_hits) != 1:
+        return UNDETERMINED
+    entry = entry_hits[0]
+
+    # attach each arm to the unique pad it touches, then read its outward side
+    owned: dict[int, tuple[int, int]] = {}
+    for arm in arms:
+        touching = [pad for pad in pads if _box_gap(arm["box"], pad["box"]) <= _TOUCH_SLACK]
+        if len(touching) != 1:
+            return UNDETERMINED
+        pad = touching[0]
+        ax, ay = arm["center"]
+        px, py = pad["center"]
+        dx = ax - px
+        dy = ay - py
+        if abs(dx) == abs(dy):
+            return UNDETERMINED
+        direction = (1 if dx > 0 else -1, 0) if abs(dx) > abs(dy) else (0, 1 if dy > 0 else -1)
+        key = id(pad)
+        if key in owned:
+            return UNDETERMINED
+        owned[key] = direction
+
+    if id(entry) not in owned:
+        return UNDETERMINED
+    first = _hop(entry, owned[id(entry)], pads)
+    if first is None or first.get("color") != "gray" or first is entry:
+        return UNDETERMINED
+    if id(first) not in owned:
+        return UNDETERMINED
+    second = _hop(first, owned[id(first)], pads)
+    if second is None:
+        return UNDETERMINED
+    color = second.get("color")
+    if color not in ("orange", "purple"):
+        return UNDETERMINED
+    return color

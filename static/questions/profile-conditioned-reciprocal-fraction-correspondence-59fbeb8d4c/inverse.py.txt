@@ -1,0 +1,118 @@
+"""Independent image-only inverse for reciprocal fraction correspondence.
+
+This module knows only the public visual grammar: four colored card borders,
+black seven-segment digits, and a black fraction bar. It localizes every card
+from color pixels, detects each divider from row ink, decodes normalized segment
+occupancy, performs the two role-reversing matches, and returns the matched
+candidate border color. It never receives or imports latent scene information.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_PALETTE = {
+    "reference": np.array((190, 45, 180), dtype=np.int16),
+    "red": np.array((220, 55, 55), dtype=np.int16),
+    "green": np.array((40, 155, 82), dtype=np.int16),
+    "blue": np.array((45, 105, 215), dtype=np.int16),
+}
+
+_DIGITS = {
+    frozenset("abdeg"): 2,
+    frozenset("abcdg"): 3,
+    frozenset("bcfg"): 4,
+    frozenset("acdfg"): 5,
+    frozenset("acdefg"): 6,
+    frozenset("abc"): 7,
+    frozenset("abcdefg"): 8,
+    frozenset("abcdfg"): 9,
+}
+
+
+def _card_box(arr: np.ndarray, rgb: np.ndarray, name: str) -> tuple[int, int, int, int]:
+    delta = arr.astype(np.int32) - rgb.astype(np.int32)
+    distance = np.sqrt((delta * delta).sum(axis=2))
+    ys, xs = np.nonzero(distance < 18.0)
+    if len(xs) < 900:
+        raise ValueError(f"{name} card border is missing or corrupted")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    if x1 - x0 < 120 or y1 - y0 < 180:
+        raise ValueError(f"{name} border does not enclose a fraction card")
+    return x0, y0, x1, y1
+
+
+def _probe(mask: np.ndarray, cx: float, cy: float, rx: float, ry: float) -> float:
+    h, w = mask.shape
+    x0 = max(0, int(round(cx - rx)))
+    x1 = min(w, int(round(cx + rx)) + 1)
+    y0 = max(0, int(round(cy - ry)))
+    y1 = min(h, int(round(cy + ry)) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return float(mask[y0:y1, x0:x1].mean())
+
+
+def _decode_role(mask: np.ndarray) -> int:
+    """Decode one digit from segment occupancy in a divider-defined role box."""
+    h, w = mask.shape
+    if h < 45 or w < 80 or int(mask.sum()) < 250:
+        raise ValueError("digit role has insufficient visible ink")
+
+    # Seven-segment glyphs are centered in their role. Probe broad normalized
+    # neighborhoods, not renderer coordinates or isolated answer pixels.
+    x_left, x_mid, x_right = 0.34 * w, 0.50 * w, 0.66 * w
+    y_top, y_mid, y_bottom = 0.20 * h, 0.50 * h, 0.80 * h
+    samples = {
+        "a": _probe(mask, x_mid, y_top, 0.10 * w, 0.045 * h),
+        "b": _probe(mask, x_right, 0.34 * h, 0.035 * w, 0.10 * h),
+        "c": _probe(mask, x_right, 0.66 * h, 0.035 * w, 0.10 * h),
+        "d": _probe(mask, x_mid, y_bottom, 0.10 * w, 0.045 * h),
+        "e": _probe(mask, x_left, 0.66 * h, 0.035 * w, 0.10 * h),
+        "f": _probe(mask, x_left, 0.34 * h, 0.035 * w, 0.10 * h),
+        "g": _probe(mask, x_mid, y_mid, 0.10 * w, 0.045 * h),
+    }
+    active = frozenset(name for name, occupancy in samples.items() if occupancy > 0.42)
+    digit = _DIGITS.get(active)
+    if digit is None:
+        raise ValueError(f"unrecognized seven-segment signature: {''.join(sorted(active))}")
+    active_values = [samples[name] for name in active]
+    inactive_values = [samples[name] for name in samples if name not in active]
+    if min(active_values, default=1.0) - max(inactive_values, default=0.0) < 0.25:
+        raise ValueError("seven-segment signature lacks a safe raster margin")
+    return digit
+
+
+def _read_fraction(arr: np.ndarray, box: tuple[int, int, int, int]) -> tuple[int, int]:
+    x0, y0, x1, y1 = box
+    inset = max(7, int(round(0.045 * (x1 - x0 + 1))))
+    crop = arr[y0 + inset : y1 - inset + 1, x0 + inset : x1 - inset + 1]
+    black = crop.max(axis=2) < 70
+    row_ink = black.sum(axis=1)
+    if len(row_ink) == 0 or int(row_ink.max()) < int(0.45 * black.shape[1]):
+        raise ValueError("fraction divider is missing")
+    divider_rows = np.flatnonzero(row_ink >= 0.72 * row_ink.max())
+    if len(divider_rows) < 3:
+        raise ValueError("fraction divider is not a stable horizontal bar")
+    split0, split1 = int(divider_rows.min()), int(divider_rows.max())
+    if not 0.35 * black.shape[0] < (split0 + split1) / 2 < 0.65 * black.shape[0]:
+        raise ValueError("fraction divider is not between two roles")
+    upper = black[: max(0, split0 - 3)]
+    lower = black[min(black.shape[0], split1 + 4) :]
+    return _decode_role(upper), _decode_role(lower)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    boxes = {name: _card_box(arr, rgb, name) for name, rgb in _PALETTE.items()}
+    ref_top, ref_bottom = _read_fraction(arr, boxes["reference"])
+    matches: list[str] = []
+    for color in ("red", "green", "blue"):
+        top, bottom = _read_fraction(arr, boxes[color])
+        if top == ref_bottom and bottom == ref_top:
+            matches.append(color)
+    if len(matches) != 1:
+        raise ValueError(f"expected one pixel-visible reciprocal, found {len(matches)}")
+    return matches[0]

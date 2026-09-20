@@ -1,0 +1,199 @@
+"""Independent image-only inverse for single-junction seam resilience."""
+
+from __future__ import annotations
+
+from collections import deque
+import numpy as np
+from PIL import Image
+
+WIDTH, HEIGHT = 1020, 650
+INK = (42, 47, 55)
+SAME_FILL = (207, 232, 219)
+FLIP_FILL = (242, 215, 221)
+COLORS = {
+    "amber": (232, 156, 37),
+    "cyan": (31, 163, 190),
+    "violet": (132, 79, 188),
+}
+COLOR_NAMES = tuple(COLORS)
+PATCH_BASES = (25, 365, 705)
+GRID_X = (18, 130, 242)
+GRID_Y = (160, 280, 400, 520)
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _node(patch: int, row: int, col: int) -> str:
+    return f"P{patch}r{row}c{col}"
+
+
+def _xy(node_id: str) -> tuple[int, int]:
+    patch, row, col = int(node_id[1]), int(node_id[3]), int(node_id[5])
+    return PATCH_BASES[patch] + GRID_X[col], GRID_Y[row]
+
+
+def _mask(arr: np.ndarray, color: tuple[int, int, int], tolerance: int = 15) -> np.ndarray:
+    return np.max(np.abs(arr.astype(np.int16) - np.asarray(color, dtype=np.int16)), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    remaining = set(map(tuple, np.argwhere(mask)))
+    found = []
+    while remaining:
+        start = remaining.pop()
+        stack, points = [start], [start]
+        while stack:
+            y, x = stack.pop()
+            for nxt in ((y-1, x), (y+1, x), (y, x-1), (y, x+1)):
+                if 0 <= nxt[0] < height and 0 <= nxt[1] < width and nxt in remaining:
+                    remaining.remove(nxt)
+                    stack.append(nxt)
+                    points.append(nxt)
+        if len(points) >= minimum:
+            found.append(np.asarray(points, dtype=np.float64))
+    return found
+
+
+def _nearest_node(x: float, y: float) -> str:
+    nodes = [_node(p, r, c) for p in range(3) for r in range(4) for c in range(3)]
+    ranked = sorted(((x-_xy(n)[0])**2 + (y-_xy(n)[1])**2, n) for n in nodes)
+    if ranked[0][0] > 8**2:
+        raise OracleError(f"colored mark is off lattice at {(x, y)}")
+    return ranked[0][1]
+
+
+def _recover_terminals(arr: np.ndarray) -> dict[str, list[str]]:
+    terminals = {}
+    for color, rgb in COLORS.items():
+        parts = _components(_mask(arr, rgb), 350)
+        if len(parts) != 2:
+            raise OracleError(f"expected two {color} terminals, found {len(parts)}")
+        located = []
+        for part in parts:
+            y, x = part.mean(axis=0)
+            located.append(_nearest_node(float(x), float(y)))
+        if len(set(located)) != 2:
+            raise OracleError(f"duplicate {color} terminal location")
+        terminals[color] = sorted(located)
+    marked = [n for pair in terminals.values() for n in pair]
+    if len(set(marked)) != 6:
+        raise OracleError("terminal colors overlap")
+    return terminals
+
+
+def _coverage(mask: np.ndarray, a: tuple[int, int], b: tuple[int, int]) -> float:
+    hits = 0
+    for t in np.linspace(0.25, 0.75, 48):
+        x = int(round(a[0] + t*(b[0]-a[0])))
+        y = int(round(a[1] + t*(b[1]-a[1])))
+        hits += bool(mask[max(0, y-3):y+4, max(0, x-3):x+4].any())
+    return hits / 48
+
+
+def _recover_patches(arr: np.ndarray) -> list[dict]:
+    ink = _mask(arr, INK, 22)
+    patches = []
+    for patch in range(3):
+        edges = []
+        for row in range(4):
+            for col in range(2):
+                a, b = _node(patch, row, col), _node(patch, row, col+1)
+                if _coverage(ink, _xy(a), _xy(b)) >= 0.82:
+                    edges.append(sorted((a, b)))
+        for row in range(3):
+            for col in range(3):
+                a, b = _node(patch, row, col), _node(patch, row+1, col)
+                if _coverage(ink, _xy(a), _xy(b)) >= 0.82:
+                    edges.append(sorted((a, b)))
+        patches.append({"name": chr(65+patch), "edges": edges})
+    if not 12 <= sum(len(p["edges"]) for p in patches) <= 42:
+        raise OracleError("implausible local link count")
+    return patches
+
+
+def _recover_seams(arr: np.ndarray) -> list[dict]:
+    same = _mask(arr, SAME_FILL, 14)
+    flip = _mask(arr, FLIP_FILL, 14)
+    seams = []
+    for left, cx in enumerate((325, 665)):
+        region = np.s_[140:555, cx-24:cx+25]
+        same_count = int(same[region].sum())
+        flip_count = int(flip[region].sum())
+        if max(same_count, flip_count) < 10000 or min(same_count, flip_count) > 80:
+            raise OracleError(f"damaged seam indicator {left}")
+        mode = "same" if same_count > flip_count else "flip"
+        seams.append({"left": left, "right": left+1, "mode": mode})
+    return seams
+
+
+def _adjacency(patches: list[dict], seams: list[dict]) -> dict[str, list[str]]:
+    nodes = [_node(p, r, c) for p in range(3) for r in range(4) for c in range(3)]
+    adjacency = {node: [] for node in nodes}
+    for patch in patches:
+        for a, b in patch["edges"]:
+            adjacency[a].append(b)
+            adjacency[b].append(a)
+    for seam in seams:
+        left, mode = seam["left"], seam["mode"]
+        for row in range(4):
+            other = row if mode == "same" else 3-row
+            a, b = _node(left, row, 2), _node(left+1, other, 0)
+            adjacency[a].append(b)
+            adjacency[b].append(a)
+    return adjacency
+
+
+def _decode(node_id: str) -> tuple[int, int, int]:
+    return int(node_id[1]), int(node_id[3]), int(node_id[5])
+
+
+def _is_socket(node_id: str) -> bool:
+    patch, _, col = _decode(node_id)
+    return (patch < 2 and col == 2) or (patch > 0 and col == 0)
+
+
+def _connected_without_junction(patches: list[dict], seams: list[dict], start: str, goal: str,
+                                removed: str | None = None) -> bool:
+    adjacency = _adjacency(patches, seams)
+    if removed is not None:
+        for neighbor in list(adjacency[removed]):
+            adjacency[neighbor].remove(removed)
+        adjacency[removed] = []
+    reached, queue = {start}, deque([start])
+    while queue:
+        here = queue.popleft()
+        if here == goal:
+            return True
+        for nxt in adjacency[here]:
+            if nxt not in reached:
+                reached.add(nxt)
+                queue.append(nxt)
+    return goal in reached
+
+
+def _resilient(patches: list[dict], seams: list[dict], pair: list[str],
+               terminals: dict[str, list[str]]) -> bool:
+    a, b = pair
+    marked = {node for colored_pair in terminals.values() for node in colored_pair}
+    removable = [_node(p, r, c) for p in range(3) for r in range(4) for c in range(3)
+                 if _node(p, r, c) not in marked and not _is_socket(_node(p, r, c))]
+    return _connected_without_junction(patches, seams, a, b) and all(
+        _connected_without_junction(patches, seams, a, b, node) for node in removable
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape[:2] != (HEIGHT, WIDTH):
+        raise OracleError(f"unexpected image size {image.size}")
+    terminals = _recover_terminals(arr)
+    patches = _recover_patches(arr)
+    seams = _recover_seams(arr)
+    answers = [color for color, pair in terminals.items()
+               if _resilient(patches, seams, pair, terminals)]
+    if len(answers) != 1:
+        raise OracleError(f"expected one resilient color pair, found {answers}")
+    return answers[0]

@@ -1,0 +1,129 @@
+"""Pixel-only decision arm for the colour-fence panel world.
+
+Receives a rendered RGB image and nothing else. It splits the raster into equal
+panel lanes, separates warm ink, cool ink and the dark neutral fence stroke by
+channel contrast, fits each lane's fence with a principal-axis fit of its own
+stroke pixels, labels the coloured dots as connected components, and returns the
+lane in which every warm dot centroid lies on one side of that fitted fence and
+every cool dot centroid lies on the other.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+PANEL_COUNT = 4
+WARM_CONTRAST = 45.0
+COOL_CONTRAST = 45.0
+FENCE_LUMINANCE = 110.0
+FENCE_NEUTRALITY = 30.0
+MIN_BLOB_AREA = 40
+MIN_FENCE_PIXELS = 120
+MIN_DOTS_PER_PANEL = 6
+MIN_PER_COLOUR = 3
+DECISION_TOLERANCE = 6.0
+MIN_WRONG_SIDE = 2
+AMBIGUOUS = "ambiguous"
+PANELS = ("panel_1", "panel_2", "panel_3", "panel_4")
+
+
+def _masks(image: Image.Image):
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    red = arr[:, :, 0]
+    green = arr[:, :, 1]
+    blue = arr[:, :, 2]
+    luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+    warm = (red - blue) > WARM_CONTRAST
+    cool = (blue - red) > COOL_CONTRAST
+    fence = (luminance < FENCE_LUMINANCE) & (np.abs(red - blue) <= FENCE_NEUTRALITY)
+    return warm, cool, fence
+
+
+def _components(mask: np.ndarray) -> list:
+    """Eight-connected components, walked over mask coordinates only."""
+    ys, xs = np.nonzero(mask)
+    remaining = set(zip(ys.tolist(), xs.tolist()))
+    blobs = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        pixels = [start]
+        while stack:
+            y, x = stack.pop()
+            for ny in (y - 1, y, y + 1):
+                for nx in (x - 1, x, x + 1):
+                    neighbour = (ny, nx)
+                    if neighbour in remaining:
+                        remaining.discard(neighbour)
+                        stack.append(neighbour)
+                        pixels.append(neighbour)
+        if len(pixels) >= MIN_BLOB_AREA:
+            blobs.append(np.array(pixels, dtype=np.float64))
+    return blobs
+
+
+def _fit_line(pixels: np.ndarray):
+    """Mean point and unit normal of the principal axis of a stroke."""
+    centre = pixels.mean(axis=0)
+    centred = pixels - centre
+    covariance = centred.T @ centred
+    values, vectors = np.linalg.eigh(covariance)
+    if values[1] <= 0.0 or values[1] < 4.0 * values[0]:
+        return None
+    direction = vectors[:, int(np.argmax(values))]
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+    norm = float(np.hypot(normal[0], normal[1]))
+    if norm < 1e-9:
+        return None
+    return centre, normal / norm
+
+
+def decision_from_image(image: Image.Image) -> str:
+    warm_mask, cool_mask, fence_mask = _masks(image)
+    _height, width = fence_mask.shape
+    lane = width / PANEL_COUNT
+    wrong_side = []
+    for index in range(PANEL_COUNT):
+        low = int(round(index * lane))
+        high = int(round((index + 1) * lane))
+        column = np.zeros(width, dtype=bool)
+        column[low:high] = True
+        fence_pixels = np.argwhere(fence_mask & column)
+        if fence_pixels.shape[0] < MIN_FENCE_PIXELS:
+            return AMBIGUOUS
+        fit = _fit_line(fence_pixels.astype(np.float64))
+        if fit is None:
+            return AMBIGUOUS
+        centre, normal = fit
+        warm_blobs = _components(warm_mask & column)
+        cool_blobs = _components(cool_mask & column)
+        if len(warm_blobs) < MIN_PER_COLOUR or len(cool_blobs) < MIN_PER_COLOUR:
+            return AMBIGUOUS
+        if len(warm_blobs) + len(cool_blobs) < MIN_DOTS_PER_PANEL:
+            return AMBIGUOUS
+        warm_positive = warm_negative = 0
+        cool_positive = cool_negative = 0
+        for blobs, is_warm in ((warm_blobs, True), (cool_blobs, False)):
+            for blob in blobs:
+                offset = float((blob.mean(axis=0) - centre) @ normal)
+                if abs(offset) < DECISION_TOLERANCE:
+                    return AMBIGUOUS
+                if is_warm:
+                    if offset > 0.0:
+                        warm_positive += 1
+                    else:
+                        warm_negative += 1
+                elif offset > 0.0:
+                    cool_positive += 1
+                else:
+                    cool_negative += 1
+        wrong_side.append(
+            min(warm_positive + cool_negative, warm_negative + cool_positive)
+        )
+    clean = [index for index, value in enumerate(wrong_side) if value == 0]
+    if len(clean) != 1:
+        return AMBIGUOUS
+    if any(value < MIN_WRONG_SIDE for index, value in enumerate(wrong_side) if index != clean[0]):
+        return AMBIGUOUS
+    return PANELS[clean[0]]

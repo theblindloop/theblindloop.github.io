@@ -1,0 +1,144 @@
+"""Pixel-only inverse arm for the weave_cycle_panel world.
+
+The oracle receives a rasterized image and nothing else.  It takes the most
+common colour to be the page, splits the remaining ink into five contiguous
+column blocks (the framed panels), reads the frame colour off each panel's
+corner pixel, and treats every other sufficiently large flat colour inside the
+panel as one band.  Each band's centre line is fitted by total least squares on
+its own visible pixels, the three pairwise line intersections give the three
+crossings, and a small disk centred on each crossing is put to a colour vote:
+the band that keeps its colour there is the band in front.  The three in-front
+relations form a tournament over the three bands; a panel is woven when that
+tournament is a cycle.  The oracle reports the unique woven panel and abstains
+whenever the panel structure, a band fit, a crossing vote, or the uniqueness of
+the woven panel is not recovered.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+AMBIGUOUS = "ambiguous"
+
+N_PANELS = 5
+PAIRS = ((0, 1), (0, 2), (1, 2))
+MIN_BAND_PIXELS = 700
+MIN_PANEL_WIDTH = 60
+VOTE_RADIUS = 5
+MIN_VOTE_PIXELS = 40
+MIN_DOMINANCE = 0.55
+
+
+def _runs(flags: np.ndarray) -> list:
+    spans, start = [], None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            spans.append((start, index - 1))
+            start = None
+    if start is not None:
+        spans.append((start, len(flags) - 1))
+    return spans
+
+
+def _fit_line(ys: np.ndarray, xs: np.ndarray):
+    """Centroid and unit direction of a thin cloud of pixels."""
+    points = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+    centre = points.mean(axis=0)
+    centred = points - centre
+    covariance = centred.T @ centred / float(points.shape[0])
+    values, vectors = np.linalg.eigh(covariance)
+    if values[1] <= 1e-9 or values[1] <= values[0] * 4.0:
+        return None
+    direction = vectors[:, 1]
+    return centre, direction / np.linalg.norm(direction)
+
+
+def _intersect(first, second):
+    (cx1, cy1), (ux1, uy1) = first
+    (cx2, cy2), (ux2, uy2) = second
+    determinant = ux1 * (-uy2) - (-ux2) * uy1
+    if abs(determinant) < 1e-6:
+        return None
+    rhs_x, rhs_y = cx2 - cx1, cy2 - cy1
+    t = (rhs_x * (-uy2) - (-ux2) * rhs_y) / determinant
+    return (cx1 + t * ux1, cy1 + t * uy1)
+
+
+def _panel_decision(rgb: np.ndarray, page: np.ndarray, box) -> bool:
+    left, right, top, bottom = box
+    patch = rgb[top : bottom + 1, left : right + 1]
+    frame = patch[0, 0]
+    is_page = np.all(patch == page, axis=2)
+    is_frame = np.all(patch == frame, axis=2)
+    body = ~(is_page | is_frame)
+    if not body.any():
+        return None
+    colours, counts = np.unique(patch[body], axis=0, return_counts=True)
+    keep = [
+        tuple(int(channel) for channel in colour)
+        for colour, count in zip(colours, counts)
+        if count >= MIN_BAND_PIXELS
+    ]
+    if len(keep) != 3:
+        return None
+
+    fits, masks = [], []
+    for colour in keep:
+        mask = np.all(patch == np.array(colour, dtype=patch.dtype), axis=2)
+        ys, xs = np.nonzero(mask)
+        fit = _fit_line(ys, xs)
+        if fit is None:
+            return None
+        fits.append(fit)
+        masks.append(mask)
+
+    height, width = body.shape
+    grid_y, grid_x = np.mgrid[0:height, 0:width]
+    wins = [0, 0, 0]
+    for i, j in PAIRS:
+        point = _intersect(fits[i], fits[j])
+        if point is None:
+            return None
+        px, py = point
+        if not (0 <= px < width and 0 <= py < height):
+            return None
+        disk = (grid_x - px) ** 2 + (grid_y - py) ** 2 <= VOTE_RADIUS ** 2
+        count_i = int(np.count_nonzero(masks[i] & disk))
+        count_j = int(np.count_nonzero(masks[j] & disk))
+        total = count_i + count_j
+        if total < MIN_VOTE_PIXELS:
+            return None
+        if abs(count_i - count_j) / float(total) < MIN_DOMINANCE:
+            return None
+        wins[i if count_i > count_j else j] += 1
+    return sorted(wins) == [1, 1, 1]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB"))
+    flat = rgb.reshape(-1, rgb.shape[2])
+    colours, counts = np.unique(flat, axis=0, return_counts=True)
+    page = colours[int(np.argmax(counts))]
+
+    ink = ~np.all(rgb == page, axis=2)
+    spans = [span for span in _runs(ink.any(axis=0)) if span[1] - span[0] >= MIN_PANEL_WIDTH]
+    if len(spans) != N_PANELS:
+        return AMBIGUOUS
+
+    woven = []
+    for index, (left, right) in enumerate(spans):
+        rows = np.flatnonzero(ink[:, left : right + 1].any(axis=1))
+        if rows.size == 0:
+            return AMBIGUOUS
+        verdict = _panel_decision(rgb, page, (left, right, int(rows[0]), int(rows[-1])))
+        if verdict is None:
+            return AMBIGUOUS
+        if verdict:
+            woven.append(index)
+
+    if len(woven) != 1:
+        return AMBIGUOUS
+    return f"panel-{woven[0] + 1}"

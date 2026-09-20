@@ -1,0 +1,133 @@
+"""Independent image-only parser for the partition-echo plaque.
+
+The inverse arm discovers frame bounding boxes and tile runs from the raster.
+It receives neither scene data nor renderer geometry.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+REFERENCE_FRAME = np.array((103, 111, 119), dtype=np.float32)
+REFERENCE_COLORS = np.array(
+    ((42, 91, 158), (191, 63, 75), (49, 132, 91), (218, 174, 49)),
+    dtype=np.float32,
+)
+CANDIDATE_COLORS = np.array(
+    ((112, 73, 166), (194, 88, 36), (30, 142, 151), (202, 86, 139)),
+    dtype=np.float32,
+)
+TAG_NAMES = ("amber", "cyan", "violet")
+TAG_COLORS = np.array(((246, 145, 35), (26, 188, 212), (143, 77, 190)), dtype=np.float32)
+
+
+def _near(array: np.ndarray, color: np.ndarray, tolerance: float = 12.0) -> np.ndarray:
+    return np.linalg.norm(array.astype(np.float32) - color, axis=2) <= tolerance
+
+
+def _frame_bounds(array: np.ndarray, color: np.ndarray, what: str) -> tuple[int, int, int, int]:
+    mask = _near(array, color)
+    ys, xs = np.where(mask)
+    if len(xs) < 9000:
+        raise ValueError(f"{what} frame is missing or damaged")
+    left, right = int(xs.min()), int(xs.max()) + 1
+    top, bottom = int(ys.min()), int(ys.max()) + 1
+    width, height = right - left, bottom - top
+    if min(width, height) < 260 or abs(width - height) > 5:
+        raise ValueError(f"{what} frame is not a large square")
+    crop = mask[top:bottom, left:right]
+    fraction = float(crop.mean())
+    if not 0.09 <= fraction <= 0.20:
+        raise ValueError(f"{what} frame has invalid ring coverage")
+    return left, top, right, bottom
+
+
+def _runs(bits: np.ndarray, what: str) -> list[tuple[int, int]]:
+    padded = np.pad(bits.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    starts = np.where(changes == 1)[0]
+    stops = np.where(changes == -1)[0]
+    runs = [(int(start), int(stop)) for start, stop in zip(starts, stops, strict=True)]
+    if len(runs) != 7:
+        raise ValueError(f"{what} does not contain seven discovered tile runs")
+    widths = [stop - start for start, stop in runs]
+    if min(widths) < 24 or max(widths) - min(widths) > 3:
+        raise ValueError(f"{what} tile runs are incomplete or inconsistent")
+    return runs
+
+
+def _mosaic(
+    array: np.ndarray,
+    bounds: tuple[int, int, int, int],
+    palette: np.ndarray,
+    what: str,
+) -> np.ndarray:
+    left, top, right, bottom = bounds
+    crop = array[top:bottom, left:right].astype(np.float32)
+    distances = np.linalg.norm(crop[:, :, None, :] - palette[None, None, :, :], axis=3)
+    union = np.min(distances, axis=2) <= 12.0
+    x_runs = _runs(union.any(axis=0), f"{what} columns")
+    y_runs = _runs(union.any(axis=1), f"{what} rows")
+    labels = np.empty((7, 7), dtype=np.int16)
+    for row, (y0, y1) in enumerate(y_runs):
+        for col, (x0, x1) in enumerate(x_runs):
+            patch = crop[y0:y1, x0:x1].reshape(-1, 3)
+            if len(patch) < 700:
+                raise ValueError(f"{what} tile ({row},{col}) is too small")
+            d = np.linalg.norm(patch[:, None, :] - palette[None, :, :], axis=2)
+            nearest = d.argmin(axis=1)
+            counts = np.bincount(nearest, minlength=4)
+            winner = int(counts.argmax())
+            if counts[winner] / len(patch) < 0.985 or np.mean(d[:, winner] <= 12.0) < 0.985:
+                raise ValueError(f"{what} tile ({row},{col}) is erased, mixed, or off-palette")
+            labels[row, col] = winner
+    counts = sorted(int(np.sum(labels == value)) for value in range(4))
+    if counts != [12, 12, 12, 13]:
+        raise ValueError(f"{what} does not have the balanced four-class histogram")
+    return labels
+
+
+def _canonical_partition(matrix: np.ndarray) -> tuple[int, ...]:
+    mapping: dict[int, int] = {}
+    normalized: list[int] = []
+    for raw in matrix.flat:
+        value = int(raw)
+        if value not in mapping:
+            mapping[value] = len(mapping)
+        normalized.append(mapping[value])
+    if len(mapping) != 4:
+        raise ValueError("mosaic does not expose four color classes")
+    return tuple(normalized)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape[0] < 600 or array.shape[1] < 600:
+        raise ValueError("plaque raster is cropped or too small")
+
+    reference_bounds = _frame_bounds(array, REFERENCE_FRAME, "reference")
+    candidate_bounds = [
+        _frame_bounds(array, TAG_COLORS[index], f"{name} candidate")
+        for index, name in enumerate(TAG_NAMES)
+    ]
+    dimensions = {(right - left, bottom - top) for left, top, right, bottom in [reference_bounds, *candidate_bounds]}
+    if len(dimensions) != 1:
+        raise ValueError("the four discovered frames do not have equal size")
+    centers = [((left + right) / 2.0, (top + bottom) / 2.0) for left, top, right, bottom in [reference_bounds, *candidate_bounds]]
+    if min(np.hypot(ax - bx, ay - by) for i, (ax, ay) in enumerate(centers) for bx, by in centers[i + 1 :]) < 250:
+        raise ValueError("the four frames are not spatially distinct")
+
+    reference = _canonical_partition(
+        _mosaic(array, reference_bounds, REFERENCE_COLORS, "reference")
+    )
+    matches: list[str] = []
+    for name, bounds in zip(TAG_NAMES, candidate_bounds, strict=True):
+        candidate = _canonical_partition(
+            _mosaic(array, bounds, CANDIDATE_COLORS, f"{name} candidate")
+        )
+        if candidate == reference:
+            matches.append(name)
+    if len(matches) != 1:
+        raise ValueError(f"expected one pixel-level partition match, found {len(matches)}")
+    return matches[0]

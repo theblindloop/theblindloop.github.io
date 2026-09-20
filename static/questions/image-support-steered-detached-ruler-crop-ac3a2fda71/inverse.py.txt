@@ -1,0 +1,126 @@
+"""Independent pixel-only inverse for the declared row/column crop."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_FRAME = np.asarray((68, 72, 78), dtype=np.uint8)
+_INKS = np.asarray(
+    (
+        (20, 126, 153), (211, 82, 67), (119, 76, 169),
+        (37, 116, 194), (207, 133, 25), (35, 146, 91),
+    ),
+    dtype=np.uint8,
+)
+_CELL = 32
+_TEMPLATES = {
+    "plus": ("00100", "00100", "11111", "00100", "00100"),
+    "X": ("10001", "01010", "00100", "01010", "10001"),
+    "T": ("11111", "00100", "00100", "00100", "00100"),
+    "L": ("10000", "10000", "10000", "10000", "11111"),
+}
+
+
+class PixelOracleError(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    remaining = {(int(y), int(x)) for y, x in np.argwhere(mask)}
+    groups = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        group = [start]
+        while stack:
+            y, x = stack.pop()
+            for q in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if q in remaining:
+                    remaining.remove(q)
+                    stack.append(q)
+                    group.append(q)
+        groups.append(np.asarray(group, dtype=np.int32))
+    return groups
+
+
+def _bbox(comp: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = comp[:, 0], comp[:, 1]
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _locate_frames(arr: np.ndarray) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    mask = np.all(arr == _FRAME, axis=2)
+    comps = [c for c in _components(mask) if len(c) > 1000]
+    found = {}
+    for comp in comps:
+        x0, y0, x1, y1 = _bbox(comp)
+        w, h = x1 - x0 + 1, y1 - y0 + 1
+        if 224 <= w <= 226 and 224 <= h <= 226:
+            role = "board"
+        elif 224 <= w <= 226 and 32 <= h <= 34:
+            role = "cols"
+        elif 32 <= w <= 34 and 224 <= h <= 226:
+            role = "rows"
+        else:
+            continue
+        if role in found:
+            raise PixelOracleError("duplicate frame role")
+        found[role] = (x0, y0)
+    if set(found) != {"board", "cols", "rows"}:
+        raise PixelOracleError("three complete detached frames are required")
+    bx, by = found["board"]
+    hx, hy = found["cols"]
+    vx, vy = found["rows"]
+    if not (abs(hx - bx) <= 1 and 236 <= by - (hy + _CELL) <= 240):
+        raise PixelOracleError("column ruler is not aligned above the board")
+    if not (abs(vy - by) <= 1 and 20 <= bx - (vx + _CELL) <= 30):
+        raise PixelOracleError("row ruler is not aligned left of the board")
+    return (bx, by), (hx, hy), (vx, vy)
+
+
+def _ink_mask(arr: np.ndarray) -> np.ndarray:
+    return np.any(np.all(arr[:, :, None, :] == _INKS[None, None, :, :], axis=3), axis=2)
+
+
+def _read_cells(mask: np.ndarray, origin: tuple[int, int], rows: int, cols: int) -> list[list[int]]:
+    x0, y0 = origin
+    out = []
+    for r in range(rows):
+        line = []
+        for c in range(cols):
+            cx = x0 + c * _CELL + _CELL // 2
+            cy = y0 + r * _CELL + _CELL // 2
+            count = int(mask[cy - 7:cy + 8, cx - 7:cx + 8].sum())
+            if count >= 210:
+                line.append(1)
+            elif count <= 2:
+                line.append(0)
+            else:
+                raise PixelOracleError("ambiguous or damaged binary cell")
+        out.append(line)
+    return out
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape != (800, 800, 3):
+        raise PixelOracleError("expected an 800 by 800 RGB raster")
+    board_at, cols_at, rows_at = _locate_frames(arr)
+    ink = _ink_mask(arr)
+    board = _read_cells(ink, board_at, 7, 7)
+    col_key = _read_cells(ink, cols_at, 1, 7)[0]
+    row_key = [line[0] for line in _read_cells(ink, rows_at, 7, 1)]
+    delete_cols = [i for i, bit in enumerate(col_key) if bit]
+    delete_rows = [i for i, bit in enumerate(row_key) if bit]
+    if len(delete_cols) != 2 or len(delete_rows) != 2:
+        raise PixelOracleError("each detached ruler must mark exactly two positions")
+    kept = [
+        [board[r][c] for c in range(7) if c not in delete_cols]
+        for r in range(7) if r not in delete_rows
+    ]
+    encoded = tuple("".join(str(bit) for bit in row) for row in kept)
+    matches = [name for name, template in _TEMPLATES.items() if encoded == template]
+    if len(matches) != 1:
+        raise PixelOracleError("cropped raster is not one exact declared symbol")
+    return matches[0]

@@ -1,0 +1,158 @@
+"""Pixel-only inverse arm for the ink-filter separation world.
+
+Receives one rendered PNG and the public question contract only: a 9x9 lattice of
+printed marks bracketed by four dark square fiducials, one large colour patch that
+names the filter, and the closed five-symbol vocabulary. The arm locates the
+fiducials, reads the filter patch, executes the declared separation (keep the
+channel that the filter passes and threshold it), and classifies the surviving
+lattice pattern by nearest template with a reported runner-up margin.
+
+It imports no renderer, prompt, generator, verifier, or gold code and never sees
+latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "ink_filter_reveal-oracle-0.1.0"
+
+GRID = 9
+ABSTAIN = "abstain"
+DARK_MAX = 90
+SAT_MIN = 60
+INK_THRESHOLD = 128
+MIN_MARGIN = 0  # ties are resolved by the declared (distance, name) order, not by abstention
+
+
+def _symbol_templates() -> dict[str, frozenset[tuple[int, int]]]:
+    """Public symbol vocabulary, re-declared independently of the renderer."""
+    ring = {(r, c) for r in range(GRID) for c in range(GRID) if max(abs(r - 4), abs(c - 4)) == 3}
+    arch = {(r, c) for c in range(GRID) for r in (abs(c - 4), abs(c - 4) + 1)}
+    vee = {(r, c) for c in range(GRID) for r in (8 - abs(c - 4), 7 - abs(c - 4))}
+    ladder = {(r, c) for r in range(1, 8) for c in (2, 6)}
+    ladder |= {(r, c) for r in (1, 4, 7) for c in range(2, 7)}
+    arrow = {(r, 4) for r in range(2, 9)}
+    arrow |= {(1 + d, 4 + s * d) for d in (1, 2, 3) for s in (-1, 1)}
+    arrow |= {(8, c) for c in (2, 3, 5, 6)}
+    return {
+        "arch": frozenset(arch),
+        "arrow": frozenset(arrow),
+        "ladder": frozenset(ladder),
+        "ring": frozenset(ring),
+        "vee": frozenset(vee),
+    }
+
+
+TEMPLATES = _symbol_templates()
+
+
+def _components(mask: np.ndarray, step: int = 2) -> list[list[tuple[int, int]]]:
+    """Four-connected components of a decimated boolean mask, in full-image pixels."""
+    small = mask[::step, ::step]
+    height, width = small.shape
+    seen = np.zeros(small.shape, dtype=bool)
+    out: list[list[tuple[int, int]]] = []
+    ys, xs = np.nonzero(small)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        seen[sy, sx] = True
+        queue = deque([(sy, sx)])
+        blob: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            blob.append((y * step, x * step))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and small[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        out.append(blob)
+    return out
+
+
+def _centroid(blob: list[tuple[int, int]]) -> tuple[float, float]:
+    ys = [p[0] for p in blob]
+    xs = [p[1] for p in blob]
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _find_filter_channel(rgb: np.ndarray) -> int | None:
+    spread = rgb.max(axis=2) - rgb.min(axis=2)
+    blobs = _components(spread > SAT_MIN)
+    if not blobs:
+        return None
+    biggest = max(blobs, key=len)
+    if len(biggest) < 200:  # the patch dwarfs any single printed mark
+        return None
+    ys = np.array([p[0] for p in biggest])
+    xs = np.array([p[1] for p in biggest])
+    mean = rgb[ys, xs].mean(axis=0)
+    order = np.argsort(mean)
+    if mean[order[-1]] - mean[order[-2]] < 40:
+        return None
+    return int(order[-1])
+
+
+def _find_lattice(rgb: np.ndarray) -> tuple[float, float, float] | None:
+    dark = (rgb < DARK_MAX).all(axis=2)
+    blobs = [b for b in _components(dark) if len(b) >= 8]
+    if len(blobs) < 4:
+        return None
+    centers = [_centroid(b) for b in blobs]
+    top_left = min(centers, key=lambda p: p[0] + p[1])
+    bottom_right = max(centers, key=lambda p: p[0] + p[1])
+    top_right = max(centers, key=lambda p: p[0] - p[1])
+    bottom_left = min(centers, key=lambda p: p[0] - p[1])
+    width = ((top_right[0] - top_left[0]) + (bottom_right[0] - bottom_left[0])) / 2.0
+    height = ((bottom_left[1] - top_left[1]) + (bottom_right[1] - top_right[1])) / 2.0
+    if width < 200 or height < 200 or abs(width - height) > 12:
+        return None
+    origin_x = (top_left[0] + bottom_left[0]) / 2.0
+    origin_y = (top_left[1] + top_right[1]) / 2.0
+    return origin_x, origin_y, (width + height) / (2.0 * GRID)
+
+
+def _read_pattern(rgb: np.ndarray, channel: int, lattice: tuple[float, float, float]) -> set:
+    origin_x, origin_y, cell = lattice
+    plane = rgb[:, :, channel]
+    height, width = plane.shape
+    radius = max(3, int(round(cell * 0.14)))
+    dark_cells = set()
+    for r in range(GRID):
+        for c in range(GRID):
+            cx = int(round(origin_x + (c + 0.5) * cell))
+            cy = int(round(origin_y + (r + 0.5) * cell))
+            y0, y1 = max(0, cy - radius), min(height, cy + radius + 1)
+            x0, x1 = max(0, cx - radius), min(width, cx + radius + 1)
+            patch = plane[y0:y1, x0:x1]
+            if patch.size == 0:
+                continue
+            if float(np.median(patch)) < INK_THRESHOLD:
+                dark_cells.add((r, c))
+    return dark_cells
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    channel = _find_filter_channel(rgb)
+    if channel is None:
+        return ABSTAIN, 0.0
+    lattice = _find_lattice(rgb)
+    if lattice is None:
+        return ABSTAIN, 0.0
+    pattern = _read_pattern(rgb, channel, lattice)
+    if not pattern:
+        return ABSTAIN, 0.0
+    ranked = sorted((len(pattern ^ set(t)), name) for name, t in TEMPLATES.items())
+    gap = float(ranked[1][0] - ranked[0][0])
+    if gap < MIN_MARGIN:
+        return ABSTAIN, gap
+    return ranked[0][1], gap
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return decision_with_margin(image)[0]

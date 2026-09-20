@@ -1,0 +1,193 @@
+"""Deterministic renderer for a cyclic scanline phase-alignment reveal."""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+CANVAS = 512
+ROWS = 15
+DATA_COLS = 15
+BAND_COLS = 16
+BORDER = 5
+SYMBOLS = ("cross", "oval", "chevron", "wave")
+PALETTES = {
+    "amber_navy": ((231, 181, 92), (45, 48, 82)),
+    "mint_plum": ((159, 220, 181), (76, 40, 89)),
+    "peach_teal": ((239, 178, 153), (25, 75, 79)),
+    "lavender_brown": ((205, 190, 230), (76, 51, 42)),
+}
+MARKER = (0, 224, 235)
+FRAME = (18, 24, 38)
+BACKGROUND = (250, 250, 247)
+QUARANTINE_GAP = 4.0
+
+
+def _nearest_four(centers: tuple[float, ...]) -> list[int]:
+    order = sorted(
+        range(DATA_COLS),
+        key=lambda x: (min(abs(x - center) for center in centers), abs(x - 7), x),
+    )
+    return sorted(order[:4])
+
+
+def _template(name: str) -> np.ndarray:
+    """Build one 15x15 symbol with exactly four dark cells in every row."""
+    mask = np.zeros((ROWS, DATA_COLS), dtype=np.uint8)
+    for row in range(ROWS):
+        if name == "cross":
+            centers = (float(row), float(14 - row))
+        elif name == "oval":
+            y = (row - 7) / 7.0
+            radius = 5.5 * math.sqrt(max(0.0, 1.0 - y * y))
+            centers = (7.0 - radius, 7.0 + radius)
+        elif name == "chevron":
+            radius = 6.0 * (1.0 - row / 14.0)
+            centers = (7.0 - radius, 7.0 + radius)
+        elif name == "wave":
+            center = 7.0 + 4.0 * math.sin(row / 14.0 * 2.0 * math.pi + math.pi / 2.0)
+            centers = (center,)
+        else:
+            raise ValueError(f"unknown symbol {name!r}")
+        mask[row, _nearest_four(centers)] = 1
+    return mask
+
+
+TEMPLATES = {name: _template(name) for name in SYMBOLS}
+
+
+def _apply_swaps(symbol: str, swaps: list[list[int]]) -> np.ndarray:
+    mask = TEMPLATES[symbol].copy()
+    for row, dark_col, light_col in swaps:
+        if mask[row, dark_col] != 1 or mask[row, light_col] != 0:
+            raise ValueError("noise swap does not preserve four dark cells in its row")
+        mask[row, dark_col] = 0
+        mask[row, light_col] = 1
+    return mask
+
+
+def _distances(mask: np.ndarray) -> list[tuple[int, str]]:
+    return sorted((int(np.count_nonzero(mask != template)), name) for name, template in TEMPLATES.items())
+
+
+def _gap(mask: np.ndarray) -> float:
+    distances = _distances(mask)
+    return float(distances[1][0] - distances[0][0])
+
+
+def _toward_swaps(source: str, target: str, rng: random.Random) -> list[list[int]]:
+    left = TEMPLATES[source]
+    right = TEMPLATES[target]
+    swaps: list[list[int]] = []
+    for row in range(ROWS):
+        remove = [int(col) for col in np.flatnonzero((left[row] == 1) & (right[row] == 0))]
+        add = [int(col) for col in np.flatnonzero((left[row] == 0) & (right[row] == 1))]
+        rng.shuffle(remove)
+        rng.shuffle(add)
+        swaps.extend([[row, old, new] for old, new in zip(remove, add, strict=True)])
+    rng.shuffle(swaps)
+    return swaps
+
+
+def _noise_swaps(symbol: str, seed: int, rng: random.Random) -> list[list[int]]:
+    competitors = [name for name in SYMBOLS if name != symbol]
+    target = competitors[(seed // 4) % len(competitors)]
+    available = _toward_swaps(symbol, target, rng)
+    if seed % 8 != 7:
+        return available[: seed % 7]
+
+    # Deliberately approach, but do not cross, a visible classification boundary.
+    best: list[list[int]] = []
+    for count in range(1, len(available) + 1):
+        trial = available[:count]
+        mask = _apply_swaps(symbol, trial)
+        distances = _distances(mask)
+        if distances[0][1] != symbol or distances[0][0] == distances[1][0]:
+            break
+        best = trial
+        if _gap(mask) <= QUARANTINE_GAP:
+            break
+    return best
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed) ^ 0x5CA11E)
+    symbol = SYMBOLS[int(seed) % len(SYMBOLS)]
+    cell_size = 24 + ((int(seed) // 16) % 2)
+    width = BAND_COLS * cell_size + 2 * BORDER
+    height = ROWS * cell_size + 2 * BORDER
+    scene = {
+        "symbol": symbol,
+        "noise_swaps": _noise_swaps(symbol, int(seed), rng),
+        "row_shifts": [rng.randrange(BAND_COLS) for _ in range(ROWS)],
+        "palette": tuple(PALETTES)[(int(seed) // 4) % len(PALETTES)],
+        "cell_size": cell_size,
+        "origin_x": (CANVAS - width) // 2 + rng.randrange(-2, 3),
+        "origin_y": (CANVAS - height) // 2 + rng.randrange(-2, 3),
+    }
+    return scene
+
+
+def _visible_bits(scene: dict) -> np.ndarray:
+    return _apply_swaps(scene["symbol"], scene["noise_swaps"])
+
+
+def render(scene: dict) -> Image.Image:
+    bits = _visible_bits(scene)
+    shifts = scene["row_shifts"]
+    if len(shifts) != ROWS:
+        raise ValueError("row_shifts must have one phase per band")
+    zero, one = PALETTES[scene["palette"]]
+    cell = int(scene["cell_size"])
+    x0 = int(scene["origin_x"])
+    y0 = int(scene["origin_y"])
+    width = BAND_COLS * cell + 2 * BORDER
+    height = ROWS * cell + 2 * BORDER
+    if not (0 <= x0 < x0 + width <= CANVAS and 0 <= y0 < y0 + height <= CANVAS):
+        raise ValueError("carpet is outside the canvas")
+
+    image = Image.new("RGB", (CANVAS, CANVAS), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((x0, y0, x0 + width - 1, y0 + height - 1), fill=FRAME)
+    ix = x0 + BORDER
+    iy = y0 + BORDER
+    for row in range(ROWS):
+        canonical = [-1] + [int(value) for value in bits[row]]
+        shift = int(shifts[row]) % BAND_COLS
+        scrambled = [0] * BAND_COLS
+        for index, value in enumerate(canonical):
+            scrambled[(index + shift) % BAND_COLS] = value
+        for col, value in enumerate(scrambled):
+            color = MARKER if value == -1 else (one if value else zero)
+            left = ix + col * cell
+            top = iy + row * cell
+            draw.rectangle((left, top, left + cell - 1, top + cell - 1), fill=color)
+
+    # Non-white one-pixel rules expose all band and cell boundaries while keeping
+    # the entire evidence field one thick connected component.
+    for col in range(1, BAND_COLS):
+        x = ix + col * cell
+        draw.line((x, iy, x, iy + ROWS * cell - 1), fill=FRAME, width=1)
+    for row in range(1, ROWS):
+        y = iy + row * cell
+        draw.line((ix, y, ix + BAND_COLS * cell - 1, y), fill=FRAME, width=1)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["symbol"])
+
+
+def margin(scene: dict) -> float:
+    return _gap(_visible_bits(scene))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= QUARANTINE_GAP
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

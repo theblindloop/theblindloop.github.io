@@ -1,0 +1,281 @@
+"""Renderer and analytic world for reflected bend-radius correspondence."""
+
+from __future__ import annotations
+
+import copy
+import itertools
+import math
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "curvature-rhythm-correspondence-0.1.0"
+WIDTH, HEIGHT = 960, 600
+SCALE = 4
+PAPER = (248, 246, 240)
+INK = (18, 72, 112)
+TEXT = (82, 86, 88)
+GUIDE = (214, 222, 221)
+SOFT = (232, 236, 233)
+
+# The route lives in the middle of the page.  It is deliberately regional,
+# while the route itself remains one elongated connected component.
+FIELD_X0 = (230, 410, 590)
+FIELD_BASE = (315, 315, 315)
+STATION_STEP = 24
+STATION_COUNT = 7
+CONNECTOR = 36
+ROUTE_WIDTH = 9
+
+# Six shared segment directions make ink, segment-length multiset, and endpoint
+# displacement equal across all fields.  Their pairwise differences avoid both
+# class boundaries by at least four degrees.
+DIRECTION_VALUES = (-34, -18, 0, 26, 36, 54)
+TIGHT_CUTOFF = 22.0
+OPEN_CUTOFF = 40.0
+CLASS_NAMES = ("tight", "medium", "open")
+QUARANTINE_MARGIN = 0.15
+ANGLE_BOUNDARY_CLEARANCE = 3.0
+
+
+def _font(size: int):
+    for name in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ):
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size=size * SCALE)
+    return ImageFont.load_default()
+
+
+def _curvature_angles(headings: list[int] | tuple[int, ...]) -> tuple[float, ...]:
+    if len(headings) != STATION_COUNT - 1:
+        raise ValueError("a route must have six segment headings")
+    return tuple(abs(float(right) - float(left)) for left, right in zip(headings[:-1], headings[1:], strict=True))
+
+
+def _curvature_classes(headings: list[int] | tuple[int, ...]) -> tuple[str, ...]:
+    classes = []
+    for angle in _curvature_angles(headings):
+        if angle < TIGHT_CUTOFF:
+            classes.append(CLASS_NAMES[0])
+        elif angle < OPEN_CUTOFF:
+            classes.append(CLASS_NAMES[1])
+        else:
+            classes.append(CLASS_NAMES[2])
+    return tuple(classes)
+
+
+def _reverse_reflection(classes: tuple[str, ...]) -> tuple[str, ...]:
+    """A left-right reflection preserves bend magnitude and reverses its order."""
+
+    return tuple(reversed(classes))
+
+
+def _route_map(scene: dict) -> dict[str, list[int]]:
+    return {
+        str(record["slot"]): [int(value) for value in record["headings"]]
+        for record in scene["candidate_routes"]
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample balanced route permutations with one exact reflected match."""
+
+    rng = random.Random(int(seed))
+    reference = list(DIRECTION_VALUES)
+    rng.shuffle(reference)
+    reference_code = _curvature_classes(reference)
+    matching_route = list(reversed(reference))
+
+    permutations = [list(item) for item in itertools.permutations(DIRECTION_VALUES)]
+
+    def score(route: list[int]) -> int:
+        observed = _reverse_reflection(_curvature_classes(route))
+        return sum(a == b for a, b in zip(observed, reference_code, strict=True))
+
+    wrong_pool = [route for route in permutations if score(route) < len(reference_code)]
+    if int(seed) % 7 == 0:
+        near = [route for route in wrong_pool if score(route) == len(reference_code) - 1]
+        wrong_pool = near or wrong_pool
+    else:
+        lowest = min(score(route) for route in wrong_pool)
+        wrong_pool = [route for route in wrong_pool if score(route) == lowest]
+    wrong_route = list(rng.choice(wrong_pool))
+
+    matching_slot = "A" if rng.randrange(2) == 0 else "B"
+    records = [
+        {
+            "slot": "A",
+            "headings": matching_route if matching_slot == "A" else wrong_route,
+        },
+        {
+            "slot": "B",
+            "headings": matching_route if matching_slot == "B" else wrong_route,
+        },
+    ]
+    rng.shuffle(records)
+    return {
+        "reference_bends": [int(value) for value in reference],
+        "candidate_routes": records,
+    }
+
+
+def _score_routes(scene: dict) -> dict[str, int]:
+    reference_code = _curvature_classes([int(value) for value in scene["reference_bends"]])
+    routes = _route_map(scene)
+    return {
+        slot: sum(
+            left == right
+            for left, right in zip(
+                _reverse_reflection(_curvature_classes(routes[slot])),
+                reference_code,
+                strict=True,
+            )
+        )
+        for slot in ("A", "B")
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _score_routes(scene)
+    if scores["A"] == scores["B"]:
+        raise ValueError("candidate curvature rhythms are tied")
+    return "A" if scores["A"] > scores["B"] else "B"
+
+
+def margin(scene: dict) -> float:
+    scores = _score_routes(scene)
+    return abs(scores["A"] - scores["B"]) / float(STATION_COUNT - 2)
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        all_routes = [[int(value) for value in scene["reference_bends"]]] + [
+            [int(value) for value in record["headings"]]
+            for record in scene["candidate_routes"]
+        ]
+        for headings in all_routes:
+            for angle in _curvature_angles(headings):
+                if min(abs(angle - TIGHT_CUTOFF), abs(angle - OPEN_CUTOFF)) < ANGLE_BOUNDARY_CLEARANCE:
+                    return True
+        return margin(scene) < QUARANTINE_MARGIN
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _scaled_box(box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SCALE)) for value in box)
+
+
+def _station_points(x0: int, base: int, headings: list[int]) -> list[tuple[float, float]]:
+    increments = [STATION_STEP * math.tan(math.radians(value)) for value in headings]
+    raw = [0.0]
+    for increment in increments:
+        raw.append(raw[-1] + increment)
+    center = (min(raw) + max(raw)) / 2.0
+    return [
+        (float(x0 + index * STATION_STEP), float(base + value - center))
+        for index, value in enumerate(raw)
+    ]
+
+
+def _draw_text(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, font, fill) -> None:
+    draw.text((int(xy[0] * SCALE), int(xy[1] * SCALE)), text, font=font, fill=fill)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render the complete question as a deterministic RGB PNG."""
+
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), PAPER)
+    draw = ImageDraw.Draw(image)
+    title_font = _font(24)
+    body_font = _font(14)
+    label_font = _font(18)
+    tiny_font = _font(11)
+
+    _draw_text(draw, (258, 28), "BEND-RADIUS RHYTHM", title_font, TEXT)
+    _draw_text(
+        draw,
+        (214, 66),
+        "Trace the single route. Reflect A and B, then compare the five bend-sharpness classes.",
+        body_font,
+        TEXT,
+    )
+    draw.rounded_rectangle(
+        _scaled_box((184, 108, 780, 522)),
+        radius=16 * SCALE,
+        outline=GUIDE,
+        width=2 * SCALE,
+    )
+
+    field_labels = ("R  REFERENCE", "A  CANDIDATE", "B  CANDIDATE")
+    for field_index, (x0, label) in enumerate(zip(FIELD_X0, field_labels, strict=True)):
+        _draw_text(draw, (x0 - 20, 132), label, label_font, TEXT)
+        for station in range(STATION_COUNT):
+            x = x0 + station * STATION_STEP
+            draw.line(
+                [(int(x * SCALE), 165 * SCALE), (int(x * SCALE), 490 * SCALE)],
+                fill=SOFT,
+                width=SCALE,
+            )
+        if field_index < 2:
+            divider_x = x0 + 6 * STATION_STEP + 54
+            draw.line(
+                [(divider_x * SCALE, 120 * SCALE), (divider_x * SCALE, 510 * SCALE)],
+                fill=GUIDE,
+                width=SCALE,
+            )
+
+    routes = _route_map(scene)
+    section_points = [
+        _station_points(x0, base, headings)
+        for x0, base, headings in (
+            (FIELD_X0[0], FIELD_BASE[0], [int(v) for v in scene["reference_bends"]]),
+            (FIELD_X0[1], FIELD_BASE[1], routes.get("A", list(DIRECTION_VALUES))),
+            (FIELD_X0[2], FIELD_BASE[2], routes.get("B", list(DIRECTION_VALUES))),
+        )
+    ]
+
+    route_points: list[tuple[float, float]] = list(section_points[0])
+    route_points.extend(
+        [
+            (route_points[-1][0] + CONNECTOR, route_points[-1][1]),
+            (section_points[1][0][0] - CONNECTOR, section_points[1][0][1]),
+        ]
+    )
+    route_points.extend(section_points[1])
+    route_points.extend(
+        [
+            (route_points[-1][0] + CONNECTOR, route_points[-1][1]),
+            (section_points[2][0][0] - CONNECTOR, section_points[2][0][1]),
+        ]
+    )
+    route_points.extend(section_points[2])
+    draw.line(
+        [(int(x * SCALE), int(y * SCALE)) for x, y in route_points],
+        fill=INK,
+        width=ROUTE_WIDTH * SCALE,
+        joint="curve",
+    )
+    radius = ROUTE_WIDTH / 2.0
+    for x, y in (route_points[0], route_points[-1]):
+        draw.ellipse(_scaled_box((x - radius, y - radius, x + radius, y + radius)), fill=INK)
+
+    _draw_text(
+        draw,
+        (208, 548),
+        "The navy route is continuous; use local bend angle, not direction, position, or endpoint span.",
+        tiny_font,
+        TEXT,
+    )
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Exercise the slot-addressed candidate-record permutation alias."""
+
+    twin = copy.deepcopy(scene)
+    twin["candidate_routes"] = list(reversed(twin["candidate_routes"]))
+    return [("candidate_record_order", twin)]

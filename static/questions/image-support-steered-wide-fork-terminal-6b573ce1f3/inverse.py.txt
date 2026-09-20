@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+# Public visual vocabulary, duplicated here deliberately. Multiple label-preserving
+# shades are supported, but no renderer state or latent geometry is imported.
+_PALETTES = (
+    {"background": "#fbfaf5", "channel": "#183653", "start": "#16a35b", "cyan": "#18b7c9", "orange": "#ed8628"},
+    {"background": "#f8fbf7", "channel": "#24334f", "start": "#249b55", "cyan": "#20aebe", "orange": "#e8792b"},
+    {"background": "#fffaf2", "channel": "#123b5c", "start": "#0f9f68", "cyan": "#0eb4c7", "orange": "#ef8f22"},
+)
+
+
+def _rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _label_image(image: Image.Image) -> dict[str, np.ndarray]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[2] != 3 or min(arr.shape[:2]) < 64:
+        raise ValueError("unsupported raster")
+    labels = ["background", "channel", "start", "cyan", "orange"]
+    # Select one coherent public palette from the four clean corner samples.
+    # Comparing each label against all variants independently can cross-assign two
+    # intentionally nearby shades from different variants.
+    corners = np.stack([arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]])
+    corner = np.median(corners, axis=0)
+    palette_index = int(np.argmin([
+        float(((corner - np.array(_rgb(p["background"]), dtype=np.float32)) ** 2).sum())
+        for p in _PALETTES
+    ]))
+    colors = [_rgb(_PALETTES[palette_index][label]) for label in labels]
+    distances = [((arr - np.array(color, dtype=np.float32)) ** 2).sum(axis=2) for color in colors]
+    # Keep only pixels close to the solid ink. Nearest-palette assignment would
+    # incorrectly relabel some navy-to-white antialias blends as green or cyan.
+    # Solid interiors provide ample support and make the masks mutually exclusive.
+    return {label: distances[index] <= 42.0 ** 2 for index, label in enumerate(labels)}
+
+
+def _centroid(mask: np.ndarray, label: str) -> np.ndarray:
+    ys, xs = np.nonzero(mask)
+    area = len(xs)
+    # Ports have a white center dot, leaving an annulus of roughly 850-1200 px.
+    if not 550 <= area <= 1450:
+        raise ValueError(f"{label} port area is invalid: {area}")
+    return np.array([xs.mean(), ys.mean()], dtype=np.float64)
+
+
+def _largest_component(mask: np.ndarray) -> tuple[int, np.ndarray]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return 0, np.zeros_like(mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = mask[y0:y1, x0:x1]
+    seen = np.zeros_like(sub, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for sy, sx in zip(*np.nonzero(sub), strict=True):
+        if seen[sy, sx]:
+            continue
+        seen[sy, sx] = True
+        queue = deque([(int(sy), int(sx))])
+        component: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            component.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < sub.shape[0] and 0 <= nx < sub.shape[1] and sub[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    full = np.zeros_like(mask)
+    if best:
+        yy = np.fromiter((p[0] + y0 for p in best), dtype=int)
+        xx = np.fromiter((p[1] + x0 for p in best), dtype=int)
+        full[yy, xx] = True
+    return len(best), full
+
+
+def _sample(mask: np.ndarray, point: np.ndarray) -> bool:
+    x, y = int(round(float(point[0]))), int(round(float(point[1])))
+    return 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1] and bool(mask[y, x])
+
+
+def _cross_section(mask: np.ndarray, terminal: np.ndarray, center: np.ndarray, fraction: float) -> int:
+    inward = center - terminal
+    length = float(np.linalg.norm(inward))
+    if not 110.0 <= length <= 152.0:
+        raise ValueError(f"invalid arm length {length:.1f}")
+    unit = inward / length
+    normal = np.array([-unit[1], unit[0]])
+    point = terminal + fraction * inward
+    samples = [_sample(mask, point + offset * normal) for offset in range(-70, 71)]
+    mid = 70
+    if not samples[mid]:
+        raise ValueError("corridor centerline is broken")
+    left = mid
+    while left > 0 and samples[left - 1]:
+        left -= 1
+    right = mid
+    while right + 1 < len(samples) and samples[right + 1]:
+        right += 1
+    width = right - left + 1
+    if not 48 <= width <= 112:
+        raise ValueError(f"invalid corridor cross-section {width}")
+    return width
+
+
+def decision_from_image(image: Image.Image) -> str:
+    masks = _label_image(image)
+    ports = {name: _centroid(masks[name], name) for name in ("start", "cyan", "orange")}
+    # Equal-radius 120-degree arms make the fork center the centroid of its three
+    # visible ports. This is independently recovered from pixels.
+    center = sum(ports.values()) / 3.0
+    channel_area, channel = _largest_component(masks["channel"])
+    if not 18000 <= channel_area <= 42000:
+        raise ValueError(f"channel component area is invalid: {channel_area}")
+    if int(masks["channel"].sum()) - channel_area > 80:
+        raise ValueError("channel contains detached ink")
+
+    # Reconstruct the three graph edges by demanding continuous centerline support
+    # from just beyond each port into their shared junction.
+    for terminal in ports.values():
+        inward = center - terminal
+        for fraction in np.linspace(0.20, 0.92, 25):
+            if not _sample(channel, terminal + float(fraction) * inward):
+                raise ValueError("fork edge is disconnected")
+    if not _sample(channel, center):
+        raise ValueError("fork junction is missing")
+
+    widths = {}
+    for name in ("start", "cyan", "orange"):
+        sections = [
+            _cross_section(channel, ports[name], center, fraction)
+            for fraction in (0.24, 0.30, 0.36, 0.42, 0.48, 0.54)
+        ]
+        if max(sections) - min(sections) > 5:
+            raise ValueError(f"{name} corridor is damaged or not constant-width")
+        widths[name] = float(np.median(sections))
+    gap = abs(widths["cyan"] - widths["orange"])
+    if gap < 14.0:
+        raise ValueError(f"ambiguous rendered width gap {gap:.1f}")
+    return "cyan" if widths["cyan"] > widths["orange"] else "orange"

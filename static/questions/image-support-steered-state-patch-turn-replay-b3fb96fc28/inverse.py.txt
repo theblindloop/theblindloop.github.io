@@ -1,0 +1,184 @@
+"""Independent pixel-only inverse for compact patch turn replay.
+
+The inverse detects the four-by-four colored tile components, the unique dark
+ring inside that grid, and five dark triangular markers to the grid's right.
+It does not import or inspect the renderer, prompt definitions, generator,
+verifier, scene data, filenames, or analytic gold.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 768
+HEIGHT = 512
+GRID_SIZE = 4
+OPERATION_COUNT = 5
+CELL_LABELS = tuple(f"{row}{column}" for row in "ABCD" for column in "1234")
+TILE_COLORS = np.asarray(
+    (
+        (228, 86, 82),
+        (71, 139, 216),
+        (75, 172, 116),
+        (231, 174, 61),
+    ),
+    dtype=np.float32,
+)
+MARKER_COLOR = np.asarray((36, 56, 70), dtype=np.float32)
+TILE_TOLERANCE = 55.0
+MARKER_TOLERANCE = 72.0
+
+
+class PixelOracleError(ValueError):
+    """The raster does not expose an unambiguous patch replay."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not dy and not dx:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _recover_tiles(array: np.ndarray) -> list[tuple[float, float, int, int, int, int]]:
+    found: list[tuple[float, float, int, int, int, int]] = []
+    for state, color in enumerate(TILE_COLORS):
+        distance = np.linalg.norm(array.astype(np.float32) - color, axis=2)
+        for points in _components(distance <= TILE_TOLERANCE):
+            ys = points[:, 0]
+            xs = points[:, 1]
+            x0, x1 = int(xs.min()), int(xs.max())
+            y0, y1 = int(ys.min()), int(ys.max())
+            width = x1 - x0 + 1
+            height = y1 - y0 + 1
+            area = len(points)
+            if 34 <= width <= 58 and 34 <= height <= 58 and 0.72 <= width / height <= 1.4 and 900 <= area <= 2600:
+                found.append((float(xs.mean()), float(ys.mean()), state, area, width, height))
+    return found
+
+
+def _grid_order(tiles: list[tuple[float, float, int, int, int, int]]) -> list[tuple[float, float, int, int, int, int]]:
+    if len(tiles) != GRID_SIZE * GRID_SIZE:
+        raise PixelOracleError(f"expected sixteen colored tile components, found {len(tiles)}")
+    by_y = sorted(tiles, key=lambda item: item[1])
+    rows: list[list[tuple[float, float, int, int, int, int]]] = []
+    for index in range(GRID_SIZE):
+        row = sorted(by_y[index * GRID_SIZE : (index + 1) * GRID_SIZE], key=lambda item: item[0])
+        if max(item[1] for item in row) - min(item[1] for item in row) > 16:
+            raise PixelOracleError("tile rows are not resolved")
+        if any(row[pos + 1][0] - row[pos][0] < 25 for pos in range(GRID_SIZE - 1)):
+            raise PixelOracleError("tile columns are merged")
+        rows.append(row)
+    if any(rows[index + 1][0][1] - rows[index][-1][1] < 25 for index in range(GRID_SIZE - 1)):
+        raise PixelOracleError("tile rows are merged")
+    return [item for row in rows for item in row]
+
+
+def _recover_initial_cell(array: np.ndarray, tiles: list[tuple[float, float, int, int, int, int]]) -> int:
+    distance = np.linalg.norm(array.astype(np.float32) - MARKER_COLOR, axis=2)
+    dark = distance <= MARKER_TOLERANCE
+    hits: list[int] = []
+    for index, item in enumerate(tiles):
+        cx, cy = int(round(item[0])), int(round(item[1]))
+        y0, y1 = max(0, cy - 22), min(HEIGHT, cy + 23)
+        x0, x1 = max(0, cx - 22), min(WIDTH, cx + 23)
+        # The square tile outline contributes a small fixed number of dark
+        # pixels near the crop edge; the open ring contributes a much larger
+        # annular run.
+        if int(dark[y0:y1, x0:x1].sum()) >= 200:
+            hits.append(index)
+    if len(hits) != 1:
+        raise PixelOracleError(f"expected one ringed tile, found {len(hits)}")
+    return hits[0]
+
+
+def _recover_operations(array: np.ndarray, tiles: list[tuple[float, float, int, int, int, int]]) -> list[str]:
+    distance = np.linalg.norm(array.astype(np.float32) - MARKER_COLOR, axis=2)
+    dark = distance <= MARKER_TOLERANCE
+    max_tile_x = max(item[0] for item in tiles)
+    min_tile_y = min(item[1] for item in tiles)
+    max_tile_y = max(item[1] for item in tiles)
+    candidates: list[np.ndarray] = []
+    for points in _components(dark):
+        ys = points[:, 0]
+        xs = points[:, 1]
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        area = len(points)
+        center_x = float(xs.mean())
+        center_y = float(ys.mean())
+        if (
+            center_x > max_tile_x + 38
+            and min_tile_y - 40 <= center_y <= max_tile_y + 40
+            and 18 <= width <= 42
+            and 18 <= height <= 42
+            and 240 <= area <= 900
+        ):
+            candidates.append(points)
+    if len(candidates) != OPERATION_COUNT:
+        raise PixelOracleError(f"expected five orientation markers, found {len(candidates)}")
+    candidates.sort(key=lambda points: float(points[:, 0].mean()))
+    centers = [float(points[:, 0].mean()) for points in candidates]
+    if any(centers[index + 1] - centers[index] < 25 for index in range(OPERATION_COUNT - 1)):
+        raise PixelOracleError("operation marker order is ambiguous")
+
+    operations: list[str] = []
+    for points in candidates:
+        xs = points[:, 1].astype(np.float64)
+        left = float(xs.min())
+        right = float(xs.max())
+        midpoint = (left + right) / 2.0
+        # A right-pointing triangle has its broad base on the left, so its
+        # pixel centroid is left of the bounding-box midpoint. The reverse
+        # holds for a left-pointing triangle.
+        operations.append("R" if float(xs.mean()) < midpoint else "L")
+    return operations
+
+
+def _replay(initial_cell: int, operations: list[str]) -> int:
+    row, column = divmod(int(initial_cell), GRID_SIZE)
+    for operation in operations:
+        if operation == "R":
+            row, column = column, GRID_SIZE - 1 - row
+        elif operation == "L":
+            row, column = GRID_SIZE - 1 - column, row
+        else:
+            raise PixelOracleError("operation marker has an invalid orientation")
+    return row * GRID_SIZE + column
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the terminal labeled cell from the raster alone."""
+
+    if image.size != (WIDTH, HEIGHT):
+        raise PixelOracleError(f"unexpected raster size {image.size}")
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tiles = _grid_order(_recover_tiles(array))
+    initial_cell = _recover_initial_cell(array, tiles)
+    operations = _recover_operations(array, tiles)
+    return CELL_LABELS[_replay(initial_cell, operations)]

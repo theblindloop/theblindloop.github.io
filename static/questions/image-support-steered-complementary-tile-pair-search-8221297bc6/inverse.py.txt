@@ -1,0 +1,147 @@
+"""Independent pixel-only inverse for complementary five-by-five tile pairs."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_GUIDE = np.asarray([207.0, 218.0, 229.0], dtype=np.float32)
+_QUADRANTS = ("NW", "NE", "SW", "SE")
+_MIN_MARGIN = 3
+
+
+def _guide_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    return np.max(np.abs(array - _GUIDE), axis=2) <= 3.0
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    # The public world uses dark positive tile cells and a much lighter neutral
+    # frame/background. This threshold is intentionally palette-blind.
+    return np.mean(array, axis=2) < 175.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        pending: deque[tuple[int, int]] = deque([(y, x)])
+        points: list[tuple[int, int]] = []
+        while pending:
+            cy, cx = pending.popleft()
+            points.append((cy, cx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    pending.append((ny, nx))
+        if len(points) >= 20:
+            component = np.zeros_like(mask, dtype=bool)
+            yy, xx = np.asarray(points).T
+            component[yy, xx] = True
+            output.append(component)
+    return output
+
+
+def _tile_frames(image: Image.Image) -> list[tuple[int, int, int]]:
+    frames = []
+    for component in _components(_guide_mask(image)):
+        ys, xs = np.nonzero(component)
+        if len(xs) < 40:
+            continue
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        if width != height or not 50 <= width <= 80:
+            continue
+        remainder = width - 4
+        if remainder <= 0 or remainder % 5:
+            continue
+        cell_size = remainder // 5
+        frames.append((x0 + 2, y0 + 2, cell_size))
+    return frames
+
+
+def _quadrant(center: tuple[float, float], width: int, height: int) -> str:
+    x, y = center
+    return ("N" if y < height / 2.0 else "S") + ("W" if x < width / 2.0 else "E")
+
+
+def _mask_from_frame(
+    ink: np.ndarray, frame: tuple[int, int, int]
+) -> tuple[str, tuple[float, float]]:
+    x0, y0, cell_size = frame
+    cells: list[str] = []
+    occupied = []
+    for row in range(5):
+        for col in range(5):
+            left = x0 + col * cell_size
+            top = y0 + row * cell_size
+            crop = ink[top : top + cell_size, left : left + cell_size]
+            if crop.shape != (cell_size, cell_size) or float(crop.mean()) < 0.70:
+                cells.append("0")
+            else:
+                cells.append("1")
+                occupied.append((left + cell_size / 2.0, top + cell_size / 2.0))
+    if len(occupied) < 3:
+        raise ValueError("tile frame contains too little visible ink")
+    center = tuple(np.mean(np.asarray(occupied, dtype=np.float64), axis=0))
+    return "".join(cells), center
+
+
+def _score_pair(first: str, second: str) -> int:
+    if len(first) != 25 or len(second) != 25:
+        raise ValueError("tile cell grid is incomplete")
+    return sum(
+        second_cell != ("0" if first_cell == "1" else "1")
+        for first_cell, second_cell in zip(first, second, strict=True)
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover exactly one quadrant, or raise when the pixels are ambiguous."""
+
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    ink = _ink_mask(rgb)
+    frames = _tile_frames(rgb)
+    if not frames:
+        raise ValueError("no complete tile frame is visible")
+    measured = []
+    for frame in frames:
+        try:
+            mask, center = _mask_from_frame(ink, frame)
+        except ValueError:
+            # A frame can remain geometrically detectable after an ablation
+            # has removed too much of its tile.  Treat that tile as incomplete
+            # instead of making every other quadrant globally decisive.
+            continue
+        measured.append({"mask": mask, "center": center, "quadrant": _quadrant(center, width, height)})
+    scores: dict[str, int] = {}
+    for quadrant in _QUADRANTS:
+        pair = [item for item in measured if item["quadrant"] == quadrant]
+        # A destructive ablation may remove a distractor frame.  It is
+        # nondiagnostic, so skip that incomplete quadrant; an ablated target
+        # pair will then have no intact zero-error winner and will abstain.
+        if len(pair) != 2:
+            continue
+        pair.sort(key=lambda item: (item["center"][0] + item["center"][1], item["center"][0]))
+        scores[quadrant] = _score_pair(str(pair[0]["mask"]), str(pair[1]["mask"]))
+    if not scores:
+        raise ValueError("no complete tile pair is visible")
+    ranked = sorted(scores.items(), key=lambda item: item[1])
+    zero_winners = [item for item in ranked if item[1] == 0]
+    if len(zero_winners) != 1:
+        raise ValueError("pixel complement evidence has no unique zero-error winner")
+    if len(ranked) > 1 and ranked[1][1] - ranked[0][1] < _MIN_MARGIN:
+        raise ValueError("pixel complement evidence has no unique robust winner")
+    return ranked[0][0]

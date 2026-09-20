@@ -1,0 +1,292 @@
+"""Mirror-fold defect world: scene sampling, rendering, analytic gold, margin.
+
+A framed lattice of 7 rows and 12 columns of tilted bars is printed around a
+marked vertical fold axis.  The right half is the mirror image of the left half,
+except in a small set of cells where the bar leans the same way as its partner
+instead of the mirrored way.  Those cells - and only those cells - spell out one
+of five named symbols on the left half of the lattice.
+"""
+
+from __future__ import annotations
+
+import math
+
+from PIL import Image, ImageDraw
+
+ROWS = 7
+COLS = 12
+HALF = COLS // 2
+
+CELL = 34
+GUTTER = 16
+PAD = 10
+FRAME_W = 3
+MARGIN_X = 26
+MARGIN_Y = 34
+
+BAR_LEN = 24
+BAR_WID = 8
+
+SS = 3  # supersampling factor
+
+GRID_W = COLS * CELL + GUTTER
+GRID_H = ROWS * CELL
+INNER_W = GRID_W + 2 * PAD
+INNER_H = GRID_H + 2 * PAD
+WIDTH = INNER_W + 2 * MARGIN_X
+HEIGHT = INNER_H + 2 * MARGIN_Y
+
+SYMBOL_NAMES = ("cee", "ell", "ex", "plus", "tee")
+
+# Each template covers a 5x5 block and uses exactly nine cells, so the number of
+# defect cells - and the total printed ink - never depends on the answer.
+TEMPLATES: dict[str, tuple[str, ...]] = {
+    "plus": ("..#..", "..#..", "#####", "..#..", "..#.."),
+    "ex": ("#...#", ".#.#.", "..#..", ".#.#.", "#...#"),
+    "tee": ("#####", "..#..", "..#..", "..#..", "..#.."),
+    "ell": ("#....", "#....", "#....", "#....", "#####"),
+    "cee": (".###.", "#....", "#....", "#....", ".###."),
+}
+
+SYM_SIZE = 5
+ROW_STARTS = (0, 1, 2)
+COL_STARTS = (0, 1)
+
+BACKGROUNDS = ((246, 246, 242), (240, 242, 246), (245, 240, 240), (238, 243, 238))
+INKS = ((24, 24, 28), (44, 40, 34), (26, 40, 36), (34, 28, 44), (20, 32, 48))
+ACCENTS = ((198, 38, 60), (28, 78, 198), (0, 138, 138), (214, 108, 12), (128, 32, 168))
+
+BETA_FLOOR_DEG = 8.0  # below this the two lean directions stop being legible
+GAP_FLOOR_CELLS = 2.0  # below this a single misread cell could rename the symbol
+
+
+def _lcg(seed: int) -> "_Rand":
+    return _Rand(seed)
+
+
+class _Rand:
+    """Small deterministic PRNG so scenes never depend on library versions."""
+
+    def __init__(self, seed: int) -> None:
+        self.state = (seed * 6364136223846793005 + 1442695040888963407) % (2**64)
+
+    def _next(self) -> int:
+        self.state = (self.state * 6364136223846793005 + 1442695040888963407) % (2**64)
+        return self.state >> 11
+
+    def random(self) -> float:
+        return self._next() / float(2**53)
+
+    def randint(self, low: int, high: int) -> int:
+        return low + int(self.random() * (high - low + 1))
+
+    def choice(self, items):
+        return items[self.randint(0, len(items) - 1)]
+
+    def shuffled(self, items: list) -> list:
+        out = list(items)
+        for i in range(len(out) - 1, 0, -1):
+            j = self.randint(0, i)
+            out[i], out[j] = out[j], out[i]
+        return out
+
+
+def template_cells(name: str) -> list[tuple[int, int]]:
+    rows = TEMPLATES[name]
+    return [
+        (r, c)
+        for r in range(SYM_SIZE)
+        for c in range(SYM_SIZE)
+        if rows[r][c] == "#"
+    ]
+
+
+def defect_mask(symbol: str, sym_row: int, sym_col: int) -> list[list[bool]]:
+    """Left-half cells whose mirror partner leans the wrong way."""
+    mask = [[False] * HALF for _ in range(ROWS)]
+    for r, c in template_cells(symbol):
+        mask[sym_row + r][sym_col + c] = True
+    return mask
+
+
+def sample_scene(seed: int) -> dict:
+    rnd = _lcg(seed)
+    symbol = rnd.choice(SYMBOL_NAMES)
+    sym_row = rnd.choice(ROW_STARTS)
+    sym_col = rnd.choice(COL_STARTS)
+    # Only the sign of a tilt code is printed; the magnitude is a redundant
+    # representation of the same lean direction.
+    tilt_codes = [
+        [rnd.choice((-4, -3, -2, -1, 1, 2, 3, 4)) for _ in range(HALF)]
+        for _ in range(ROWS)
+    ]
+    if rnd.random() < 0.22:
+        beta = 4.5 + rnd.random() * 8.5  # near and below the legibility floor
+    else:
+        beta = 20.0 + rnd.random() * 18.0
+    beta_deg = round(beta, 3)
+    palette = rnd.randint(0, len(BACKGROUNDS) * len(INKS) * len(ACCENTS) - 1)
+    jitter_x = rnd.randint(-6, 6)
+    jitter_y = rnd.randint(-5, 5)
+    draw_order = rnd.shuffled(list(range(ROWS * COLS)))
+    return {
+        "symbol": symbol,
+        "sym_row": sym_row,
+        "sym_col": sym_col,
+        "tilt_codes": tilt_codes,
+        "beta_deg": beta_deg,
+        "palette": palette,
+        "jitter_x": jitter_x,
+        "jitter_y": jitter_y,
+        "draw_order": draw_order,
+    }
+
+
+def _colors(scene: dict) -> tuple[tuple, tuple, tuple]:
+    p = int(scene["palette"])
+    bg = BACKGROUNDS[p % len(BACKGROUNDS)]
+    ink = INKS[(p // len(BACKGROUNDS)) % len(INKS)]
+    accent = ACCENTS[(p // (len(BACKGROUNDS) * len(INKS))) % len(ACCENTS)]
+    return bg, ink, accent
+
+
+def _origin(scene: dict) -> tuple[int, int]:
+    ox = MARGIN_X + PAD + int(scene["jitter_x"])
+    oy = MARGIN_Y + PAD + int(scene["jitter_y"])
+    return ox, oy
+
+
+def _cell_center(scene: dict, row: int, col: int) -> tuple[float, float]:
+    ox, oy = _origin(scene)
+    x = ox + col * CELL + CELL / 2.0 + (GUTTER if col >= HALF else 0)
+    y = oy + row * CELL + CELL / 2.0
+    return x, y
+
+
+def _axis_x(scene: dict) -> float:
+    ox, _ = _origin(scene)
+    return ox + HALF * CELL + GUTTER / 2.0
+
+
+def cell_tilts(scene: dict) -> list[list[float]]:
+    """Signed lean angle (degrees from vertical) of every printed bar."""
+    beta = float(scene["beta_deg"])
+    mask = defect_mask(scene["symbol"], int(scene["sym_row"]), int(scene["sym_col"]))
+    tilts = [[0.0] * COLS for _ in range(ROWS)]
+    for r in range(ROWS):
+        for c in range(HALF):
+            sign = 1.0 if scene["tilt_codes"][r][c] > 0 else -1.0
+            tilts[r][c] = sign * beta
+            partner = -sign if not mask[r][c] else sign
+            tilts[r][COLS - 1 - c] = partner * beta
+    return tilts
+
+
+def _bar_polygon(cx: float, cy: float, angle_deg: float) -> list[tuple[float, float]]:
+    t = math.radians(angle_deg)
+    ax, ay = math.sin(t), math.cos(t)
+    px, py = math.cos(t), -math.sin(t)
+    hl, hw = BAR_LEN / 2.0, BAR_WID / 2.0
+    return [
+        (cx + hl * ax + hw * px, cy + hl * ay + hw * py),
+        (cx + hl * ax - hw * px, cy + hl * ay - hw * py),
+        (cx - hl * ax - hw * px, cy - hl * ay - hw * py),
+        (cx - hl * ax + hw * px, cy - hl * ay + hw * py),
+    ]
+
+
+def render(scene: dict) -> Image.Image:
+    bg, ink, accent = _colors(scene)
+    img = Image.new("RGB", (WIDTH * SS, HEIGHT * SS), bg)
+    draw = ImageDraw.Draw(img)
+    ox, oy = _origin(scene)
+
+    def sc(v: float) -> float:
+        return v * SS
+
+    # Frame fiducial around the lattice.
+    x0, y0 = ox - PAD, oy - PAD
+    x1, y1 = x0 + INNER_W, y0 + INNER_H
+    draw.rectangle(
+        [sc(x0), sc(y0), sc(x1), sc(y1)], outline=accent, width=FRAME_W * SS
+    )
+
+    # Fold-axis fiducial: a dashed line in the gutter plus two pointers.
+    ax = _axis_x(scene)
+    yy = y0 + 6
+    while yy < y1 - 6:
+        draw.rectangle(
+            [sc(ax - 1.5), sc(yy), sc(ax + 1.5), sc(min(yy + 9, y1 - 6))], fill=accent
+        )
+        yy += 17
+    draw.polygon(
+        [(sc(ax), sc(y0 - 6)), (sc(ax - 9), sc(y0 - 20)), (sc(ax + 9), sc(y0 - 20))],
+        fill=accent,
+    )
+    draw.polygon(
+        [(sc(ax), sc(y1 + 6)), (sc(ax - 9), sc(y1 + 20)), (sc(ax + 9), sc(y1 + 20))],
+        fill=accent,
+    )
+
+    tilts = cell_tilts(scene)
+    for index in scene["draw_order"]:
+        row, col = divmod(int(index), COLS)
+        cx, cy = _cell_center(scene, row, col)
+        poly = _bar_polygon(cx, cy, tilts[row][col])
+        draw.polygon([(sc(px), sc(py)) for px, py in poly], fill=ink)
+
+    return img.resize((WIDTH, HEIGHT), Image.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["symbol"])
+
+
+def _template_gap(symbol: str, sym_row: int, sym_col: int) -> int:
+    """Cell distance to the nearest competing named symbol at any placement."""
+    target = defect_mask(symbol, sym_row, sym_col)
+    best = None
+    for name in SYMBOL_NAMES:
+        if name == symbol:
+            continue
+        for r0 in ROW_STARTS:
+            for c0 in COL_STARTS:
+                other = defect_mask(name, r0, c0)
+                dist = sum(
+                    1
+                    for r in range(ROWS)
+                    for c in range(HALF)
+                    if target[r][c] != other[r][c]
+                )
+                best = dist if best is None else min(best, dist)
+    return int(best)
+
+
+def margin(scene: dict) -> float:
+    """Safety factor: 1.0 sits exactly on the readability/naming boundary."""
+    lean = float(scene["beta_deg"]) / BETA_FLOOR_DEG
+    gap = _template_gap(
+        scene["symbol"], int(scene["sym_row"]), int(scene["sym_col"])
+    ) / GAP_FLOOR_CELLS
+    return round(min(lean, gap), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < 1.0)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Nontrivial scene rewrites that must be pixel-identical and gold-preserving."""
+    rotated = dict(scene)
+    order = list(scene["draw_order"])
+    rotated["draw_order"] = order[7:] + order[:7]
+
+    recoded = dict(scene)
+    recoded["tilt_codes"] = [
+        [(1 if v > 0 else -1) * ((abs(v) % 4) + 1) for v in row]
+        for row in scene["tilt_codes"]
+    ]
+    return [
+        ("bar_draw_order_cycle", rotated),
+        ("tilt_code_magnitude_relabel", recoded),
+    ]

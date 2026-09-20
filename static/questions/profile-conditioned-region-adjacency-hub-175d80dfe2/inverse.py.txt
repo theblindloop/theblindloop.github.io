@@ -1,0 +1,138 @@
+"""Independent inverse for the region-adjacency hub world.
+
+Only the final RGB raster reaches this module. It recovers the three largest
+color components and counts four-neighbor contacts between component masks.
+There is no import or call into the renderer, prompt, generator, or verifier.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+BACKGROUND = (248, 247, 242)
+FRAME = (35, 36, 42)
+PALETTE = {
+    "red": (211, 66, 72),
+    "green": (54, 157, 93),
+    "blue": (68, 105, 198),
+}
+CONTACT_PIXELS = 12
+AMBIGUITY_BAND = 3
+_DECISION_CACHE: dict[tuple[tuple[int, ...], bytes], str] = {}
+
+
+def _nearest_labels(image: Image.Image) -> np.ndarray:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int32)
+    colors = np.asarray(list(PALETTE.values()) + [BACKGROUND, FRAME], dtype=np.int32)
+    distances = ((pixels[:, :, None, :] - colors[None, None, :, :]) ** 2).sum(axis=3)
+    return np.argmin(distances, axis=2)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    """Return the largest 4-connected component using row-run unions.
+
+    Run-length components keep the inverse independent while avoiding a slow
+    Python queue over every pixel. Runs in neighboring rows are joined when
+    their x-intervals overlap, which is exactly 4-connectivity for a binary
+    raster.
+    """
+
+    height, _ = mask.shape
+    runs: list[tuple[int, int, int]] = []
+    previous: list[tuple[int, int, int]] = []
+    parent: list[int] = []
+    area: list[int] = []
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left == right:
+            return
+        if area[left] < area[right]:
+            left, right = right, left
+        parent[right] = left
+        area[left] += area[right]
+
+    for y in range(height):
+        row = mask[y]
+        starts = np.flatnonzero(row & ~np.r_[False, row[:-1]])
+        ends = np.flatnonzero(row & ~np.r_[row[1:], False])
+        current: list[tuple[int, int, int]] = []
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            run_id = len(parent)
+            parent.append(run_id)
+            area.append(int(end - start + 1))
+            current.append((run_id, int(start), int(end)))
+            for previous_id, previous_start, previous_end in previous:
+                if previous_end >= start and end >= previous_start:
+                    union(run_id, previous_id)
+        runs.extend((y, start, end) for _, start, end in current)
+        previous = current
+
+    if not parent:
+        return np.zeros_like(mask, dtype=bool)
+    roots = [find(index) for index in range(len(parent))]
+    largest_root = max(set(roots), key=lambda root: area[find(root)])
+    component = np.zeros_like(mask, dtype=bool)
+    run_index = 0
+    for y in range(height):
+        row = mask[y]
+        starts = np.flatnonzero(row & ~np.r_[False, row[:-1]])
+        ends = np.flatnonzero(row & ~np.r_[row[1:], False])
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            if find(run_index) == largest_root:
+                component[y, start : end + 1] = True
+            run_index += 1
+    return component
+
+
+def _contact_count(first: np.ndarray, second: np.ndarray) -> int:
+    near_second = np.zeros_like(second, dtype=bool)
+    near_second[1:, :] |= second[:-1, :]
+    near_second[:-1, :] |= second[1:, :]
+    near_second[:, 1:] |= second[:, :-1]
+    near_second[:, :-1] |= second[:, 1:]
+    return int(np.logical_and(first, near_second).sum())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the unique degree-two color from the PNG alone."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    cache_key = (tuple(rgb.shape), rgb.tobytes())
+    cached = _DECISION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    labels = _nearest_labels(image)
+    masks = {
+        color: _largest_component(labels == index)
+        for index, color in enumerate(PALETTE)
+    }
+    colors = tuple(PALETTE)
+    contacts = {color: {} for color in colors}
+    for index, first in enumerate(colors):
+        for second in colors[index + 1 :]:
+            value = _contact_count(masks[first], masks[second])
+            contacts[first][second] = value
+            contacts[second][first] = value
+    flat = [value for row in contacts.values() for value in row.values()]
+    if not flat or max(flat) < CONTACT_PIXELS:
+        raise ValueError(f"no reliable shared side was measured: {contacts}")
+    if any(abs(value - CONTACT_PIXELS) <= AMBIGUITY_BAND for value in flat):
+        raise ValueError(f"boundary contact is ambiguous: {contacts}")
+    degrees = {
+        color: sum(value >= CONTACT_PIXELS for value in contacts[color].values())
+        for color in colors
+    }
+    hubs = [color for color, degree in degrees.items() if degree == 2]
+    if len(hubs) != 1 or sorted(degrees.values()) != [1, 1, 2]:
+        raise ValueError(f"measured adjacency is not a three-region path: {contacts}")
+    decision = hubs[0]
+    _DECISION_CACHE[cache_key] = decision
+    return decision

@@ -1,0 +1,144 @@
+"""Independent pixel-only inverse arm for recursive planar nesting.
+
+The oracle segments navy pixels, labels foreground components, labels bounded
+complement regions inside each component, validates the public two-annulus plus
+one-solid visual grammar, and builds the containment relation from recovered
+component bounding boxes.  It receives no scene data and imports no world code.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class Component:
+    points: list[tuple[int, int]]
+    area: int
+    bbox: tuple[int, int, int, int]
+    holes: int
+
+    @property
+    def width(self) -> int:
+        return self.bbox[2] - self.bbox[0] + 1
+
+    @property
+    def height(self) -> int:
+        return self.bbox[3] - self.bbox[1] + 1
+
+    @property
+    def fill(self) -> float:
+        return self.area / float(self.width * self.height)
+
+
+def _navy_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = array[..., 0], array[..., 1], array[..., 2]
+    return (red < 105) & (green < 135) & (blue < 165) & ((blue - red) > 16)
+
+
+def _raw_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    """Return 4-connected true-pixel components without external libraries."""
+
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    components: list[list[tuple[int, int]]] = []
+    for y_value, x_value in np.argwhere(mask):
+        y, x = int(y_value), int(x_value)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        stack = [(y, x)]
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            if cy and mask[cy - 1, cx] and not seen[cy - 1, cx]:
+                seen[cy - 1, cx] = True
+                stack.append((cy - 1, cx))
+            if cy + 1 < height and mask[cy + 1, cx] and not seen[cy + 1, cx]:
+                seen[cy + 1, cx] = True
+                stack.append((cy + 1, cx))
+            if cx and mask[cy, cx - 1] and not seen[cy, cx - 1]:
+                seen[cy, cx - 1] = True
+                stack.append((cy, cx - 1))
+            if cx + 1 < width and mask[cy, cx + 1] and not seen[cy, cx + 1]:
+                seen[cy, cx + 1] = True
+                stack.append((cy, cx + 1))
+        components.append(points)
+    return components
+
+
+def _hole_count(points: list[tuple[int, int]]) -> int:
+    ys = [point[0] for point in points]
+    xs = [point[1] for point in points]
+    y_min, y_max = min(ys), max(ys)
+    x_min, x_max = min(xs), max(xs)
+    local = np.zeros((y_max - y_min + 3, x_max - x_min + 3), dtype=bool)
+    for y, x in points:
+        local[y - y_min + 1, x - x_min + 1] = True
+    holes = 0
+    local_height, local_width = local.shape
+    for region in _raw_components(~local):
+        touches_border = any(
+            y in {0, local_height - 1} or x in {0, local_width - 1}
+            for y, x in region
+        )
+        if not touches_border and len(region) >= 300:
+            holes += 1
+    return holes
+
+
+def _measure(points: list[tuple[int, int]]) -> Component:
+    ys = [point[0] for point in points]
+    xs = [point[1] for point in points]
+    bbox = (min(xs), min(ys), max(xs), max(ys))
+    return Component(points, len(points), bbox, _hole_count(points))
+
+
+def _strictly_contains(outer: Component, inner: Component) -> bool:
+    ox0, oy0, ox1, oy1 = outer.bbox
+    ix0, iy0, ix1, iy1 = inner.bbox
+    return min(ix0 - ox0, iy0 - oy0, ox1 - ix1, oy1 - iy1) >= 20
+
+
+def decision_from_image(image: Image.Image) -> str:
+    mask = _navy_mask(image)
+    raw = [points for points in _raw_components(mask) if len(points) >= 300]
+    if len(raw) != 3:
+        raise OracleAbstention(f"expected three navy components, found {len(raw)}")
+    components = [_measure(points) for points in raw]
+    components.sort(key=lambda item: item.width * item.height, reverse=True)
+    large, first_small, second_small = components
+
+    if not (164 <= large.width <= 188 and 164 <= large.height <= 188):
+        raise OracleAbstention("large annulus extent is missing or corrupted")
+    if abs(large.width - large.height) > 2 or not (0.52 <= large.fill <= 0.68):
+        raise OracleAbstention("large component is not a robust orthogonal annulus")
+    if large.holes != 1:
+        raise OracleAbstention(f"large component has {large.holes} recoverable holes")
+
+    small = (first_small, second_small)
+    if any(
+        not (52 <= item.width <= 60 and 52 <= item.height <= 60)
+        or abs(item.width - item.height) > 2
+        for item in small
+    ):
+        raise OracleAbstention("small component extent is missing or corrupted")
+    hole_bearing = [item for item in small if item.holes == 1 and 0.72 <= item.fill <= 0.88]
+    solid = [item for item in small if item.holes == 0 and item.fill >= 0.94]
+    if len(hole_bearing) != 1 or len(solid) != 1:
+        raise OracleAbstention("expected one small annulus and one equal-sized solid")
+
+    # The large component has one bounded complement.  A disconnected small
+    # annulus whose full recovered box lies well inside the large annulus's box
+    # occupies that bounded complement; otherwise its surrounding complement is
+    # the exterior.  This is a component-containment-tree relation, not a count.
+    return "yes" if _strictly_contains(large, hole_bearing[0]) else "no"

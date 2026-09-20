@@ -1,0 +1,123 @@
+"""PNG-only inverse arm for station-link graphs."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[list[tuple[int, int]]] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        stack = [(int(y), int(x))]
+        group: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            group.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(group) >= 120:
+            groups.append(group)
+    return groups
+
+
+def _centers(image: Image.Image) -> list[tuple[float, float]]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    cyan = (arr[:, :, 0] < 105) & (arr[:, :, 1] > 130) & (arr[:, :, 2] > 150)
+    groups = _components(cyan)
+    if len(groups) != 18:
+        raise ValueError(f"expected 18 visible cyan stations, found {len(groups)}")
+    centers = []
+    for group in groups:
+        ys = np.fromiter((p[0] for p in group), dtype=float)
+        xs = np.fromiter((p[1] for p in group), dtype=float)
+        centers.append((float(xs.mean()), float(ys.mean())))
+    return centers
+
+
+def _edge_coverage(dark: np.ndarray, p: tuple[float, float], q: tuple[float, float]) -> float:
+    dx, dy = q[0] - p[0], q[1] - p[1]
+    length = math.hypot(dx, dy)
+    if length < 55:
+        return 0.0
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    samples = max(40, int(length - 44))
+    hits = 0
+    for step in range(samples):
+        distance = 22.0 + (length - 44.0) * (step + 0.5) / samples
+        cx, cy = p[0] + ux * distance, p[1] + uy * distance
+        found = False
+        for offset in (-3, -2, -1, 0, 1, 2, 3):
+            x = int(round(cx + nx * offset))
+            y = int(round(cy + ny * offset))
+            if 0 <= y < dark.shape[0] and 0 <= x < dark.shape[1] and dark[y, x]:
+                found = True
+                break
+        hits += int(found)
+    return hits / samples
+
+
+def _panel_graph(dark: np.ndarray, centers: list[tuple[float, float]]) -> tuple[list[set[int]], float]:
+    adjacency = [set() for _ in centers]
+    confidence = 1.0
+    for a in range(len(centers)):
+        for b in range(a + 1, len(centers)):
+            px, py = centers[a]
+            qx, qy = centers[b]
+            length2 = (qx - px) ** 2 + (qy - py) ** 2
+            blocked_by_station = False
+            for c, (rx, ry) in enumerate(centers):
+                if c in (a, b):
+                    continue
+                along = ((rx - px) * (qx - px) + (ry - py) * (qy - py)) / length2
+                if 0.08 < along < 0.92:
+                    sx, sy = px + along * (qx - px), py + along * (qy - py)
+                    if math.hypot(rx - sx, ry - sy) < 24:
+                        blocked_by_station = True
+                        break
+            coverage = 0.0 if blocked_by_station else _edge_coverage(dark, centers[a], centers[b])
+            confidence = min(confidence, abs(coverage - 0.90))
+            if coverage > 0.90:
+                adjacency[a].add(b)
+                adjacency[b].add(a)
+    if sum(len(values) for values in adjacency) // 2 != 7:
+        raise ValueError("ambiguous link segmentation")
+    seen, pending = {0}, [0]
+    while pending:
+        node = pending.pop()
+        for neighbor in adjacency[node] - seen:
+            seen.add(neighbor)
+            pending.append(neighbor)
+    if len(seen) != 6:
+        raise ValueError("recovered panel is disconnected")
+    return adjacency, confidence
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    dark = (arr[:, :, 0] < 125) & (arr[:, :, 1] < 125) & (arr[:, :, 2] < 125)
+    centers = sorted(_centers(image), key=lambda point: point[0])
+    panels = [centers[index : index + 6] for index in (0, 6, 12)]
+    if any(max(x for x, _ in panel) - min(x for x, _ in panel) > 270 for panel in panels):
+        raise ValueError("station panels cannot be separated confidently")
+    winners = []
+    for index, panel in enumerate(panels):
+        graph, confidence = _panel_graph(dark, panel)
+        if confidence < 0.04:
+            raise ValueError("link decision margin is too small")
+        odd = sum(len(neighbors) % 2 for neighbors in graph)
+        if odd in (0, 2):
+            winners.append(index)
+    if len(winners) != 1:
+        raise ValueError(f"expected one one-stroke panel, found {winners}")
+    return ("left", "center", "right")[winners[0]]

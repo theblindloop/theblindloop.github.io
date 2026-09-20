@@ -1,0 +1,169 @@
+"""Deterministic renderer and analytic arm for three-sided socket search."""
+
+from __future__ import annotations
+
+from collections import deque
+import random
+
+from PIL import Image, ImageDraw
+
+GRID = 6
+CELL = 16
+CYAN_CELLS = 15
+CANVAS = 512
+CYAN = (26, 164, 188)
+AMBER = (231, 158, 38)
+PAPER = (249, 247, 240)
+PANEL = (216, 214, 207)
+INK = (34, 43, 56)
+LABELS = ("upper-left", "upper-right", "lower-left", "lower-right")
+DIRS = ((-1, 0), (0, 1), (1, 0), (0, -1))
+
+
+def _neighbor_count(patch: dict) -> int:
+    amber = tuple(patch["amber"])
+    cyan = {tuple(cell) for cell in patch["cyan"]}
+    return sum((amber[0] + dr, amber[1] + dc) in cyan for dr, dc in DIRS)
+
+
+def _shortest_path(
+    start: tuple[int, int], goal: tuple[int, int], blocked: set[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    queue = deque([start])
+    parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+    while queue:
+        here = queue.popleft()
+        if here == goal:
+            path = []
+            while here is not None:
+                path.append(here)
+                here = parent[here]
+            return path[::-1]
+        for dr, dc in DIRS:
+            nxt = (here[0] + dr, here[1] + dc)
+            if 0 <= nxt[0] < GRID and 0 <= nxt[1] < GRID and nxt not in blocked and nxt not in parent:
+                parent[nxt] = here
+                queue.append(nxt)
+    raise RuntimeError("unable to connect socket neighbors")
+
+
+def _make_patch(rng: random.Random, degree: int) -> dict:
+    amber = (rng.choice((2, 3)), rng.choice((2, 3)))
+    direction_order = list(range(4))
+    rng.shuffle(direction_order)
+    selected_ids = set(direction_order[:degree])
+    selected = {(amber[0] + DIRS[i][0], amber[1] + DIRS[i][1]) for i in selected_ids}
+    absent = {(amber[0] + DIRS[i][0], amber[1] + DIRS[i][1]) for i in range(4) if i not in selected_ids}
+    blocked = absent | {amber}
+
+    # Join all selected cyan neighbors around (never through) the amber square,
+    # then grow one connected equal-area cyan patch. This keeps global component
+    # count and total ink nondiagnostic across all four candidates.
+    cyan = {next(iter(selected))}
+    for endpoint in selected:
+        best = min(cyan, key=lambda cell: abs(cell[0] - endpoint[0]) + abs(cell[1] - endpoint[1]))
+        cyan.update(_shortest_path(best, endpoint, blocked))
+    while len(cyan) < CYAN_CELLS:
+        frontier = {
+            (r + dr, c + dc)
+            for r, c in cyan
+            for dr, dc in DIRS
+            if 0 <= r + dr < GRID and 0 <= c + dc < GRID
+            and (r + dr, c + dc) not in cyan
+            and (r + dr, c + dc) not in blocked
+        }
+        if not frontier:
+            raise RuntimeError("cyan growth exhausted")
+        cyan.add(rng.choice(sorted(frontier)))
+    patch = {"amber": list(amber), "cyan": [list(cell) for cell in sorted(cyan)]}
+    assert len(cyan) == CYAN_CELLS and _neighbor_count(patch) == degree
+    return patch
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    answer_index = int(seed) % 4
+    distractor_degrees = [1, 2, 2]
+    rng.shuffle(distractor_degrees)
+    degrees = []
+    for index in range(4):
+        degrees.append(3 if index == answer_index else distractor_degrees.pop())
+    patches = [_make_patch(rng, degree) for degree in degrees]
+
+    # The decisive cross-shaped neighborhood stays inside one 64 px ablation
+    # cell. Balanced answer identity moves it among all four canvas quadrants.
+    cue_centers = ((160, 160), (352, 160), (160, 352), (352, 352))
+    origins = []
+    for index, patch in enumerate(patches):
+        ar, ac = patch["amber"]
+        cx, cy = cue_centers[index]
+        jitter_x = rng.choice((-4, 0, 4))
+        jitter_y = rng.choice((-4, 0, 4))
+        origins.append([
+            int(cx + jitter_x - (ac + 0.5) * CELL),
+            int(cy + jitter_y - (ar + 0.5) * CELL),
+        ])
+    return {
+        "patches": patches,
+        "cell_size": CELL,
+        "origins": origins,
+        "canvas_size": CANVAS,
+        "palette": {
+            "background": list(PAPER),
+            "cyan": list(CYAN),
+            "amber": list(AMBER),
+            "ink": list(INK),
+        },
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    # Keep the audited label boundary at the public top-level ``patches`` field;
+    # the nested cell dictionaries are merely its visible representation.
+    scores = []
+    for patch in scene["patches"]:
+        amber = tuple(patch["amber"])
+        cyan = {tuple(cell) for cell in patch["cyan"]}
+        scores.append(sum((amber[0] + dr, amber[1] + dc) in cyan for dr, dc in DIRS))
+    winners = [index for index, score in enumerate(scores) if score == 3]
+    return LABELS[winners[0]] if len(winners) == 1 else "abstain"
+
+
+def margin(scene: dict) -> float:
+    scores = sorted((_neighbor_count(patch) for patch in scene["patches"]), reverse=True)
+    return float(scores[0] - scores[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = [_neighbor_count(patch) for patch in scene["patches"]]
+    return scores.count(3) != 1 or sorted(scores, reverse=True)[:2] != [3, 2]
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []
+
+
+def render(scene: dict) -> Image.Image:
+    size = int(scene["canvas_size"])
+    palette = scene["palette"]
+    image = Image.new("RGB", (size, size), tuple(palette["background"]))
+    draw = ImageDraw.Draw(image)
+    cell = int(scene["cell_size"])
+    for patch, origin in zip(scene["patches"], scene["origins"], strict=True):
+        ox, oy = map(int, origin)
+        # Identical faint cards expose candidate regions without encoding the
+        # answer. The colored cells touch exactly along full edges.
+        draw.rounded_rectangle(
+            (ox - 14, oy - 14, ox + GRID * cell + 14, oy + GRID * cell + 14),
+            radius=10,
+            fill=tuple(palette["background"]),
+            outline=PANEL,
+            width=2,
+        )
+        for r, c in patch["cyan"]:
+            x0, y0 = ox + int(c) * cell, oy + int(r) * cell
+            draw.rectangle((x0, y0, x0 + cell - 1, y0 + cell - 1), fill=tuple(palette["cyan"]))
+        ar, ac = patch["amber"]
+        x0, y0 = ox + int(ac) * cell, oy + int(ar) * cell
+        draw.rectangle((x0, y0, x0 + cell - 1, y0 + cell - 1), fill=tuple(palette["amber"]))
+    return image

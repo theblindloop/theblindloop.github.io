@@ -1,0 +1,313 @@
+"""Deflector-flip world: the answer is the outcome of an *edited* board.
+
+A ball is released from a black dot at the top of a lattice of slanted bars.
+Falling straight down, it slides to the lower end of every slanted bar whose
+horizontal span it meets, and passes straight through empty lattice cells;
+after the last row it drops into one of five colored bins.
+
+Exactly one bar is drawn in red. The decision is NOT the outcome of the board
+as drawn: it is the outcome of the counterfactual board in which that single
+red bar is replaced by a bar of the opposite slant and nothing else changes.
+Half the sampled boards put the red bar on the factual trajectory (the edit
+moves the ball to a different bin), and half put it off the trajectory (the
+edit changes nothing), so neither "just trace what is drawn" nor "the answer
+must differ from what is drawn" is a correct strategy.
+
+The renderer owns scene sampling, rasterization, and the analytic gold. The
+independent pixel-only inverse arm (``oracle.py``) recovers the same bin color
+from the final PNG alone by segmenting bars, bins and ball, reading each bar's
+slant, and re-running the intervention.
+"""
+
+from __future__ import annotations
+
+from PIL import Image, ImageDraw
+
+WIDTH = 544
+HEIGHT = 670
+
+COLS = 5
+ROWS = 6
+X0 = 80
+XSTEP = 96
+Y0 = 110
+YSTEP = 86
+
+BAR_W = 7
+BIN_TOP = 595
+BIN_H = 52
+BIN_HALF_W = 38
+BALL_Y = 40
+BALL_R = 12
+
+BACKGROUND = (255, 255, 255)
+BAR_COLOR = (60, 66, 78)
+RED_COLOR = (200, 40, 50)
+BALL_COLOR = (0, 0, 0)
+
+BIN_PALETTE = {
+    "blue": (35, 85, 205),
+    "green": (25, 145, 65),
+    "orange": (245, 150, 25),
+    "purple": (135, 55, 190),
+    "yellow": (240, 200, 30),
+}
+BIN_NAMES = ("blue", "green", "orange", "purple", "yellow")
+
+FILL_PROB = 0.6
+DX_JITTER = 10
+DY_JITTER = 6
+HALF_LO = 20
+HALF_HI = 25
+MIN_VISITED = 3
+QUARANTINE_PX = 11.0
+
+
+def _col_x(col: int) -> float:
+    return float(X0 + XSTEP * col)
+
+
+def _row_y(row: int) -> float:
+    return float(Y0 + YSTEP * row)
+
+
+def _walk(bars: list, start: int, flip_index: int) -> tuple[list, bool]:
+    """Drop the ball, flipping the bar at ``flip_index``. Returns (steps, ok).
+
+    ``steps`` is a list of ``[row, col, bar_index, delta]`` for every bar the
+    ball meets. ``ok`` is False when the trajectory leaves the lattice or when
+    a deflection would land the ball on another bar inside the same row.
+    """
+    at_cell = {}
+    for index, bar in enumerate(bars):
+        at_cell[(int(bar[0]), int(bar[1]))] = index
+    col = int(start)
+    steps = []
+    if col < 0 or col >= COLS:
+        return steps, False
+    for row in range(ROWS):
+        index = at_cell.get((row, col))
+        if index is None:
+            continue
+        delta = int(bars[index][2])
+        if index == flip_index:
+            delta = -delta
+        col += delta
+        if col < 0 or col >= COLS:
+            return steps, False
+        if (row, col) in at_cell:
+            return steps, False
+        steps.append([row, int(bars[index][1]), index, delta])
+    return steps, True
+
+
+def _final_col(bars: list, start: int, flip_index: int) -> int:
+    steps, ok = _walk(bars, start, flip_index)
+    if not ok:
+        return -1
+    col = int(start)
+    for step in steps:
+        col += int(step[3])
+    return col
+
+
+def _walk_grid(grid: dict, start: int, flip_cell) -> tuple:
+    """Sampling-time walk over a cell dictionary.
+
+    Returns ``(visited_cells, final_col, status, offender)`` where ``status`` is
+    ``ok``, ``out`` (the ball would leave the lattice) or ``collide`` (a
+    deflection would land the ball on another bar inside the same row, which
+    the sampler repairs by deleting that bar).
+    """
+    col = int(start)
+    visited = []
+    for row in range(ROWS):
+        cell = (row, col)
+        bar = grid.get(cell)
+        if bar is None:
+            continue
+        delta = -bar[0] if cell == flip_cell else bar[0]
+        visited.append(cell)
+        col += delta
+        if col < 0 or col >= COLS:
+            return visited, -1, "out", None
+        if (row, col) in grid:
+            return visited, -1, "collide", (row, col)
+    return visited, col, "ok", None
+
+
+def _try_scene(rng, on_path: bool) -> dict | None:
+    grid = {}
+    for row in range(ROWS):
+        for col in range(COLS):
+            if rng.random() >= FILL_PROB:
+                continue
+            slant = -1 if rng.random() < 0.5 else 1
+            grid[(row, col)] = [
+                slant,
+                rng.randint(-DX_JITTER, DX_JITTER),
+                rng.randint(-DY_JITTER, DY_JITTER),
+                rng.randint(HALF_LO, HALF_HI),
+            ]
+
+    ball_col = rng.randrange(COLS)
+
+    # Repair the drawn trajectory: a deflection must never land the ball on
+    # another bar inside the same row, so any such bar is removed.
+    for _ in range(40):
+        _visited, _bin, status, offender = _walk_grid(grid, ball_col, None)
+        if status == "out":
+            return None
+        if status == "ok":
+            break
+        del grid[offender]
+    else:
+        return None
+
+    visited_cells, factual_bin, status, _ = _walk_grid(grid, ball_col, None)
+    if status != "ok" or len(visited_cells) < MIN_VISITED:
+        return None
+
+    visited = set(visited_cells)
+    pool = sorted(visited) if on_path else sorted(set(grid) - visited)
+    if not pool:
+        return None
+    red_cell = pool[rng.randrange(len(pool))]
+
+    # Repair the edited trajectory the same way, never removing the marked bar.
+    for _ in range(40):
+        _visited, _bin, status, offender = _walk_grid(grid, ball_col, red_cell)
+        if status == "out":
+            return None
+        if status == "ok":
+            break
+        if offender == red_cell:
+            return None
+        del grid[offender]
+    else:
+        return None
+
+    visited_cells, factual_bin, status, _ = _walk_grid(grid, ball_col, None)
+    if status != "ok" or len(visited_cells) < MIN_VISITED:
+        return None
+    if (red_cell in set(visited_cells)) != on_path:
+        return None
+    _cf_cells, counter_bin, status, _ = _walk_grid(grid, ball_col, red_cell)
+    if status != "ok":
+        return None
+    if on_path and counter_bin == factual_bin:
+        return None
+    if not on_path and counter_bin != factual_bin:
+        return None
+
+    cells = sorted(grid)
+    bars = [[row, col, *grid[(row, col)]] for row, col in cells]
+    red = cells.index(red_cell)
+
+    order = list(BIN_NAMES)
+    for i in range(len(order) - 1, 0, -1):
+        j = rng.randrange(i + 1)
+        order[i], order[j] = order[j], order[i]
+
+    return {
+        "bars": bars,
+        "red": int(red),
+        "ball_col": int(ball_col),
+        "bin_colors": order,
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``."""
+    import random
+
+    # Half of all seeds place the red bar on the ball's trajectory (the edit
+    # moves it to a different bin) and half place it off the trajectory (the
+    # edit is inert). The target is fixed per seed, before rejection sampling,
+    # so the two intervention regimes stay balanced.
+    on_path = bool(random.Random(int(seed) ^ 0x5EED).random() < 0.5)
+    for attempt in range(4000):
+        rng = random.Random((int(seed) * 1000003 + attempt * 7919 + 11) & 0x7FFFFFFF)
+        scene = _try_scene(rng, on_path)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the latent scene (a deterministic PNG)."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(img)
+
+    red_index = int(scene["red"])
+    for index, bar in enumerate(scene["bars"]):
+        row, col, slant, dx, dy, half = (int(v) for v in bar)
+        cx = _col_x(col) + dx
+        cy = _row_y(row) + dy
+        if slant < 0:
+            xy = [cx - half, cy + half, cx + half, cy - half]
+        else:
+            xy = [cx - half, cy - half, cx + half, cy + half]
+        color = RED_COLOR if index == red_index else BAR_COLOR
+        draw.line(xy, fill=color, width=BAR_W)
+
+    ball_x = _col_x(int(scene["ball_col"]))
+    draw.ellipse(
+        [ball_x - BALL_R, BALL_Y - BALL_R, ball_x + BALL_R, BALL_Y + BALL_R],
+        fill=BALL_COLOR,
+    )
+    draw.line([ball_x, BALL_Y + BALL_R, ball_x, BALL_Y + BALL_R + 12], fill=BALL_COLOR, width=5)
+
+    for col, name in enumerate(scene["bin_colors"]):
+        cx = _col_x(col)
+        draw.rectangle(
+            [cx - BIN_HALF_W, BIN_TOP, cx + BIN_HALF_W, BIN_TOP + BIN_H],
+            fill=BIN_PALETTE[name],
+            outline=BAR_COLOR,
+            width=3,
+        )
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Structural gold: the bin color reached after flipping the red bar."""
+    bars = scene["bars"]
+    final = _final_col(bars, int(scene["ball_col"]), int(scene["red"]))
+    return str(scene["bin_colors"][final])
+
+
+def _insets(scene: dict) -> list:
+    """Legibility clearances that decide every bar-meeting event."""
+    bars = scene["bars"]
+    values = []
+    for flip in (-1, int(scene["red"])):
+        steps, ok = _walk(bars, int(scene["ball_col"]), flip)
+        if not ok:
+            return [0.0]
+        for row, col, index, _delta in steps:
+            bar = bars[index]
+            cx = _col_x(int(bar[1])) + int(bar[3])
+            half = int(bar[5])
+            column_x = _col_x(int(col))
+            values.append(float(half - abs(column_x - cx)))
+            for other, ob in enumerate(bars):
+                if other == index or int(ob[0]) != int(row):
+                    continue
+                ocx = _col_x(int(ob[1])) + int(ob[3])
+                values.append(float(abs(column_x - ocx) - int(ob[5])))
+    return values or [0.0]
+
+
+def margin(scene: dict) -> float:
+    """Commitment magnitude: minimum decisive bar/column clearance in pixels."""
+    return float(min(_insets(scene)))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine boards whose bar-meeting events are not cleanly separated."""
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict) -> list:
+    """The scene is injectively rendered; no latent aliases are declared."""
+    return []

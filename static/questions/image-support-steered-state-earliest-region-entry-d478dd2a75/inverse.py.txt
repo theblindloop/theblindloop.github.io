@@ -1,0 +1,153 @@
+"""Independent pixel-only inverse for ordered region-entry cards.
+
+The inverse reads only the final RGB raster. It detects the four separated card
+interiors from their visible fills, finds four chromatic marker components per
+card, assigns rows by their visible vertical order, classifies inside/outside
+from the shaded boundary, and replays the resulting state matrix.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 768
+HEIGHT = 512
+PANEL_FILL = np.asarray((236, 242, 245), dtype=np.float32)
+ZONE_FILL = np.asarray((211, 226, 233), dtype=np.float32)
+ROW_LABELS = ("A", "B", "C", "D")
+
+
+class PixelOracleError(ValueError):
+    """The raster does not expose one unambiguous card replay."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not dy and not dx:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _recover_panels(array: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    distances = np.linalg.norm(array.astype(np.float32)[:, :, None, :] - np.stack((PANEL_FILL, ZONE_FILL))[None, None, :, :], axis=3)
+    mask = np.min(distances, axis=2) <= 18.0
+    candidates: list[tuple[int, int, int, int, int]] = []
+    for points in _components(mask):
+        ys = points[:, 0]
+        xs = points[:, 1]
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        area = len(points)
+        if 55 <= width <= 76 and 70 <= height <= 94 and area >= 2200:
+            candidates.append((x0, y0, width, height, area))
+    if len(candidates) != 4:
+        raise PixelOracleError(f"expected four separated cards, found {len(candidates)}")
+    widths = [item[2] for item in candidates]
+    heights = [item[3] for item in candidates]
+    median_area = float(np.median([item[4] for item in candidates]))
+    if max(widths) - min(widths) > 4 or max(heights) - min(heights) > 4:
+        raise PixelOracleError("card geometry is not consistent")
+    if any(abs(item[4] - median_area) / median_area > 0.18 for item in candidates):
+        raise PixelOracleError("one card is materially erased")
+
+    by_y = sorted(candidates, key=lambda item: item[1] + item[3] / 2.0)
+    if by_y[1][1] - by_y[0][1] > 24 or by_y[3][1] - by_y[2][1] > 24:
+        raise PixelOracleError("card rows are unresolved")
+    if by_y[2][1] - by_y[1][1] < 100:
+        raise PixelOracleError("card rows are merged")
+    top = sorted(by_y[:2], key=lambda item: item[0])
+    bottom = sorted(by_y[2:], key=lambda item: item[0])
+    if top[1][0] - top[0][0] < 100 or bottom[1][0] - bottom[0][0] < 100:
+        raise PixelOracleError("card columns are unresolved")
+    return top + bottom
+
+
+def _recover_markers(array: np.ndarray, panel: tuple[int, int, int, int, int]) -> list[tuple[float, float]]:
+    x0, y0, width, height, _ = panel
+    crop = array[max(0, y0 - 2) : min(HEIGHT, y0 + height + 2), max(0, x0 - 2) : min(WIDTH, x0 + width + 2)]
+    spread = crop.astype(np.int16).max(axis=2) - crop.astype(np.int16).min(axis=2)
+    bright = crop.astype(np.int16).max(axis=2) > 105
+    mask = (spread >= 55) & bright
+    found: list[tuple[float, float]] = []
+    for points in _components(mask):
+        ys = points[:, 0]
+        xs = points[:, 1]
+        local_x0, local_x1 = int(xs.min()), int(xs.max())
+        local_y0, local_y1 = int(ys.min()), int(ys.max())
+        box_width = local_x1 - local_x0 + 1
+        box_height = local_y1 - local_y0 + 1
+        area = len(points)
+        center_x = float(xs.mean() + max(0, x0 - 2))
+        center_y = float(ys.mean() + max(0, y0 - 2))
+        if (
+            5 <= box_width <= 16
+            and 5 <= box_height <= 16
+            and 35 <= area <= 190
+            and x0 + 5 <= center_x <= x0 + width - 4
+            and y0 + 16 <= center_y <= y0 + height - 4
+        ):
+            found.append((center_x, center_y))
+    if len(found) != 4:
+        raise PixelOracleError(f"expected four row markers in card, found {len(found)}")
+    found.sort(key=lambda item: item[1])
+    if any(found[index + 1][1] - found[index][1] < 8 for index in range(3)):
+        raise PixelOracleError("card rows are merged")
+    return found
+
+
+def _replay(states: list[list[bool]]) -> str:
+    candidates: list[tuple[int, int]] = []
+    for label in range(4):
+        if not states[3][label]:
+            continue
+        entries = [
+            step
+            for step in range(1, 4)
+            if not states[step - 1][label] and states[step][label]
+        ]
+        if entries:
+            candidates.append((min(entries), label))
+    if not candidates:
+        raise PixelOracleError("no final-inside object has a visible entry")
+    candidates.sort()
+    if len([item for item in candidates if item[0] == candidates[0][0]]) != 1:
+        raise PixelOracleError("earliest qualifying entry is tied")
+    return ROW_LABELS[candidates[0][1]]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the selected row label from the raster alone."""
+
+    if image.size != (WIDTH, HEIGHT):
+        raise PixelOracleError(f"unexpected raster size {image.size}")
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    panels = _recover_panels(array)
+    states: list[list[bool]] = []
+    for x0, y0, width, height, _ in panels:
+        markers = _recover_markers(array, (x0, y0, width, height, 0))
+        boundary = x0 + width * 0.50
+        states.append([center_x > boundary for center_x, _ in markers])
+    return _replay(states)

@@ -1,0 +1,154 @@
+"""Scene-free pixel inverse arm for egocentric_turn_walk.
+
+Receives one rendered RGB image and nothing else.  It re-finds the board's
+drawn grid lines, the coloured pads, the robot triangle and its facing, orders
+the cream cards by drawn horizontal position, reads each card as a left turn, a
+right turn or a k-cell drive, replays the program egocentrically and reports the
+pad colour the robot finishes on together with its final facing.  It imports no
+renderer, prompt, generator, verifier or analytic-gold code and never sees a
+latent scene.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "egocentric_turn_walk-oracle-0.1.0"
+
+_BOARD_BG = (232, 232, 232)
+_LINE = (120, 120, 120)
+_INK = (18, 18, 18)
+_CARD = (246, 238, 213)
+_LEFT = (26, 140, 60)
+_RIGHT = (232, 124, 20)
+_PADS = {
+    "red": (206, 44, 52),
+    "blue": (30, 86, 200),
+    "purple": (128, 52, 168),
+    "teal": (0, 140, 140),
+    "yellow": (226, 178, 20),
+}
+_HEADINGS = ("up", "right", "down", "left")
+_STEP = {"up": (0, -1), "right": (1, 0), "down": (0, 1), "left": (-1, 0)}
+
+
+def _mask(arr: np.ndarray, colour, tol: int = 14) -> np.ndarray:
+    diff = np.abs(arr.astype(np.int16) - np.array(colour, dtype=np.int16))
+    return diff.max(axis=2) <= tol
+
+
+def _runs(flags: np.ndarray, min_len: int = 1) -> list:
+    out = []
+    start = None
+    for i, flag in enumerate(flags):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            out.append((start, i - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(flags) - 1))
+    return [r for r in out if r[1] - r[0] + 1 >= min_len]
+
+
+def _index(value: float, edges: list) -> int:
+    for i in range(len(edges) - 1):
+        if edges[i] <= value < edges[i + 1]:
+            return i
+    return -1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    h, w, _ = arr.shape
+
+    # ---- board band and its drawn grid lines
+    board = _mask(arr, _BOARD_BG)
+    ys, xs = np.nonzero(board)
+    if xs.size < 500:
+        return "abstain"
+    by0, by1, bx0, bx1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    band = slice(max(by0 - 4, 0), min(by1 + 5, h))
+    line = _mask(arr, _LINE)
+    cols = line[band, :].sum(axis=0) > (by1 - by0) * 0.6
+    rows = line[band, :].sum(axis=1) > (bx1 - bx0) * 0.6
+    vx = [(a + b) / 2.0 for a, b in _runs(cols)]
+    vy = [(a + b) / 2.0 + band.start for a, b in _runs(rows)]
+    if len(vx) < 3 or len(vy) < 3 or len(vx) != len(vy):
+        return "abstain"
+    n = len(vx) - 1
+
+    # ---- pads
+    pads = {}
+    for name, colour in _PADS.items():
+        m = _mask(arr, colour)
+        pys, pxs = np.nonzero(m)
+        if pxs.size < 200:
+            continue
+        cell = (_index(float(pxs.mean()), vx), _index(float(pys.mean()), vy))
+        if -1 in cell:
+            continue
+        pads[cell] = name
+
+    # ---- robot: black ink inside the board band
+    ink = _mask(arr, _INK)
+    ink_board = np.zeros_like(ink)
+    ink_board[by0:by1 + 1, bx0:bx1 + 1] = ink[by0:by1 + 1, bx0:bx1 + 1]
+    rys, rxs = np.nonzero(ink_board)
+    if rxs.size < 100:
+        return "abstain"
+    cxf, cyf = float(rxs.mean()), float(rys.mean())
+    # the apex is the ink farthest from the triangle's centroid; the mean
+    # direction of the farthest few pixels gives the drawn facing
+    d2 = (rxs - cxf) ** 2 + (rys - cyf) ** 2
+    far = np.argsort(d2)[-3:]
+    dx = float((rxs[far] - cxf).mean())
+    dy = float((rys[far] - cyf).mean())
+    if abs(dx) > abs(dy):
+        heading = "right" if dx > 0 else "left"
+    else:
+        heading = "down" if dy > 0 else "up"
+    cell = [_index(cxf, vx), _index(cyf, vy)]
+    if -1 in cell:
+        return "abstain"
+
+    # ---- cards, ordered by drawn horizontal position
+    card = _mask(arr, _CARD)
+    cys, cxs = np.nonzero(card)
+    if cxs.size < 500:
+        return "abstain"
+    cy0, cy1 = int(cys.min()), int(cys.max())
+    windows = _runs(card.sum(axis=0) > 10, min_len=20)
+    if not windows:
+        return "abstain"
+
+    program = []
+    for x0, x1 in windows:
+        sub = arr[cy0:cy1 + 1, x0:x1 + 1]
+        if _mask(sub, _LEFT).sum() > 60:
+            program.append(("L", 0))
+        elif _mask(sub, _RIGHT).sum() > 60:
+            program.append(("R", 0))
+        else:
+            dots = _mask(sub, _INK)
+            k = len(_runs(dots.sum(axis=0) > 0, min_len=4))
+            if k < 1 or k > 3:
+                return "abstain"
+            program.append(("F", k))
+
+    # ---- egocentric replay
+    for kind, k in program:
+        if kind in ("L", "R"):
+            i = _HEADINGS.index(heading)
+            heading = _HEADINGS[(i + (1 if kind == "R" else -1)) % 4]
+        else:
+            sx, sy = _STEP[heading]
+            for _ in range(k):
+                cell = [cell[0] + sx, cell[1] + sy]
+                if not (0 <= cell[0] < n and 0 <= cell[1] < n):
+                    return "abstain"
+    colour = pads.get((cell[0], cell[1]))
+    if colour is None:
+        return "abstain"
+    return f"{colour}:{heading}"

@@ -1,0 +1,180 @@
+"""Independent image-only inverse for the edge-clue assembly puzzle."""
+
+from __future__ import annotations
+
+import functools
+import itertools
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_TAGS = {
+    "red": (220, 55, 65),
+    "green": (45, 150, 90),
+    "blue": (45, 100, 210),
+    "orange": (235, 135, 35),
+}
+_NAVY = (22, 50, 82)
+_GRAY = (112, 118, 126)
+_MAGENTA = (202, 38, 156)
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int], tolerance: int = 8) -> np.ndarray:
+    # int32 avoids overflow when three squared channel deltas are accumulated.
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 8) -> list[dict]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return []
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = mask[y0:y1, x0:x1]
+    seen = np.zeros_like(sub, dtype=bool)
+    components = []
+    height, width = sub.shape
+    for sy, sx in np.argwhere(sub):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        points = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and sub[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) < minimum:
+            continue
+        py = np.asarray([point[0] + y0 for point in points], dtype=float)
+        px = np.asarray([point[1] + x0 for point in points], dtype=float)
+        components.append(
+            {
+                "area": len(points),
+                "cx": float(px.mean()),
+                "cy": float(py.mean()),
+                "box": (int(px.min()), int(py.min()), int(px.max()), int(py.max())),
+            }
+        )
+    return components
+
+
+def _single_centroid(arr: np.ndarray, rgb: tuple[int, int, int], name: str) -> tuple[float, float]:
+    ys, xs = np.nonzero(_mask(arr, rgb))
+    if len(xs) < 100:
+        raise PixelParseError(f"missing {name} ink")
+    return float(xs.mean()), float(ys.mean())
+
+
+def _edge_counts(pips: list[dict], box: tuple[int, int, int, int]) -> list[int]:
+    x0, y0, x1, y1 = box
+    counts = [0, 0, 0, 0]
+    for pip in pips:
+        x, y = pip["cx"], pip["cy"]
+        if not (x0 < x < x1 and y0 < y < y1):
+            continue
+        distances = (y - y0, x1 - x, y1 - y, x - x0)
+        side = min(range(4), key=lambda index: distances[index])
+        counts[side] += 1
+    if any(value not in (1, 2, 3, 4) for value in counts):
+        raise PixelParseError(f"invalid tile edge counts {counts}")
+    return counts
+
+
+def _solve(tiles: list[dict], clues: list[int]) -> tuple[int, ...]:
+    solutions = []
+    for placement in itertools.permutations(range(4)):
+        a, b, c, d = (tiles[index]["edges"] for index in placement)
+        valid = (
+            a[1] == b[3]
+            and a[2] == c[0]
+            and b[2] == d[0]
+            and c[1] == d[3]
+            and a[0] == clues[0]
+            and b[1] == clues[1]
+            and c[3] == clues[2]
+            and d[2] == clues[3]
+        )
+        if valid:
+            solutions.append(placement)
+    if len(solutions) != 1:
+        raise PixelParseError(f"image yields {len(solutions)} complete assemblies")
+    return solutions[0]
+
+
+@functools.lru_cache(maxsize=256)
+def _decision_from_bytes(size: tuple[int, int], pixels: bytes) -> str:
+    arr = np.frombuffer(pixels, dtype=np.uint8).reshape((size[1], size[0], 3))
+    gray_components = _components(_mask(arr, _GRAY), minimum=100)
+    if len(gray_components) < 5:
+        raise PixelParseError("could not recover frame and four tile outlines")
+    frame = max(gray_components, key=lambda component: component["area"])
+    fx0, fy0, fx1, fy1 = frame["box"]
+    if fx1 - fx0 < 200 or fy1 - fy0 < 200:
+        raise PixelParseError("largest gray structure is not the assembly frame")
+    tile_boxes = [
+        component["box"]
+        for component in gray_components
+        if component is not frame and 80 <= component["box"][2] - component["box"][0] <= 160
+        and 80 <= component["box"][3] - component["box"][1] <= 160
+    ]
+    if len(tile_boxes) != 4:
+        raise PixelParseError(f"expected four loose tile boxes, found {len(tile_boxes)}")
+
+    pips = _components(_mask(arr, _NAVY), minimum=40)
+    # Text is navy too, but square clue components are compact 9x9 blocks.
+    pips = [
+        pip for pip in pips
+        if 6 <= pip["box"][2] - pip["box"][0] <= 12
+        and 6 <= pip["box"][3] - pip["box"][1] <= 12
+        and 55 <= pip["area"] <= 100
+    ]
+    if len(pips) < 12:
+        raise PixelParseError("too few navy edge squares")
+
+    tag_centers = {name: _single_centroid(arr, rgb, name) for name, rgb in _TAGS.items()}
+    tiles = []
+    used_tags = set()
+    for box in tile_boxes:
+        x0, y0, x1, y1 = box
+        contained = [name for name, (x, y) in tag_centers.items() if x0 < x < x1 and y0 < y < y1]
+        if len(contained) != 1:
+            raise PixelParseError("tile does not contain exactly one color tag")
+        tag = contained[0]
+        used_tags.add(tag)
+        tiles.append({"tag": tag, "edges": _edge_counts(pips, box)})
+    if used_tags != set(_TAGS):
+        raise PixelParseError("tag colors are not one-to-one with tiles")
+
+    midx, midy = (fx0 + fx1) / 2, (fy0 + fy1) / 2
+    clue_regions = [
+        [pip for pip in pips if fy0 - 45 < pip["cy"] < fy0 and fx0 < pip["cx"] < midx],
+        [pip for pip in pips if fx1 < pip["cx"] < fx1 + 45 and fy0 < pip["cy"] < midy],
+        [pip for pip in pips if fx0 - 45 < pip["cx"] < fx0 and midy < pip["cy"] < fy1],
+        [pip for pip in pips if fy1 < pip["cy"] < fy1 + 45 and midx < pip["cx"] < fx1],
+    ]
+    clues = [len(region) for region in clue_regions]
+    if any(value not in (1, 2, 3, 4) for value in clues):
+        raise PixelParseError(f"invalid frame clues {clues}")
+
+    mx, my = _single_centroid(arr, _MAGENTA, "magenta target ring")
+    if not (fx0 < mx < fx1 and fy0 < my < fy1):
+        raise PixelParseError("target ring is outside frame")
+    target = (1 if mx > midx else 0) + (2 if my > midy else 0)
+    placement = _solve(tiles, clues)
+    return str(tiles[placement[target]]["tag"])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = image.convert("RGB")
+    return _decision_from_bytes(rgb.size, rgb.tobytes())

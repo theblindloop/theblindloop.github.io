@@ -1,0 +1,142 @@
+"""Independent pixel-only inverse arm for atomic cross-panel change.
+
+Receives only the final PNG. From the raster alone it:
+  1. segments the two panel frames by their gray border colour;
+  2. within each panel locates the four coloured disks by colour segmentation;
+  3. classifies each disk's fill state (solid disk vs hollow ring) from the
+     ink at the disk centre;
+  4. compares each color's fill across the two panels and reports the single
+     colour whose state changed -- the atomic change.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BORDER = (200, 200, 200)
+BG = (255, 255, 255)
+COLOR_NAMES = ["red", "green", "blue", "purple"]
+COLORS = {
+    "red": (220, 40, 40),
+    "green": (40, 170, 80),
+    "blue": (40, 80, 220),
+    "purple": (150, 60, 190),
+}
+WINDOW = 3
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected two-panel structure."""
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points) -> tuple[int, int, int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _mask_equal(arr: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    r, g, b = color
+    return (arr[:, :, 0] == r) & (arr[:, :, 1] == g) & (arr[:, :, 2] == b)
+
+
+def _panel_centers(labels: np.ndarray, box: tuple[int, int, int, int]) -> dict[str, tuple[int, int]]:
+    """Median/centroid of the largest pixel component for each colour."""
+    x0, y0, x1, y1 = box
+    centers = {}
+    for name in COLOR_NAMES:
+        mask = np.zeros((labels.shape[0], labels.shape[1]), dtype=bool)
+        mask[y0:y1, x0:x1] = _mask_equal(labels, COLORS[name])[y0:y1, x0:x1]
+        comps = _components(mask)
+        if not comps:
+            raise UnreadableImageError(f"panel missing colour {name}")
+        # largest component = the disk body
+        largest = max(comps, key=len)
+        ys = [p[0] for p in largest]
+        xs = [p[1] for p in largest]
+        centers[name] = (int(np.mean(xs)), int(np.mean(ys)))
+    return centers
+
+
+def _fill_state(labels: np.ndarray, center: tuple[int, int], color) -> int:
+    cx, cy = center
+    y0 = max(0, cy - WINDOW)
+    y1 = min(labels.shape[0], cy + WINDOW + 1)
+    x0 = max(0, cx - WINDOW)
+    x1 = min(labels.shape[1], cx + WINDOW + 1)
+    win = labels[y0:y1, x0:x1]
+    color_count = int(_mask_equal(win, color).sum())
+    bg_count = int(_mask_equal(win, BG).sum())
+    if color_count > bg_count:
+        return 1
+    if bg_count > color_count:
+        return 0
+    raise UnreadableImageError("fill state is ambiguous at disk centre")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    boxes = []
+    for comp in _components(_mask_equal(arr, BORDER)):
+        if len(comp) < 50:
+            continue
+        boxes.append(_bbox(comp))
+    boxes.sort(key=lambda box: box[0])
+    if len(boxes) < 2:
+        raise UnreadableImageError(f"found {len(boxes)} panels; expected 2")
+
+    def locate(box):
+        x0, y0, x1, y1 = box
+        x0 += 2
+        y0 += 2
+        x1 -= 2
+        y1 -= 2
+        return _panel_centers(arr, (x0, y0, x1, y1))
+
+    panel_a = locate(boxes[0])
+    panel_b = locate(boxes[1])
+
+    changed = []
+    for name in COLOR_NAMES:
+        fa = _fill_state(arr, panel_a[name], COLORS[name])
+        fb = _fill_state(arr, panel_b[name], COLORS[name])
+        if fa != fb:
+            changed.append(name)
+    if len(changed) != 1:
+        raise UnreadableImageError(f"expected exactly one change; found {changed}")
+    return changed[0]

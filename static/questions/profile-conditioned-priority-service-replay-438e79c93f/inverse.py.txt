@@ -1,0 +1,123 @@
+"""Independent inverse arm: recover the complete ledger from PNG pixels only."""
+
+from __future__ import annotations
+
+from PIL import Image
+import numpy as np
+
+LABELS = ("A", "B", "C", "D")
+PALETTE_RGB = (
+    (76, 120, 168),
+    (228, 87, 86),
+    (84, 162, 75),
+    (242, 207, 91),
+)
+CARD_RGB = (244, 246, 248)
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _runs(flags: np.ndarray, minimum: int = 3) -> list[tuple[int, int]]:
+    padded = np.pad(flags.astype(np.int8), (1, 1))
+    edges = np.diff(padded)
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1) - 1
+    return [(int(a), int(b)) for a, b in zip(starts, ends) if b - a + 1 >= minimum]
+
+
+def _colored_components(arr: np.ndarray) -> list[list[tuple[int, int, tuple[int, int, int]]]]:
+    color_mask = np.zeros(arr.shape[:2], dtype=bool)
+    for rgb in PALETTE_RGB:
+        color_mask |= np.all(arr == np.asarray(rgb, dtype=np.uint8), axis=2)
+    row_bands = _runs(color_mask.any(axis=1), minimum=12)
+    groups: list[list[tuple[int, int, tuple[int, int, int]]]] = []
+    for y0, y1 in row_bands:
+        slab = color_mask[y0 : y1 + 1]
+        x_runs = _runs(slab.any(axis=0), minimum=12)
+        items = []
+        for x0, x1 in x_runs:
+            xs = np.arange(x0, x1 + 1)
+            ys = np.arange(y0, y1 + 1)
+            xx, yy = np.meshgrid(xs, ys)
+            active = color_mask[y0 : y1 + 1, x0 : x1 + 1]
+            if int(active.sum()) < 250:
+                continue
+            cx = int(round(float(xx[active].mean())))
+            cy = int(round(float(yy[active].mean())))
+            rgb = tuple(int(value) for value in arr[cy, cx])
+            if rgb not in PALETTE_RGB:
+                pixels = arr[y0 : y1 + 1, x0 : x1 + 1][active]
+                counts = {candidate: int(np.all(pixels == candidate, axis=1).sum()) for candidate in PALETTE_RGB}
+                rgb = max(counts, key=counts.get)
+            items.append((cx, cy, rgb))
+        groups.append(sorted(items))
+    return groups
+
+
+def _card_columns(arr: np.ndarray) -> list[tuple[int, int]]:
+    mask = np.all(arr == np.asarray(CARD_RGB, dtype=np.uint8), axis=2)
+    return _runs(mask.sum(axis=0) > 80, minimum=50)
+
+
+def _decode(image: Image.Image) -> tuple[list[str], list[str], list[dict]]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    groups = _colored_components(arr)
+    expected_counts = [4, 4, 3, 4]
+    if len(groups) != 4 or [len(group) for group in groups] != expected_counts:
+        raise OracleAbstention(
+            f"expected colored rows {expected_counts}, found {[len(group) for group in groups]}"
+        )
+    legend, priority_row, initial_row, add_row = groups
+    color_to_label = {item[2]: label for item, label in zip(legend, LABELS)}
+    if len(color_to_label) != 4:
+        raise OracleAbstention("legend colors are not one-to-one")
+
+    def labels(items: list[tuple[int, int, tuple[int, int, int]]]) -> list[str]:
+        try:
+            return [color_to_label[item[2]] for item in items]
+        except KeyError as exc:
+            raise OracleAbstention("chip color absent from legend") from exc
+
+    priority = labels(priority_row)
+    initial = labels(initial_row)
+    cards = _card_columns(arr)
+    if len(cards) != 8:
+        raise OracleAbstention(f"expected eight separated cards, found {len(cards)}")
+    add_by_card: dict[int, str] = {}
+    for chip in add_row:
+        matches = [index for index, (x0, x1) in enumerate(cards) if x0 <= chip[0] <= x1]
+        if len(matches) != 1:
+            raise OracleAbstention("an ADD chip does not belong to exactly one card")
+        add_by_card[matches[0]] = color_to_label[chip[2]]
+    if len(add_by_card) != 4:
+        raise OracleAbstention("expected four ADD cards")
+    operations = [
+        {"kind": "add", "label": add_by_card[index]}
+        if index in add_by_card
+        else {"kind": "serve"}
+        for index in range(8)
+    ]
+    return priority, initial, operations
+
+
+def decision_from_image(image: Image.Image) -> str:
+    priority, initial, operations = _decode(image)
+    if sorted(priority) != list(LABELS) or len(set(initial)) != 3:
+        raise OracleAbstention("decoded legend rows are structurally invalid")
+    waiting = set(initial)
+    for operation in operations:
+        if operation["kind"] == "add":
+            label = operation["label"]
+            if label in waiting:
+                raise OracleAbstention("ADD names a task already waiting")
+            waiting.add(label)
+        else:
+            if not waiting:
+                raise OracleAbstention("SERVE reaches an empty waiting set")
+            waiting.remove(next(label for label in priority if label in waiting))
+    ordered = [label for label in priority if label in waiting]
+    if len(ordered) != 3:
+        raise OracleAbstention(f"expected three final waiting tasks, found {len(ordered)}")
+    return ordered[0]

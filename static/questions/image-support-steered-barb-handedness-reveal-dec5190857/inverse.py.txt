@@ -1,0 +1,227 @@
+"""Pixel-only inverse arm for the barb-handedness reveal world.
+
+The oracle receives one RGB image and nothing else.  It locates the visible
+fiducials (the wire colour, the node studs and the crimson start pad), recovers
+the wire's connectivity, executes the declared raster operation - walk the wire
+from the padded end and record for every barb whether it points to the walker's
+left - and classifies the resulting five by five pattern against the declared
+symbol alphabet, abstaining whenever the transform is not well posed.
+
+It imports no renderer, prompt, generator, verifier or analytic-gold code and
+never sees a scene.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "barb_handedness_reveal-oracle-0.1.0"
+
+WIRE = (0, 138, 148)
+NODE = (24, 32, 84)
+PAD = (188, 32, 48)
+
+GRID = 5
+STATION_COUNT = 25
+ABSTAIN = "abstain"
+
+SYMBOLS: dict[str, tuple[tuple[int, int], ...]] = {
+    "ell": tuple((r, 0) for r in range(5)) + tuple((4, c) for c in range(1, 5)),
+    "ex": tuple((i, i) for i in range(5)) + tuple((i, 4 - i) for i in (0, 1, 3, 4)),
+    "plus": tuple((2, c) for c in range(5)) + tuple((r, 2) for r in (0, 1, 3, 4)),
+    "tack": tuple((4, c) for c in range(5)) + tuple((r, 2) for r in range(4)),
+    "tee": tuple((0, c) for c in range(5)) + tuple((r, 2) for r in range(1, 5)),
+}
+PATTERNS = {
+    name: tuple(1 if (r, c) in set(cells) else 0 for r in range(GRID) for c in range(GRID))
+    for name, cells in SYMBOLS.items()
+}
+DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+def _mask(arr: np.ndarray, colour: tuple[int, int, int]) -> np.ndarray:
+    return np.all(arr == np.array(colour, dtype=np.int16), axis=2)
+
+
+def _components(mask: np.ndarray, limit: int = 400) -> list[list[tuple[int, int]]]:
+    """Four-connected components of a boolean mask, as pixel lists."""
+    seen = np.zeros(mask.shape, dtype=bool)
+    out: list[list[tuple[int, int]]] = []
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if seen[y0, x0]:
+            continue
+        queue = deque([(y0, x0)])
+        seen[y0, x0] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1]:
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        out.append(pixels)
+        if len(out) > limit:
+            break
+    return out
+
+
+def _centroids(mask: np.ndarray, min_pixels: int = 12) -> list[tuple[float, float]]:
+    centres = []
+    for pixels in _components(mask):
+        if len(pixels) < min_pixels:
+            continue
+        ys = [p[0] for p in pixels]
+        xs = [p[1] for p in pixels]
+        centres.append((sum(xs) / len(xs), sum(ys) / len(ys)))
+    return centres
+
+
+def _nearest_symbol(bits: tuple[int, ...]) -> tuple[str, int, int]:
+    scored = sorted(
+        (sum(1 for a, b in zip(bits, PATTERNS[name]) if a != b), name) for name in PATTERNS
+    )
+    return scored[0][1], scored[0][0], scored[1][0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        return ABSTAIN
+    height, width = arr.shape[:2]
+    wire = _mask(arr, WIRE)
+    node = _mask(arr, NODE)
+    pad = _mask(arr, PAD)
+    if not wire.any() or not node.any() or not pad.any():
+        return ABSTAIN
+
+    nodes = _centroids(node, min_pixels=40)
+    if len(nodes) < 4 or len(nodes) > 40:
+        return ABSTAIN
+
+    # lattice pitch: the closest pair of node studs sits one lattice step apart
+    pitch = None
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            gap = ((nodes[i][0] - nodes[j][0]) ** 2 + (nodes[i][1] - nodes[j][1]) ** 2) ** 0.5
+            if pitch is None or gap < pitch:
+                pitch = gap
+    if pitch is None or pitch < 24 or pitch > 200:
+        return ABSTAIN
+    step = int(round(pitch))
+    probe = max(7, int(round(0.15 * step)))
+    tol = max(2.0, 0.08 * step)
+
+    def sample(x: float, y: float) -> bool:
+        xi, yi = int(round(x)), int(round(y))
+        if not (0 <= xi < width and 0 <= yi < height):
+            return False
+        return bool(wire[yi, xi])
+
+    # adjacency: a lattice neighbour joined by wire ink a quarter step out
+    adjacency: dict[int, list[int]] = {i: [] for i in range(len(nodes))}
+    edges = 0
+    for i, (xi, yi) in enumerate(nodes):
+        for dx, dy in DIRS:
+            tx, ty = xi + dx * step, yi + dy * step
+            match = None
+            for j, (xj, yj) in enumerate(nodes):
+                if j == i:
+                    continue
+                if abs(xj - tx) <= tol and abs(yj - ty) <= tol:
+                    match = j
+                    break
+            if match is None:
+                continue
+            if sample(xi + dx * 0.25 * step, yi + dy * 0.25 * step):
+                adjacency[i].append(match)
+    for i, neighbours in adjacency.items():
+        for j in neighbours:
+            if i not in adjacency[j]:
+                return ABSTAIN
+        edges += len(neighbours)
+    edges //= 2
+    if edges != len(nodes) - 1:
+        return ABSTAIN
+    degrees = {i: len(v) for i, v in adjacency.items()}
+    ends = [i for i, d in degrees.items() if d == 1]
+    if len(ends) != 2 or any(d not in (1, 2) for d in degrees.values()):
+        return ABSTAIN
+
+    pad_centres = _centroids(pad, min_pixels=40)
+    if len(pad_centres) != 1:
+        return ABSTAIN
+    px, py = pad_centres[0]
+    ranked = sorted(
+        range(len(nodes)),
+        key=lambda i: (nodes[i][0] - px) ** 2 + (nodes[i][1] - py) ** 2,
+    )
+    start = ranked[0]
+    if start not in ends:
+        return ABSTAIN
+    if ((nodes[start][0] - px) ** 2 + (nodes[start][1] - py) ** 2) ** 0.5 > 0.45 * step:
+        return ABSTAIN
+
+    # walk the wire from the padded end
+    order = [start]
+    previous = None
+    current = start
+    while True:
+        nexts = [j for j in adjacency[current] if j != previous]
+        if not nexts:
+            break
+        if len(nexts) != 1:
+            return ABSTAIN
+        previous, current = current, nexts[0]
+        order.append(current)
+        if len(order) > len(nodes):
+            return ABSTAIN
+    if len(order) != len(nodes):
+        return ABSTAIN
+
+    bits: list[int] = []
+    for index in range(len(order) - 1):
+        ax, ay = nodes[order[index]]
+        bx, by = nodes[order[index + 1]]
+        span = ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
+        if span < 1e-6:
+            return ABSTAIN
+        dx, dy = (bx - ax) / span, (by - ay) / span
+        lx, ly = dy, -dx
+        runs: list[tuple[int, int]] = []          # (start t, side) with side +1 = left
+        current_side = 0
+        run_start = 0
+        for t in range(int(round(0.12 * step)), int(round(span - 0.12 * step)) + 1):
+            cx, cy = ax + dx * t, ay + dy * t
+            left = sample(cx + lx * probe, cy + ly * probe)
+            right = sample(cx - lx * probe, cy - ly * probe)
+            if left and right:
+                return ABSTAIN
+            side = 1 if left else (-1 if right else 0)
+            if side != current_side:
+                if current_side != 0:
+                    if not 3 <= t - run_start <= 9:
+                        return ABSTAIN
+                    runs.append((run_start, current_side))
+                current_side = side
+                run_start = t
+        if current_side != 0:
+            return ABSTAIN
+        if not runs:
+            return ABSTAIN
+        bits.extend(1 if side > 0 else 0 for _, side in runs)
+        if len(bits) > STATION_COUNT:
+            return ABSTAIN
+
+    if len(bits) != STATION_COUNT:
+        return ABSTAIN
+    name, best, runner_up = _nearest_symbol(tuple(bits))
+    if best >= runner_up:
+        return ABSTAIN
+    return name

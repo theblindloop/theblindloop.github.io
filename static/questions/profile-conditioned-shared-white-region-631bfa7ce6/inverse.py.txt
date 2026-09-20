@@ -1,0 +1,137 @@
+"""Independent pixel-only inverse arm for the shared-white-region world.
+
+Receives ONLY the final PNG. It never imports or reads the renderer, the
+analytic scene, prompts, or renderer state. It recovers the answer by:
+
+1. segmenting the black ring ink, the three coloured dots, and the white areas;
+2. flood-filling the connected white regions (4-connected) while treating every
+   black ring pixel and every coloured dot pixel as blocked, which labels each
+   sealed white pocket and the outside independently;
+3. assigning each coloured dot to the white component adjacent to it;
+4. the answer pair is the unique pair of dots that share the same white region.
+
+This is a genuine region-connectivity / connected-white-pockets decision.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "shared_white_region-oracle-0.4.0"
+
+_WHITE_THRESHOLD = 200
+_RING_DARK = 100
+_COLOR_TOLERANCE = 95.0
+_PAIRS = [("red", "green"), ("red", "blue"), ("green", "blue")]
+_RANK = {"red": 0, "green": 1, "blue": 2}
+_COLORS = {
+    "red": np.array([230.0, 45.0, 45.0]),
+    "green": np.array([50.0, 185.0, 60.0]),
+    "blue": np.array([50.0, 90.0, 230.0]),
+}
+_N4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+# Small memo of decisions keyed by image bytes. Each scene is probed by more
+# than one prompt family row (and the oracle can be called repeatedly on the
+# same PNG), so recomputing the identical decision is redundant. This never
+# reads renderer state or the analytic scene; it only caches pixel-only output.
+_cache: dict[bytes, str] = {}
+
+
+def _is_white(arr: np.ndarray, threshold: int = _WHITE_THRESHOLD) -> np.ndarray:
+    return arr.min(axis=-1) > threshold
+
+
+def _is_ring(arr: np.ndarray, dark: int = _RING_DARK) -> np.ndarray:
+    return arr.max(axis=-1) < dark
+
+
+def _color_mask(arr: np.ndarray, target: np.ndarray, tolerance: float) -> np.ndarray:
+    diff = arr.astype(np.float32) - target
+    return np.sqrt((diff * diff).sum(axis=-1)) < tolerance
+
+
+def _components(passable: np.ndarray) -> np.ndarray:
+    """4-connected component labelling of the passable (white) mask.
+
+    Returns an int32 array where 0 means blocked and each positive integer is
+    a distinct connected white region.
+    """
+    h, w = passable.shape
+    labels = np.zeros((h, w), dtype=np.int32)
+    cur = 0
+    stack: list[tuple[int, int]] = []
+    passable = passable.astype(bool)
+    for y in range(h):
+        for x in range(w):
+            if passable[y, x] and labels[y, x] == 0:
+                cur += 1
+                labels[y, x] = cur
+                stack.append((x, y))
+                while stack:
+                    cx, cy = stack.pop()
+                    for dx, dy in _N4:
+                        nx = cx + dx
+                        ny = cy + dy
+                        if 0 <= nx < w and 0 <= ny < h and passable[ny, nx] and labels[ny, nx] == 0:
+                            labels[ny, nx] = cur
+                            stack.append((nx, ny))
+    return labels
+
+
+def _dot_component(dot_mask: np.ndarray, labels: np.ndarray) -> int | None:
+    """The white-region label of the component adjacent to a coloured dot."""
+    h, w = labels.shape
+    neigh = np.zeros_like(dot_mask)
+    neigh[1:, :] |= dot_mask[:-1, :]
+    neigh[:-1, :] |= dot_mask[1:, :]
+    neigh[:, 1:] |= dot_mask[:, :-1]
+    neigh[:, :-1] |= dot_mask[:, 1:]
+    candidate = labels[neigh & (labels > 0)]
+    if candidate.size == 0:
+        return None
+    values, counts = np.unique(candidate, return_counts=True)
+    return int(values[int(np.argmax(counts))])
+
+
+def _pair_label(c1: str, c2: str) -> str:
+    return "-".join(sorted((c1, c2), key=lambda c: _RANK[c]))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """The pair of coloured dots that share a connected white region,
+    recovered from the final pixels alone."""
+    key = image.tobytes()
+    cached = _cache.get(key)
+    if cached is not None:
+        return cached
+    arr = np.asarray(image.convert("RGB")).astype(np.float32)
+    white = _is_white(arr)
+    ring = _is_ring(arr)
+    dot_masks = {
+        color: _color_mask(arr, _COLORS[color], _COLOR_TOLERANCE) for color in _COLORS
+    }
+    dots_union = np.zeros_like(white)
+    for mask in dot_masks.values():
+        dots_union |= mask
+    blocked = ring | dots_union
+    passable = white & ~blocked
+    labels = _components(passable)
+
+    comps = {}
+    for color in _COLORS:
+        comps[color] = _dot_component(dot_masks[color], labels)
+
+    for c1, c2 in _PAIRS:
+        a = comps[c1]
+        b = comps[c2]
+        if a is not None and a == b:
+            result = _pair_label(c1, c2)
+            if len(_cache) < 4000:
+                _cache[key] = result
+            return result
+    result = _pair_label(*_PAIRS[0])
+    if len(_cache) < 4000:
+        _cache[key] = result
+    return result

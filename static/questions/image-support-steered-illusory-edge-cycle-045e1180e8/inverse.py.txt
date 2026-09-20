@@ -1,0 +1,227 @@
+"""Independent pixel-only inverse arm for the illusory-edge-cycle world.
+
+The arm receives one rasterised PNG and the public question contract only.  It
+reconstructs the continuation graph of the scene from pixels alone:
+
+1. threshold the dark ink and label its connected components;
+2. keep every component that reads as a disc with one wedge removed, fitting the
+   underlying circle to the component's outer arc by trimmed algebraic fits;
+3. read each wedge as the missing angular interval of that circle's occupied
+   directions, which yields the wedge's bisector and opening without ever
+   needing the wedge's own apex pixels;
+4. join two discs whenever one straight wedge edge of each runs along the line
+   joining their fitted centres, within the public angular tolerance;
+5. accept the reading only when the resulting graph is one simple cycle whose
+   discs all have exactly two partners and whose remaining discs have none, and
+   only when the tightest rejected alignment stands clear of the tightest
+   accepted one by the public margin.
+
+Nothing here imports renderer, prompts, generate, verify or any gold code, and
+no latent scene data is accepted.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "illusory_edge_cycle-oracle-0.1.0"
+
+DARK_LEVEL = 128.0
+ALIGN_TOLERANCE_DEG = 10.0
+QUARANTINE_MARGIN_DEG = 14.0
+
+MIN_COMPONENT_PIXELS = 500
+MAX_COMPONENT_PIXELS = 9000
+RADIUS_RANGE = (16.0, 40.0)
+WEDGE_RANGE_DEG = (30.0, 160.0)
+SECOND_GAP_LIMIT_DEG = 7.0
+AREA_TOLERANCE = 0.035
+# The fitted radius tracks the centres of the rim pixels, half a pixel inside
+# the painted edge; this constant restores the painted radius before the area
+# consistency check.
+RADIUS_PIXEL_OFFSET = 0.42
+
+SIDE_LABELS = {3: "three", 4: "four", 5: "five"}
+UNCLEAR = "unclear"
+
+
+def _wrap(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _angle_gap(a: float, b: float) -> float:
+    return abs(_wrap(a - b))
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        if seen[y0, x0]:
+            continue
+        queue = deque([(int(y0), int(x0))])
+        seen[y0, x0] = True
+        pixels = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((x, y))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        found.append(np.asarray(pixels, dtype=np.float64))
+    return found
+
+
+def _circle_fit(points: np.ndarray) -> tuple[float, float, float] | None:
+    if len(points) < 12:
+        return None
+    x = points[:, 0]
+    y = points[:, 1]
+    design = np.stack([2.0 * x, 2.0 * y, np.ones_like(x)], axis=1)
+    target = x * x + y * y
+    try:
+        solution, *_ = np.linalg.lstsq(design, target, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    cx, cy, offset = solution
+    squared = offset + cx * cx + cy * cy
+    if not np.isfinite(squared) or squared <= 1.0:
+        return None
+    return float(cx), float(cy), float(math.sqrt(squared))
+
+
+def _boundary(points: np.ndarray) -> np.ndarray:
+    members = {(int(px), int(py)) for px, py in points}
+    keep = [
+        (px, py)
+        for px, py in members
+        if any((px + dx, py + dy) not in members for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+    ]
+    return np.asarray(sorted(keep), dtype=np.float64)
+
+
+def _read_disc(points: np.ndarray) -> tuple[float, float, float, float, float] | None:
+    """Recover (cx, cy, radius, wedge bisector, wedge opening) from one blob."""
+    if not (MIN_COMPONENT_PIXELS <= len(points) <= MAX_COMPONENT_PIXELS):
+        return None
+    edge = _boundary(points)
+    fit = _circle_fit(edge)
+    if fit is None:
+        return None
+    cx, cy, radius = fit
+    for band in (0.30, 0.16, 0.07, 0.035):
+        distance = np.hypot(edge[:, 0] - cx, edge[:, 1] - cy)
+        keep = np.abs(distance - radius) <= band * radius
+        refit = _circle_fit(edge[keep])
+        if refit is None:
+            break
+        cx, cy, radius = refit
+    if not (RADIUS_RANGE[0] <= radius <= RADIUS_RANGE[1]):
+        return None
+
+    distance = np.hypot(points[:, 0] - cx, points[:, 1] - cy)
+    if float(distance.max()) > 1.09 * radius:
+        return None
+    outer = points[distance > 0.72 * radius]
+    if len(outer) < 40:
+        return None
+    angles = np.sort(np.arctan2(outer[:, 1] - cy, outer[:, 0] - cx))
+    steps = np.diff(np.concatenate([angles, angles[:1] + 2.0 * math.pi]))
+    order = np.argsort(steps)
+    index = int(order[-1])
+    opening = float(steps[index])
+    low = float(angles[index])
+    bisector = _wrap(low + 0.5 * opening)
+    if not (math.radians(WEDGE_RANGE_DEG[0]) <= opening <= math.radians(WEDGE_RANGE_DEG[1])):
+        return None
+    # A disc with exactly one wedge removed has exactly one angular gap in its
+    # rim; any second gap means the blob is not an intact disc-with-one-wedge.
+    if len(steps) > 1 and float(steps[order[-2]]) > math.radians(SECOND_GAP_LIMIT_DEG):
+        return None
+    # The remaining area of a disc of radius r missing a wedge of angle w is
+    # exactly r^2 (2*pi - w) / 2; a blob that lost ink elsewhere fails this.
+    painted = radius + RADIUS_PIXEL_OFFSET
+    expected = painted * painted * (2.0 * math.pi - opening) / 2.0
+    if abs(len(points) - expected) > AREA_TOLERANCE * expected:
+        return None
+    return cx, cy, radius, bisector, opening
+
+
+def _edge_directions(bisector: float, opening: float) -> tuple[float, float]:
+    return (_wrap(bisector - 0.5 * opening), _wrap(bisector + 0.5 * opening))
+
+
+def _pair_error_deg(discs: list, i: int, j: int) -> float:
+    xi, yi, _ri, bi, wi = discs[i]
+    xj, yj, _rj, bj, wj = discs[j]
+    towards_j = math.atan2(yj - yi, xj - xi)
+    towards_i = math.atan2(yi - yj, xi - xj)
+    dev_i = min(_angle_gap(towards_j, e) for e in _edge_directions(bi, wi))
+    dev_j = min(_angle_gap(towards_i, e) for e in _edge_directions(bj, wj))
+    return math.degrees(max(dev_i, dev_j))
+
+
+def _read_structure(discs: list) -> tuple[int | None, float]:
+    count = len(discs)
+    errors = {
+        (i, j): _pair_error_deg(discs, i, j)
+        for i in range(count)
+        for j in range(i + 1, count)
+    }
+    adjacency: list[list[int]] = [[] for _ in range(count)]
+    for (i, j), error in errors.items():
+        if error <= ALIGN_TOLERANCE_DEG:
+            adjacency[i].append(j)
+            adjacency[j].append(i)
+    inside = [e for e in errors.values() if e <= ALIGN_TOLERANCE_DEG]
+    outside = [e for e in errors.values() if e > ALIGN_TOLERANCE_DEG]
+
+    def broken() -> tuple[int | None, float]:
+        return None, float(min(inside)) if inside else 0.0
+
+    if any(len(row) not in (0, 2) for row in adjacency):
+        return broken()
+    active = [i for i in range(count) if len(adjacency[i]) == 2]
+    if len(active) < 3:
+        return broken()
+    start = active[0]
+    previous = start
+    current = adjacency[start][0]
+    walked = [start]
+    while current != start:
+        walked.append(current)
+        following = [n for n in adjacency[current] if n != previous]
+        if len(following) != 1:
+            return broken()
+        previous, current = current, following[0]
+        if len(walked) > count:
+            return broken()
+    if len(walked) != len(active) or len(walked) not in SIDE_LABELS:
+        return broken()
+    slack = (min(outside) if outside else 180.0) - (max(inside) if inside else 0.0)
+    return len(walked), float(max(0.0, slack))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    grey = np.asarray(image.convert("L"), dtype=np.float64)
+    mask = grey < DARK_LEVEL
+    if not mask.any():
+        return UNCLEAR
+    discs = []
+    for component in _components(mask):
+        reading = _read_disc(component)
+        if reading is not None:
+            discs.append(reading)
+    if len(discs) < 3:
+        return UNCLEAR
+    length, slack = _read_structure(discs)
+    if length is None or slack < QUARANTINE_MARGIN_DEG:
+        return UNCLEAR
+    return SIDE_LABELS[length]

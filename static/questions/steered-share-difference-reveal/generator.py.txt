@@ -1,0 +1,337 @@
+"""Renderer for the paired-share difference reveal world.
+
+Two small square chips are drawn with a black border, close together, inside one
+small neighbourhood of an otherwise decorated canvas. Each chip is a 5x5 lattice
+of cells; every cell carries one of exactly two rendered tones. The two chips are
+statistically independent uniform two-tone fields: each chip on its own is a fair
+coin flip per cell and carries no information about the answer. The declared
+raster transform is a cell-by-cell difference of the two black-bordered chips:
+the cells whose tone differs between the two chips spell one abstract glyph on
+the 5x5 lattice.
+
+Placement is deliberately ablation aware. Each decisive chip is placed inside the
+exclusive interior window of one cell of an 8x8 lattice, so a single grid
+occlusion erases a whole chip and no occlusion touches both chips. The two chips
+sit two lattice steps apart, so the decisive support is two disconnected
+components inside one small span, with plain background visible between them.
+Gray-bordered decoy chips and the tone reference key are remote and carry no
+information about the answer.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "share_difference_reveal-renderer-0.2.0"
+
+CANVAS = 768
+LATTICE = 8
+LATTICE_PX = CANVAS // LATTICE  # 96
+WINDOW_LO = 24  # exclusive interior window of one lattice cell
+WINDOW_PX = 48
+
+CELLS = 5
+CELL_PX = 8
+FRAME_PX = 2
+CHIP_PX = CELLS * CELL_PX + 2 * FRAME_PX  # 44
+
+BG_RGB = (247, 245, 241)
+FRAME_DARK = (18, 18, 22)
+FRAME_GRAY = (152, 152, 156)
+
+MIN_TONE_GAP = 26
+MAX_TONE_GAP = 90
+QUARANTINE_CLEARANCE = 17.0
+REFERENCE_HAMMING = 8.0
+
+GLYPHS = ("plus", "ex", "tee", "ell")
+
+_TEMPLATE_ART = {
+    "plus": (
+        "..#..",
+        "..#..",
+        "#####",
+        "..#..",
+        "..#..",
+    ),
+    "ex": (
+        "#...#",
+        ".#.#.",
+        "..#..",
+        ".#.#.",
+        "#...#",
+    ),
+    "tee": (
+        "#####",
+        "..#..",
+        "..#..",
+        "..#..",
+        "..#..",
+    ),
+    "ell": (
+        "#....",
+        "#....",
+        "#....",
+        "#....",
+        "#####",
+    ),
+}
+
+TEMPLATES = {
+    name: tuple(1 if char == "#" else 0 for row in art for char in row)
+    for name, art in _TEMPLATE_ART.items()
+}
+
+# Two lattice steps apart, never 4-connected on the ablation lattice, and never
+# further apart than sqrt(5) lattice steps, which keeps the decisive support
+# inside one small span.
+OFFSETS = (
+    (0, 2),
+    (0, -2),
+    (2, 0),
+    (-2, 0),
+    (1, 2),
+    (2, 1),
+    (-1, 2),
+    (2, -1),
+    (1, -2),
+    (-2, 1),
+    (-1, -2),
+    (-2, -1),
+)
+
+_LATTICE_MIN = 1
+_LATTICE_MAX = 6
+
+
+def _hamming(left, right) -> int:
+    return sum(1 for a, b in zip(left, right) if a != b)
+
+
+def _min_template_hamming(bits) -> int:
+    """Closest distance from a 25-bit field to any template or its complement."""
+    best = 25
+    for template in TEMPLATES.values():
+        best = min(best, _hamming(bits, template))
+        best = min(best, _hamming(bits, tuple(1 - value for value in template)))
+    return best
+
+
+def _runner_up_hamming(name: str) -> int:
+    target = TEMPLATES[name]
+    return min(
+        _hamming(target, other) for key, other in TEMPLATES.items() if key != name
+    )
+
+
+def _sample_share_pair(rng: random.Random, glyph: tuple[int, ...]):
+    """Uniform independent share plus its difference partner.
+
+    Rejection keeps both shares far from every glyph and from every complement,
+    so neither chip can be read as the answer on its own, and keeps each chip's
+    dark-cell count near balance so that ink area carries no information.
+    """
+    for _ in range(4096):
+        first = tuple(rng.randint(0, 1) for _ in range(25))
+        second = tuple(a ^ g for a, g in zip(first, glyph))
+        if not 10 <= sum(first) <= 15:
+            continue
+        if not 10 <= sum(second) <= 15:
+            continue
+        if _min_template_hamming(first) < 6 or _min_template_hamming(second) < 6:
+            continue
+        return first, second
+    raise RuntimeError("could not sample a balanced share pair")
+
+
+def _sample_decoy_bits(rng: random.Random):
+    for _ in range(4096):
+        bits = tuple(rng.randint(0, 1) for _ in range(25))
+        if not 10 <= sum(bits) <= 15:
+            continue
+        if _min_template_hamming(bits) < 6:
+            continue
+        return bits
+    raise RuntimeError("could not sample decoy bits")
+
+
+def _chip_origin(cell: tuple[int, int], jitter: tuple[int, int]) -> tuple[int, int]:
+    row, col = cell
+    dy, dx = jitter
+    return (row * LATTICE_PX + WINDOW_LO + dy, col * LATTICE_PX + WINDOW_LO + dx)
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    glyph_name = GLYPHS[seed % len(GLYPHS)]
+    glyph = TEMPLATES[glyph_name]
+
+    tone_gap = rng.randint(MIN_TONE_GAP, MAX_TONE_GAP)
+    pale_value = rng.randint(200, 226)
+    tint = (rng.randint(0, 22), rng.randint(0, 22), rng.randint(0, 22))
+
+    while True:
+        base = (
+            rng.randint(_LATTICE_MIN, _LATTICE_MAX),
+            rng.randint(_LATTICE_MIN, _LATTICE_MAX),
+        )
+        offset = OFFSETS[rng.randrange(len(OFFSETS))]
+        partner = (base[0] + offset[0], base[1] + offset[1])
+        if all(_LATTICE_MIN <= value <= _LATTICE_MAX for value in partner):
+            break
+
+    first_bits, second_bits = _sample_share_pair(rng, glyph)
+    jitter_span = WINDOW_PX - CHIP_PX
+    shares = []
+    for cell, bits in ((base, first_bits), (partner, second_bits)):
+        shares.append(
+            {
+                "cell": list(cell),
+                "jitter": [rng.randint(0, jitter_span), rng.randint(0, jitter_span)],
+                "bits": list(bits),
+            }
+        )
+
+    used = {base, partner}
+    decoys = []
+    for _ in range(rng.choice((3, 4, 5))):
+        for _attempt in range(64):
+            cell = (
+                rng.randint(_LATTICE_MIN, _LATTICE_MAX),
+                rng.randint(_LATTICE_MIN, _LATTICE_MAX),
+            )
+            far = all(
+                max(abs(cell[0] - other[0]), abs(cell[1] - other[1])) >= 2
+                for other in used
+            )
+            if far:
+                used.add(cell)
+                decoys.append(
+                    {
+                        "cell": list(cell),
+                        "jitter": [
+                            rng.randint(0, jitter_span),
+                            rng.randint(0, jitter_span),
+                        ],
+                        "bits": list(_sample_decoy_bits(rng)),
+                    }
+                )
+                break
+
+    return {
+        "canvas": CANVAS,
+        "cells": CELLS,
+        "cell_px": CELL_PX,
+        "frame_px": FRAME_PX,
+        "tone_gap": tone_gap,
+        "pale_value": pale_value,
+        "tint": list(tint),
+        "shares": shares,
+        "decoys": decoys,
+        "key_origin": [CANVAS - 56 + rng.randint(-4, 4), 28 + rng.randint(-4, 4)],
+        "swap_tones": rng.randint(0, 1),
+    }
+
+
+def _tones(scene: dict) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    pale_value = int(scene["pale_value"])
+    dark_value = pale_value - int(scene["tone_gap"])
+    tint = tuple(int(value) for value in scene["tint"])
+    pale = tuple(max(0, min(255, pale_value - shift)) for shift in tint)
+    dark = tuple(max(0, min(255, dark_value - shift)) for shift in tint)
+    return pale, dark  # type: ignore[return-value]
+
+
+def _cell_colors(scene: dict) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Colour used for bit 0 and bit 1, honouring the global tone swap."""
+    pale, dark = _tones(scene)
+    if int(scene["swap_tones"]):
+        return dark, pale
+    return pale, dark
+
+
+def _draw_chip(
+    array: np.ndarray, origin: tuple[int, int], bits, frame_rgb, zero_rgb, one_rgb
+) -> None:
+    y0, x0 = origin
+    side = CHIP_PX
+    array[y0 : y0 + side, x0 : x0 + side] = frame_rgb
+    for index, bit in enumerate(bits):
+        row, col = divmod(index, CELLS)
+        cy = y0 + FRAME_PX + row * CELL_PX
+        cx = x0 + FRAME_PX + col * CELL_PX
+        array[cy : cy + CELL_PX, cx : cx + CELL_PX] = one_rgb if bit else zero_rgb
+
+
+def render(scene: dict) -> Image.Image:
+    canvas = int(scene["canvas"])
+    array = np.zeros((canvas, canvas, 3), dtype=np.uint8)
+    array[:, :] = BG_RGB
+    zero_rgb, one_rgb = _cell_colors(scene)
+    pale, dark = _tones(scene)
+
+    for decoy in scene["decoys"]:
+        _draw_chip(
+            array,
+            _chip_origin(tuple(decoy["cell"]), tuple(decoy["jitter"])),
+            decoy["bits"],
+            FRAME_GRAY,
+            zero_rgb,
+            one_rgb,
+        )
+    for share in scene["shares"]:
+        _draw_chip(
+            array,
+            _chip_origin(tuple(share["cell"]), tuple(share["jitter"])),
+            share["bits"],
+            FRAME_DARK,
+            zero_rgb,
+            one_rgb,
+        )
+
+    # Tone reference key: the two rendered tones with their exact midpoint tone
+    # between them, so the per-cell classification boundary is visible.
+    ky, kx = (int(scene["key_origin"][0]), int(scene["key_origin"][1]))
+    swatch = 24
+    mid = tuple((int(a) + int(b)) // 2 for a, b in zip(pale, dark))
+    array[ky - 2 : ky + swatch + 2, kx - 2 : kx + 3 * swatch + 2] = FRAME_GRAY
+    for index, colour in enumerate((dark, mid, pale)):
+        array[ky : ky + swatch, kx + index * swatch : kx + (index + 1) * swatch] = colour
+    return Image.fromarray(array, mode="RGB")
+
+
+def revealed_mask(scene: dict) -> tuple[int, ...]:
+    first, second = (tuple(share["bits"]) for share in scene["shares"])
+    return tuple(a ^ b for a, b in zip(first, second))
+
+
+def analytic_gold(scene: dict) -> str:
+    mask = revealed_mask(scene)
+    matches = [name for name, template in TEMPLATES.items() if template == mask]
+    if len(matches) != 1:
+        raise ValueError("revealed difference mask is not exactly one declared glyph")
+    return matches[0]
+
+
+def margin(scene: dict) -> float:
+    """Per-cell tone clearance, scaled by the runner-up glyph separation."""
+    clearance = float(scene["tone_gap"]) / 2.0
+    runner_up = float(_runner_up_hamming(analytic_gold(scene)))
+    return round(clearance * runner_up / REFERENCE_HAMMING, 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return (float(scene["tone_gap"]) / 2.0) < QUARANTINE_CLEARANCE
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases exist: every sampled field is rendered.
+
+    The analytic label reads only the two share bit fields, and both are visible
+    cell by cell in the raster, so the scene-to-raster map is injective on all
+    label inputs and there is no nontrivial pixel-identical reparametrization.
+    """
+    return []

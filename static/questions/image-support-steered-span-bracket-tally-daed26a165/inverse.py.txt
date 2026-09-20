@@ -1,0 +1,151 @@
+"""Pixel-only inverse arm for the split-calibrator length-interval tally.
+
+The arm receives the final PNG and nothing else.  It segments the three
+informative ink classes by colour, groups each class into rectangular bars with
+a run-length union-find, measures every bar's pixel length, builds the open
+interval bounded by the two calibration bars, and tallies the black bars whose
+own length lies strictly inside it.  Grey and pale decoration is never
+segmented, so it cannot enter the tally.
+
+The arm abstains with ``"unresolved"`` when the raster does not expose the
+decision: a missing or duplicated calibration bar, no measurable black bar, a
+bar whose shape is not a clean rectangle, or a black bar whose length sits
+within ``AMBIGUOUS_PX`` of a calibration length.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "span_bracket_tally-oracle-0.1.0"
+
+ABSTAIN = "unresolved"
+AMBIGUOUS_PX = 4
+MIN_BAR_WIDTH = 18
+BAR_HEIGHT_RANGE = (5, 16)
+MIN_RECT_FILL = 0.9
+
+
+def _masks(array: np.ndarray) -> dict[str, np.ndarray]:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    return {
+        "black": (red < 60) & (green < 60) & (blue < 60),
+        "red": (red > 150) & (green < 110) & (blue < 110),
+        "blue": (blue > 150) & (red < 110) & (green < 110),
+    }
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int, int]]:
+    """Horizontal runs of set pixels as (row, x_start, x_end_inclusive)."""
+    runs: list[tuple[int, int, int]] = []
+    height, width = mask.shape
+    for row in range(height):
+        line = mask[row]
+        if not line.any():
+            continue
+        padded = np.concatenate(([False], line, [False]))
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        for start, end in zip(edges[0::2], edges[1::2]):
+            runs.append((row, int(start), int(end) - 1))
+    return runs
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Group runs into 4-connected components and describe each one."""
+    runs = _runs(mask)
+    parent = list(range(len(runs)))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    by_row: dict[int, list[int]] = {}
+    for index, (row, _, _) in enumerate(runs):
+        by_row.setdefault(row, []).append(index)
+    for row, indices in by_row.items():
+        for above in by_row.get(row - 1, []):
+            _, ax0, ax1 = runs[above]
+            for index in indices:
+                _, bx0, bx1 = runs[index]
+                if ax0 <= bx1 and bx0 <= ax1:
+                    union(above, index)
+
+    groups: dict[int, list[int]] = {}
+    for index in range(len(runs)):
+        groups.setdefault(find(index), []).append(index)
+
+    described = []
+    for members in groups.values():
+        rows = [runs[i][0] for i in members]
+        x0 = min(runs[i][1] for i in members)
+        x1 = max(runs[i][2] for i in members)
+        area = sum(runs[i][2] - runs[i][1] + 1 for i in members)
+        box_h = max(rows) - min(rows) + 1
+        box_w = x1 - x0 + 1
+        described.append(
+            {
+                "x0": x0,
+                "x1": x1,
+                "y0": min(rows),
+                "y1": max(rows),
+                "width": box_w,
+                "height": box_h,
+                "fill": area / float(box_w * box_h),
+            }
+        )
+    return described
+
+
+def _bars(mask: np.ndarray) -> tuple[list[dict], bool]:
+    """Rectangular bars of one ink class, plus a flag for malformed ink."""
+    bars = []
+    malformed = False
+    for component in _components(mask):
+        tall_enough = BAR_HEIGHT_RANGE[0] <= component["height"] <= BAR_HEIGHT_RANGE[1]
+        if not tall_enough or component["fill"] < MIN_RECT_FILL:
+            malformed = True
+            continue
+        if component["width"] < MIN_BAR_WIDTH:
+            continue
+        bars.append(component)
+    return bars, malformed
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Tally the black bars whose length lies inside the calibration interval."""
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    masks = _masks(array)
+
+    calibrators = []
+    for name in ("red", "blue"):
+        bars, malformed = _bars(masks[name])
+        if malformed or len(bars) != 1:
+            return ABSTAIN
+        calibrators.append(bars[0])
+
+    low, high = sorted(bar["width"] for bar in calibrators)
+    if high - low < 2 * AMBIGUOUS_PX + 2:
+        return ABSTAIN
+
+    black_bars, malformed = _bars(masks["black"])
+    if malformed or not black_bars:
+        return ABSTAIN
+
+    count = 0
+    for bar in black_bars:
+        width = bar["width"]
+        if min(abs(width - low), abs(width - high)) < AMBIGUOUS_PX:
+            return ABSTAIN
+        if low < width < high:
+            count += 1
+    return str(count)

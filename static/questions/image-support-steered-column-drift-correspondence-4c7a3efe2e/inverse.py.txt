@@ -1,0 +1,165 @@
+"""Independent pixel-only inverse arm for Column Drift Correspondence."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+TILE_RGB = np.asarray(
+    (
+        (218, 73, 83),
+        (32, 151, 137),
+        (237, 190, 56),
+        (102, 91, 181),
+        (103, 170, 78),
+    ),
+    dtype=np.int16,
+)
+PIP_RGB = np.asarray((45, 105, 218), dtype=np.int16)
+TAG_RGB = {
+    "amber": np.asarray((244, 151, 28), dtype=np.int16),
+    "cyan": np.asarray((33, 186, 222), dtype=np.int16),
+    "violet": np.asarray((166, 69, 190), dtype=np.int16),
+}
+
+
+def _runs(active: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(active)
+    if not len(indices):
+        return []
+    output: list[tuple[int, int]] = []
+    start = previous = int(indices[0])
+    for raw in indices[1:]:
+        value = int(raw)
+        if value != previous + 1:
+            output.append((start, previous + 1))
+            start = value
+        previous = value
+    output.append((start, previous + 1))
+    return output
+
+
+def _centers(runs: list[tuple[int, int]]) -> list[float]:
+    return [(start + end - 1) / 2.0 for start, end in runs]
+
+
+def _extract_tiles(array: np.ndarray) -> tuple[list[list[list[int]]], list[float], list[float]]:
+    distances = np.max(np.abs(array[:, :, None, :].astype(np.int16) - TILE_RGB), axis=3)
+    labels = np.argmin(distances, axis=2)
+    labels[np.min(distances, axis=2) > 4] = -1
+    mask = labels >= 0
+    x_runs = _runs(mask.any(axis=0))
+    y_runs = _runs(mask.any(axis=1))
+    if len(x_runs) != 14 or len(y_runs) != 14:
+        raise ValueError("the four complete seven-by-seven mosaics are not recoverable")
+    widths = [end - start for start, end in x_runs]
+    heights = [end - start for start, end in y_runs]
+    if max(widths) - min(widths) > 1 or max(heights) - min(heights) > 1:
+        raise ValueError("mosaic tile interiors are malformed")
+
+    board = [[-1 for _ in range(14)] for _ in range(14)]
+    for row, (y0, y1) in enumerate(y_runs):
+        for column, (x0, x1) in enumerate(x_runs):
+            patch = labels[y0:y1, x0:x1]
+            values = np.unique(patch)
+            if len(values) != 1 or int(values[0]) < 0:
+                raise ValueError("a mosaic cell has been erased or contains mixed pixels")
+            board[row][column] = int(values[0])
+
+    grids = []
+    for row_offset, column_offset in ((0, 0), (0, 7), (7, 0), (7, 7)):
+        grids.append(
+            [
+                board[row_offset + row][column_offset : column_offset + 7]
+                for row in range(7)
+            ]
+        )
+    return grids, _centers(x_runs), _centers(y_runs)
+
+
+def _extract_drifts(array: np.ndarray, source_x: list[float]) -> list[int]:
+    distance = np.max(np.abs(array.astype(np.int16) - PIP_RGB), axis=2)
+    mask = distance <= 4
+    x_runs = _runs(mask.any(axis=0))
+    if len(x_runs) != 7:
+        raise ValueError("seven pip-stack keys are required")
+    pip_x = _centers(x_runs)
+    tile_spacing = float(np.median(np.diff(source_x)))
+    if any(abs(left - right) > tile_spacing / 4.0 for left, right in zip(pip_x, source_x)):
+        raise ValueError("pip keys do not align with the source columns")
+    counts = []
+    for x0, x1 in x_runs:
+        vertical = mask[:, x0:x1].any(axis=1)
+        count = len(_runs(vertical))
+        if count not in (1, 2, 3):
+            raise ValueError("each column key must visibly contain one, two, or three pips")
+        counts.append(count)
+    return counts
+
+
+def _extract_tags(array: np.ndarray, x_centers: list[float], y_centers: list[float]) -> list[str]:
+    left_center = float(np.mean(x_centers[:7]))
+    right_center = float(np.mean(x_centers[7:]))
+    top_center = float(np.mean(y_centers[:7]))
+    bottom_center = float(np.mean(y_centers[7:]))
+    panel_centers = (
+        (right_center, top_center),
+        (left_center, bottom_center),
+        (right_center, bottom_center),
+    )
+    assigned: list[str | None] = [None, None, None]
+    for name, rgb in TAG_RGB.items():
+        mask = np.max(np.abs(array.astype(np.int16) - rgb), axis=2) <= 4
+        points = np.argwhere(mask)
+        if len(points) < 8000:
+            raise ValueError(f"the {name} label bar is missing or damaged")
+        y0, x0 = points.min(axis=0)
+        y1, x1 = points.max(axis=0)
+        fill = len(points) / float((y1 - y0 + 1) * (x1 - x0 + 1))
+        if fill < 0.88:
+            raise ValueError(f"the {name} label bar is malformed")
+        center = (float(points[:, 1].mean()), float(points[:, 0].mean()))
+        distances = [
+            (center[0] - panel_x) ** 2 + (center[1] - panel_y) ** 2
+            for panel_x, panel_y in panel_centers
+        ]
+        index = int(np.argmin(distances))
+        if assigned[index] is not None:
+            raise ValueError("two label colors are bound to the same proposal")
+        assigned[index] = name
+    if any(value is None for value in assigned):
+        raise ValueError("every proposal must have one color label")
+    return [str(value) for value in assigned]
+
+
+def _shift_columns(source: list[list[int]], counts: list[int]) -> list[list[int]]:
+    # Reconstruct each output row by indexing backward through its own column.
+    size = len(source)
+    return [
+        [source[(output_row - counts[column]) % size][column] for column in range(size)]
+        for output_row in range(size)
+    ]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected an RGB raster")
+    grids, x_centers, y_centers = _extract_tiles(array)
+    source, proposals = grids[0], grids[1:]
+    drifts = _extract_drifts(array, x_centers[:7])
+    tags = _extract_tags(array, x_centers, y_centers)
+    expected = _shift_columns(source, drifts)
+    distances = [
+        sum(
+            expected[row][column] != proposal[row][column]
+            for row in range(7)
+            for column in range(7)
+        )
+        for proposal in proposals
+    ]
+    winners = [index for index, distance in enumerate(distances) if distance == 0]
+    if len(winners) != 1 or sorted(distances)[1] < 4:
+        raise ValueError("proposal assignment is non-unique or below the visible margin")
+    return tags[winners[0]]

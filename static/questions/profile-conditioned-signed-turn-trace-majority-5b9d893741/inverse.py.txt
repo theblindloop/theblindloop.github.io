@@ -1,0 +1,149 @@
+"""Independent pixel-only inverse for the signed-turn trace question."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+ROUTE_PALETTE = np.asarray(((28, 52, 73), (38, 63, 82), (42, 50, 75)), dtype=np.float32)
+MARKER_PALETTE = np.asarray(((127, 76, 170), (146, 81, 158), (105, 84, 174)), dtype=np.float32)
+START = np.asarray((44, 145, 91), dtype=np.float32)
+TERMINAL = np.asarray((214, 75, 83), dtype=np.float32)
+
+
+class OracleFitError(ValueError):
+    """Raised when the raster does not expose a stable route decision."""
+
+
+def _palette_mask(arr: np.ndarray, palette: np.ndarray, tolerance: float) -> np.ndarray:
+    distance = np.linalg.norm(arr[:, :, None, :] - palette[None, None, :, :], axis=3)
+    return np.min(distance, axis=2) <= tolerance
+
+
+def _color_mask(arr: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    return np.linalg.norm(arr - color, axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        found: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            found.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(found) >= minimum:
+            components.append(np.asarray(found, dtype=np.int32))
+    return components
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Close small raster gaps at the explicitly ringed route corners."""
+
+    result = mask.copy()
+    height, width = mask.shape
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx * dx + dy * dy > radius * radius:
+                continue
+            source_y0 = max(0, -dy)
+            source_y1 = min(height, height - dy)
+            source_x0 = max(0, -dx)
+            source_x1 = min(width, width - dx)
+            target_y0 = max(0, dy)
+            target_y1 = target_y0 + source_y1 - source_y0
+            target_x0 = max(0, dx)
+            target_x1 = target_x0 + source_x1 - source_x0
+            result[target_y0:target_y1, target_x0:target_x1] |= mask[source_y0:source_y1, source_x0:source_x1]
+    return result
+
+
+def _center(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _distance_to_point(component: np.ndarray, point: tuple[float, float]) -> float:
+    dx = component[:, 1].astype(np.float64) - point[0]
+    dy = component[:, 0].astype(np.float64) - point[1]
+    return float(np.sqrt(np.min(dx * dx + dy * dy)))
+
+
+def _turn_sign(previous: tuple[float, float], current: tuple[float, float], following: tuple[float, float]) -> float:
+    x0, y0 = previous
+    x1, y1 = current
+    x2, y2 = following
+    return (y1 - y0) * (x2 - x1) - (x1 - x0) * (y2 - y1)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover left/right from only the final RGB raster."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    route_mask = _dilate(_palette_mask(arr, ROUTE_PALETTE, 46.0), 2)
+    route_components = _components(route_mask, minimum=180)
+    if len(route_components) != 1:
+        raise OracleFitError(f"expected one connected dark route, found {len(route_components)}")
+    route = route_components[0]
+
+    starts = _components(_color_mask(arr, START, 55.0), minimum=80)
+    terminals = _components(_color_mask(arr, TERMINAL, 55.0), minimum=80)
+    if len(starts) != 1 or len(terminals) != 1:
+        raise OracleFitError("expected one green port and one red terminal")
+    start = _center(starts[0])
+    terminal = _center(terminals[0])
+    if _distance_to_point(route, start) > 24.0 or _distance_to_point(route, terminal) > 24.0:
+        raise OracleFitError("endpoint markers are not attached to the dark route")
+
+    marker_components = _components(_palette_mask(arr, MARKER_PALETTE, 52.0), minimum=32)
+    marker_centers = []
+    for component in marker_components:
+        center = _center(component)
+        if _distance_to_point(route, center) <= 22.0:
+            marker_centers.append(center)
+    if len(marker_centers) != 6:
+        raise OracleFitError(f"expected six route-centered corner rings, found {len(marker_centers)}")
+
+    axis_x = terminal[0] - start[0]
+    axis_y = terminal[1] - start[1]
+    axis_norm = math.hypot(axis_x, axis_y)
+    if axis_norm < 100.0:
+        raise OracleFitError("endpoint axis is too short to order the route")
+
+    def projection(point: tuple[float, float]) -> float:
+        return ((point[0] - start[0]) * axis_x + (point[1] - start[1]) * axis_y) / axis_norm
+
+    ordered_markers = sorted(marker_centers, key=projection)
+    if not all(projection(start) < projection(point) < projection(terminal) for point in ordered_markers):
+        raise OracleFitError("corner rings do not lie in the ordered endpoint corridor")
+    centerline = [start, *ordered_markers, terminal]
+
+    left = 0
+    right = 0
+    for index in range(1, len(centerline) - 1):
+        cross = _turn_sign(centerline[index - 1], centerline[index], centerline[index + 1])
+        if abs(cross) < 450.0:
+            raise OracleFitError("corner turn has insufficient raster margin")
+        if cross > 0.0:
+            left += 1
+        else:
+            right += 1
+    if left == right:
+        raise OracleFitError("left and right turn counts are tied")
+    return "left" if left > right else "right"

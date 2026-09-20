@@ -1,0 +1,165 @@
+"""Pixel-only inverse arm for the taut-cord world.
+
+Receives a rendered RGB image and nothing else: no scene, no renderer, no
+prompts, no generator, no analytic gold. It segments the paper by nearest
+palette colour, recovers each cord's two pinned ends as the geodesic extremes
+of its own ink, closes each cord with the straight line between those ends, and
+decides peg enclosure by ray-crossing parity against that closed barrier.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+
+_PALETTE = {
+    "paper": (255, 255, 255),
+    "peg": (16, 16, 16),
+    "red": (208, 32, 44),
+    "green": (18, 138, 62),
+    "blue": (36, 74, 206),
+}
+_CORDS = ("red", "green", "blue")
+_RAYS = ((1, 0), (-1, 0), (4, 1), (-4, 1))
+_RAY_MAJORITY = 3
+_MIN_CORD_PIXELS = 400
+_MIN_PEG_PIXELS = 40
+
+
+def _labels(image):
+    arr = np.asarray(image.convert("RGB"), dtype=np.int32)
+    names = list(_PALETTE)
+    ref = np.array([_PALETTE[n] for n in names], dtype=np.int32)
+    d = ((arr[:, :, None, :] - ref[None, None, :, :]) ** 2).sum(axis=3)
+    idx = d.argmin(axis=2)
+    return {n: (idx == i) for i, n in enumerate(names)}
+
+
+def _components(mask, min_pixels):
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if seen[y0, x0]:
+            continue
+        q = deque([(y0, x0)])
+        seen[y0, x0] = True
+        pix = []
+        while q:
+            y, x = q.popleft()
+            pix.append((y, x))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    q.append((ny, nx))
+        if len(pix) >= min_pixels:
+            out.append(pix)
+    return out
+
+
+def _farthest(pix_set, start, shape):
+    h, w = shape
+    dist = {start: 0}
+    q = deque([start])
+    far, fd = start, 0
+    while q:
+        y, x = q.popleft()
+        d = dist[(y, x)]
+        if d > fd:
+            far, fd = (y, x), d
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and (ny, nx) in pix_set and (ny, nx) not in dist:
+                dist[(ny, nx)] = d + 1
+                q.append((ny, nx))
+    return far
+
+
+def _ends(pix, shape):
+    pix_set = set(pix)
+    a = _farthest(pix_set, pix[0], shape)
+    b = _farthest(pix_set, a, shape)
+    return a, b
+
+
+def _draw_chord(barrier, a, b):
+    h, w = barrier.shape
+    (ay, ax), (by, bx) = a, b
+    steps = int(max(abs(by - ay), abs(bx - ax)) * 2) + 1
+    for i in range(steps + 1):
+        t = i / steps
+        y = int(round(ay + (by - ay) * t))
+        x = int(round(ax + (bx - ax) * t))
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w:
+                    barrier[ny, nx] = True
+
+
+def _crossings(barrier, y0, x0, dy, dx):
+    h, w = barrier.shape
+    y, x = float(y0), float(x0)
+    step = 1.0 / max(abs(dy), abs(dx))
+    sy, sx = dy * step, dx * step
+    runs, prev = 0, False
+    while True:
+        y += sy
+        x += sx
+        iy, ix = int(round(y)), int(round(x))
+        if not (0 <= iy < h and 0 <= ix < w):
+            return runs
+        cur = bool(barrier[iy, ix])
+        if cur and not prev:
+            runs += 1
+        prev = cur
+
+
+def _enclosed(barrier, point):
+    y0, x0 = point
+    votes = [_crossings(barrier, y0, x0, dy, dx) % 2 == 1 for dy, dx in _RAYS]
+    inside = sum(1 for v in votes if v)
+    if inside >= _RAY_MAJORITY:
+        return True
+    if len(votes) - inside >= _RAY_MAJORITY:
+        return False
+    return None
+
+
+def decision_from_image(image) -> str:
+    lab = _labels(image)
+    pegs = _components(lab["peg"], _MIN_PEG_PIXELS)
+    if not pegs:
+        return "abstain"
+    centres = []
+    for pix in pegs:
+        ys = sum(p[0] for p in pix) / len(pix)
+        xs = sum(p[1] for p in pix) / len(pix)
+        centres.append((int(round(ys)), int(round(xs))))
+
+    shape = lab["peg"].shape
+    free = []
+    for color in _CORDS:
+        comps = _components(lab[color], _MIN_CORD_PIXELS)
+        if len(comps) != 1:
+            return "abstain"
+        pix = comps[0]
+        a, b = _ends(pix, shape)
+        barrier = np.zeros(shape, dtype=bool)
+        for y, x in pix:
+            barrier[y, x] = True
+        _draw_chord(barrier, a, b)
+        trapped = 0
+        for centre in centres:
+            verdict = _enclosed(barrier, centre)
+            if verdict is None:
+                return "abstain"
+            trapped += 1 if verdict else 0
+        if trapped == 0:
+            free.append(color)
+    if len(free) != 1:
+        return "abstain"
+    return free[0]

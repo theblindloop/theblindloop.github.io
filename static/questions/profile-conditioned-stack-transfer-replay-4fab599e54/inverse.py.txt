@@ -1,0 +1,116 @@
+"""Independent image-only inverse for the LIFO stack-transfer world.
+
+The parser segments four public ink families, finds connected components, uses
+relative layout to reconstruct initial stacks and ordered cards, then performs
+its own replay. It has no access to renderer code or latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import numpy as np
+from PIL import Image
+
+TOKEN_COLORS = ((35, 145, 190), (112, 88, 190))
+MOVE_COLORS = ((239, 161, 65), (226, 125, 74))
+STACK_COLORS = ((73, 174, 119), (48, 158, 151))
+QUERY_COLORS = ((183, 70, 151), (211, 70, 116))
+
+
+def _near_any(pixels: np.ndarray, colors: tuple[tuple[int, int, int], ...], tolerance: int = 10) -> np.ndarray:
+    return np.any(np.stack([np.max(np.abs(pixels - np.array(color)), axis=2) <= tolerance for color in colors]), axis=0)
+
+
+def _components(mask: np.ndarray, minimum: int = 20) -> list[dict]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    results: list[dict] = []
+    for yy, xx in np.argwhere(mask):
+        y, x = int(yy), int(xx)
+        if visited[y, x]:
+            continue
+        todo = deque([(y, x)])
+        visited[y, x] = True
+        points: list[tuple[int, int]] = []
+        while todo:
+            cy, cx = todo.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    todo.append((ny, nx))
+        if len(points) >= minimum:
+            ys = [p[0] for p in points]
+            xs = [p[1] for p in points]
+            results.append({"area": len(points), "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys), "cx": sum(xs) / len(xs), "cy": sum(ys) / len(ys)})
+    return results
+
+
+def _black_dot_count(pixels: np.ndarray, component: dict) -> int:
+    pad = 2
+    x0, x1 = component["x0"] + pad, component["x1"] - pad
+    y0, y1 = component["y0"] + pad, component["y1"] - pad
+    crop = pixels[y0:y1 + 1, x0:x1 + 1]
+    black = np.max(crop, axis=2) < 65
+    dots = []
+    for item in _components(black, minimum=25):
+        width = item["x1"] - item["x0"] + 1
+        height = item["y1"] - item["y0"] + 1
+        if 6 <= width <= 13 and 6 <= height <= 13 and item["area"] <= 150:
+            dots.append(item)
+    if len(dots) not in (1, 2, 3, 4):
+        raise ValueError(f"invalid dot code with {len(dots)} dots")
+    return len(dots)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int16)
+    token_parts = [c for c in _components(_near_any(pixels, TOKEN_COLORS), 700) if 75 <= c["x1"] - c["x0"] + 1 <= 95]
+    move_parts = [c for c in _components(_near_any(pixels, MOVE_COLORS), 700) if 50 <= c["x1"] - c["x0"] + 1 <= 65]
+    stack_parts = [c for c in _components(_near_any(pixels, STACK_COLORS), 700) if 50 <= c["x1"] - c["x0"] + 1 <= 65]
+    query_parts = _components(_near_any(pixels, QUERY_COLORS), 100)
+    if len(token_parts) != 4 or len(stack_parts) != 3 or len(query_parts) != 1:
+        raise ValueError(f"expected 4 tokens, 3 stack labels, 1 query marker; got {len(token_parts)}, {len(stack_parts)}, {len(query_parts)}")
+    stack_parts.sort(key=lambda c: c["cx"])
+    centers = [c["cx"] for c in stack_parts]
+    initial: list[list[int]] = [[], [], []]
+    for token in token_parts:
+        index = min(range(3), key=lambda i: abs(token["cx"] - centers[i]))
+        if abs(token["cx"] - centers[index]) > 45:
+            raise ValueError("token is not aligned with one stack")
+        initial[index].append((_black_dot_count(pixels, token), token["cy"]))
+    stacks: list[list[int]] = []
+    for items in initial:
+        items.sort(key=lambda pair: pair[1], reverse=True)
+        stacks.append([number for number, _y in items])
+    if sorted(number for stack in stacks for number in stack) != [1, 2, 3, 4]:
+        raise ValueError("token codes are not unique 1 through 4")
+
+    # The two legend badges lie together below the scene. The ten card badges
+    # form five same-x pairs in the upper operation region; relative vertical
+    # separation distinguishes these groups without fixed pixel coordinates.
+    by_x: list[list[dict]] = []
+    for part in sorted(move_parts, key=lambda c: c["cx"]):
+        for group in by_x:
+            if abs(group[0]["cx"] - part["cx"]) < 8:
+                group.append(part)
+                break
+        else:
+            by_x.append([part])
+    card_groups = [sorted(group, key=lambda c: c["cy"]) for group in by_x if len(group) == 2 and abs(group[0]["cy"] - group[1]["cy"]) > 80]
+    card_groups.sort(key=lambda group: group[0]["cx"])
+    if len(card_groups) != 5:
+        raise ValueError(f"expected five ordered card pairs, found {len(card_groups)}")
+    for source_part, destination_part in card_groups:
+        source = _black_dot_count(pixels, source_part)
+        destination = _black_dot_count(pixels, destination_part)
+        if source not in (1, 2, 3) or destination not in (1, 2, 3) or source == destination:
+            raise ValueError("card has invalid endpoints")
+        if stacks[source - 1]:
+            stacks[destination - 1].append(stacks[source - 1].pop())
+
+    query_x = query_parts[0]["cx"]
+    query = min(range(3), key=lambda i: abs(query_x - centers[i]))
+    if abs(query_x - centers[query]) > 45 or not stacks[query]:
+        raise ValueError("query marker is ambiguous or final stack is empty")
+    return str(stacks[query][-1])

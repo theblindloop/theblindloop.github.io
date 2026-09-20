@@ -1,0 +1,142 @@
+"""Independent pixel-only inverse arm for `seal_pair_ring_binding`.
+
+Receives one rasterised RGB image and nothing else: no scene, no renderer
+constant, no palette table, no canvas pitch, no analytic gold. It segments red
+ink, labels connected red components, groups nested components into seals by
+bounding-box nesting, decides for each component whether it encloses
+background (a sealed ring) or is broken (a mouth lets background escape), and
+finally compares the upper seal against the lower pair.
+
+Returns "equal", "upper_more", "lower_more", or "abstain" when the picture does
+not present one upper seal above two lower seals.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+MIN_COMPONENT = 24
+ABSTAIN = "abstain"
+
+
+def _red_mask(array: np.ndarray) -> np.ndarray:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    return (red >= 150) & (green <= 110) & (blue <= 110) & (red - green >= 60) & (red - blue >= 60)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Four-connected components of a sparse boolean mask, as coordinate arrays."""
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    out = []
+    for sy, sx in np.argwhere(mask):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(int(sy), int(sx))])
+        seen[sy, sx] = True
+        pixels = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) >= MIN_COMPONENT:
+            out.append(np.asarray(pixels, dtype=np.int64))
+    return out
+
+
+def _bbox(pixels: np.ndarray) -> tuple[int, int, int, int]:
+    return (int(pixels[:, 0].min()), int(pixels[:, 1].min()),
+            int(pixels[:, 0].max()), int(pixels[:, 1].max()))
+
+
+def _encloses_background(pixels: np.ndarray) -> bool:
+    """True when this component alone traps at least one background pixel."""
+    y0, x0, y1, x1 = _bbox(pixels)
+    height, width = y1 - y0 + 3, x1 - x0 + 3
+    solid = np.zeros((height, width), dtype=bool)
+    solid[pixels[:, 0] - y0 + 1, pixels[:, 1] - x0 + 1] = True
+    free = ~solid
+    reached = np.zeros_like(free)
+    queue = deque()
+    for y in range(height):
+        for x in (0, width - 1):
+            if free[y, x] and not reached[y, x]:
+                reached[y, x] = True
+                queue.append((y, x))
+    for x in range(width):
+        for y in (0, height - 1):
+            if free[y, x] and not reached[y, x]:
+                reached[y, x] = True
+                queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and free[ny, nx] and not reached[ny, nx]:
+                reached[ny, nx] = True
+                queue.append((ny, nx))
+    return bool(np.any(free & ~reached))
+
+
+def _group(boxes: list[tuple[int, int, int, int]]) -> list[list[int]]:
+    """Union components whose bounding boxes overlap (nested rings of one seal)."""
+    parent = list(range(len(boxes)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            ay0, ax0, ay1, ax1 = boxes[i]
+            by0, bx0, by1, bx1 = boxes[j]
+            if ay0 <= by1 and by0 <= ay1 and ax0 <= bx1 and bx0 <= ax1:
+                parent[find(i)] = find(j)
+    groups: dict[int, list[int]] = {}
+    for i in range(len(boxes)):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    try:
+        array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        mask = _red_mask(array)
+        if int(mask.sum()) < 120:
+            return ABSTAIN
+        parts = _components(mask)
+        if not 3 <= len(parts) <= 8:
+            return ABSTAIN
+        boxes = [_bbox(part) for part in parts]
+        groups = _group(boxes)
+        if len(groups) != 3:
+            return ABSTAIN
+        stats = []
+        for members in groups:
+            ys0 = min(boxes[i][0] for i in members)
+            ys1 = max(boxes[i][2] for i in members)
+            sealed = sum(1 for i in members if _encloses_background(parts[i]))
+            stats.append({"top": ys0, "bottom": ys1, "sealed": sealed,
+                          "rings": len(members)})
+        stats.sort(key=lambda s: s["top"])
+        upper, first, second = stats
+        if any(item["rings"] > 3 for item in stats):
+            return ABSTAIN
+        if upper["bottom"] >= first["top"] or upper["bottom"] >= second["top"]:
+            return ABSTAIN
+        up = upper["sealed"]
+        low = first["sealed"] + second["sealed"]
+        if up == low:
+            return "equal"
+        return "upper_more" if up > low else "lower_more"
+    except Exception:
+        return ABSTAIN

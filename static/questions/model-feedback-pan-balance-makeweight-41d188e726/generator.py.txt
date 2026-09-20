@@ -1,0 +1,427 @@
+"""Scene model and renderer for the pan-balance makeweight world.
+
+Nothing in this picture can be evaluated forward.  Two drawn equalities are a
+coupled system: each row shows a mixture of squares and triangles left of a
+double bar and a run of circles right of it, so neither row prices any glyph on
+its own and both must be combined before a single worth exists.  A balance
+carries two gray pans holding interleaved mixtures, and the reported object is
+the one colour-framed purse whose contents are worth exactly the difference
+between the two pans -- a quantity that is drawn nowhere and that is not the
+value of anything in the raster.
+
+Only axis-aligned filled rectangles, filled ellipses and filled polygons are
+drawn, so the raster is free of antialiasing and byte-deterministic.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 1300
+HEIGHT = 980
+
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+PAN_INK = (120, 120, 120)
+BEAM_INK = (190, 190, 190)
+
+HUES = {
+    "blue": (37, 86, 196),
+    "green": (24, 140, 66),
+    "orange": (232, 124, 20),
+    "purple": (128, 52, 168),
+}
+COLOR_NAMES = ("blue", "green", "orange", "purple")
+
+# Every glyph is drawn inside the same square bounding box, so the three kinds
+# differ only by how much of that box they fill: square 1.00, circle 0.79,
+# triangle 0.50.
+GLYPH = 56
+CIRCLE, TRIANGLE, SQUARE = 0, 1, 2
+
+# --- the two coupled equalities -----------------------------------------------
+EQ_ROW_Y = (80, 190)
+EQ_LEFT_X = 60
+EQ_BAR_X = 410
+EQ_W = 52
+EQ_H = 12
+EQ_GAP = 20
+EQ_RIGHT_X = 500
+EQ_PITCH = 84
+
+# --- the balance ---------------------------------------------------------------
+BEAM_X0, BEAM_X1 = 300, 1000
+BEAM_Y, BEAM_H = 250, 14
+FULCRUM = [(650, 266), (612, 330), (688, 330)]
+HANGER_W = 10
+PAN_X = (110, 744)
+PAN_Y = 330
+PAN_W = 440
+PAN_H = 220
+PAN_FRAME = 10
+PAN_CELL_X = 30
+PAN_CELL_Y = 30
+PAN_PITCH_X = 88
+PAN_PITCH_Y = 95
+PAN_COLS = 4
+
+# --- the four purses -----------------------------------------------------------
+PURSE_X = (25, 350, 675, 1000)
+PURSE_Y = 650
+PURSE_W = 250
+PURSE_H = 300
+FRAME = 10
+CELL_X0 = 30
+CELL_Y0 = 30
+CELL_PITCH_X = 90
+CELL_PITCH_Y = 88
+GRID_COLS = 2
+
+QUARANTINE_MARGIN = 11.0
+_MAX_JITTER = 12
+
+# Fixed geometric clearances of the layout, in pixels.
+_GLYPH_GAP = min(PAN_PITCH_X, CELL_PITCH_X, EQ_PITCH) - GLYPH  # 28
+_ROW_GAP = min(PAN_PITCH_Y, CELL_PITCH_Y) - GLYPH  # 32
+_FRAME_CLEAR = min(PAN_CELL_X, PAN_CELL_Y, CELL_X0, CELL_Y0) - FRAME  # 20
+_STRIP_GAP = EQ_RIGHT_X - (EQ_BAR_X + EQ_W)  # 38
+_PURSE_GAP = PURSE_X[1] - (PURSE_X[0] + PURSE_W)  # 75
+_PAN_GAP = PAN_X[1] - (PAN_X[0] + PAN_W)  # 194
+_FILL_SEPARATION = 21.5  # 100 x smallest bounding-box fill-ratio gap
+
+_COEFFS = ((1, 1), (1, 2), (2, 1), (2, 2), (1, 3), (3, 1))
+
+
+def _systems() -> tuple:
+    """All coupled equality systems that fit the drawn strip.
+
+    Both rows carry at least one square and at least one triangle, so no row
+    prices a glyph on its own, and the pair is independent, so the two worths
+    are uniquely determined by the two rows together.
+    """
+    out = []
+    for a1, b1 in _COEFFS:
+        for a2, b2 in _COEFFS:
+            if (a1, b1) == (a2, b2) or a1 * b2 - a2 * b1 == 0:
+                continue
+            for square in range(2, 8):
+                for triangle in range(2, 8):
+                    if square == triangle:
+                        continue
+                    n1 = a1 * square + b1 * triangle
+                    n2 = a2 * square + b2 * triangle
+                    if 3 <= n1 <= 9 and 3 <= n2 <= 9 and n1 != n2:
+                        out.append((a1, b1, n1, a2, b2, n2, square, triangle))
+    return tuple(out)
+
+
+_SYSTEMS = _systems()
+
+
+def _count(tokens, kind: int) -> int:
+    return sum(1 for token in tokens if token == kind)
+
+
+def _row_terms(scene: dict):
+    return [
+        (_count(row["left"], SQUARE), _count(row["left"], TRIANGLE), row["n"])
+        for row in scene["rows"]
+    ]
+
+
+def _worths(scene: dict) -> tuple:
+    """Worth of (circle, triangle, square) in circle units, from both rows."""
+    (a1, b1, n1), (a2, b2, n2) = _row_terms(scene)
+    det = a1 * b2 - a2 * b1
+    square = (n1 * b2 - n2 * b1) // det
+    triangle = (a1 * n2 - a2 * n1) // det
+    return (1, triangle, square)
+
+
+def _total(tokens, worths) -> int:
+    return sum(worths[token] for token in tokens)
+
+
+def _deficit(scene: dict, worths) -> int:
+    left, right = scene["pans"]
+    return abs(_total(left, worths) - _total(right, worths))
+
+
+def _purse_totals(scene: dict, worths=None) -> list:
+    if worths is None:
+        worths = _worths(scene)
+    return [_total(purse, worths) for purse in scene["purses"]]
+
+
+def _gold_index(scene: dict) -> int:
+    worths = _worths(scene)
+    target = _deficit(scene, worths)
+    totals = _purse_totals(scene, worths)
+    matches = [i for i, value in enumerate(totals) if value == target]
+    if len(matches) != 1:
+        raise ValueError("scene has no unique makeweight purse")
+    return matches[0]
+
+
+def _mixed(rng: random.Random, size: int) -> list:
+    while True:
+        tokens = [rng.randrange(3) for _ in range(size)]
+        if len(set(tokens)) >= 2:
+            return tokens
+
+
+def _row_alone_is_indecisive(scene: dict, gold: int) -> bool:
+    """No single equality row may already fix the answer.
+
+    A row is one linear constraint in two unknowns, so it admits several
+    positive integer valuations.  At least one of them must fail to select the
+    makeweight, otherwise a solver could skip the elimination step entirely.
+    """
+    truth = _worths(scene)
+    for a, b, n in _row_terms(scene):
+        lost = False
+        for square in range(1, 20):
+            for triangle in range(1, 20):
+                if a * square + b * triangle != n:
+                    continue
+                other = (1, triangle, square)
+                if other == truth:
+                    continue
+                target = _deficit(scene, other)
+                totals = _purse_totals(scene, other)
+                hits = [i for i, value in enumerate(totals) if value == target]
+                if len(hits) != 1 or hits[0] != gold:
+                    lost = True
+                    break
+            if lost:
+                break
+        if not lost:
+            return False
+    return True
+
+
+def _biased(rng: random.Random, size: int, weights) -> list:
+    kinds = (CIRCLE, TRIANGLE, SQUARE)
+    while True:
+        tokens = [rng.choices(kinds, weights=weights)[0] for _ in range(size)]
+        if len(set(tokens)) >= 2:
+            return tokens
+
+
+def _purse_for(rng: random.Random, target: int, worths) -> list:
+    for _ in range(400):
+        tokens = _mixed(rng, rng.randint(3, 6))
+        if _total(tokens, worths) == target:
+            rng.shuffle(tokens)
+            return tokens
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one accepted scene deterministically from ``seed``."""
+    rng = random.Random(seed)
+    # Most scenes keep the nearest wrong purse two or more units away from the
+    # deficit.  One seed in seven admits a one-unit near miss, which the margin
+    # rule quarantines, so the gallery still covers the near-boundary regime.
+    least_gap = 1 if seed % 7 == 0 else 2
+
+    for _ in range(6000):
+        a1, b1, n1, a2, b2, n2, square, triangle = rng.choice(_SYSTEMS)
+        ceiling = 5 * max(square, triangle)
+
+        worths = (1, triangle, square)
+        swapped = (1, square, triangle)
+
+        # The crowded pan is drawn mostly from cheap glyphs and the sparse pan
+        # mostly from dear ones, so glyph tallies point the wrong way.
+        crowded = _biased(rng, rng.randint(6, 8), (0.60, 0.30, 0.10))
+        sparse = _biased(rng, rng.randint(4, 5), (0.15, 0.35, 0.50))
+        if rng.random() < 0.5:
+            left, right = crowded, sparse
+        else:
+            left, right = sparse, crowded
+        # Counting glyphs must give the wrong direction: the fuller pan is the
+        # lighter one, so the heavier pan is never the more crowded pan.
+        heavier = left if _total(left, worths) > _total(right, worths) else right
+        lighter = right if heavier is left else left
+        if len(heavier) >= len(lighter):
+            continue
+
+        pans = [left, right]
+        deficit = abs(_total(left, worths) - _total(right, worths))
+        if not 4 <= deficit <= ceiling:
+            continue
+        # The reported quantity is the value of no drawn object.
+        if deficit in (_total(left, worths), _total(right, worths)):
+            continue
+
+        # Decoy target 1: the deficit a solver gets after mis-assigning the two
+        # solved unknowns to the wrong silhouettes.
+        swap_deficit = abs(_total(left, swapped) - _total(right, swapped))
+        if not 4 <= swap_deficit <= ceiling or swap_deficit == deficit:
+            continue
+        targets = [deficit, swap_deficit]
+        # Decoy target 2, when the first row admits it: the deficit a solver
+        # gets by reading that row alone as if the two unknown glyphs were
+        # interchangeable, which is the forward reading the system forbids.
+        if n1 % (a1 + b1) == 0:
+            flat = n1 // (a1 + b1)
+            flat_deficit = abs(
+                _total(left, (1, flat, flat)) - _total(right, (1, flat, flat))
+            )
+            if 4 <= flat_deficit <= ceiling and flat_deficit not in targets:
+                targets.append(flat_deficit)
+        while len(targets) < 4:
+            filler = rng.randint(4, ceiling)
+            if filler in targets:
+                continue
+            targets.append(filler)
+        nearest = min(abs(deficit - other) for other in targets[1:])
+        if least_gap == 1:
+            if nearest != 1:
+                continue
+        elif nearest < least_gap:
+            continue
+        ordered = sorted(targets)
+        # The makeweight is neither the richest nor the poorest purse, so no
+        # extremum over the four purses can select it.
+        if deficit in (ordered[0], ordered[-1]):
+            continue
+
+        purses = [_purse_for(rng, value, worths) for value in targets]
+        if any(purse is None for purse in purses):
+            continue
+        sizes = [len(purse) for purse in purses]
+        if sizes[0] == max(sizes) and sizes.count(max(sizes)) == 1:
+            continue
+        if sizes[0] == min(sizes) and sizes.count(min(sizes)) == 1:
+            continue
+
+        order = list(range(4))
+        rng.shuffle(order)
+        purses = [purses[i] for i in order]
+        colors = list(COLOR_NAMES)
+        rng.shuffle(colors)
+
+        rows = []
+        for a, b, n in ((a1, b1, n1), (a2, b2, n2)):
+            group = [SQUARE] * a + [TRIANGLE] * b
+            rng.shuffle(group)
+            rows.append({"left": group, "n": n})
+
+        scene = {
+            "colors": colors,
+            "purses": purses,
+            "pans": pans,
+            "rows": rows,
+            "purse_jitters": [rng.randrange(_MAX_JITTER + 1) for _ in range(4)],
+            "pan_jitters": [rng.randrange(_MAX_JITTER + 1) for _ in range(2)],
+            "row_jitters": [rng.randrange(_MAX_JITTER + 1) for _ in range(2)],
+        }
+        if not _row_alone_is_indecisive(scene, _gold_index(scene)):
+            continue
+        return scene
+    raise RuntimeError("scene sampling failed to converge")
+
+
+def _draw_glyph(draw: ImageDraw.ImageDraw, kind: int, x: int, y: int) -> None:
+    x1, y1 = x + GLYPH - 1, y + GLYPH - 1
+    if kind == SQUARE:
+        draw.rectangle([x, y, x1, y1], fill=BLACK)
+    elif kind == CIRCLE:
+        draw.ellipse([x, y, x1, y1], fill=BLACK)
+    else:
+        draw.polygon([(x + GLYPH // 2, y), (x1, y1), (x, y1)], fill=BLACK)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
+    draw = ImageDraw.Draw(image)
+
+    # --- the two coupled equalities -----------------------------------------
+    for idx, row in enumerate(scene["rows"]):
+        cy = EQ_ROW_Y[idx]
+        jx = scene["row_jitters"][idx]
+        top = cy - GLYPH // 2
+        for pos, kind in enumerate(row["left"]):
+            _draw_glyph(draw, kind, EQ_LEFT_X + jx + pos * EQ_PITCH, top)
+        ex = EQ_BAR_X + jx
+        for sign in (-1, 1):
+            by = cy + sign * (EQ_GAP // 2 + EQ_H // 2) - EQ_H // 2
+            draw.rectangle([ex, by, ex + EQ_W - 1, by + EQ_H - 1], fill=BLACK)
+        for pos in range(row["n"]):
+            _draw_glyph(draw, CIRCLE, EQ_RIGHT_X + jx + pos * EQ_PITCH, top)
+
+    # --- the balance --------------------------------------------------------
+    draw.rectangle([BEAM_X0, BEAM_Y, BEAM_X1, BEAM_Y + BEAM_H - 1], fill=BEAM_INK)
+    draw.polygon(FULCRUM, fill=BEAM_INK)
+    for x0 in PAN_X:
+        hx = x0 + PAN_W // 2 - HANGER_W // 2
+        draw.rectangle(
+            [hx, BEAM_Y + BEAM_H, hx + HANGER_W - 1, PAN_Y - 20], fill=BEAM_INK
+        )
+    for side in (0, 1):
+        x0 = PAN_X[side]
+        draw.rectangle(
+            [x0, PAN_Y, x0 + PAN_W - 1, PAN_Y + PAN_H - 1],
+            outline=PAN_INK,
+            width=PAN_FRAME,
+        )
+        jx = scene["pan_jitters"][side]
+        for pos, kind in enumerate(scene["pans"][side]):
+            gx = x0 + PAN_CELL_X + jx + (pos % PAN_COLS) * PAN_PITCH_X
+            gy = PAN_Y + PAN_CELL_Y + (pos // PAN_COLS) * PAN_PITCH_Y
+            _draw_glyph(draw, kind, gx, gy)
+
+    # --- the four purses ----------------------------------------------------
+    for slot in range(4):
+        x0 = PURSE_X[slot]
+        hue = HUES[scene["colors"][slot]]
+        draw.rectangle(
+            [x0, PURSE_Y, x0 + PURSE_W - 1, PURSE_Y + PURSE_H - 1],
+            outline=hue,
+            width=FRAME,
+        )
+        jx = scene["purse_jitters"][slot]
+        for pos, kind in enumerate(scene["purses"][slot]):
+            gx = x0 + CELL_X0 + jx + (pos % GRID_COLS) * CELL_PITCH_X
+            gy = PURSE_Y + CELL_Y0 + (pos // GRID_COLS) * CELL_PITCH_Y
+            _draw_glyph(draw, kind, gx, gy)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return scene["colors"][_gold_index(scene)]
+
+
+def margin(scene: dict) -> float:
+    worths = _worths(scene)
+    target = _deficit(scene, worths)
+    totals = _purse_totals(scene, worths)
+    gold = _gold_index(scene)
+    gap = min(
+        abs(value - target) for i, value in enumerate(totals) if i != gold
+    )
+    return float(
+        min(
+            _GLYPH_GAP,
+            _ROW_GAP,
+            _FRAME_CLEAR,
+            _STRIP_GAP,
+            _PURSE_GAP,
+            _PAN_GAP,
+            _FILL_SEPARATION,
+            6.0 * gap,
+        )
+    )
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No transform holds the raster fixed: every sampled field is drawn."""
+    return []

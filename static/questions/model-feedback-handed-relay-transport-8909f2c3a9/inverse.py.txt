@@ -1,0 +1,163 @@
+"""Pixel-only inverse arm for the handed relay transport world.
+
+Receives a rendered PNG and nothing else.  It recovers the lattice from the
+drawn rules, reads each cell's role from flat colour counts, solves for the two
+lattice motions demonstrated by the two congruent tile pairs, composes them in
+the stated order, and reports which black square receives the purple dot.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(RuntimeError):
+    """Raised when the raster does not present a legible decision."""
+
+
+_RULE = (200, 200, 204)
+_ROLES = {
+    "green": (33, 160, 74),
+    "orange": (239, 122, 16),
+    "blue": (34, 85, 204),
+    "cyan": (18, 183, 200),
+    "dot": (122, 47, 191),
+    "target": (0, 0, 0),
+}
+_MIN_PIXELS = 900
+
+
+def _mask(pixels: np.ndarray, colour) -> np.ndarray:
+    return np.all(pixels == np.array(colour, dtype=np.uint8), axis=-1)
+
+
+def _runs(flags: np.ndarray) -> list[float]:
+    centres = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            centres.append((start + index - 1) / 2.0)
+            start = None
+    if start is not None:
+        centres.append((start + len(flags) - 1) / 2.0)
+    return centres
+
+
+def _lattice(rule: np.ndarray) -> tuple[int, int, int]:
+    height, width = rule.shape
+    column_hits = rule.sum(axis=0)
+    row_hits = rule.sum(axis=1)
+    threshold = max(64, int(0.55 * min(height, width)))
+    xs = _runs(column_hits >= threshold)
+    ys = _runs(row_hits >= threshold)
+    if len(xs) < 4 or len(xs) != len(ys):
+        raise OracleAbstention("grid rules are not legible")
+    steps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+    step = round(sum(steps) / len(steps))
+    if step < 16 or any(abs(value - step) > 1.0 for value in steps):
+        raise OracleAbstention("grid pitch is not uniform")
+    return int(round(xs[0])), int(round(ys[0])), int(step)
+
+
+def _roles(pixels: np.ndarray, ox: int, oy: int, step: int, cells: int) -> dict:
+    masks = {name: _mask(pixels, colour) for name, colour in _ROLES.items()}
+    found: dict[str, list[tuple[int, int]]] = {name: [] for name in _ROLES}
+    inset = max(2, step // 20)
+    for r in range(cells):
+        y0 = oy + r * step + inset
+        y1 = oy + (r + 1) * step - inset
+        for c in range(cells):
+            x0 = ox + c * step + inset
+            x1 = ox + (c + 1) * step - inset
+            best_name = None
+            best_count = 0
+            for name, mask in masks.items():
+                count = int(mask[y0:y1, x0:x1].sum())
+                if count > best_count:
+                    best_name, best_count = name, count
+            if best_name is not None and best_count >= _MIN_PIXELS:
+                found[best_name].append((c, r))
+    return found
+
+
+def _apply(motion, point):
+    u, v = point
+    if motion[0] == "rot":
+        k, pu, pv = motion[1], motion[2], motion[3]
+        for _ in range(k):
+            u, v = pu - (v - pv), pv + (u - pu)
+        return (u, v)
+    if motion[0] == "mir":
+        if motion[1] == "v":
+            return (2 * motion[2] - u, v)
+        return (u, 2 * motion[2] - v)
+    return (u + motion[1], v + motion[2])
+
+
+def _catalogue(cells: int):
+    span = 2 * cells
+    out = []
+    for pu in range(span + 1):
+        for pv in range(span + 1):
+            out.append(("rot", 2, pu, pv))
+            if (pu + pv) % 2 == 0:
+                out.append(("rot", 1, pu, pv))
+                out.append(("rot", 3, pu, pv))
+    for m in range(span + 1):
+        out.append(("mir", "v", m))
+        out.append(("mir", "h", m))
+    for du in range(-span, span + 1, 2):
+        for dv in range(-span, span + 1, 2):
+            if du or dv:
+                out.append(("trans", du, dv))
+    return out
+
+
+def _solve(catalogue, source, image_cells):
+    src = [(2 * c + 1, 2 * r + 1) for c, r in source]
+    want = {(2 * c + 1, 2 * r + 1) for c, r in image_cells}
+    if len(src) != len(want) or len(set(src)) != len(src):
+        raise OracleAbstention("tile pair is not a congruent pair of equal size")
+    hits = []
+    for motion in catalogue:
+        if {_apply(motion, p) for p in src} == want:
+            hits.append(motion)
+            if len(hits) > 1:
+                raise OracleAbstention("tile pair does not pin down one motion")
+    if not hits:
+        raise OracleAbstention("no lattice motion carries the pair")
+    return hits[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    rule = _mask(pixels, _RULE)
+    ox, oy, step = _lattice(rule)
+    cells = max(1, int(round((pixels.shape[0] - 2 * ox) / step)))
+    found = _roles(pixels, ox, oy, step, cells)
+
+    if len(found["dot"]) != 1:
+        raise OracleAbstention("expected exactly one purple dot")
+    if len(found["target"]) != 4:
+        raise OracleAbstention("expected exactly four black squares")
+    for name in ("green", "orange", "blue", "cyan"):
+        if len(found[name]) != 4:
+            raise OracleAbstention(f"expected a four-cell {name} tile")
+
+    catalogue = _catalogue(cells)
+    motion_a = _solve(catalogue, found["green"], found["orange"])
+    motion_b = _solve(catalogue, found["blue"], found["cyan"])
+
+    c, r = found["dot"][0]
+    u, v = _apply(motion_b, _apply(motion_a, (2 * c + 1, 2 * r + 1)))
+    landing = ((u - 1) // 2, (v - 1) // 2)
+
+    ordered = sorted(found["target"], key=lambda cell: cell[0])
+    if len({cell[0] for cell in ordered}) != 4:
+        raise OracleAbstention("black squares do not have distinct columns")
+    if landing not in ordered:
+        raise OracleAbstention("composed landing is not a drawn black square")
+    return f"square-{ordered.index(landing) + 1}"

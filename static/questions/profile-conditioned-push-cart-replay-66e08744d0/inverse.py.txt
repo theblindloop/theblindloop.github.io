@@ -1,0 +1,157 @@
+"""Scene-free pixel oracle for push_cart_replay.
+
+Receives one RGB image and nothing else. It re-finds the track cells, the two
+discs, the cards and each card's selector spot, arrow direction and pip count
+purely from colour components, then replays the push rules itself.
+
+This module imports no renderer, prompt, generator, verifier or gold code.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+from PIL import Image
+
+ORACLE_VERSION = "push_cart_replay-oracle-0.1.0"
+
+_CELL_FILL = (226, 226, 226)
+_RED = (200, 45, 45)
+_BLUE = (45, 80, 200)
+_CARD_FILL = (250, 240, 205)
+_GREEN = (30, 140, 60)
+_PURPLE = (130, 40, 160)
+
+_TOL = 12
+
+
+def _mask(px, w: int, h: int, colour: tuple[int, int, int]) -> bytearray:
+    cr, cg, cb = colour
+    m = bytearray(w * h)
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            r, g, b = px[x, y]
+            if abs(r - cr) <= _TOL and abs(g - cg) <= _TOL and abs(b - cb) <= _TOL:
+                m[row + x] = 1
+    return m
+
+
+def _components(mask: bytearray, w: int, h: int, min_area: int) -> list[dict]:
+    seen = bytearray(w * h)
+    out = []
+    for start in range(w * h):
+        if not mask[start] or seen[start]:
+            continue
+        q = deque([start])
+        seen[start] = 1
+        pts = []
+        while q:
+            p = q.popleft()
+            pts.append(p)
+            y, x = divmod(p, w)
+            if x > 0 and mask[p - 1] and not seen[p - 1]:
+                seen[p - 1] = 1
+                q.append(p - 1)
+            if x + 1 < w and mask[p + 1] and not seen[p + 1]:
+                seen[p + 1] = 1
+                q.append(p + 1)
+            if y > 0 and mask[p - w] and not seen[p - w]:
+                seen[p - w] = 1
+                q.append(p - w)
+            if y + 1 < h and mask[p + w] and not seen[p + w]:
+                seen[p + w] = 1
+                q.append(p + w)
+        if len(pts) < min_area:
+            continue
+        xs = [p % w for p in pts]
+        ys = [p // w for p in pts]
+        out.append(
+            {
+                "area": len(pts),
+                "x0": min(xs),
+                "x1": max(xs),
+                "y0": min(ys),
+                "y1": max(ys),
+                "cx": sum(xs) / len(xs),
+                "cy": sum(ys) / len(ys),
+                "bx": (min(xs) + max(xs)) / 2.0,
+                "by": (min(ys) + max(ys)) / 2.0,
+            }
+        )
+    return out
+
+
+def _inside(comp: dict, box: dict) -> bool:
+    return box["x0"] <= comp["bx"] <= box["x1"] and box["y0"] <= comp["by"] <= box["y1"]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    img = image.convert("RGB")
+    w, h = img.size
+    px = img.load()
+
+    cells = sorted(_components(_mask(px, w, h, _CELL_FILL), w, h, 400), key=lambda c: c["bx"])
+    cards = sorted(_components(_mask(px, w, h, _CARD_FILL), w, h, 400), key=lambda c: c["bx"])
+    if len(cells) < 2 or not cards:
+        raise ValueError("image does not show a track and a card row")
+    centres = [c["bx"] for c in cells]
+    n_cells = len(cells)
+
+    reds = _components(_mask(px, w, h, _RED), w, h, 80)
+    blues = _components(_mask(px, w, h, _BLUE), w, h, 80)
+    greens = _components(_mask(px, w, h, _GREEN), w, h, 80)
+    pips = _components(_mask(px, w, h, _PURPLE), w, h, 40)
+
+    def _split(comps):
+        on_track, on_cards = [], []
+        for c in comps:
+            if any(_inside(c, card) for card in cards):
+                on_cards.append(c)
+            else:
+                on_track.append(c)
+        return on_track, on_cards
+
+    red_discs, red_spots = _split(reds)
+    blue_discs, blue_spots = _split(blues)
+    if len(red_discs) != 1 or len(blue_discs) != 1:
+        raise ValueError("expected exactly one red and one blue disc on the track")
+
+    def _cell_of(comp):
+        return min(range(n_cells), key=lambda i: abs(centres[i] - comp["bx"]))
+
+    pos = {"red": _cell_of(red_discs[0]), "blue": _cell_of(blue_discs[0])}
+
+    program = []
+    for card in cards:
+        spot = [c for c in red_spots if _inside(c, card)]
+        target = "red" if spot else "blue"
+        if not spot:
+            spot = [c for c in blue_spots if _inside(c, card)]
+        if len(spot) != 1:
+            raise ValueError("card does not carry exactly one selector spot")
+        arrow = [c for c in greens if _inside(c, card)]
+        if len(arrow) != 1:
+            raise ValueError("card does not carry exactly one arrow")
+        # the apex side of an isoceles arrow head holds less area, so the
+        # colour centroid sits on the side the arrow points away from
+        direction = 1 if arrow[0]["cx"] < arrow[0]["bx"] else -1
+        steps = sum(1 for c in pips if _inside(c, card))
+        if steps < 1:
+            raise ValueError("card carries no pips")
+        program.append({"target": target, "dir": direction, "steps": steps})
+
+    for card in program:
+        other = "blue" if card["target"] == "red" else "red"
+        for _ in range(card["steps"]):
+            nxt = pos[card["target"]] + card["dir"]
+            if not 0 <= nxt < n_cells:
+                break
+            if nxt == pos[other]:
+                shoved = pos[other] + card["dir"]
+                if not 0 <= shoved < n_cells:
+                    break
+                pos[other] = shoved
+            pos[card["target"]] = nxt
+
+    return f"{pos['red'] + 1}|{pos['blue'] + 1}"

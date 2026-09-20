@@ -1,0 +1,173 @@
+"""Independent pixel-only inverse arm for the elastic-bounce register tracker.
+
+Receives only the final PNG. From the raster alone it:
+  1. finds the five grey slot boxes across the top and the four grey operator
+     boxes below (both drawn with a light grey outline), separating them by
+     vertical position;
+  2. locates the single red marker disk inside one track box -- its left-to-right
+     index is the ringed START slot (the orange ring redundantly confirms it);
+  3. reads each operator box left to right and, from the coloured disk inside,
+     recovers the operator type (green=+1, blue=-1) purely by colour;
+  4. replays the operators from the ringed start, honouring an elastic BOUNCE at
+     either wall (a +1 attempted past the right wall reflects to the previous
+     slot, a -1 attempted past the left wall reflects to the next slot), and
+     returns the final slot label.
+
+No latent scene, renderer, prompt, or analytic-gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+LIGHT = (190, 190, 190)
+MARKER = (205, 40, 40)
+RING = (240, 150, 20)
+GREEN = (35, 160, 70)
+BLUE = (45, 70, 210)
+
+PALETTE = [BG, LIGHT, MARKER, RING, GREEN, BLUE]
+_BG, _LIGHT, _MARKER, _RING, _GREEN, _BLUE = range(6)
+
+NOSLOT = 5
+NOPS = 4
+OP_BY_CLASS = {_GREEN: "+1", _BLUE: "-1"}
+SLOT_LABELS = [f"slot {i + 1}" for i in range(NOSLOT)]
+SPLIT_Y = 150
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected track + operator structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points):
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _average(points):
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+
+def _sort_by_x(boxes):
+    return sorted(boxes, key=lambda b: b[0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+
+    gray_pts = _components(labels == _LIGHT)
+    boxes = []
+    for pts in gray_pts:
+        x0, y0, x1, y1 = _bbox(pts)
+        if (x1 - x0) > 20 and (y1 - y0) > 20:
+            boxes.append((x0, y0, x1, y1))
+
+    track_boxes = [b for b in boxes if (b[1] + b[3]) / 2.0 < SPLIT_Y]
+    op_boxes = [b for b in boxes if (b[1] + b[3]) / 2.0 >= SPLIT_Y]
+    track_boxes = _sort_by_x(track_boxes)
+    op_boxes = _sort_by_x(op_boxes)
+    if len(track_boxes) != NOSLOT:
+        raise UnreadableImageError(f"found {len(track_boxes)} track boxes; expected {NOSLOT}")
+    if len(op_boxes) != NOPS:
+        raise UnreadableImageError(f"found {len(op_boxes)} operator boxes; expected {NOPS}")
+
+    marker = None
+    for pts in _components(labels == _MARKER):
+        if len(pts) < 30:
+            continue
+        marker = _average(pts)
+        break
+    if marker is None:
+        raise UnreadableImageError("no red marker disk found")
+    mx, my = marker
+
+    start = None
+    for i, (x0, y0, x1, y1) in enumerate(track_boxes):
+        if x0 - 4 <= mx <= x1 + 4 and y0 - 4 <= my <= y1 + 4:
+            start = i
+            break
+    if start is None:
+        raise UnreadableImageError("red marker is not inside any track box")
+
+    disks = {}
+    for cls, op in OP_BY_CLASS.items():
+        for pts in _components(labels == cls):
+            if len(pts) < 8:
+                continue
+            dx, dy = _average(pts)
+            disks.setdefault(op, []).append((dx, dy))
+
+    ops = []
+    for x0, y0, x1, y1 in op_boxes:
+        found = None
+        for op, pts in disks.items():
+            for dx, dy in pts:
+                if x0 - 2 <= dx <= x1 + 2 and y0 - 2 <= dy <= y1 + 2:
+                    found = op
+                    break
+            if found is not None:
+                break
+        if found is None:
+            raise UnreadableImageError("an operator box has no decoded disk")
+        ops.append(found)
+
+    pos = start
+    for op in ops:
+        if op == "+1":
+            if pos == NOSLOT - 1:
+                pos = NOSLOT - 2
+            else:
+                pos += 1
+        else:
+            if pos == 0:
+                pos = 1
+            else:
+                pos -= 1
+    return SLOT_LABELS[pos]

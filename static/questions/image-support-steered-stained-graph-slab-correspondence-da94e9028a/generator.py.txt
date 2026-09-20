@@ -1,0 +1,383 @@
+"""Renderer and analytic arm for directional colored-part graph correspondence."""
+
+from __future__ import annotations
+
+import copy
+import random
+from collections import Counter
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "stained-graph-slab-correspondence-0.1.0"
+
+WIDTH, HEIGHT = 960, 640
+SCALE = 2
+BOARD_W, BOARD_H = 880, 500
+GRID = 5
+COLOR_COUNT = 5
+CELL = 42
+CARD_W, CARD_H = 250, 360
+CARD_RELS = {"R": (26, 82), "A": (315, 82), "B": (604, 82)}
+GRID_REL = (20, 86)
+QUARANTINE_MARGIN = 0.05
+
+BACKGROUND = (246, 243, 236)
+FRAME = (28, 48, 65)
+FRAME_EDGE = (17, 32, 45)
+CARD = (241, 237, 224)
+CARD_EDGE = (184, 180, 164)
+GRID_EDGE = (31, 51, 63)
+TEXT_LIGHT = (231, 238, 231)
+TEXT_DARK = (37, 52, 59)
+NEUTRAL_BADGE = (141, 169, 157)
+AMBER_BADGE = (236, 166, 54)
+VIOLET_BADGE = (177, 109, 198)
+
+# The palette is permuted per scene. The inverse learns the five actual cell
+# colors from the raster and compares their RGB identities consistently.
+PALETTE_BANK = (
+    (36, 124, 139),
+    (211, 92, 67),
+    (117, 86, 166),
+    (224, 168, 54),
+    (73, 143, 91),
+)
+
+
+def _font(size: int, bold: bool = False):
+    names = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ) if bold else (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    )
+    for name in names:
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size=size * SCALE)
+    return ImageFont.load_default()
+
+
+def _rotate_cw(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> list[list[int]]:
+    return [list(row) for row in zip(*pattern[::-1])]
+
+
+def _rotate_ccw(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> list[list[int]]:
+    return [list(row) for row in zip(*pattern)][::-1]
+
+
+def _connected(pattern: tuple[tuple[int, ...], ...], value: int) -> bool:
+    points = [(row, col) for row in range(GRID) for col in range(GRID) if pattern[row][col] == value]
+    if not points:
+        return False
+    todo = [points[0]]
+    seen = {points[0]}
+    while todo:
+        row, col = todo.pop()
+        for nr, nc in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if 0 <= nr < GRID and 0 <= nc < GRID and pattern[nr][nc] == value and (nr, nc) not in seen:
+                seen.add((nr, nc))
+                todo.append((nr, nc))
+    return len(seen) == len(points)
+
+
+def _edge_counter(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> Counter[tuple[str, int, int]]:
+    """Build a compass-directed multigraph from touching colored cells."""
+
+    edges: Counter[tuple[str, int, int]] = Counter()
+    for row in range(GRID):
+        for col in range(GRID):
+            if col + 1 < GRID:
+                edges[("E", int(pattern[row][col]), int(pattern[row][col + 1]))] += 1
+            if row + 1 < GRID:
+                edges[("S", int(pattern[row][col]), int(pattern[row + 1][col]))] += 1
+    return edges
+
+
+def _graph_error(left: Counter, right: Counter) -> int:
+    keys = set(left) | set(right)
+    return int(sum(abs(int(left.get(key, 0)) - int(right.get(key, 0))) for key in keys))
+
+
+def _pattern_tuple(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> tuple[tuple[int, ...], ...]:
+    if len(pattern) != GRID or any(len(row) != GRID for row in pattern):
+        raise ValueError("each colored field must be a five-by-five grid")
+    values = tuple(tuple(int(value) for value in row) for row in pattern)
+    if any(value < 0 or value >= COLOR_COUNT for row in values for value in row):
+        raise ValueError("field color IDs are outside the public five-color set")
+    if any(sum(value == color for row in values for value in row) != GRID for color in range(COLOR_COUNT)):
+        raise ValueError("each color must occupy five cells")
+    if any(not _connected(values, color) for color in range(COLOR_COUNT)):
+        raise ValueError("each colored part must be connected")
+    return values
+
+
+def _make_pattern_pool() -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Generate connected equal-count colored partitions with distinct graphs."""
+
+    rng = random.Random(61019)
+    pool: list[tuple[tuple[int, ...], ...]] = []
+    signatures: set[tuple[tuple[tuple[str, int, int], int], ...]] = set()
+    for _ in range(500_000):
+        # Grow five labelled polyominoes from five random seeds.  A flat
+        # equal-count shuffle almost never has all five color parts connected,
+        # while frontier growth gives a plentiful, genuinely varied pool.
+        cells = [-1] * (GRID * GRID)
+        seeds = rng.sample(range(GRID * GRID), COLOR_COUNT)
+        for color, index in enumerate(seeds):
+            cells[index] = color
+        counts = [1] * COLOR_COUNT
+        for _step in range(GRID * GRID - COLOR_COUNT):
+            choices: list[tuple[int, int]] = []
+            for color in range(COLOR_COUNT):
+                if counts[color] >= GRID:
+                    continue
+                frontier: set[int] = set()
+                for index, value in enumerate(cells):
+                    if value != color:
+                        continue
+                    row, col = divmod(index, GRID)
+                    for nr, nc in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+                        if 0 <= nr < GRID and 0 <= nc < GRID:
+                            neighbor = nr * GRID + nc
+                            if cells[neighbor] < 0:
+                                frontier.add(neighbor)
+                choices.extend((color, index) for index in frontier)
+            if not choices:
+                break
+            color, index = rng.choice(choices)
+            if cells[index] >= 0:
+                continue
+            cells[index] = color
+            counts[color] += 1
+        if any(value < 0 for value in cells) or counts != [GRID] * COLOR_COUNT:
+            continue
+        pattern = tuple(tuple(cells[row * GRID:(row + 1) * GRID]) for row in range(GRID))
+        if _rotate_cw(pattern) == [list(row) for row in pattern]:
+            continue
+        signature = tuple(sorted(_edge_counter(pattern).items()))
+        if signature in signatures:
+            continue
+        signatures.add(signature)
+        pool.append(pattern)
+        if len(pool) >= 180:
+            break
+    if len(pool) < 80:
+        raise RuntimeError(f"connected graph pattern pool too small: {len(pool)}")
+    return tuple(pool)
+
+
+_PATTERN_POOL = _make_pattern_pool()
+
+
+def _panel_map(scene: dict) -> dict[str, dict]:
+    panels: dict[str, dict] = {}
+    for record in scene["candidate_fields"]:
+        slot = str(record["slot"])
+        if slot in panels or slot not in {"A", "B"}:
+            raise ValueError("candidate fields must contain one A and one B record")
+        panels[slot] = record
+    if set(panels) != {"A", "B"}:
+        raise ValueError("candidate fields must contain slots A and B")
+    return panels
+
+
+def _validate_scene(scene: dict) -> tuple[tuple[tuple[int, ...], ...], dict[str, dict]]:
+    reference = _pattern_tuple(scene["reference_graph"])
+    panels = _panel_map(scene)
+    for record in panels.values():
+        _pattern_tuple(record["grid"])
+        if record.get("badge") not in {"amber", "violet"}:
+            raise ValueError("candidate badge must be amber or violet")
+    palette = scene.get("paint_palette")
+    if not isinstance(palette, dict) or set(palette) != {str(i) for i in range(COLOR_COUNT)}:
+        raise ValueError("paint palette must expose five numbered RGB colors")
+    rgb_values = []
+    for key in sorted(palette):
+        value = palette[key]
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise ValueError("paint colors must be RGB triples")
+        rgb = tuple(int(channel) for channel in value)
+        if any(channel < 0 or channel > 255 for channel in rgb):
+            raise ValueError("paint channel outside byte range")
+        rgb_values.append(rgb)
+    if len(set(rgb_values)) != COLOR_COUNT:
+        raise ValueError("paint colors must be distinct")
+    anchor = scene.get("slab_anchor")
+    if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
+        raise ValueError("slab anchor must be an x,y pair")
+    ax, ay = int(anchor[0]), int(anchor[1])
+    if not (0 <= ax <= WIDTH - BOARD_W and 0 <= ay <= HEIGHT - BOARD_H):
+        raise ValueError("slab does not fit canvas")
+    return reference, panels
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample balanced graph worlds with equalized geometry and palette nuisances."""
+
+    rng = random.Random(int(seed))
+    reference = [list(row) for row in rng.choice(_PATTERN_POOL)]
+    target = _edge_counter(reference)
+    transformed_candidates = []
+    for pattern in _PATTERN_POOL:
+        error = _graph_error(target, _edge_counter(_rotate_cw(pattern)))
+        if error >= 6:
+            transformed_candidates.append((error, pattern))
+    if not transformed_candidates:
+        raise RuntimeError("no separated wrong graph candidate")
+    if int(seed) % 7 == 0:
+        near = [item for item in transformed_candidates if item[0] <= 8]
+        source = near if near else transformed_candidates
+    else:
+        far = [item for item in transformed_candidates if item[0] >= 12]
+        source = far if far else transformed_candidates
+    wrong = [list(row) for row in rng.choice(source)[1]]
+    matching_slot = "A" if rng.randrange(2) == 0 else "B"
+    matching_badge = "amber" if rng.randrange(2) == 0 else "violet"
+    wrong_badge = "violet" if matching_badge == "amber" else "amber"
+    records = [
+        {
+            "slot": "A",
+            "grid": _rotate_ccw(reference) if matching_slot == "A" else wrong,
+            "badge": matching_badge if matching_slot == "A" else wrong_badge,
+        },
+        {
+            "slot": "B",
+            "grid": _rotate_ccw(reference) if matching_slot == "B" else wrong,
+            "badge": matching_badge if matching_slot == "B" else wrong_badge,
+        },
+    ]
+    rng.shuffle(records)
+    palette_values = list(PALETTE_BANK)
+    rng.shuffle(palette_values)
+    return {
+        "reference_graph": reference,
+        "candidate_fields": records,
+        "paint_palette": {str(index): list(rgb) for index, rgb in enumerate(palette_values)},
+        "slab_anchor": [rng.randrange(28, 53), rng.randrange(48, 73)],
+    }
+
+
+def _errors(reference: tuple[tuple[int, ...], ...], panels: dict[str, dict]) -> dict[str, int]:
+    target = _edge_counter(reference)
+    return {
+        slot: _graph_error(target, _edge_counter(_rotate_cw(_pattern_tuple(panels[slot]["grid"]))))
+        for slot in ("A", "B")
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    """Select the badge attached to the uniquely exact transformed graph."""
+
+    reference, panels = _validate_scene(scene)
+    errors = _errors(reference, panels)
+    if errors["A"] == errors["B"]:
+        raise ValueError("transformed graph errors are tied")
+    best = "A" if errors["A"] < errors["B"] else "B"
+    return str(panels[best]["badge"])
+
+
+def margin(scene: dict) -> float:
+    """Return the runner-up graph error gap normalized by 80 possible edge units."""
+
+    reference, panels = _validate_scene(scene)
+    errors = sorted(_errors(reference, panels).values())
+    return float(errors[1] - errors[0]) / 80.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        reference, panels = _validate_scene(scene)
+        errors = _errors(reference, panels)
+        return errors["A"] == errors["B"] or margin(scene) < QUARANTINE_MARGIN
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _box(box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SCALE)) for value in box)  # type: ignore[return-value]
+
+
+def _draw_label(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font, fill) -> None:
+    draw.text((xy[0] * SCALE, xy[1] * SCALE), text, font=font, fill=fill)
+
+
+def _draw_field(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    label: str,
+    grid: list[list[int]] | tuple[tuple[int, ...], ...],
+    badge: str,
+    palette: dict[str, list[int]],
+) -> None:
+    draw.rounded_rectangle(
+        _box((x, y, x + CARD_W, y + CARD_H)),
+        radius=12 * SCALE,
+        fill=CARD,
+        outline=CARD_EDGE,
+        width=2 * SCALE,
+    )
+    _draw_label(draw, (x + 15, y + 14), label, _font(17, bold=True), TEXT_DARK)
+    badge_color = NEUTRAL_BADGE if badge == "neutral" else AMBER_BADGE if badge == "amber" else VIOLET_BADGE
+    draw.rounded_rectangle(
+        _box((x + CARD_W - 45, y + 16, x + CARD_W - 17, y + 43)),
+        radius=7 * SCALE,
+        fill=badge_color,
+        outline=TEXT_DARK,
+        width=1 * SCALE,
+    )
+    gx, gy = x + GRID_REL[0], y + GRID_REL[1]
+    draw.rectangle(
+        _box((gx - 3, gy - 3, gx + GRID * CELL + 2, gy + GRID * CELL + 2)),
+        fill=GRID_EDGE,
+    )
+    for row in range(GRID):
+        for col in range(GRID):
+            left = gx + col * CELL
+            top = gy + row * CELL
+            right = left + CELL - 1
+            bottom = top + CELL - 1
+            draw.rectangle(_box((left, top, right, bottom)), fill=tuple(palette[str(int(grid[row][col]))]))
+    # A thin compass-like grid line makes the cell boundaries observable while
+    # leaving a large exact-color interior for the independent sampler.
+    for index in range(GRID + 1):
+        xx = gx + index * CELL - 1
+        yy = gy + index * CELL - 1
+        draw.line((xx * SCALE, (gy - 2) * SCALE, xx * SCALE, (gy + GRID * CELL + 1) * SCALE), fill=GRID_EDGE, width=SCALE)
+        draw.line(((gx - 2) * SCALE, yy * SCALE, (gx + GRID * CELL + 1) * SCALE, yy * SCALE), fill=GRID_EDGE, width=SCALE)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one translated, high-fill connected stained slab."""
+
+    reference, panels = _validate_scene(scene)
+    ax, ay = int(scene["slab_anchor"][0]), int(scene["slab_anchor"][1])
+    palette = scene["paint_palette"]
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        _box((ax, ay, ax + BOARD_W, ay + BOARD_H)),
+        radius=22 * SCALE,
+        fill=FRAME,
+        outline=FRAME_EDGE,
+        width=3 * SCALE,
+    )
+    _draw_label(draw, (ax + 28, ay + 20), "STAINED GRAPH CORRESPONDENCE", _font(22, bold=True), TEXT_LIGHT)
+    _draw_label(draw, (ax + 30, ay + 50), "rotate A and B clockwise; compare every compass contact", _font(13), TEXT_LIGHT)
+    _draw_field(draw, ax + CARD_RELS["R"][0], ay + CARD_RELS["R"][1], "R  REFERENCE", reference, "neutral", palette)
+    for slot in ("A", "B"):
+        record = panels[slot]
+        relx, rely = CARD_RELS[slot]
+        _draw_field(draw, ax + relx, ay + rely, f"{slot}  CANDIDATE", record["grid"], str(record["badge"]), palette)
+    _draw_label(draw, (ax + 30, ay + BOARD_H - 42), "same five paint colors; only the matching badge is the answer", _font(13), TEXT_LIGHT)
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Reverse slot-addressed records while retaining their visible slots."""
+
+    twin = copy.deepcopy(scene)
+    twin["candidate_fields"] = list(reversed(twin["candidate_fields"]))
+    return [("candidate_record_order", twin)]

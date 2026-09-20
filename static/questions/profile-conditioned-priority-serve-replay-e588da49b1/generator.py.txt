@@ -1,0 +1,274 @@
+"""Renderer, sampler and analytic gold for priority_serve_replay.
+
+The picture is one row of cream cards, acted on in drawn left-to-right order.
+An *add* card carries a coloured bar standing on a common baseline: the bar's
+colour names an item and the bar's drawn height is that item's priority.  A
+*serve* card carries a black downward triangle: it takes away the item whose bar
+is the tallest among those still waiting.  Nothing about the waiting set is ever
+drawn, so the answer -- the colour taken by the last serve card -- is only
+recoverable by replaying the drawn row while carrying an undrawn set and
+re-ranking it by drawn height at each serve.
+
+Every quantity the answer depends on is a drawn stroke: the kind of each card,
+the colour of each bar, the pixel height of each bar and the left-to-right order
+of the cards.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "priority_serve_replay-renderer-0.1.0"
+
+CANVAS = (1140, 348)
+PAGE_BG = (250, 247, 239)
+CARD_BG = (255, 253, 248)
+CARD_EDGE = (198, 192, 180)
+ARROW = (168, 168, 168)
+INK = (12, 12, 12)
+
+CARD_W = 88
+CARD_GAP = 12
+CARD_TOP = 46
+CARD_BOT = 286
+BAR_W = 46
+BASE = 272           # y of the common bar baseline (inclusive, drawn)
+H_MIN, H_MAX = 34, 176
+SAFE_SEP = 14        # pairwise height separation in the safe sampling mode
+QUARANTINE_MARGIN = 9.0
+
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (206, 48, 42),
+    "orange": (238, 150, 26),
+    "blue": (46, 86, 196),
+    "green": (36, 142, 72),
+    "purple": (128, 60, 168),
+    "teal": (18, 132, 142),
+}
+COLOUR_ORDER = ("red", "orange", "blue", "green", "purple", "teal")
+
+
+# --------------------------------------------------------------------------
+# geometry
+# --------------------------------------------------------------------------
+def _card_x(n_cards: int, pos: int) -> int:
+    """Left edge of the card drawn at slot ``pos`` of a row of ``n_cards``."""
+    total = n_cards * CARD_W + (n_cards - 1) * CARD_GAP
+    x0 = (CANVAS[0] - total) // 2
+    return x0 + pos * (CARD_W + CARD_GAP)
+
+
+def _ordered(scene: dict) -> list[dict]:
+    """The drawn cards in the order they act: by their own drawn position."""
+    return sorted(scene["cards"], key=lambda c: c["pos"])
+
+
+# --------------------------------------------------------------------------
+# the declared replay rule
+# --------------------------------------------------------------------------
+def _replay(cards: list[dict], pick: str = "tallest") -> list[tuple[dict, float]]:
+    """Replay the row, returning (item taken, runner-up height gap) per serve.
+
+    ``pick`` selects the removal rule; only ``"tallest"`` is the declared rule.
+    ``"oldest"`` and ``"newest"`` are the two arrival-order shortcuts the
+    sampler is required to break.
+    """
+    waiting: list[dict] = []
+    events: list[tuple[dict, float]] = []
+    for card in cards:
+        if card["kind"] == "add":
+            waiting.append(card)
+            continue
+        if len(waiting) < 2:
+            raise ValueError("serve card with fewer than two waiting items")
+        if pick == "oldest":
+            taken = waiting[0]
+        elif pick == "newest":
+            taken = waiting[-1]
+        else:
+            taken = max(waiting, key=lambda w: w["height"])
+        rest = [w for w in waiting if w is not taken]
+        runner = max(rest, key=lambda w: w["height"])
+        events.append((taken, float(taken["height"] - runner["height"])))
+        waiting.remove(taken)
+    if not events:
+        raise ValueError("no serve card")
+    return events
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour of the bar the last drawn serve card takes away."""
+    return _replay(_ordered(scene))[-1][0]["colour"]
+
+
+def margin(scene: dict) -> float:
+    """Smallest runner-up height gap, in pixels, over all serve decisions.
+
+    This is the clearance of the whole replay: if any serve's top-two waiting
+    bars were closer than this, that serve could resolve the other way.
+    """
+    return min(gap for _, gap in _replay(_ordered(scene)))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _heights_safe(rng: random.Random, k: int) -> list[int] | None:
+    for _ in range(200):
+        vals = sorted(rng.sample(range(H_MIN, H_MAX + 1), k))
+        if all(b - a >= SAFE_SEP for a, b in zip(vals, vals[1:])):
+            return vals
+    return None
+
+
+def _kinds(rng: random.Random, n_add: int, n_serve: int) -> list[str] | None:
+    """A card order whose last card serves and whose every serve has >= 2 waiting."""
+    for _ in range(200):
+        kinds = ["add"] * n_add + ["serve"] * (n_serve - 1)
+        rng.shuffle(kinds)
+        kinds.append("serve")
+        waiting = 0
+        ok = True
+        for kind in kinds:
+            if kind == "add":
+                waiting += 1
+            elif waiting < 2:
+                ok = False
+                break
+            else:
+                waiting -= 1
+        if ok:
+            return kinds
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one scene.  The cards are stored as an unordered bag: each card
+    carries its own drawn slot, so the list order is not load-bearing."""
+    rng = random.Random(seed * 7919 + 13)
+    for _ in range(6000):
+        n_add = rng.choice([5, 6, 6])
+        n_serve = rng.choice([2, 3, 3, 4])
+        if n_serve >= n_add:
+            continue
+        kinds = _kinds(rng, n_add, n_serve)
+        if kinds is None:
+            continue
+        heights = _heights_safe(rng, n_add)
+        if heights is None:
+            continue
+        near = rng.random() < 0.20
+        rng.shuffle(heights)
+        if near:
+            # pull one bar close to another so some serve decision is tight
+            i, j = rng.sample(range(n_add), 2)
+            delta = rng.randint(3, 12)
+            cand = heights[j] + (delta if rng.random() < 0.5 else -delta)
+            if not (H_MIN <= cand <= H_MAX) or cand in heights:
+                continue
+            heights[i] = cand
+        colours = rng.sample(COLOUR_ORDER, n_add)
+
+        cards: list[dict] = []
+        item = 0
+        for pos, kind in enumerate(kinds):
+            if kind == "add":
+                cards.append(
+                    {
+                        "pos": pos,
+                        "kind": "add",
+                        "colour": colours[item],
+                        "height": heights[item],
+                    }
+                )
+                item += 1
+            else:
+                cards.append({"pos": pos, "kind": "serve", "colour": None, "height": None})
+
+        scene = {
+            "canvas": list(CANVAS),
+            "n_cards": len(cards),
+            "n_add": n_add,
+            "n_serve": n_serve,
+            "near_boundary": bool(near),
+            "cards": cards,
+        }
+        try:
+            events = _replay(_ordered(scene))
+        except ValueError:
+            continue
+        gap = min(g for _, g in events)
+        if near:
+            if not (3.0 <= gap <= 12.0):
+                continue
+        elif gap < float(SAFE_SEP):
+            continue
+
+        gold = events[-1][0]["colour"]
+        adds = [c for c in _ordered(scene) if c["kind"] == "add"]
+        # shortcut blocks: the answer is never simply the tallest bar drawn,
+        # never the arrival-order (FIFO) answer and never the newest (LIFO) one.
+        if gold == max(adds, key=lambda c: c["height"])["colour"]:
+            continue
+        if gold == _replay(_ordered(scene), "oldest")[-1][0]["colour"]:
+            continue
+        if gold == _replay(_ordered(scene), "newest")[-1][0]["colour"]:
+            continue
+        # and never just the bar on the add card nearest the last serve card
+        if gold == adds[-1]["colour"]:
+            continue
+        rng.shuffle(scene["cards"])  # the bag order carries no information
+        return scene
+    raise RuntimeError(f"sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", tuple(scene["canvas"]), PAGE_BG)
+    d = ImageDraw.Draw(img)
+    n = scene["n_cards"]
+    for card in _ordered(scene):
+        x0 = _card_x(n, card["pos"])
+        x1 = x0 + CARD_W - 1
+        d.rectangle([x0, CARD_TOP, x1, CARD_BOT], fill=CARD_BG, outline=CARD_EDGE, width=2)
+        cx = x0 + CARD_W // 2
+        if card["kind"] == "add":
+            h = int(card["height"])
+            d.rectangle(
+                [cx - BAR_W // 2, BASE - h + 1, cx - BAR_W // 2 + BAR_W - 1, BASE],
+                fill=PALETTE[card["colour"]],
+            )
+        else:
+            d.polygon([(cx - 26, 150), (cx + 26, 150), (cx, 196)], fill=INK)
+    # drawn order arrow under the row
+    left = _card_x(n, 0)
+    right = _card_x(n, n - 1) + CARD_W - 1
+    y = 316
+    d.rectangle([left, y - 1, right - 16, y + 1], fill=ARROW)
+    d.polygon([(right - 20, y - 9), (right - 20, y + 9), (right, y)], fill=ARROW)
+    return img
+
+
+# --------------------------------------------------------------------------
+# declared latent symmetries: bag permutations are pixel-identical
+# --------------------------------------------------------------------------
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    cards = list(scene["cards"])
+    out: list[tuple[str, dict]] = []
+    for name, perm in (
+        ("cards_bag_reversed", list(reversed(cards))),
+        ("cards_bag_rotated", cards[3:] + cards[:3]),
+        ("cards_bag_sorted_by_drawn_position", sorted(cards, key=lambda c: c["pos"])),
+    ):
+        alt = dict(scene)
+        alt["cards"] = [dict(c) for c in perm]
+        out.append((name, alt))
+    return out

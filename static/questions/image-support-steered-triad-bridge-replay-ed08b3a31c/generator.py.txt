@@ -1,0 +1,193 @@
+"""Deterministic latent sampler and crisp raster renderer for bridge replay."""
+
+from __future__ import annotations
+
+import hashlib
+import itertools
+import random
+from functools import lru_cache
+
+from PIL import Image, ImageDraw
+
+CANVAS = 640
+BACKGROUND = (250, 248, 242)
+INK = (42, 45, 52)
+FRAME = (181, 181, 185)
+DECOR = (218, 216, 210)
+
+# Each edge identity is rendered with one palette chosen by palette_order.
+VIVID = ((214, 53, 70), (47, 103, 211), (232, 151, 35))
+PALE = ((246, 190, 198), (181, 205, 247), (250, 220, 173))
+
+
+def _reachable(states: list[int] | tuple[int, ...]) -> bool:
+    """Edges 0/1 form the two-hop route; edge 2 is the direct route."""
+    return bool(states[2] or (states[0] and states[1]))
+
+
+def _apply(initial: list[int] | tuple[int, ...], commands: list[list[int]] | tuple) -> list[int]:
+    states = [int(value) for value in initial]
+    for edge, state in commands:
+        states[int(edge)] = int(state)
+    return states
+
+
+@lru_cache(maxsize=1)
+def _scene_pools() -> tuple[tuple[tuple, ...], tuple[tuple, ...]]:
+    pools: list[list[tuple]] = [[], []]
+    atoms = tuple(itertools.product(range(3), range(2)))
+    for initial in itertools.product(range(2), repeat=3):
+        for commands in itertools.product(atoms, repeat=4):
+            touched = {edge for edge, _ in commands}
+            if len(touched) != 2:
+                continue
+            if sum(state for _, state in commands) != 2:
+                continue
+            # At least one bridge receives contradictory overwrites.
+            if not any(
+                {state for edge, state in commands if edge == chosen} == {0, 1}
+                for chosen in touched
+            ):
+                continue
+            final = _apply(initial, commands)
+            answer = _reachable(final)
+            if _reachable(initial) == answer:
+                continue
+            if _reachable(_apply(initial, tuple(reversed(commands)))) == answer:
+                continue
+            untouched = next(iter(set(range(3)) - touched))
+            twin_initial = list(initial)
+            twin_initial[untouched] ^= 1
+            if _reachable(_apply(twin_initial, commands)) == answer:
+                continue
+            pools[int(answer)].append((initial, commands))
+    if not pools[0] or not pools[1]:
+        raise AssertionError("causal scene pools are unexpectedly empty")
+    return tuple(pools[0]), tuple(pools[1])
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample balanced, order-live, two-component scenes."""
+    rng = random.Random(int(seed))
+    target = int(seed) & 1
+    pool = _scene_pools()[target]
+    initial, commands = pool[rng.randrange(len(pool))]
+    palette_order = list(range(3))
+    rng.shuffle(palette_order)
+
+    # The two decisive components occupy cell centers two 8x8-grid cells apart.
+    left_cell = rng.choice((1, 2, 3, 4))
+    row_cell = rng.choice((1, 2, 3, 4, 5, 6))
+    anchor_x = left_cell * 80 + 40
+    anchor_y = row_cell * 80 + 40
+
+    decorations: list[list[int]] = []
+    while len(decorations) < 12:
+        x = rng.randrange(24, CANVAS - 24)
+        y = rng.randrange(24, CANVAS - 24)
+        if min(abs(x - anchor_x), abs(x - (anchor_x + 160))) < 62 and abs(y - anchor_y) < 62:
+            continue
+        decorations.append([x, y, rng.randrange(2)])
+
+    return {
+        "initial": list(initial),
+        "commands": [list(command) for command in commands],
+        "palette_order": palette_order,
+        "anchor_x": anchor_x,
+        "anchor_y": anchor_y,
+        "decorations": decorations,
+    }
+
+
+def _draw_vertex(draw: ImageDraw.ImageDraw, kind: int, x: int, y: int) -> None:
+    if kind == 0:  # circle
+        draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=BACKGROUND, outline=INK, width=2)
+    elif kind == 1:  # triangle
+        draw.polygon(((x, y - 6), (x - 6, y + 5), (x + 6, y + 5)), fill=BACKGROUND, outline=INK)
+        draw.line(((x, y - 6), (x - 6, y + 5), (x + 6, y + 5), (x, y - 6)), fill=INK, width=2)
+    else:  # square
+        draw.rectangle((x - 5, y - 5, x + 5, y + 5), fill=BACKGROUND, outline=INK, width=2)
+
+
+def render(scene: dict) -> Image.Image:
+    initial = [int(value) for value in scene["initial"]]
+    commands = [[int(value) for value in command] for command in scene["commands"]]
+    palette_order = [int(value) for value in scene["palette_order"]]
+    cx, cy = int(scene["anchor_x"]), int(scene["anchor_y"])
+    decorations = scene["decorations"]
+
+    image = Image.new("RGB", (CANVAS, CANVAS), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    # Remote marks are visible but deliberately use no semantic palette color.
+    for x, y, kind in decorations:
+        x, y, kind = int(x), int(y), int(kind)
+        if kind == 0:
+            draw.ellipse((x - 3, y - 3, x + 3, y + 3), outline=DECOR, width=2)
+        else:
+            draw.line((x - 3, y, x + 3, y), fill=DECOR, width=2)
+            draw.line((x, y - 3, x, y + 3), fill=DECOR, width=2)
+
+    command_x = cx + 160
+    draw.rounded_rectangle((cx - 27, cy - 26, cx + 27, cy + 25), radius=7, outline=FRAME, width=2)
+    draw.rounded_rectangle(
+        (command_x - 16, cy - 27, command_x + 16, cy + 27),
+        radius=7,
+        outline=FRAME,
+        width=2,
+    )
+
+    vertices = ((cx - 16, cy + 13), (cx, cy - 15), (cx + 16, cy + 13))
+    edge_ends = ((vertices[0], vertices[1]), (vertices[1], vertices[2]), (vertices[0], vertices[2]))
+    for edge, (start, end) in enumerate(edge_ends):
+        palette = palette_order[edge]
+        color = VIVID[palette] if initial[edge] else PALE[palette]
+        draw.line((start, end), fill=color, width=5)
+    for kind, (x, y) in enumerate(vertices):
+        _draw_vertex(draw, kind, x, y)
+
+    # Arrowhead plus vertical guide declare the top-to-bottom order visually.
+    draw.line((command_x - 10, cy - 21, command_x - 10, cy + 20), fill=FRAME, width=1)
+    draw.polygon(
+        ((command_x - 13, cy + 17), (command_x - 7, cy + 17), (command_x - 10, cy + 22)),
+        fill=FRAME,
+    )
+    for row, (edge, state) in enumerate(commands):
+        palette = palette_order[edge]
+        color = VIVID[palette] if state else PALE[palette]
+        y = cy - 15 + row * 10
+        draw.rectangle((command_x - 2, y - 3, command_x + 4, y + 3), fill=color)
+
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    final = _apply(scene["initial"], scene["commands"])
+    return "yes" if _reachable(final) else "no"
+
+
+def margin(scene: dict) -> float:
+    # Crisp 7x7 command marks have 29 pixels of area headroom above the oracle floor.
+    _ = scene["commands"]
+    return 29.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        return not (
+            len(scene["initial"]) == 3
+            and len(scene["commands"]) == 4
+            and sorted(scene["palette_order"]) == [0, 1, 2]
+        )
+    except (KeyError, TypeError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    _ = scene["initial"]
+    return []
+
+
+def scene_digest(scene: dict) -> str:
+    """Small diagnostic used only by tests, never by the pixel oracle."""
+    return hashlib.sha256(repr(sorted(scene.items())).encode("utf-8")).hexdigest()

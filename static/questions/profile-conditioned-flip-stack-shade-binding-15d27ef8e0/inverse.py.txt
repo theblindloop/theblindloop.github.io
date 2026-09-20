@@ -1,0 +1,183 @@
+"""Pixel-only oracle for flip_stack_shade_binding.
+
+Receives a rendered image and nothing else. It segments the three halo
+rectangles, groups the flat gray tiles into tokens, recovers each token's
+reading direction from its black tab, quantizes tile shades into three classes,
+solves the reference-to-candidate correspondence, and only then reports the
+matching candidate's letter and halo color. It abstains whenever the parse is
+incomplete or the correspondence is not unique.
+"""
+
+from __future__ import annotations
+
+from PIL import Image
+
+ORACLE_VERSION = "flip_stack_shade_binding-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+
+HALO_RGB = {
+    (214, 32, 32): "red",
+    (32, 64, 214): "blue",
+    (24, 140, 56): "green",
+}
+
+GRAY_LO = 70
+GRAY_HI = 230
+MIN_TILE_AREA = 400
+MIN_HALO_AREA = 200
+MIN_TAB_AREA = 400
+TAB_SEARCH = 40
+N_TILES = 4
+THRESHOLDS = (127.5, 182.5)
+LETTERS = ("A", "B", "C")
+
+
+def _components(mask: list[list[bool]], width: int, height: int, min_area: int) -> list[list[tuple[int, int]]]:
+    seen = [[False] * width for _ in range(height)]
+    blobs = []
+    for sy in range(height):
+        row = mask[sy]
+        for sx in range(width):
+            if not row[sx] or seen[sy][sx]:
+                continue
+            stack = [(sx, sy)]
+            seen[sy][sx] = True
+            pixels = []
+            while stack:
+                x, y = stack.pop()
+                pixels.append((x, y))
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < width and 0 <= ny < height and mask[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            if len(pixels) >= min_area:
+                blobs.append(pixels)
+    return blobs
+
+
+def _bbox(pixels: list[tuple[int, int]]) -> tuple[int, int, int, int]:
+    xs = [p[0] for p in pixels]
+    ys = [p[1] for p in pixels]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _shade_class(value: float) -> int:
+    if value < THRESHOLDS[0]:
+        return 0
+    if value < THRESHOLDS[1]:
+        return 1
+    return 2
+
+
+def _median(values: list[int]) -> float:
+    ordered = sorted(values)
+    count = len(ordered)
+    middle = count // 2
+    if count % 2:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    pixels = rgb.load()
+
+    gray_mask = [[False] * width for _ in range(height)]
+    black_mask = [[False] * width for _ in range(height)]
+    halo_masks = {name: [[False] * width for _ in range(height)] for name in HALO_RGB.values()}
+
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixels[x, y]
+            if r == g == b:
+                if GRAY_LO <= r <= GRAY_HI:
+                    gray_mask[y][x] = True
+                elif r <= 40:
+                    black_mask[y][x] = True
+                continue
+            name = HALO_RGB.get((r, g, b))
+            if name is not None:
+                halo_masks[name][y][x] = True
+
+    # Halos: one rectangle outline per candidate token.
+    halos = []
+    for name, mask in halo_masks.items():
+        blobs = _components(mask, width, height, MIN_HALO_AREA)
+        if len(blobs) != 1:
+            return ABSTAIN
+        halos.append((name, _bbox(blobs[0])))
+    if len(halos) != 3:
+        return ABSTAIN
+
+    tiles = []
+    for blob in _components(gray_mask, width, height, MIN_TILE_AREA):
+        x0, y0, x1, y1 = _bbox(blob)
+        values = [pixels[x, y][0] for x, y in blob]
+        tiles.append({"bbox": (x0, y0, x1, y1), "level": _median(values)})
+    if len(tiles) != 4 * N_TILES:
+        return ABSTAIN
+
+    tabs = [_bbox(blob) for blob in _components(black_mask, width, height, MIN_TAB_AREA)]
+
+    def _inside(box: tuple[int, int, int, int], halo: tuple[int, int, int, int]) -> bool:
+        cx = (box[0] + box[2]) / 2.0
+        cy = (box[1] + box[3]) / 2.0
+        return halo[0] <= cx <= halo[2] and halo[1] <= cy <= halo[3]
+
+    groups: list[dict] = [{"halo": name, "box": box, "tiles": []} for name, box in halos]
+    reference = {"halo": None, "box": None, "tiles": []}
+    for tile in tiles:
+        owners = [group for group in groups if _inside(tile["bbox"], group["box"])]
+        if len(owners) > 1:
+            return ABSTAIN
+        if owners:
+            owners[0]["tiles"].append(tile)
+        else:
+            reference["tiles"].append(tile)
+
+    tokens = [reference] + groups
+    for token in tokens:
+        if len(token["tiles"]) != N_TILES:
+            return ABSTAIN
+
+    def _sequence(token: dict) -> list[int] | None:
+        ordered = sorted(token["tiles"], key=lambda tile: tile["bbox"][1])
+        left = min(tile["bbox"][0] for tile in ordered)
+        right = max(tile["bbox"][2] for tile in ordered)
+        top = ordered[0]["bbox"][1]
+        bottom = ordered[-1]["bbox"][3]
+        above = []
+        below = []
+        for tab in tabs:
+            tab_cx = (tab[0] + tab[2]) / 2.0
+            tab_cy = (tab[1] + tab[3]) / 2.0
+            if not (left <= tab_cx <= right):
+                continue
+            if top - TAB_SEARCH <= tab_cy < top:
+                above.append(tab)
+            elif bottom < tab_cy <= bottom + TAB_SEARCH:
+                below.append(tab)
+        if len(above) + len(below) != 1:
+            return None
+        classes = [_shade_class(tile["level"]) for tile in ordered]
+        return list(reversed(classes)) if below else classes
+
+    reference_sequence = _sequence(reference)
+    if reference_sequence is None:
+        return ABSTAIN
+
+    groups.sort(key=lambda group: (group["box"][0] + group["box"][2]) / 2.0)
+    matched = []
+    for index, group in enumerate(groups):
+        sequence = _sequence(group)
+        if sequence is None:
+            return ABSTAIN
+        if sequence == reference_sequence:
+            matched.append(index)
+    if len(matched) != 1:
+        return ABSTAIN
+
+    index = matched[0]
+    return f"{LETTERS[index]}:{groups[index]['halo']}"

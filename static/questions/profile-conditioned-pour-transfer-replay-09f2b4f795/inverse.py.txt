@@ -1,0 +1,186 @@
+"""Scene-free pixel inverse arm for pour_transfer_replay.
+
+Receives only the rendered RGB image. It re-discovers the four vessels from
+their drawn label discs, counts each vessel's drawn unit cells to recover its
+capacity and its starting level, re-discovers the marked vessel from the drawn
+red ring, re-discovers the pour cards as cream blocks in drawn left-to-right
+order, reads each card's two named vessels from the label colours of its two
+small discs and its direction from the thickness asymmetry between its
+arrowhead end and its tail end, replays the pours, and returns the marked
+vessel's final level together with the number of cards that changed it.
+
+It imports no renderer, prompt, generator, verifier or gold code, and it never
+sees latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "pour_transfer_replay-oracle-0.1.0"
+
+_LABELS: dict[str, tuple[int, int, int]] = {
+    "green": (26, 150, 72),
+    "orange": (232, 124, 20),
+    "purple": (128, 54, 168),
+    "yellow": (232, 200, 24),
+}
+_BLACK = (15, 15, 15)
+_RED = (214, 38, 38)
+_EMPTY = (226, 226, 226)
+_FILLED = (40, 72, 152)
+_CREAM = (250, 242, 215)
+
+_MIN_LABEL_PIXELS = 400
+_MIN_CARD_DISC = 120
+_MIN_CELL_RUN = 12
+_MIN_CARD_RUN = 60
+_MIN_ARROW_PIXELS = 150
+
+
+def _mask(arr: np.ndarray, ref, tol: int = 26) -> np.ndarray:
+    return (
+        (np.abs(arr[:, :, 0].astype(np.int16) - ref[0]) <= tol)
+        & (np.abs(arr[:, :, 1].astype(np.int16) - ref[1]) <= tol)
+        & (np.abs(arr[:, :, 2].astype(np.int16) - ref[2]) <= tol)
+    )
+
+
+def _runs(flags: np.ndarray, min_len: int = 1) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, v in enumerate(flags):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if i - start >= min_len:
+                out.append((start, i - 1))
+            start = None
+    if start is not None and len(flags) - start >= min_len:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def _centroid(mask: np.ndarray) -> tuple[float, float]:
+    ys, xs = np.nonzero(mask)
+    return float(xs.mean()), float(ys.mean())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    h, w, _ = arr.shape
+
+    empty = _mask(arr, _EMPTY, tol=14)
+    filled = _mask(arr, _FILLED)
+    cells = empty | filled
+
+    # ---- vessels: the big label disc of each colour names one vessel ---------
+    vessels: list[tuple[float, float, str]] = []
+    label_masks: dict[str, np.ndarray] = {}
+    for name, rgb in _LABELS.items():
+        m = _mask(arr, rgb)
+        if int(m.sum()) < _MIN_LABEL_PIXELS:
+            raise ValueError(f"label colour {name} is not present in the image")
+        label_masks[name] = m
+        bands = _runs(m.any(axis=1))
+        if not bands:
+            raise ValueError(f"label colour {name} has no drawn band")
+        # the vessel's own label disc is the tallest band of its colour; the
+        # smaller bands are that colour's discs inside the pour cards
+        y0, y1 = max(bands, key=lambda b: b[1] - b[0])
+        band = np.zeros_like(m)
+        band[y0 : y1 + 1, :] = m[y0 : y1 + 1, :]
+        cx, cy = _centroid(band)
+        vessels.append((cx, cy, name))
+    vessels.sort()
+    lane_x = [v[0] for v in vessels]
+    lane_y = [v[1] for v in vessels]
+    names = [v[2] for v in vessels]
+    index_of = {name: i for i, name in enumerate(names)}
+    n = len(vessels)
+
+    # ---- capacities and starting levels, from the drawn unit cells ----------
+    caps: list[int] = []
+    levels: list[int] = []
+    for i in range(n):
+        col = int(round(lane_x[i]))
+        col = max(0, min(w - 1, col))
+        stack = _runs(cells[:, col], min_len=_MIN_CELL_RUN)
+        if not stack:
+            raise ValueError("a vessel has no drawn unit cells")
+        cap = len(stack)
+        level = 0
+        for y0, y1 in stack:
+            mid = (y0 + y1) // 2
+            if bool(filled[mid, col]):
+                level += 1
+            elif not bool(empty[mid, col]):
+                raise ValueError("a drawn unit cell has an unreadable state")
+        caps.append(cap)
+        levels.append(level)
+
+    # ---- marked vessel, from the drawn red ring -----------------------------
+    rm = _mask(arr, _RED)
+    if int(rm.sum()) < 100:
+        raise ValueError("no marker ring found")
+    rx, ry = _centroid(rm)
+    marked = min(range(n), key=lambda i: (rx - lane_x[i]) ** 2 + (ry - lane_y[i]) ** 2)
+
+    # ---- pour cards, in drawn left-to-right order ---------------------------
+    cm = _mask(arr, _CREAM, tol=10)
+    if int(cm.sum()) < 1000:
+        raise ValueError("no pour cards found")
+    spans = _runs(cm.any(axis=0), min_len=_MIN_CARD_RUN)
+    if not spans:
+        raise ValueError("no pour cards recovered")
+    black = _mask(arr, _BLACK, tol=40)
+
+    cards: list[tuple[int, int]] = []
+    for x0, x1 in spans:
+        rows = _runs(cm[:, x0 : x1 + 1].any(axis=1), min_len=10)
+        if not rows:
+            raise ValueError("a pour card has no drawn body")
+        y0, y1 = max(rows, key=lambda b: b[1] - b[0])
+
+        found: list[tuple[float, str]] = []
+        for name, m in label_masks.items():
+            sub = m[y0 : y1 + 1, x0 : x1 + 1]
+            if int(sub.sum()) < _MIN_CARD_DISC:
+                continue
+            xs = np.nonzero(sub.any(axis=0))[0]
+            found.append((float(xs.mean()) + x0, name))
+        if len(found) != 2:
+            raise ValueError("a pour card does not name exactly two vessels")
+        found.sort()
+
+        band = black[y0 : y1 + 1, x0 : x1 + 1]
+        if int(band.sum()) < _MIN_ARROW_PIXELS:
+            raise ValueError("a pour card has no readable arrow")
+        cols = np.nonzero(band.any(axis=0))[0]
+        a_lo, a_hi = int(cols[0]), int(cols[-1])
+        thick = band.sum(axis=0)
+        win = 20
+        lo_thick = int(thick[a_lo : a_lo + win].max())
+        hi_thick = int(thick[max(a_hi - win + 1, 0) : a_hi + 1].max())
+        if lo_thick == hi_thick:
+            raise ValueError("a pour card's direction is not readable")
+        if hi_thick > lo_thick:
+            src_name, tgt_name = found[0][1], found[1][1]
+        else:
+            src_name, tgt_name = found[1][1], found[0][1]
+        if src_name == tgt_name:
+            raise ValueError("a pour card names one vessel twice")
+        cards.append((index_of[src_name], index_of[tgt_name]))
+
+    # ---- replay -------------------------------------------------------------
+    state = list(levels)
+    changes = 0
+    for src, tgt in cards:
+        amount = min(state[src], caps[tgt] - state[tgt])
+        if amount > 0:
+            state[src] -= amount
+            state[tgt] += amount
+            if src == marked or tgt == marked:
+                changes += 1
+    return f"{state[marked]}|{changes}"

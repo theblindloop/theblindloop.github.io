@@ -1,0 +1,179 @@
+"""Independent pixel-only inverse arm for the conjunctive dual-binding world.
+
+Receives ONLY the final rasterized PNG and the public visual spec below. It
+never imports renderer, prompts, generate, verify, or analytic-gold code, and
+never reads any scene data.
+
+Public visual spec (the oracle's own specification):
+
+  * upper panel: one reference object = solid fill disk  +  thin marker ring,
+    exposing two bound attributes (fill color, marker color);
+  * lower panel: a row of three candidate objects, each = fill disk + marker
+    ring + outer halo ring; a dark divider line separates the panels;
+  * the task: find the candidate whose fill AND marker both equal the
+    reference's, then report that candidate's halo color.
+
+The oracle recovers the divider, the reference fill and marker colors, each
+candidate's fill/marker/halo colors from its concentric bands, and returns the
+halo of the single candidate satisfying both equality constraints. A fill-only
+or marker-only matcher is deliberately ambiguous (two decoys satisfy each single
+criterion), so the answer is unreachable unless both attributes are bound
+together.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "correspondence_dual_binding-oracle-0.1.0"
+
+FILL_PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (255, 0, 0),
+    "green": (0, 200, 0),
+    "blue": (0, 0, 255),
+    "orange": (255, 140, 0),
+}
+MARKER_PALETTE: dict[str, tuple[int, int, int]] = {
+    "cyan": (0, 220, 220),
+    "magenta": (255, 0, 255),
+    "yellow": (255, 235, 0),
+    "purple": (200, 40, 220),
+}
+HALO_PALETTE: dict[str, tuple[int, int, int]] = {
+    "navy": (20, 20, 120),
+    "teal": (0, 110, 110),
+    "gold": (200, 165, 0),
+    "maroon": (150, 40, 90),
+}
+
+FILL_R = 26
+MARK_R = 44
+HALO_R = 62
+CENTER_BAND = 22.0
+MARK_LO, MARK_HI = 29.0, 42.0
+HALO_LO, HALO_HI = 47.0, 60.0
+MIN_COMPONENT_PX = 800
+
+
+def _background_mask(arr: np.ndarray) -> np.ndarray:
+    return (arr[..., 0] > 200) & (arr[..., 1] > 200) & (arr[..., 2] > 200)
+
+
+def _line_mask(arr: np.ndarray) -> np.ndarray:
+    return arr.max(axis=2) < 110
+
+
+def _nearest_names(pixels: np.ndarray, palette: dict[str, tuple[int, int, int]]) -> np.ndarray:
+    names = list(palette)
+    rgbs = np.array([palette[n] for n in names], dtype=np.float32)
+    d = np.linalg.norm(pixels[..., None, :] - rgbs[None, None, :, :], axis=-1)
+    return np.array(names)[d.argmin(axis=-1)]
+
+
+def _majority(pixels: np.ndarray, palette: dict[str, tuple[int, int, int]]) -> str:
+    if len(pixels) == 0:
+        raise ValueError("empty color band")
+    names = _nearest_names(pixels[None, :, :], palette)[0]
+    vals, counts = np.unique(names, return_counts=True)
+    return vals[int(np.argmax(counts))]
+
+
+def _connected_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    comps = []
+    for y in range(h):
+        for x in range(w):
+            if mask[y, x] and not visited[y, x]:
+                queue = deque([(x, y)])
+                visited[y, x] = True
+                cur = []
+                while queue:
+                    cx, cy = queue.popleft()
+                    cur.append((cx, cy))
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < w and 0 <= ny < h and mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            queue.append((nx, ny))
+                comps.append(cur)
+    return comps
+
+
+def _object_bands(arr: np.ndarray, cx: float, cy: float, ink: np.ndarray, low: int):
+    """Return (fill, marker, halo) sampled from concentric bands about (cx, cy)."""
+    sub = arr[low:]
+    sub_h, sub_w = sub.shape[:2]
+    yloc = np.arange(sub_h)[:, None]
+    xloc = np.arange(sub_w)[None, :]
+    r2 = np.sqrt((xloc - cx) ** 2 + (yloc - cy) ** 2)
+    inkmask = ink[low:]
+    fill_band = (r2 <= CENTER_BAND) & inkmask
+    mark_band = (r2 >= MARK_LO) & (r2 <= MARK_HI) & inkmask
+    halo_band = (r2 >= HALO_LO) & (r2 <= HALO_HI) & inkmask
+    fill = _majority(sub[fill_band], FILL_PALETTE)
+    marker = _majority(sub[mark_band], MARKER_PALETTE)
+    halo = _majority(sub[halo_band], HALO_PALETTE)
+    return fill, marker, halo
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.float32)
+    h, w = arr.shape[:2]
+
+    bg = _background_mask(arr)
+    line = _line_mask(arr)
+    ink = ~(bg | line)
+
+    line_counts = line.sum(axis=1)
+    divider_rows = np.where(line_counts > 0.5 * w)[0]
+    if divider_rows.size == 0:
+        divider_y = h // 2
+    else:
+        divider_y = int(round(float(divider_rows.mean())))
+
+    # Reference: the single ink component above the divider.
+    ref_region = slice(0, divider_y)
+    ref_mask = ink[ref_region]
+    ref_comp = None
+    for comp in _connected_components(ref_mask):
+        if len(comp) >= MIN_COMPONENT_PX:
+            ref_comp = comp
+            break
+    if ref_comp is None:
+        raise ValueError("reference object not found")
+
+    ref_pts = np.array(ref_comp, dtype=np.float32)
+    ref_x = float(ref_pts[:, 0].mean())
+    ref_y = float(ref_pts[:, 1].mean())
+
+    top = arr[:divider_y]
+    ty = np.arange(divider_y)[:, None]
+    tx = np.arange(w)[None, :]
+    r2t = np.sqrt((tx - ref_x) ** 2 + (ty - ref_y) ** 2)
+    ref_fill = _majority(top[(r2t <= CENTER_BAND) & ref_mask], FILL_PALETTE)
+    ref_marker = _majority(top[(r2t >= MARK_LO) & (r2t <= MARK_HI) & ref_mask], MARKER_PALETTE)
+
+    # Candidates: ink components below the divider.
+    low = divider_y + 1
+    if low >= h:
+        raise ValueError("no candidate panel")
+    cand_ink = ink[low:]
+    matched = None
+    for comp in _connected_components(cand_ink):
+        if len(comp) < MIN_COMPONENT_PX:
+            continue
+        pts = np.array(comp, dtype=np.float32)
+        cx = float(pts[:, 0].mean())
+        cy = float(pts[:, 1].mean())
+        fill, marker, halo = _object_bands(arr, cx, cy, ink, low)
+        if fill == ref_fill and marker == ref_marker:
+            matched = halo
+            break
+    if matched is not None:
+        return matched
+
+    raise ValueError("could not establish conjunctive dual-attribute correspondence")

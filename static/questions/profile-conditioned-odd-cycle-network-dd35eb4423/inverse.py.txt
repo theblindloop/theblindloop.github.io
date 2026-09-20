@@ -1,0 +1,140 @@
+"""Independent pixel-only inverse arm for the odd-cycle graph world.
+
+The implementation knows only the public visual contract: eight saturated
+colored junction disks, twelve dark straight links, and degree three at every
+junction. It locates junctions from pixels, tests every pair for a continuous
+dark corridor, validates the public invariants, and then runs a bipartite test.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class AmbiguousRasterError(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= 180:
+            groups.append(np.asarray(points, dtype=np.float64))
+    return groups
+
+
+def _junctions_and_radius(arr: np.ndarray) -> tuple[list[tuple[float, float]], float]:
+    high = arr.max(axis=2)
+    low = arr.min(axis=2)
+    saturated = (high - low > 48) & (high > 90) & (high < 235) & (low < 190)
+    groups = _components(saturated)
+    if len(groups) != 8:
+        raise AmbiguousRasterError(f"expected 8 colored junctions, recovered {len(groups)}")
+    centers: list[tuple[float, float]] = []
+    radii: list[float] = []
+    for points in groups:
+        ys, xs = points[:, 0], points[:, 1]
+        centers.append((float(xs.mean()), float(ys.mean())))
+        radii.append(math.sqrt(len(points) / math.pi))
+    return centers, float(np.median(radii))
+
+
+def _corridor_fraction(
+    dark: np.ndarray,
+    first: tuple[float, float],
+    second: tuple[float, float],
+    endpoint_exclusion: float,
+) -> float:
+    x1, y1 = first
+    x2, y2 = second
+    distance = math.hypot(x2 - x1, y2 - y1)
+    usable = distance - 2 * endpoint_exclusion
+    if usable < 12:
+        return 0.0
+    samples = max(24, int(usable))
+    start = endpoint_exclusion / distance
+    stop = 1.0 - start
+    hits = 0
+    height, width = dark.shape
+    for t in np.linspace(start, stop, samples):
+        x = int(round(x1 + t * (x2 - x1)))
+        y = int(round(y1 + t * (y2 - y1)))
+        y0, y1w = max(0, y - 2), min(height, y + 3)
+        x0, x1w = max(0, x - 2), min(width, x + 3)
+        hits += bool(dark[y0:y1w, x0:x1w].any())
+    return hits / samples
+
+
+def _recover_graph(image: Image.Image) -> list[set[int]]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    centers, radius = _junctions_and_radius(arr)
+    channel_spread = arr.max(axis=2) - arr.min(axis=2)
+    dark = (arr.max(axis=2) < 115) & (channel_spread < 35)
+    exclusion = max(17.0, radius + 7.0)
+    adjacency = [set() for _ in centers]
+    scores: list[tuple[float, int, int]] = []
+    for a in range(len(centers)):
+        for b in range(a + 1, len(centers)):
+            score = _corridor_fraction(dark, centers[a], centers[b], exclusion)
+            scores.append((score, a, b))
+    # The public contract fixes twelve links. A wide score separation is
+    # required so a nearly erased or spurious corridor causes abstention.
+    scores.sort(reverse=True)
+    if len(scores) < 13 or scores[11][0] < 0.88 or scores[12][0] > 0.62:
+        raise AmbiguousRasterError(
+            f"uncertain link recovery: 12th={scores[11][0]:.3f}, 13th={scores[12][0]:.3f}"
+        )
+    for _, a, b in scores[:12]:
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+    degrees = [len(items) for items in adjacency]
+    if degrees != [3] * 8:
+        raise AmbiguousRasterError(f"expected degree three at every junction, got {degrees}")
+    reached = {0}
+    queue = [0]
+    for vertex in queue:
+        for neighbor in adjacency[vertex]:
+            if neighbor not in reached:
+                reached.add(neighbor)
+                queue.append(neighbor)
+    if len(reached) != 8:
+        raise AmbiguousRasterError("recovered graph is not connected")
+    return adjacency
+
+
+def decision_from_image(image: Image.Image) -> str:
+    adjacency = _recover_graph(image)
+    colors: list[int | None] = [None] * len(adjacency)
+    for start in range(len(adjacency)):
+        if colors[start] is not None:
+            continue
+        colors[start] = 0
+        queue = [start]
+        for vertex in queue:
+            for neighbor in adjacency[vertex]:
+                if colors[neighbor] is None:
+                    colors[neighbor] = 1 - int(colors[vertex])
+                    queue.append(neighbor)
+                elif colors[neighbor] == colors[vertex]:
+                    return "yes"
+    return "no"
+

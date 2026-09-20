@@ -1,0 +1,159 @@
+"""Independent image-only inverse for network station correspondence.
+
+The inverse segments station interiors, reconstructs both adjacency graphs from
+dark connector pixels, requires a unique full graph isomorphism, transports the
+magenta target through that mapping, and only then reads the matched fill.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+PALETTES = {
+    "neutral": np.array((210, 218, 227), dtype=np.int16),
+    "red": np.array((220, 68, 72), dtype=np.int16),
+    "green": np.array((48, 166, 92), dtype=np.int16),
+    "blue": np.array((62, 116, 218), dtype=np.int16),
+    "target": np.array((205, 48, 167), dtype=np.int16),
+}
+
+
+def _components(mask: np.ndarray, minimum: int = 45) -> list[tuple[float, float, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[tuple[float, float, int]] = []
+    for y, x in zip(*np.nonzero(mask & ~seen)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(xs) >= minimum:
+            found.append((float(sum(xs)) / len(xs), float(sum(ys)) / len(ys), len(xs)))
+    return found
+
+
+def _mask_near(array: np.ndarray, color: np.ndarray, tolerance: int = 24) -> np.ndarray:
+    # int32 avoids overflow when the squared RGB distance is accumulated.
+    delta = array.astype(np.int32) - color.astype(np.int32)
+    return np.sqrt(np.sum(delta * delta, axis=2)) <= tolerance
+
+
+def _station_centers(array: np.ndarray) -> tuple[list[tuple[float, float]], list[tuple[float, float]], list[str]]:
+    neutral = _components(_mask_near(array, PALETTES["neutral"]), minimum=500)
+    left = [(x, y) for x, y, area in neutral if 500 <= area <= 1500]
+    right_with_color: list[tuple[float, float, str]] = []
+    for name in ("red", "green", "blue"):
+        for x, y, area in _components(_mask_near(array, PALETTES[name]), minimum=500):
+            if 500 <= area <= 1500:
+                right_with_color.append((x, y, name))
+    if len(left) != 7 or len(right_with_color) != 7:
+        raise ValueError(f"abstain: expected 7+7 stations, found {len(left)}+{len(right_with_color)}")
+    left.sort(key=lambda point: (point[0], point[1]))
+    right_with_color.sort(key=lambda item: (item[0], item[1]))
+    right = [(x, y) for x, y, _ in right_with_color]
+    colors = [name for _, _, name in right_with_color]
+    return left, right, colors
+
+
+def _point_segment_distance(
+    point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]
+) -> tuple[float, float]:
+    px, py = point
+    ax, ay = start
+    bx, by = end
+    dx = bx - ax
+    dy = by - ay
+    norm = dx * dx + dy * dy
+    if norm == 0:
+        return math.inf, 0.0
+    t = ((px - ax) * dx + (py - ay) * dy) / norm
+    qx = ax + t * dx
+    qy = ay + t * dy
+    return math.hypot(px - qx, py - qy), t
+
+
+def _graph(array: np.ndarray, centers: list[tuple[float, float]]) -> set[tuple[int, int]]:
+    dark = np.max(array, axis=2) < 92
+    edges: set[tuple[int, int]] = set()
+    for first in range(len(centers)):
+        for second in range(first + 1, len(centers)):
+            a = centers[first]
+            b = centers[second]
+            distance = math.dist(a, b)
+            if distance < 35:
+                continue
+            blocked = False
+            for third, point in enumerate(centers):
+                if third in (first, second):
+                    continue
+                clearance, t = _point_segment_distance(point, a, b)
+                if 0.12 < t < 0.88 and clearance < 19:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            endpoint_cut = min(0.38, 24.0 / distance)
+            hits = 0
+            total = 72
+            for step in range(total):
+                t = endpoint_cut + (1.0 - 2.0 * endpoint_cut) * (step + 0.5) / total
+                x = int(round(a[0] + t * (b[0] - a[0])))
+                y = int(round(a[1] + t * (b[1] - a[1])))
+                patch = dark[max(0, y - 2) : y + 3, max(0, x - 2) : x + 3]
+                hits += bool(patch.size and patch.any())
+            if hits / total >= 0.78:
+                edges.add((first, second))
+    if len(edges) != 6:
+        raise ValueError(f"abstain: expected six visible connections, found {len(edges)}")
+    return edges
+
+
+def _unique_mapping(
+    left_edges: set[tuple[int, int]], right_edges: set[tuple[int, int]]
+) -> tuple[int, ...]:
+    matches: list[tuple[int, ...]] = []
+    normalized_right = {tuple(sorted(edge)) for edge in right_edges}
+    for permutation in itertools.permutations(range(7)):
+        mapped = {
+            tuple(sorted((permutation[a], permutation[b]))) for a, b in left_edges
+        }
+        if mapped == normalized_right:
+            matches.append(permutation)
+            if len(matches) > 1:
+                break
+    if len(matches) != 1:
+        raise ValueError(f"abstain: graph correspondence count is {len(matches)}")
+    return matches[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    left, right, right_colors = _station_centers(array)
+    targets = _components(_mask_near(array, PALETTES["target"]), minimum=45)
+    if len(targets) != 1:
+        raise ValueError(f"abstain: expected one target mark, found {len(targets)}")
+    tx, ty, _ = targets[0]
+    target_distances = [math.hypot(tx - x, ty - y) for x, y in left]
+    target_index = int(np.argmin(target_distances))
+    if target_distances[target_index] > 8:
+        raise ValueError("abstain: target mark is not centered on a left station")
+    left_edges = _graph(array, left)
+    right_edges = _graph(array, right)
+    mapping = _unique_mapping(left_edges, right_edges)
+    return right_colors[mapping[target_index]]

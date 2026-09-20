@@ -1,0 +1,144 @@
+"""Independent PNG-only inverse for visible magnifier handle direction.
+
+The inverse does not know renderer geometry, scene state, filenames, or gold.
+It segments the dominant dark icon, flood-fills exterior light pixels to recover
+the enclosed lens opening, then measures handle ink below that opening relative
+to the recovered lens center.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import asdict, dataclass
+
+import numpy as np
+from PIL import Image
+
+MIN_DARK_PIXELS = 4_000
+MIN_HOLE_PIXELS = 6_000
+MIN_TAIL_PIXELS = 1_000
+MIN_RUNNER_UP_MARGIN = 42.0
+
+
+class PixelOracleError(ValueError):
+    """Raised when the raster does not expose an unambiguous ring and handle."""
+
+
+@dataclass(frozen=True)
+class PixelMeasurement:
+    decision: str
+    signed_handle_offset: float
+    runner_up_margin: float
+    dark_pixel_count: int
+    lens_pixel_count: int
+    tail_pixel_count: int
+    lens_center: tuple[float, float]
+    lens_bbox: tuple[int, int, int, int]
+    icon_bbox: tuple[int, int, int, int]
+    lens_fill_fraction: float
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _dark_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    return arr.max(axis=2) < 145
+
+
+def _enclosed_light(mask: np.ndarray) -> np.ndarray:
+    """Return light pixels disconnected from the raster border."""
+
+    light = ~mask
+    height, width = light.shape
+    if not bool(light[0, 0]):
+        raise PixelOracleError("upper-left exterior seed is obstructed")
+    outside = np.zeros_like(light, dtype=bool)
+    outside[0, 0] = True
+    pending: deque[tuple[int, int]] = deque([(0, 0)])
+    while pending:
+        y, x = pending.popleft()
+        if y > 0 and light[y - 1, x] and not outside[y - 1, x]:
+            outside[y - 1, x] = True
+            pending.append((y - 1, x))
+        if y + 1 < height and light[y + 1, x] and not outside[y + 1, x]:
+            outside[y + 1, x] = True
+            pending.append((y + 1, x))
+        if x > 0 and light[y, x - 1] and not outside[y, x - 1]:
+            outside[y, x - 1] = True
+            pending.append((y, x - 1))
+        if x + 1 < width and light[y, x + 1] and not outside[y, x + 1]:
+            outside[y, x + 1] = True
+            pending.append((y, x + 1))
+    return light & ~outside
+
+
+def measure_from_image(image: Image.Image) -> PixelMeasurement:
+    """Recover the ring center and signed side of its lower handle."""
+
+    mask = _dark_mask(image)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < MIN_DARK_PIXELS:
+        raise PixelOracleError("too little dark ink for a magnifier icon")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    if x0 <= 3 or y0 <= 3 or x1 >= mask.shape[1] - 4 or y1 >= mask.shape[0] - 4:
+        raise PixelOracleError("dark icon touches the raster boundary")
+
+    enclosed = _enclosed_light(mask)
+    hy, hx = np.nonzero(enclosed)
+    if len(hx) < MIN_HOLE_PIXELS:
+        raise PixelOracleError("no large enclosed lens opening is visible")
+    hx0, hx1 = int(hx.min()), int(hx.max())
+    hy0, hy1 = int(hy.min()), int(hy.max())
+    hole_w = hx1 - hx0 + 1
+    hole_h = hy1 - hy0 + 1
+    if hole_w < 105 or hole_h < 105:
+        raise PixelOracleError("enclosed lens opening is too small")
+    aspect = hole_w / hole_h
+    if not 0.90 <= aspect <= 1.10:
+        raise PixelOracleError("enclosed opening is not circular enough")
+    fill_fraction = len(hx) / float(hole_w * hole_h)
+    if not 0.70 <= fill_fraction <= 0.84:
+        raise PixelOracleError("enclosed opening has implausible circle fill")
+
+    lens_cx = float(hx.mean())
+    lens_cy = float(hy.mean())
+    inner_radius = 0.25 * (hole_w + hole_h)
+    tail_floor = lens_cy + inner_radius + max(26.0, inner_radius * 0.36)
+    row_coords = np.indices(mask.shape)[0]
+    tail = mask & (row_coords >= tail_floor)
+    ty, tx = np.nonzero(tail)
+    if len(tx) < MIN_TAIL_PIXELS:
+        raise PixelOracleError("too little lower-tail ink for a handle")
+    signed_offset = float(tx.mean() - lens_cx)
+    runner_up_margin = abs(signed_offset)
+    if runner_up_margin < MIN_RUNNER_UP_MARGIN:
+        raise PixelOracleError(
+            f"handle side is ambiguous: signed offset {signed_offset:.3f}px"
+        )
+
+    tail_w = int(tx.max() - tx.min() + 1)
+    tail_h = int(ty.max() - ty.min() + 1)
+    if tail_h < 55 or tail_w < 55 or tail_w > tail_h * 1.55:
+        raise PixelOracleError("lower ink does not form a diagonal handle tail")
+
+    decision = "down-right" if signed_offset > 0 else "down-left"
+    return PixelMeasurement(
+        decision=decision,
+        signed_handle_offset=round(signed_offset, 8),
+        runner_up_margin=round(runner_up_margin, 8),
+        dark_pixel_count=int(len(xs)),
+        lens_pixel_count=int(len(hx)),
+        tail_pixel_count=int(len(tx)),
+        lens_center=(round(lens_cx, 8), round(lens_cy, 8)),
+        lens_bbox=(hx0, hy0, hx1, hy1),
+        icon_bbox=(x0, y0, x1, y1),
+        lens_fill_fraction=round(fill_fraction, 8),
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return down-left or down-right from final raster pixels alone."""
+
+    return measure_from_image(image).decision

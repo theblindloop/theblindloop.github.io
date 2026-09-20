@@ -1,0 +1,122 @@
+"""Independent pixel-only inverse for the connected-trace stencil."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+WAVE = (1, 1, 0, 0, 1, 1, 0, 0)
+FORK = (1, 0, 0, 1, 1, 0, 0, 0)
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            output.append(np.asarray(pixels, dtype=np.float64))
+    return output
+
+
+def _centers(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    return [component.mean(axis=0)[::-1] for component in _components(mask, minimum)]
+
+
+def _blue_mask(array: np.ndarray) -> np.ndarray:
+    red, green, blue = [array[:, :, index].astype(np.int16) for index in range(3)]
+    return (red < 130) & (green < 145) & (blue > 80) & ((blue - red) > 25)
+
+
+def _red_mask(array: np.ndarray) -> np.ndarray:
+    red, green, blue = [array[:, :, index].astype(np.int16) for index in range(3)]
+    return (red > 145) & (green < 120) & (blue < 120) & ((red - green) > 45)
+
+
+def _cyan_mask(array: np.ndarray) -> np.ndarray:
+    red, green, blue = [array[:, :, index].astype(np.int16) for index in range(3)]
+    return (red < 125) & (green > 115) & (blue > 115) & ((green - red) > 35) & ((blue - red) > 35)
+
+
+def _sample(mask: np.ndarray, x: float, y: float, radius: int = 1) -> float:
+    height, width = mask.shape
+    ix, iy = int(round(x)), int(round(y))
+    x0, x1 = max(0, ix - radius), min(width, ix + radius + 1)
+    y0, y1 = max(0, iy - radius), min(height, iy + radius + 1)
+    if x0 >= x1 or y0 >= y1:
+        return 0.0
+    return float(mask[y0:y1, x0:x1].mean())
+
+
+def _side_score(mask: np.ndarray, point: np.ndarray, normal: np.ndarray) -> float:
+    values = []
+    for distance in np.linspace(3.0, 5.5, 13):
+        values.append(_sample(mask, point[0] + normal[0] * distance, point[1] + normal[1] * distance))
+    return float(np.mean(values))
+
+
+def _hamming(code: tuple[int, ...], template: tuple[int, ...]) -> int:
+    return sum(a != b for a, b in zip(code, template))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the code from visible fiducials, a route walk, and side ticks."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    red = _centers(_red_mask(array), 12)
+    cyan = _centers(_cyan_mask(array), 5)
+    if len(red) != 1 or len(cyan) != 7:
+        raise ValueError(f"expected one red start cap and seven station dots, got {len(red)} and {len(cyan)}")
+    stations = [red[0], *cyan]
+    red_index = int(np.argmin([float(np.linalg.norm(point - red[0])) for point in stations]))
+    # The route templates have distinct x positions.  The red cap determines
+    # whether the visible x order agrees with or reverses traversal order.
+    order = sorted(range(len(stations)), key=lambda index: float(stations[index][0]))
+    if order[-1] == red_index:
+        order.reverse()
+    elif order[0] != red_index:
+        raise ValueError("start cap is not an endpoint of the visible route")
+    points = [stations[index] for index in order]
+    blue = _blue_mask(array)
+    bits: list[int] = []
+    for index, point in enumerate(points):
+        if index == 0:
+            tangent = points[1] - points[0]
+        elif index == len(points) - 1:
+            tangent = points[-1] - points[-2]
+        else:
+            tangent = points[index + 1] - points[index - 1]
+        length = float(math.hypot(float(tangent[0]), float(tangent[1])))
+        if length < 4.0:
+            raise ValueError("station order is geometrically ambiguous")
+        normal = np.asarray((-tangent[1] / length, tangent[0] / length), dtype=np.float64)
+        positive = _side_score(blue, point, normal)
+        negative = _side_score(blue, point, -normal)
+        if max(positive, negative) < 0.20 or abs(positive - negative) < 0.08:
+            raise ValueError("station tick side is ambiguous")
+        bits.append(1 if positive > negative else 0)
+    code = tuple(bits)
+    distance_a = _hamming(code, WAVE)
+    distance_b = _hamming(code, FORK)
+    if distance_a == distance_b:
+        raise ValueError("projected stencil is exactly on the template boundary")
+    return "A" if distance_a < distance_b else "B"

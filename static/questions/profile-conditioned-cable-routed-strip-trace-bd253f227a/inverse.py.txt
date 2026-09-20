@@ -1,0 +1,188 @@
+"""Independent PNG-only inverse for the colored switchboard rule."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_ROWS = 10
+_COLS = 8
+_ROUTE_COLORS = (
+    (224, 161, 24),
+    (229, 76, 38),
+    (190, 45, 128),
+    (121, 69, 190),
+    (38, 100, 205),
+    (24, 160, 178),
+    (39, 151, 82),
+    (145, 88, 39),
+)
+_DARKS = {(27, 48, 66), (68, 42, 91), (43, 73, 51)}
+_LIGHTS = {(216, 227, 229), (231, 221, 232), (224, 231, 211)}
+_ORDERS = {
+    "rising_staircase": (7, 6, 5, 4, 3, 2, 1, 0),
+    "falling_staircase": (0, 1, 2, 3, 4, 5, 6, 7),
+    "valley": (0, 2, 4, 6, 7, 5, 3, 1),
+    "peak": (7, 5, 3, 1, 0, 2, 4, 6),
+}
+
+
+class OracleAbstention(ValueError):
+    """Visible routing or tile evidence is incomplete or ambiguous."""
+
+
+def _components(mask: np.ndarray, minimum_area: int) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[dict] = []
+    for y_value, x_value in np.argwhere(mask):
+        y, x = int(y_value), int(x_value)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(xs) >= minimum_area:
+            result.append({
+                "area": len(xs),
+                "x": float(np.mean(xs)),
+                "y": float(np.mean(ys)),
+                "x0": min(xs),
+                "x1": max(xs),
+                "y0": min(ys),
+                "y1": max(ys),
+            })
+    return result
+
+
+def _cluster(values: list[float], separation: float = 8.0) -> list[float]:
+    ordered = sorted(values)
+    groups: list[list[float]] = []
+    for value in ordered:
+        if not groups or value - groups[-1][-1] > separation:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return [float(np.mean(group)) for group in groups]
+
+
+def _tile_matrix(arr: np.ndarray) -> tuple[np.ndarray, list[float]]:
+    tile_colors = _DARKS | _LIGHTS
+    mask = np.zeros(arr.shape[:2], dtype=bool)
+    for rgb in tile_colors:
+        mask |= np.all(arr == np.asarray(rgb, dtype=np.uint8), axis=2)
+    parts = _components(mask, minimum_area=400)
+    if len(parts) != _ROWS * _COLS:
+        raise OracleAbstention(f"need 80 separate tile faces; found {len(parts)}")
+    x_centers = _cluster([part["x"] for part in parts])
+    y_centers = _cluster([part["y"] for part in parts])
+    if len(x_centers) != _COLS or len(y_centers) != _ROWS:
+        raise OracleAbstention(
+            f"tile faces do not form an 8-by-10 lattice: {len(x_centers)} by {len(y_centers)}"
+        )
+    matrix = np.full((_ROWS, _COLS), -1, dtype=np.int8)
+    for part in parts:
+        column = int(np.argmin(np.abs(np.asarray(x_centers) - part["x"])))
+        row = int(np.argmin(np.abs(np.asarray(y_centers) - part["y"])))
+        cx, cy = int(round(part["x"])), int(round(part["y"]))
+        rgb = tuple(int(value) for value in arr[cy, cx])
+        if rgb in _DARKS:
+            value = 1
+        elif rgb in _LIGHTS:
+            value = 0
+        else:
+            raise OracleAbstention("a tile center is outside the public binary palette")
+        if matrix[row, column] != -1:
+            raise OracleAbstention("multiple tile faces map to one lattice position")
+        matrix[row, column] = value
+    if np.any(matrix < 0):
+        raise OracleAbstention("the recovered tile lattice has a missing position")
+    if not all(int(matrix[:, column].sum()) == 2 for column in range(_COLS)):
+        raise OracleAbstention("every source strip must contain exactly two dark tiles")
+    return matrix, x_centers
+
+
+def _route_endpoints(arr: np.ndarray) -> list[tuple[float, float]]:
+    endpoints: list[tuple[float, float]] = []
+    for rgb in _ROUTE_COLORS:
+        ys, xs = np.where(np.all(arr == np.asarray(rgb, dtype=np.uint8), axis=2))
+        if len(xs) < 120:
+            raise OracleAbstention(f"colored cable {rgb} is missing or too short")
+        y_min, y_max = int(ys.min()), int(ys.max())
+        if y_max - y_min < 120:
+            raise OracleAbstention(f"colored cable {rgb} does not span two socket rows")
+        top = xs[ys <= y_min + 7]
+        bottom = xs[ys >= y_max - 7]
+        if len(top) < 8 or len(bottom) < 8:
+            raise OracleAbstention(f"colored cable {rgb} has an incomplete endpoint")
+        endpoints.append((float(np.median(top)), float(np.median(bottom))))
+    top_order = sorted(value[0] for value in endpoints)
+    if min(np.diff(top_order)) < 20.0:
+        raise OracleAbstention("top sockets are not eight visibly separated positions")
+    return endpoints
+
+
+def _base_strip(strip_id: int) -> np.ndarray:
+    result = np.zeros(_ROWS, dtype=np.int8)
+    result[int(strip_id) : int(strip_id) + 2] = 1
+    return result
+
+
+def _template(order: tuple[int, ...]) -> np.ndarray:
+    return np.stack([_base_strip(strip_id) for strip_id in order], axis=1)
+
+
+def analyze_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    source_matrix, source_centers = _tile_matrix(arr)
+    endpoints = _route_endpoints(arr)
+    top_positions = sorted(top for top, _ in endpoints)
+    reconstructed = np.zeros_like(source_matrix)
+    used_sources: set[int] = set()
+    for top_x, bottom_x in endpoints:
+        destination = int(np.argmin(np.abs(np.asarray(top_positions) - top_x)))
+        source = int(np.argmin(np.abs(np.asarray(source_centers) - bottom_x)))
+        if abs(source_centers[source] - bottom_x) > 12.0:
+            raise OracleAbstention("a cable plug is not centered above a visible strip")
+        if source in used_sources:
+            raise OracleAbstention("two cables terminate at the same source strip")
+        used_sources.add(source)
+        reconstructed[:, destination] = source_matrix[:, source]
+    if len(used_sources) != _COLS:
+        raise OracleAbstention("the switchboard does not bind every source strip once")
+
+    scores = {
+        name: int(np.count_nonzero(reconstructed != _template(order)))
+        for name, order in _ORDERS.items()
+    }
+    ranking = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    best_name, best_score = ranking[0]
+    runner_name, runner_score = ranking[1]
+    decision_margin = float(runner_score - best_score)
+    if best_score > 2 or decision_margin < 12.0:
+        raise OracleAbstention(
+            f"routed trace is ambiguous: best={best_name}/{best_score}, "
+            f"runner={runner_name}/{runner_score}"
+        )
+    return {
+        "decision": best_name,
+        "margin": decision_margin,
+        "best_mismatches": int(best_score),
+        "runner_up": runner_name,
+        "source_strip_count": len(used_sources),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

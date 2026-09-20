@@ -1,0 +1,173 @@
+"""Independent raster-only graph inverse for the link-depth world."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray, minimum: int = 80) -> list[tuple[float, float]]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    centers: list[tuple[float, float]] = []
+    for y0 in range(height):
+        for x0 in range(width):
+            if not mask[y0, x0] or seen[y0, x0]:
+                continue
+            stack = [(y0, x0)]
+            seen[y0, x0] = True
+            xs: list[int] = []
+            ys: list[int] = []
+            while stack:
+                y, x = stack.pop()
+                xs.append(x)
+                ys.append(y)
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if not dx and not dy:
+                            continue
+                        ny, nx = y + dy, x + dx
+                        if (
+                            0 <= ny < height
+                            and 0 <= nx < width
+                            and mask[ny, nx]
+                            and not seen[ny, nx]
+                        ):
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+            if len(xs) >= minimum:
+                centers.append((float(np.mean(xs)), float(np.mean(ys))))
+    return centers
+
+
+def _only_center(mask: np.ndarray, label: str) -> tuple[float, float]:
+    centers = _components(mask, minimum=70)
+    if not centers:
+        raise ValueError(f"missing {label} marker")
+    if len(centers) > 1:
+        # The largest connected component is the only meaningful color marker;
+        # tiny antialias fragments are excluded by the component floor above.
+        # A deterministic centroid fallback keeps malformed images quarantinable.
+        ys, xs = np.nonzero(mask)
+        return float(xs.mean()), float(ys.mean())
+    return centers[0]
+
+
+def _near_dark(mask: np.ndarray, x: float, y: float, radius: int = 2) -> bool:
+    cx, cy = int(round(x)), int(round(y))
+    y0 = max(0, cy - radius)
+    y1 = min(mask.shape[0], cy + radius + 1)
+    x0 = max(0, cx - radius)
+    x1 = min(mask.shape[1], cx + radius + 1)
+    return bool(mask[y0:y1, x0:x1].any())
+
+
+def _line_support(mask: np.ndarray, first: tuple[float, float], second: tuple[float, float]) -> float:
+    ax, ay = first
+    bx, by = second
+    length = float(np.hypot(bx - ax, by - ay))
+    if length < 38.0:
+        return 0.0
+    inset = min(18.0, max(12.0, length * 0.17))
+    usable = max(10.0, length - 2.0 * inset)
+    samples = max(12, int(usable / 2.0))
+    hits = 0
+    for fraction in np.linspace(inset / length, 1.0 - inset / length, samples):
+        x = ax + (bx - ax) * float(fraction)
+        y = ay + (by - ay) * float(fraction)
+        hits += int(_near_dark(mask, x, y, radius=2))
+    return hits / float(samples)
+
+
+def _between_line(
+    first: tuple[float, float], second: tuple[float, float], candidate: tuple[float, float]
+) -> bool:
+    ax, ay = first
+    bx, by = second
+    cx, cy = candidate
+    dx, dy = bx - ax, by - ay
+    length = float(np.hypot(dx, dy))
+    if length <= 1.0:
+        return False
+    projection = ((cx - ax) * dx + (cy - ay) * dy) / (length * length)
+    cross_distance = abs((cx - ax) * dy - (cy - ay) * dx) / length
+    return 0.12 < projection < 0.88 and cross_distance < 19.0
+
+
+def _graph_from_pixels(
+    dark: np.ndarray, centers: list[tuple[float, float]]
+) -> list[list[int]]:
+    adjacency = [[] for _ in centers]
+    for left in range(len(centers)):
+        for right in range(left + 1, len(centers)):
+            if any(
+                _between_line(centers[left], centers[right], centers[middle])
+                for middle in range(len(centers))
+                if middle not in (left, right)
+            ):
+                continue
+            support = _line_support(dark, centers[left], centers[right])
+            if support >= 0.68:
+                adjacency[left].append(right)
+                adjacency[right].append(left)
+    return adjacency
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the deepest terminal from final RGB pixels only."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    red_mask = (red > 145) & (red > green * 1.80) & (red > blue * 1.18)
+    blue_mask = (blue > 125) & (blue > red * 1.25) & (blue > green * 1.06)
+    gold_mask = (
+        (red > 145)
+        & (green > 92)
+        & (blue < 150)
+        & (red > green * 1.12)
+        & (green > blue * 1.22)
+    )
+    green_mask = (green > 98) & (green > red * 1.15) & (green > blue * 1.03)
+    purple_mask = (
+        (red > 105)
+        & (blue > 95)
+        & (green < 158)
+        & (red > green * 1.18)
+        & (blue > green * 1.20)
+    )
+    channel_max = rgb.max(axis=2)
+    channel_min = rgb.min(axis=2)
+    dark_mask = (channel_max < 148) & ((channel_max - channel_min) < 88)
+
+    source = _only_center(green_mask, "green source")
+    terminals = [
+        ("red", _only_center(red_mask, "red terminal")),
+        ("blue", _only_center(blue_mask, "blue terminal")),
+        ("gold", _only_center(gold_mask, "gold terminal")),
+    ]
+    junctions = _components(purple_mask, minimum=90)
+    if len(junctions) < 1:
+        raise ValueError("no junction markers recovered")
+
+    centers = [source] + [center for _, center in terminals] + junctions
+    adjacency = _graph_from_pixels(dark_mask, centers)
+    distances: list[int | None] = [None] * len(centers)
+    distances[0] = 0
+    queue: deque[int] = deque([0])
+    while queue:
+        current = queue.popleft()
+        for neighbor in adjacency[current]:
+            if distances[neighbor] is None:
+                distances[neighbor] = int(distances[current]) + 1
+                queue.append(neighbor)
+
+    terminal_depths = [distances[index] for index in range(1, 4)]
+    if any(depth is None for depth in terminal_depths):
+        raise ValueError("a terminal is disconnected from the source")
+    numeric_depths = [int(depth) for depth in terminal_depths]
+    best = max(numeric_depths)
+    if numeric_depths.count(best) != 1:
+        raise ValueError("deepest terminal is not unique")
+    return terminals[numeric_depths.index(best)][0]

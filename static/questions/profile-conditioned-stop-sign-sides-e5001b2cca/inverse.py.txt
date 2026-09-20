@@ -1,0 +1,166 @@
+"""Independent image-only inverse for the STOP-sign side-count world.
+
+This module intentionally duplicates the public visual constants only as
+measurement policy.  It receives a final RGB image, isolates the dominant
+saturated sign fill, constructs a convex hull, and counts the turns left by a
+range of Ramer--Douglas--Peucker tolerances.  No renderer state, scene, prompt,
+metadata, or analytic gold is imported or accepted.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import Counter
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "stop_sign_sides-oracle-0.1.0"
+ALLOWED_COUNTS = tuple(range(5, 11))
+
+
+def _chromatic_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    spread = arr.max(axis=2) - arr.min(axis=2)
+    # The sign fill is strongly saturated; pale backgrounds, neutral outlines,
+    # and the warm-white STOP bitmap are intentionally excluded.
+    return spread >= 65
+
+
+def _convex_hull(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    unique = sorted(set(points))
+    if len(unique) <= 1:
+        return unique
+
+    def cross(origin: tuple[int, int], a: tuple[int, int], b: tuple[int, int]) -> int:
+        return (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
+
+    lower: list[tuple[int, int]] = []
+    for point in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[int, int]] = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _distance_to_line(point: tuple[int, int], start: tuple[int, int], end: tuple[int, int]) -> float:
+    x, y = point
+    x0, y0 = start
+    x1, y1 = end
+    dx = x1 - x0
+    dy = y1 - y0
+    denominator = math.hypot(dx, dy)
+    if denominator == 0.0:
+        return math.hypot(x - x0, y - y0)
+    return abs(dy * x - dx * y + x1 * y0 - y1 * x0) / denominator
+
+
+def _rdp(points: list[tuple[int, int]], epsilon: float) -> list[tuple[int, int]]:
+    if len(points) < 3:
+        return points
+    start, end = points[0], points[-1]
+    distances = [_distance_to_line(point, start, end) for point in points[1:-1]]
+    if not distances:
+        return [start, end]
+    index = int(np.argmax(np.asarray(distances))) + 1
+    largest = distances[index - 1]
+    if largest > epsilon:
+        left = _rdp(points[: index + 1], epsilon)
+        right = _rdp(points[index:], epsilon)
+        return left[:-1] + right
+    return [start, end]
+
+
+def _closed_simplify(hull: list[tuple[int, int]], epsilon: float) -> int:
+    if len(hull) < 3:
+        raise ValueError("sign silhouette has too few hull points")
+    # Start at an extreme point so the closed chain is cut at a likely corner.
+    start_index = max(range(len(hull)), key=lambda index: (hull[index][0], -hull[index][1]))
+    ordered = hull[start_index:] + hull[:start_index] + [hull[start_index]]
+    simplified = _rdp(ordered, epsilon)
+    if len(simplified) >= 2 and simplified[0] == simplified[-1]:
+        simplified = simplified[:-1]
+    return len(simplified)
+
+
+def _polygon_centroid(hull: list[tuple[int, int]]) -> np.ndarray:
+    area_twice = 0.0
+    x_sum = 0.0
+    y_sum = 0.0
+    for first, second in zip(hull, hull[1:] + hull[:1]):
+        cross = float(first[0] * second[1] - second[0] * first[1])
+        area_twice += cross
+        x_sum += (first[0] + second[0]) * cross
+        y_sum += (first[1] + second[1]) * cross
+    if abs(area_twice) < 1e-6:
+        return np.mean(np.asarray(hull, dtype=np.float64), axis=0)
+    return np.asarray(
+        [x_sum / (3.0 * area_twice), y_sum / (3.0 * area_twice)],
+        dtype=np.float64,
+    )
+
+
+def _regular_fit_error(hull: list[tuple[int, int]], sides: int) -> float:
+    """Fit a regular n-gon's support lines to the measured convex hull.
+
+    The center is the independent area centroid.  A small orientation sweep is
+    enough because a regular n-gon is periodic; for each orientation, the
+    robust 99th-percentile support gives the fitted apothem.  Correct n has
+    nearly constant support on its flat sides, while an incorrect n leaves a
+    multi-pixel sawtooth residual.
+    """
+
+    points = np.asarray(hull, dtype=np.float64)
+    center = _polygon_centroid(hull)
+    vectors = points - center
+    best = float("inf")
+    period = 2.0 * math.pi / sides
+    for phase in np.linspace(0.0, period, 361, endpoint=False):
+        normals = np.asarray(
+            [
+                (math.cos(phase + (2.0 * index + 1.0) * math.pi / sides),
+                 math.sin(phase + (2.0 * index + 1.0) * math.pi / sides))
+                for index in range(sides)
+            ],
+            dtype=np.float64,
+        )
+        support = (vectors @ normals.T).max(axis=1)
+        apothem = float(np.percentile(support, 99.0))
+        error = float(np.mean(np.abs(support - apothem)) + 0.2 * np.std(support))
+        if error < best:
+            best = error
+    return best
+
+
+def _estimate(image: Image.Image) -> tuple[str, float]:
+    mask = _chromatic_mask(image)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 400:
+        raise ValueError("no measurable saturated sign silhouette")
+    hull = _convex_hull([(int(x), int(y)) for x, y in zip(xs.tolist(), ys.tolist())])
+    fit_errors = {sides: _regular_fit_error(hull, sides) for sides in ALLOWED_COUNTS}
+    ordered = sorted(fit_errors, key=lambda sides: (fit_errors[sides], abs(sides - 8), sides))
+    winner = ordered[0]
+    runner_up = ordered[1]
+    # The geometric fit gap is the reported runner-up decision margin.  A
+    # larger residual gap means the visible silhouette rejects the runner-up
+    # cardinality more strongly.
+    decision_margin = round(fit_errors[runner_up] - fit_errors[winner], 6)
+    return str(winner), decision_margin
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return only the side-count decision recovered from the PNG."""
+
+    return _estimate(image)[0]
+
+
+def decision_margin(image: Image.Image) -> float:
+    """Return the winner-versus-runner-up tolerance-vote margin."""
+
+    return _estimate(image)[1]

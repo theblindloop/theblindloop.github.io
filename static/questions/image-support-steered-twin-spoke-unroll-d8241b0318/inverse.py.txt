@@ -1,0 +1,176 @@
+"""Independent pixel-only inverse for Twin Spoke Unroll.
+
+The detector finds the two colored circular frames, their external green phase
+beads, and their one/two amber role dots. It then samples the eight evenly spaced
+cells on each of four spokes and classifies the assembled 8x8 raster by Hamming
+distance. It imports no renderer or latent-scene code.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+TEMPLATES = {
+    "box": (
+        "11111111", "10000001", "10000001", "10000001",
+        "10000001", "10000001", "10000001", "11111111",
+    ),
+    "D": (
+        "11111100", "10000110", "10000011", "10000001",
+        "10000001", "10000011", "10000110", "11111100",
+    ),
+    "backward D": (
+        "00111111", "01100001", "11000001", "10000001",
+        "10000001", "11000001", "01100001", "00111111",
+    ),
+    "oval": (
+        "00111100", "01100110", "11000011", "10000001",
+        "10000001", "11000011", "01100110", "00111100",
+    ),
+}
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray, minimum: int = 5) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            yy, xx = queue.popleft()
+            points.append((yy, xx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = yy + dy, xx + dx
+                    if (
+                        (dx or dy) and 0 <= ny < height and 0 <= nx < width
+                        and mask[ny, nx] and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=float))
+    return output
+
+
+def _detect_reels(arr: np.ndarray) -> list[dict]:
+    # Saturated violet or teal frame ink; excludes green and amber fiducials.
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    frame_mask = ((b > r + 25) & (b > g + 10) & (r > 65)) | (
+        (g > r + 45) & (b > r + 45) & (g < 165)
+    )
+    reels = []
+    for points in _components(frame_mask, minimum=250):
+        ys, xs = points[:, 0], points[:, 1]
+        width, height = xs.max() - xs.min(), ys.max() - ys.min()
+        if width < 120 or height < 120:
+            continue
+        reels.append({
+            "cx": float((xs.min() + xs.max()) / 2.0),
+            "cy": float((ys.min() + ys.max()) / 2.0),
+            "radius": float((width + height) / 4.0),
+        })
+    if len(reels) != 2:
+        raise OracleError(f"expected two circular frames, found {len(reels)}")
+    return reels
+
+
+def _centroids(mask: np.ndarray, minimum: int) -> list[tuple[float, float, int]]:
+    values = []
+    for points in _components(mask, minimum=minimum):
+        values.append((float(points[:, 1].mean()), float(points[:, 0].mean()), len(points)))
+    return values
+
+
+def _read_reel(arr: np.ndarray, reel: dict, greens: list[tuple[float, float, int]], ambers: list[tuple[float, float, int]]) -> tuple[int, list[list[int]]]:
+    cx, cy, radius = reel["cx"], reel["cy"], reel["radius"]
+    marker_candidates = []
+    for x, y, _ in greens:
+        distance = math.hypot(x-cx, y-cy)
+        if 0.84 * radius < distance < 1.08 * radius:
+            marker_candidates.append((distance, x, y))
+    if not marker_candidates:
+        raise OracleError("missing green phase bead")
+    # Position is randomized, so bind by nearest detected frame rather than by
+    # left/right order.
+    _, mx, my = min(marker_candidates)
+    phase = math.atan2(my-cy, mx-cx)
+
+    role_dots = [
+        (x, y) for x, y, _ in ambers if math.hypot(x-cx, y-cy) < 0.23 * radius
+    ]
+    role = len(role_dots)
+    if role not in (1, 2):
+        raise OracleError(f"invalid amber role-dot count {role}")
+
+    columns: list[list[int]] = []
+    luminance = arr.mean(axis=2)
+    for column in range(4):
+        angle = phase + column * math.pi / 2.0
+        values = []
+        for row in range(8):
+            radial = radius * (0.29 + row * (0.53 / 7.0))
+            x = int(round(cx + radial * math.cos(angle)))
+            y = int(round(cy + radial * math.sin(angle)))
+            patch = luminance[max(0, y-2):y+3, max(0, x-2):x+3]
+            if patch.size == 0:
+                raise OracleError("spoke sample outside image")
+            values.append(1 if float(patch.min()) < 95.0 else 0)
+        columns.append(values)
+    return role, columns
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    reels = _detect_reels(arr)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    green_mask = (g > 145) & (g > r + 70) & (g > b + 25)
+    amber_mask = (r > 190) & (g > 110) & (g < 195) & (b < 100)
+    greens = _centroids(green_mask, 20)
+    ambers = _centroids(amber_mask, 12)
+    if len(greens) != 2:
+        raise OracleError(f"expected two green phase beads, found {len(greens)}")
+    # Jointly assign the two detached markers to the two frames. This remains
+    # stable when both beads happen to point into the gap between nearby reels.
+    def assignment_cost(order: tuple[int, int]) -> float:
+        return sum(
+            math.hypot(greens[order[i]][0] - reels[i]["cx"], greens[order[i]][1] - reels[i]["cy"])
+            for i in range(2)
+        )
+    green_order = min(((0, 1), (1, 0)), key=assignment_cost)
+    halves = {}
+    for index, reel in enumerate(reels):
+        role, columns = _read_reel(arr, reel, [greens[green_order[index]]], ambers)
+        if role in halves:
+            raise OracleError("duplicate reel role")
+        halves[role] = columns
+    if set(halves) != {1, 2}:
+        raise OracleError("both reel roles are required")
+
+    columns = halves[1] + halves[2]
+    bits = [[columns[column][row] for column in range(8)] for row in range(8)]
+    scored = []
+    for name, rows in TEMPLATES.items():
+        distance = sum(bits[row][column] != int(rows[row][column]) for row in range(8) for column in range(8))
+        scored.append((distance, name))
+    scored.sort()
+    if scored[0][0] == scored[1][0]:
+        raise OracleError("template decision is tied")
+    return scored[0][1], float(scored[1][0] - scored[0][0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return decision_with_margin(image)[0]

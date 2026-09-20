@@ -1,0 +1,243 @@
+"""frontal_anamorph_reveal: front-on perspective (homography) reveal world.
+
+Declared transform: view the blue-framed quadrilateral from directly in front.
+A block glyph A or B is drawn inside the quadrilateral under a perspective
+(keystone) warp; directly it is a foreshortened, unreadable smear. Rectifying
+the four visible corner fiducials of the marked quadrilateral to a rectangle
+via a planar homography restores the flat letter, whose identity is the answer.
+
+Latent scene z = {noise, glyph, corners}. label = glyph.
+}
+
+The independent inverse arm receives only the final PNG, segments the blue
+fiducial frame, computes its convex hull to recover the four corner fiducials,
+builds the same planar homography to the unit rectangle, resamples the glyph
+grid, and classifies it against the two block candidates A and B.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "frontal_anamorph_reveal-0.1.0"
+
+W = 400
+H = 400
+
+G_ROWS = 15
+G_COLS = 12
+Q_TOL = 0.40  # quarantine threshold on the rectified A/B template margin
+
+# Block-glyph templates: G_ROWS rows x G_COLS columns of cells (5-cell grid).
+TEMPLATE_A = [
+    list("............"),
+    list("....##......"),
+    list("....##......"),
+    list("...#..#....."),
+    list("...#..#....."),
+    list("..#....#...."),
+    list("..#....#...."),
+    list(".#......#..."),
+    list(".#......#..."),
+    list(".########..."),
+    list("#........#.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("............"),
+    list("............"),
+]
+TEMPLATE_B = [
+    list("............"),
+    list("##########.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("##########.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("##########.."),
+    list("............"),
+    list("............"),
+    list("............"),
+    list("............"),
+    list("............"),
+]
+TEMPLATES = {"A": TEMPLATE_A, "B": TEMPLATE_B}
+
+
+def _template_mask(glyph: str) -> np.ndarray:
+    return np.array([[c == "#" for c in row] for row in TEMPLATES[glyph]], dtype=bool)
+
+
+def build_scene(seed: int, glyph: str) -> dict:
+    rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+    cx = rng.uniform(0.40, 0.60) * W
+    cy = rng.uniform(0.42, 0.58) * H
+    top_h = rng.uniform(95.0, 125.0)
+    bot_h = rng.uniform(95.0, 125.0)
+    w_top = rng.uniform(85.0, 115.0)
+    ratio = rng.uniform(1.6, 2.3)
+    w_bot = w_top * ratio
+    p0 = [int(round(cx - w_top / 2.0)), int(round(cy - top_h))]
+    p1 = [int(round(cx + w_top / 2.0)), int(round(cy - top_h))]
+    p2 = [int(round(cx + w_bot / 2.0)), int(round(cy + bot_h))]
+    p3 = [int(round(cx - w_bot / 2.0)), int(round(cy + bot_h))]
+    return {
+        "noise": int(seed),
+        "glyph": glyph,
+        "corners": [p0, p1, p2, p3],
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+    glyph = "A" if int(rng.integers(0, 2)) else "B"
+    return build_scene(seed, glyph)
+
+
+def _homography(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Return 3x3 H with dst ~ H*src from four point correspondences (DLT)."""
+    rows = []
+    for p, q in zip(src, dst):
+        x, y = p[0], p[1]
+        u, v = q[0], q[1]
+        rows.append([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, -u])
+        rows.append([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, -v])
+    matrix = np.array(rows, dtype=float)
+    _, _, vt = np.linalg.svd(matrix)
+    h = vt[-1].reshape(3, 3)
+    return h / h[2, 2]
+
+
+def _apply(h: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=float)
+    if pts.ndim == 1:
+        pts = pts[None, :]
+    hom = np.column_stack([pts, np.ones(pts.shape[0])])
+    out = hom @ h.T
+    out = out / out[:, 2:3]
+    return out[:, :2]
+
+
+def _unit_to_image(h: np.ndarray, u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    pts = np.column_stack([u.ravel(), v.ravel()])
+    mapped = _apply(h, pts)
+    return mapped[:, 0], mapped[:, 1]
+
+
+def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    ys, xs = np.nonzero(mask)
+    coords = set(zip(xs.tolist(), ys.tolist()))
+    components = []
+    height, width = mask.shape
+    while coords:
+        start = coords.pop()
+        stack = [start]
+        pixels = [start]
+        while stack:
+            x, y = stack.pop()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < width and 0 <= ny < height and (nx, ny) in coords:
+                    coords.remove((nx, ny))
+                    stack.append((nx, ny))
+                    pixels.append((nx, ny))
+        components.append(np.array(pixels, dtype=float))
+    return components
+
+
+def corners_from_frame(blue_mask: np.ndarray) -> list[list[int]]:
+    components = _connected_components(blue_mask)
+    if len(components) < 4:
+        return []
+    components.sort(key=lambda c: -len(c))
+    blobs = components[:4]
+    centroids = []
+    for blob in blobs:
+        x = float(blob[:, 0].mean())
+        y = float(blob[:, 1].mean())
+        centroids.append([int(round(x)), int(round(y))])
+    pts = np.array(centroids, dtype=float)
+    order = np.argsort(pts[:, 1])
+    top = pts[order[:2]]
+    bot = pts[order[2:]]
+    top = top[np.argsort(top[:, 0])]
+    bot = bot[np.argsort(bot[:, 0])]
+    p0 = [int(round(top[0][0])), int(round(top[0][1]))]
+    p1 = [int(round(top[1][0])), int(round(top[1][1]))]
+    p2 = [int(round(bot[1][0])), int(round(bot[1][1]))]
+    p3 = [int(round(bot[0][0])), int(round(bot[0][1]))]
+    return [p0, p1, p2, p3]
+
+
+
+
+def render_mask(scene: dict) -> np.ndarray:
+    corners = scene["corners"]
+    src = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    dst = np.array(corners, dtype=float)
+    h = _homography(src, dst)
+    hinv = np.linalg.inv(h)
+    yy, xx = np.mgrid[0:H, 0:W]
+    u, v = _unit_to_image(hinv, xx, yy)
+    template = _template_mask(scene["glyph"])
+    inside = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
+    rows = np.floor(v * G_ROWS).astype(int)
+    cols = np.floor(u * G_COLS).astype(int)
+    np.clip(rows, 0, G_ROWS - 1, out=rows)
+    np.clip(cols, 0, G_COLS - 1, out=cols)
+    mask = (template[rows, cols] & inside).reshape(H, W)
+    return mask
+
+
+EDGE_COLOR = (150, 150, 150)
+MARKER_COLOR = (40, 90, 220)
+MARKER_RADIUS = 6
+
+
+def render(scene: dict) -> Image.Image:
+    mask = render_mask(scene)
+    arr = np.where(mask[:, :, None], np.array([0, 0, 0], dtype=np.uint8),
+                   np.array([255, 255, 255], dtype=np.uint8))
+    image = Image.fromarray(arr.astype(np.uint8), "RGB")
+    draw = ImageDraw.Draw(image)
+    corners = scene["corners"]
+    for a, b in ((0, 1), (1, 2), (2, 3), (3, 0)):
+        draw.line([tuple(corners[a]), tuple(corners[b])], fill=EDGE_COLOR, width=2)
+    for corner in corners:
+        x, y = corner
+        draw.ellipse([x - MARKER_RADIUS, y - MARKER_RADIUS,
+                      x + MARKER_RADIUS, y + MARKER_RADIUS], fill=MARKER_COLOR)
+    return image
+
+
+def unwrap_grid(scene: dict) -> np.ndarray:
+    """Analytic flat glyph grid (the front-on letter), used for gold/margin."""
+    return _template_mask(scene["glyph"])
+
+
+def margin(scene: dict) -> float:
+    chosen = unwrap_grid(scene)
+    other = _template_mask("B" if scene["glyph"] == "A" else "A")
+    c_filled = int(chosen.sum())
+    o_filled = int(other.sum())
+    corr_chosen = float((chosen & chosen).sum()) / max(1, c_filled)
+    corr_other = float((chosen & other).sum()) / max(1, o_filled)
+    return round(corr_chosen - corr_other, 6)
+
+
+def analytic_gold(scene: dict) -> str:
+    return scene["glyph"]
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < Q_TOL
+
+
+def latent_symmetries(scene: dict):
+    """not_applicable: every latent field directly changes pixels, so no two
+    distinct latent vectors share a raster and no render-invariant transform
+    exists. Declared empty."""
+    return iter(())

@@ -1,0 +1,349 @@
+"""Deterministic renderer for a dual-source counterfactual provenance mosaic."""
+
+from __future__ import annotations
+
+import itertools
+import random
+from copy import deepcopy
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH, HEIGHT, SCALE = 960, 780, 2
+BACKGROUND, PANEL_FILL = (246, 245, 240), (255, 255, 255)
+INK, OFF, WIRE = (35, 40, 47), (255, 255, 255), (158, 164, 172)
+RED, BLUE = (205, 54, 54), (35, 105, 210)
+GATE_COLORS = {"and": (48, 112, 190), "or": (224, 148, 39), "xor": (132, 76, 183)}
+GATE_LABELS = {"and": "ALL", "or": "ANY", "xor": "ONE"}
+TOKEN_COLORS = ((0, 150, 180), (0, 140, 70), (225, 100, 0), (190, 45, 135))
+TOKEN_LABELS = tuple("ABCD")
+ROW_Y = (130, 225, 320, 415, 510)
+TOP_X0, CELL_STEP, CELL_RADIUS = 84, 60, 16
+GATE_X0, GATE_X1 = 650, 758
+CARD_BOXES = ((35, 625, 245, 755), (260, 625, 470, 755),
+              (485, 625, 695, 755), (710, 625, 920, 755))
+CARD_PATTERN_X = (34, 81, 128, 175)
+BALANCED_PATTERNS = tuple(pattern for pattern in itertools.product((0, 1), repeat=4)
+                          if sum(pattern) == 2)
+
+
+def _apply(kind: str, left: int, right: int) -> int:
+    if kind == "and":
+        return int(bool(left) and bool(right))
+    if kind == "or":
+        return int(bool(left) or bool(right))
+    if kind == "xor":
+        return int(bool(left) != bool(right))
+    raise ValueError(f"unknown gate {kind!r}")
+
+
+def _next_row(row: list[int], kind: str) -> list[int]:
+    return [_apply(kind, row[index], row[index + 1]) for index in range(len(row) - 1)]
+
+
+def _run(top: list[int], gates: list[str]) -> list[list[int]]:
+    rows = [list(top)]
+    for kind in gates:
+        rows.append(_next_row(rows[-1], kind))
+    return rows
+
+
+def _intervened_top(top: list[int], *marked: int) -> list[int]:
+    changed = list(top)
+    for index in marked:
+        changed[index] ^= 1
+    return changed
+
+
+def _hybrid_run(top: list[int], gates: list[str], red_rows: list[list[int]],
+                blue_rows: list[list[int]], mediators: list[tuple[int, int]],
+                card: tuple[int, ...] | list[int]) -> list[list[int]]:
+    """Restore factual TOP and clamp each mediator from its card-named source run."""
+    rows = [list(top)]
+    for row_index, kind in enumerate(gates, 1):
+        row = _next_row(rows[-1], kind)
+        for token, (selected_row, selected_cell) in enumerate(mediators):
+            if selected_row == row_index:
+                source = blue_rows if int(card[token]) else red_rows
+                row[selected_cell] = int(source[row_index][selected_cell])
+        rows.append(row)
+    return rows
+
+
+def _worlds(scene: dict) -> tuple[list[list[int]], list[list[int]], list[list[int]], list[list[int]]]:
+    top = [int(value) for value in scene["top"]]
+    gates = [str(value) for value in scene["gates"]]
+    red_marked, blue_marked = int(scene["red_marked"]), int(scene["blue_marked"])
+    return (
+        _run(top, gates),
+        _run(_intervened_top(top, red_marked), gates),
+        _run(_intervened_top(top, blue_marked), gates),
+        _run(_intervened_top(top, red_marked, blue_marked), gates),
+    )
+
+
+def _card_outcomes(scene: dict) -> list[list[int]]:
+    top = [int(value) for value in scene["top"]]
+    gates = [str(value) for value in scene["gates"]]
+    mediators = [tuple(int(value) for value in item) for item in scene["mediators"]]
+    _factual, red_rows, blue_rows, _both = _worlds(scene)
+    return [_hybrid_run(top, gates, red_rows, blue_rows, mediators,
+                        [int(value) for value in card])[-1]
+            for card in scene["cards"]]
+
+
+def _distance(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
+    return sum(a != b for a, b in zip(left, right, strict=True))
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    target_slot = int(seed) % 4
+    for _ in range(60000):
+        top = [rng.randrange(2) for _ in range(9)]
+        gates = [rng.choice(("and", "or", "xor")) for _ in range(4)]
+        if len(set(gates)) < 3:
+            continue
+        red_marked, blue_marked = rng.sample(range(1, 8), 2)
+        if abs(red_marked - blue_marked) > 3:
+            continue
+        factual = _run(top, gates)
+        red_rows = _run(_intervened_top(top, red_marked), gates)
+        blue_rows = _run(_intervened_top(top, blue_marked), gates)
+        both_rows = _run(_intervened_top(top, red_marked, blue_marked), gates)
+        target = both_rows[-1]
+        if any(_distance(rows[-1], target) < 2 for rows in (factual, red_rows, blue_rows)):
+            continue
+        available = [(row, cell) for row in (2, 3) for cell in range(9 - row)
+                     if red_rows[row][cell] != blue_rows[row][cell]]
+        if sum(row == 2 for row, _ in available) < 2 or sum(row == 3 for row, _ in available) < 2:
+            continue
+        coordinate_sets = [item for item in itertools.combinations(available, 4)
+                           if sum(row == 2 for row, _ in item) == 2]
+        rng.shuffle(coordinate_sets)
+        selection = None
+        for mediators in coordinate_sets:
+            outcomes = [tuple(_hybrid_run(top, gates, red_rows, blue_rows,
+                                          list(mediators), pattern)[-1])
+                        for pattern in BALANCED_PATTERNS]
+            good = [index for index, outcome in enumerate(outcomes)
+                    if outcome == tuple(target)]
+            wrong = [index for index, outcome in enumerate(outcomes)
+                     if _distance(outcome, target) >= 2]
+            rng.shuffle(good)
+            for survivor_index in good:
+                wrong_pool = [index for index in wrong if index != survivor_index]
+                rng.shuffle(wrong_pool)
+                for distractor_indices in itertools.combinations(wrong_pool, 3):
+                    chosen_indices = (survivor_index, *distractor_indices)
+                    if len({outcomes[index] for index in distractor_indices}) != 3:
+                        continue
+                    patterns = [BALANCED_PATTERNS[index] for index in chosen_indices]
+                    if any(len({pattern[column] for pattern in patterns}) != 2
+                           for column in range(4)):
+                        continue
+                    selection = (mediators, BALANCED_PATTERNS[survivor_index],
+                                 [BALANCED_PATTERNS[index] for index in distractor_indices])
+                    break
+                if selection is not None:
+                    break
+            if selection is not None:
+                break
+        if selection is None:
+            continue
+        mediators, survivor, distractors = selection
+        rng.shuffle(distractors)
+        ordered: list[tuple[int, ...]] = []
+        cursor = 0
+        for slot in range(4):
+            pattern = survivor if slot == target_slot else distractors[cursor]
+            cursor += int(slot != target_slot)
+            ordered.append(pattern)
+        return {
+            "top": top,
+            "gates": gates,
+            "red_marked": red_marked,
+            "blue_marked": blue_marked,
+            "mediators": [list(item) for item in mediators],
+            "cards": [list(pattern) for pattern in ordered],
+            "card_draw_order": [0, 1, 2, 3],
+        }
+    raise RuntimeError("could not sample a separated provenance-mosaic scene")
+
+
+def analytic_gold(scene: dict) -> str:
+    target = _worlds(scene)[-1][-1]
+    matches = [index for index, outcome in enumerate(_card_outcomes(scene)) if outcome == target]
+    if len(matches) != 1:
+        raise ValueError(f"expected one provenance card, got {matches}")
+    return f"card-{matches[0] + 1}"
+
+
+def margin(scene: dict) -> float:
+    target = _worlds(scene)[-1][-1]
+    correct = int(analytic_gold(scene).split("-")[1]) - 1
+    return float(min(_distance(outcome, target) for index, outcome in enumerate(_card_outcomes(scene))
+                     if index != correct))
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        top = [int(value) for value in scene["top"]]
+        gates = [str(value) for value in scene["gates"]]
+        red_marked, blue_marked = int(scene["red_marked"]), int(scene["blue_marked"])
+        mediators = [tuple(int(value) for value in item) for item in scene["mediators"]]
+        cards = [tuple(int(value) for value in item) for item in scene["cards"]]
+        if len(top) != 9 or any(value not in (0, 1) for value in top):
+            return True
+        if len(gates) != 4 or any(kind not in GATE_COLORS for kind in gates) or len(set(gates)) < 3:
+            return True
+        if not (1 <= red_marked <= 7 and 1 <= blue_marked <= 7) or red_marked == blue_marked:
+            return True
+        if abs(red_marked - blue_marked) > 3:
+            return True
+        if len(mediators) != 4 or len(set(mediators)) != 4:
+            return True
+        if sum(row == 2 for row, _ in mediators) != 2:
+            return True
+        if any(row not in (2, 3) or not 0 <= cell < 9 - row for row, cell in mediators):
+            return True
+        if len(cards) != 4 or len(set(cards)) != 4:
+            return True
+        if any(len(card) != 4 or any(value not in (0, 1) for value in card)
+               or sum(card) != 2 for card in cards):
+            return True
+        if any(len({card[column] for card in cards}) != 2 for column in range(4)):
+            return True
+        if sorted(scene["card_draw_order"]) != [0, 1, 2, 3]:
+            return True
+        factual, red_rows, blue_rows, both_rows = _worlds(scene)
+        if any(_distance(rows[-1], both_rows[-1]) < 2
+               for rows in (factual, red_rows, blue_rows)):
+            return True
+        if any(red_rows[row][cell] == blue_rows[row][cell] for row, cell in mediators):
+            return True
+        outcomes = _card_outcomes(scene)
+        matches = [index for index, outcome in enumerate(outcomes) if outcome == both_rows[-1]]
+        if len(matches) != 1:
+            return True
+        wrong = [outcome for index, outcome in enumerate(outcomes) if index != matches[0]]
+        if len({tuple(outcome) for outcome in wrong}) != 3:
+            return True
+        if any(_distance(outcome, both_rows[-1]) < 2 for outcome in wrong):
+            return True
+        return margin(scene) < 2.0
+    except (KeyError, TypeError, ValueError, IndexError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = deepcopy(scene)
+    twin["card_draw_order"] = list(reversed(twin["card_draw_order"]))
+    return [("reverse_disjoint_card_draw_order", twin)]
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf", size * SCALE)
+
+
+def _pt(point: tuple[int, int]) -> tuple[int, int]:
+    return point[0] * SCALE, point[1] * SCALE
+
+
+def _box(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    return tuple(value * SCALE for value in box)  # type: ignore[return-value]
+
+
+def _row_centers(row_index: int) -> list[tuple[int, int]]:
+    x0 = TOP_X0 + row_index * (CELL_STEP // 2)
+    return [(x0 + index * CELL_STEP, ROW_Y[row_index]) for index in range(9 - row_index)]
+
+
+def _draw_cell(draw: ImageDraw.ImageDraw, center: tuple[int, int], value: int) -> None:
+    x, y = center
+    draw.ellipse(_box((x - CELL_RADIUS, y - CELL_RADIUS, x + CELL_RADIUS, y + CELL_RADIUS)),
+                 fill=INK if value else OFF, outline=INK, width=3 * SCALE)
+
+
+def _draw_token_marker(draw: ImageDraw.ImageDraw, center: tuple[int, int], token: int) -> None:
+    x, y = center
+    color = TOKEN_COLORS[token]
+    draw.ellipse(_box((x - 27, y - 27, x + 27, y + 27)), outline=color, width=6 * SCALE)
+    draw.rounded_rectangle(_box((x - 13, y + 27, x + 13, y + 50)), radius=6 * SCALE,
+                           fill=color, outline=INK, width=2 * SCALE)
+    label, font = TOKEN_LABELS[token], _font(15, True)
+    bbox = draw.textbbox((0, 0), label, font=font)
+    draw.text((x * SCALE - (bbox[2] - bbox[0]) // 2,
+               (y + 37) * SCALE - (bbox[3] - bbox[1]) // 2 - SCALE),
+              label, fill=(255, 255, 255), font=font)
+
+
+def _draw_card(draw: ImageDraw.ImageDraw, slot: int, card: list[int]) -> None:
+    x0, y0, x1, y1 = CARD_BOXES[slot]
+    draw.rounded_rectangle(_box((x0, y0, x1, y1)), radius=13 * SCALE,
+                           fill=PANEL_FILL, outline=INK, width=3 * SCALE)
+    heading, font = f"CARD {slot + 1}", _font(17, True)
+    bbox = draw.textbbox((0, 0), heading, font=font)
+    draw.text(((x0 + x1) * SCALE // 2 - (bbox[2] - bbox[0]) // 2, (y0 + 10) * SCALE),
+              heading, fill=INK, font=font)
+    for token, offset in enumerate(CARD_PATTERN_X):
+        x = x0 + offset
+        draw.text(_pt((x - 6, y0 + 42)), TOKEN_LABELS[token], fill=INK, font=_font(14, True))
+        source = int(card[token])
+        color, source_label = (BLUE, "B") if source else (RED, "R")
+        draw.rounded_rectangle(_box((x - 18, y0 + 68, x + 18, y0 + 112)), radius=8 * SCALE,
+                               fill=color, outline=INK, width=2 * SCALE)
+        source_font = _font(17, True)
+        sb = draw.textbbox((0, 0), source_label, font=source_font)
+        draw.text((x * SCALE - (sb[2] - sb[0]) // 2,
+                   (y0 + 90) * SCALE - (sb[3] - sb[1]) // 2 - SCALE),
+                  source_label, fill=(255, 255, 255), font=source_font)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.text(_pt((28, 14)), "BUILD A MOSAIC FROM TWO COUNTERFACTUAL WORLDS",
+              fill=INK, font=_font(22, True))
+    draw.text(_pt((30, 50)), "record RED-only + BLUE-only letters   restore TOP   test one card",
+              fill=INK, font=_font(15))
+    draw.text(_pt((794, 20)), "dark = ON", fill=INK, font=_font(16, True))
+    top = [int(value) for value in scene["top"]]
+    gates = [str(value) for value in scene["gates"]]
+    rows = _run(top, gates)
+    centers = [_row_centers(index) for index in range(5)]
+    for row_index in range(1, 5):
+        for index, child in enumerate(centers[row_index]):
+            for parent in (centers[row_index - 1][index], centers[row_index - 1][index + 1]):
+                draw.line([_pt(parent), _pt(child)], fill=WIRE, width=3 * SCALE)
+    draw.text(_pt((17, ROW_Y[0] - 10)), "TOP", fill=INK, font=_font(14, True))
+    mediator_lookup = {tuple(int(value) for value in coordinate): token
+                       for token, coordinate in enumerate(scene["mediators"])}
+    for row_index, row in enumerate(rows):
+        for cell_index, value in enumerate(row):
+            center = centers[row_index][cell_index]
+            if row_index == 0 and cell_index == int(scene["red_marked"]):
+                x, y = center
+                draw.ellipse(_box((x - 27, y - 27, x + 27, y + 27)), outline=RED, width=6 * SCALE)
+            if row_index == 0 and cell_index == int(scene["blue_marked"]):
+                x, y = center
+                draw.ellipse(_box((x - 27, y - 27, x + 27, y + 27)), outline=BLUE, width=6 * SCALE)
+            token = mediator_lookup.get((row_index, cell_index))
+            if token is not None:
+                _draw_token_marker(draw, center, token)
+            _draw_cell(draw, center, int(value))
+        if row_index:
+            kind, y = gates[row_index - 1], ROW_Y[row_index]
+            draw.rounded_rectangle(_box((GATE_X0, y - 23, GATE_X1, y + 23)), radius=9 * SCALE,
+                                   fill=GATE_COLORS[kind], outline=INK, width=2 * SCALE)
+            label, font = GATE_LABELS[kind], _font(17, True)
+            bbox = draw.textbbox((0, 0), label, font=font)
+            draw.text((704 * SCALE - (bbox[2] - bbox[0]) // 2,
+                       y * SCALE - (bbox[3] - bbox[1]) // 2 - SCALE),
+                      label, fill=(255, 255, 255), font=font)
+            row_label = "FACTUAL BOTTOM" if row_index == 4 else f"ROW {row_index}"
+            draw.text(_pt((776, y - 10)), row_label, fill=INK, font=_font(14, True))
+    draw.text(_pt((28, 577)), "WHICH RED/BLUE MOSAIC RECREATES THE BOTH-FLIPPED BOTTOM?",
+              fill=INK, font=_font(18, True))
+    for slot in scene["card_draw_order"]:
+        _draw_card(draw, int(slot), [int(value) for value in scene["cards"][int(slot)]])
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)

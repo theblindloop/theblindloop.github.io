@@ -1,0 +1,157 @@
+"""Independent PNG-only inverse arm for common-focus broken rings."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose four clean, directionally readable rings."""
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    chroma = array.max(axis=2) - array.min(axis=2)
+    darkness = 255.0 - array.mean(axis=2)
+    return (chroma >= 48) & (darkness >= 42)
+
+
+def _raw_components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for raw_y, raw_x in np.argwhere(mask):
+        sy, sx = int(raw_y), int(raw_x)
+        if seen[sy, sx]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(sy, sx)])
+        seen[sy, sx] = True
+        points: list[tuple[float, float]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((float(x), float(y)))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= 18:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _ring_groups(mask: np.ndarray) -> list[np.ndarray]:
+    """Merge nearby fragments of one ring while keeping remote rings separate."""
+
+    components = _raw_components(mask)
+    if not components:
+        return []
+    centers = np.asarray([points.mean(axis=0) for points in components])
+    parent = list(range(len(components)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    for left in range(len(components)):
+        for right in range(left + 1, len(components)):
+            if float(np.linalg.norm(centers[left] - centers[right])) <= 88.0:
+                union(left, right)
+    grouped: dict[int, list[np.ndarray]] = {}
+    for index, points in enumerate(components):
+        grouped.setdefault(find(index), []).append(points)
+    rings = [np.concatenate(parts, axis=0) for parts in grouped.values()]
+    return sorted((points for points in rings if len(points) >= 420), key=lambda p: float(p[:, 1].mean()))
+
+
+def _longest_circular_gap(empty: np.ndarray) -> tuple[int, int]:
+    count = len(empty)
+    doubled = np.concatenate((empty, empty))
+    best_start = best_length = current_start = current_length = 0
+    for index, value in enumerate(doubled):
+        if bool(value):
+            if current_length == 0:
+                current_start = index
+            current_length += 1
+            if current_start < count and current_length > best_length:
+                best_start = current_start
+                best_length = min(current_length, count)
+        else:
+            current_length = 0
+    return best_start % count, best_length
+
+
+def _fit_ring(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+    x, y = points[:, 0], points[:, 1]
+    design = np.column_stack((2.0 * x, 2.0 * y, np.ones(len(points))))
+    target = x * x + y * y
+    coefficients, _, _, _ = np.linalg.lstsq(design, target, rcond=None)
+    center = coefficients[:2]
+    radius_sq = float(coefficients[2] + center @ center)
+    if not np.isfinite(radius_sq) or radius_sq <= 0.0:
+        raise OracleAbstention("degenerate circle fit")
+    radius = float(np.sqrt(radius_sq))
+    radial = np.linalg.norm(points - center, axis=1)
+    thickness = float(np.percentile(radial, 90) - np.percentile(radial, 10))
+    if not 19.0 <= radius <= 48.0 or not 5.0 <= thickness <= 24.0:
+        raise OracleAbstention("a component is not a resolvable broken ring")
+
+    angles = (np.degrees(np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])) + 360.0) % 360.0
+    bin_count = 90
+    bins = np.floor(angles * bin_count / 360.0).astype(int) % bin_count
+    counts = np.bincount(bins, minlength=bin_count)
+    positive = counts[counts > 0]
+    if not len(positive):
+        raise OracleAbstention("ring has no angular support")
+    empty = counts <= max(2, int(np.median(positive) * 0.12))
+    start, length = _longest_circular_gap(empty)
+    gap_width = length * 360.0 / bin_count
+    if not 36.0 <= gap_width <= 190.0:
+        raise OracleAbstention("ring gap is absent or too damaged")
+    gap_angle = (start + length / 2.0) * 2.0 * np.pi / bin_count
+    gap_vector = np.asarray([np.cos(gap_angle), np.sin(gap_angle)], dtype=np.float64)
+    return center, gap_vector, radius, gap_width
+
+
+def _measure(image: Image.Image) -> tuple[list[float], list[float]]:
+    groups = _ring_groups(_ink_mask(image))
+    if len(groups) != 4:
+        raise OracleAbstention(f"expected four separated rings, found {len(groups)}")
+    fits = [_fit_ring(points) for points in groups]
+    centers = np.asarray([item[0] for item in fits])
+    focus = centers.mean(axis=0)
+    alignments: list[float] = []
+    for center, gap_vector, _, _ in fits:
+        inward = focus - center
+        norm = float(np.linalg.norm(inward))
+        if norm < 80.0:
+            raise OracleAbstention("ring centers do not define a spread quartet")
+        alignments.append(float(gap_vector @ (inward / norm)))
+    gaps = [float(item[3]) for item in fits]
+    return alignments, gaps
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the all-gaps-inward decision from final pixels alone."""
+
+    alignments, _ = _measure(image)
+    inward = [value >= 0.57 for value in alignments]
+    outward = [value <= -0.57 for value in alignments]
+    if all(inward):
+        return "yes"
+    if sum(outward) == 1 and sum(inward) == 3:
+        return "no"
+    raise OracleAbstention(f"gap directions fall in the angular decision band: {alignments}")

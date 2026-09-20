@@ -1,0 +1,280 @@
+"""Renderer and analytic arm for local quadrant-mass correspondence."""
+
+from __future__ import annotations
+
+import copy
+import itertools
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "mosaic-density-correspondence-0.1.0"
+WIDTH = 512
+HEIGHT = 512
+SCALE = 4
+
+BACKGROUND = (248, 247, 242)
+CASSETTE = (29, 82, 111)
+CASSETTE_EDGE = (18, 57, 79)
+PANEL = (238, 235, 224)
+PANEL_EDGE = (177, 184, 178)
+PAPER = (248, 244, 231)
+INK = (42, 47, 52)
+TEXT = (230, 237, 232)
+TEXT_DARK = (60, 69, 73)
+NEUTRAL_SEAL = (122, 171, 159)
+AMBER_SEAL = (237, 163, 57)
+VIOLET_SEAL = (177, 110, 199)
+
+GRID = 4
+QUADRANT = 2
+TARGET_CELLS = 8
+FRAME_WIDTH = 134
+FRAME_HEIGHT = 134
+PANEL_SIZE = 52
+PANEL_RELS = {"R": (8, 8), "A": (74, 8), "B": (8, 74)}
+CELL = 7
+CELL_ORIGIN = (12, 14)
+QUARANTINE_MARGIN = 1.0 / 16.0
+
+
+def _font(size: int):
+    for name in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ):
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size=size * SCALE)
+    return ImageFont.load_default()
+
+
+def _reflect_lr(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> list[list[int]]:
+    return [list(reversed(row)) for row in pattern]
+
+
+def _pattern_tuple(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> tuple[tuple[int, ...], ...]:
+    if len(pattern) != GRID or any(len(row) != GRID for row in pattern):
+        raise ValueError("mosaic must be a four-by-four grid")
+    values = tuple(tuple(int(value) for value in row) for row in pattern)
+    if any(value not in (0, 1) for row in values for value in row):
+        raise ValueError("mosaic cells must be binary")
+    if sum(sum(row) for row in values) != TARGET_CELLS:
+        raise ValueError("mosaic must contain exactly eight dark cells")
+    return values
+
+
+def _mass_signature(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> tuple[int, int, int, int]:
+    values = _pattern_tuple(pattern)
+    return (
+        sum(values[row][col] for row in range(0, 2) for col in range(0, 2)),
+        sum(values[row][col] for row in range(0, 2) for col in range(2, 4)),
+        sum(values[row][col] for row in range(2, 4) for col in range(2, 4)),
+        sum(values[row][col] for row in range(2, 4) for col in range(0, 2)),
+    )
+
+
+def _l1(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+    return sum(abs(a - b) for a, b in zip(left, right, strict=True))
+
+
+def _make_pattern_pool() -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Return deterministic, equal-ink mosaics with visible mass diversity."""
+
+    pool: list[tuple[tuple[int, ...], ...]] = []
+    for cells in itertools.combinations(range(GRID * GRID), TARGET_CELLS):
+        occupied = set(cells)
+        pattern = tuple(
+            tuple(1 if row * GRID + col in occupied else 0 for col in range(GRID))
+            for row in range(GRID)
+        )
+        signature = _mass_signature(pattern)
+        if min(signature) < 1 or max(signature) > 3:
+            continue
+        # Avoid shapes whose reflected mass and visible arrangement are both
+        # unchanged; they make a weak correspondence example.
+        reflected = tuple(tuple(row) for row in _reflect_lr(pattern))
+        if reflected == pattern:
+            continue
+        pool.append(pattern)
+    if len(pool) < 100:
+        raise RuntimeError("mosaic pattern pool is too small")
+    return tuple(pool)
+
+
+_PATTERN_POOL = _make_pattern_pool()
+
+
+def _panel_map(scene: dict) -> dict[str, dict]:
+    panels: dict[str, dict] = {}
+    for record in scene["candidate_panels"]:
+        slot = str(record["slot"])
+        if slot in panels or slot not in {"A", "B"}:
+            raise ValueError("candidate slots must be unique A and B")
+        panels[slot] = record
+    if set(panels) != {"A", "B"}:
+        raise ValueError("candidate slots must be A and B")
+    return panels
+
+
+def _validate_scene(scene: dict) -> tuple[tuple[tuple[int, ...], ...], dict[str, dict]]:
+    reference = _pattern_tuple(scene["reference_pattern"])
+    panels = _panel_map(scene)
+    for record in panels.values():
+        _pattern_tuple(record["pattern"])
+        if record["seal"] not in {"amber", "violet"}:
+            raise ValueError("candidate seal must be amber or violet")
+    anchor = scene["cassette_anchor"]
+    if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
+        raise ValueError("cassette anchor must be an x,y pair")
+    x, y = (int(anchor[0]), int(anchor[1]))
+    if not (0 <= x <= WIDTH - FRAME_WIDTH and 0 <= y <= HEIGHT - FRAME_HEIGHT):
+        raise ValueError("cassette does not fit canvas")
+    return reference, panels
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample equal-ink mosaics and nuisance permutations."""
+
+    rng = random.Random(int(seed))
+    reference = [list(row) for row in rng.choice(_PATTERN_POOL)]
+    match = _reflect_lr(reference)
+    reference_signature = _mass_signature(reference)
+    wrong_candidates = []
+    for candidate in _PATTERN_POOL:
+        transformed = _reflect_lr(candidate)
+        error = _l1(reference_signature, _mass_signature(transformed))
+        if error >= 2:
+            wrong_candidates.append(candidate)
+    if not wrong_candidates:
+        raise RuntimeError("no separated wrong mosaic")
+    near = [candidate for candidate in wrong_candidates if _l1(reference_signature, _mass_signature(_reflect_lr(candidate))) <= 4]
+    source = near if near and rng.randrange(3) == 0 else wrong_candidates
+    wrong = [list(row) for row in rng.choice(source)]
+    matching_slot = "A" if rng.randrange(2) == 0 else "B"
+    matching_seal = "amber" if rng.randrange(2) == 0 else "violet"
+    wrong_seal = "violet" if matching_seal == "amber" else "amber"
+    records = [
+        {
+            "slot": "A",
+            "pattern": match if matching_slot == "A" else wrong,
+            "seal": matching_seal if matching_slot == "A" else wrong_seal,
+        },
+        {
+            "slot": "B",
+            "pattern": match if matching_slot == "B" else wrong,
+            "seal": matching_seal if matching_slot == "B" else wrong_seal,
+        },
+    ]
+    rng.shuffle(records)
+    anchor = [rng.randrange(28, WIDTH - FRAME_WIDTH - 28), rng.randrange(28, HEIGHT - FRAME_HEIGHT - 28)]
+    return {
+        "reference_pattern": reference,
+        "candidate_panels": records,
+        "cassette_anchor": anchor,
+    }
+
+
+def _errors(reference: tuple[tuple[int, ...], ...], panels: dict[str, dict]) -> dict[str, int]:
+    reference_signature = _mass_signature(reference)
+    return {
+        slot: _l1(reference_signature, _mass_signature(_reflect_lr(_pattern_tuple(panels[slot]["pattern"]))))
+        for slot in ("A", "B")
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return the seal attached to the uniquely best transformed mass signature."""
+
+    reference, panels = _validate_scene(scene)
+    errors = _errors(reference, panels)
+    if errors["A"] == errors["B"]:
+        raise ValueError("transformed mosaic errors are tied")
+    best = "A" if errors["A"] < errors["B"] else "B"
+    return str(panels[best]["seal"])
+
+
+def margin(scene: dict) -> float:
+    """Return the transformed signature top-gap normalized by 16 cells."""
+
+    reference, panels = _validate_scene(scene)
+    errors = sorted(_errors(reference, panels).values())
+    return float(errors[1] - errors[0]) / 16.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        reference, panels = _validate_scene(scene)
+        errors = _errors(reference, panels)
+        if errors["A"] == errors["B"]:
+            return True
+        return margin(scene) <= QUARANTINE_MARGIN
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _box(values: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SCALE)) for value in values)  # type: ignore[return-value]
+
+
+def _draw_badge(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    label: str,
+    pattern: list[list[int]] | tuple[tuple[int, ...], ...],
+    seal: str,
+) -> None:
+    draw.rounded_rectangle(
+        _box((x, y, x + PANEL_SIZE, y + PANEL_SIZE)),
+        radius=5 * SCALE,
+        fill=PANEL,
+        outline=PANEL_EDGE,
+        width=1 * SCALE,
+    )
+    draw.text((int((x + 5) * SCALE), int((y + 3) * SCALE)), label, font=_font(8), fill=TEXT_DARK)
+    seal_color = NEUTRAL_SEAL if seal == "neutral" else AMBER_SEAL if seal == "amber" else VIOLET_SEAL
+    draw.rounded_rectangle(
+        _box((x + 40, y + 5, x + 48, y + 13)),
+        radius=2 * SCALE,
+        fill=seal_color,
+    )
+    origin_x, origin_y = x + CELL_ORIGIN[0], y + CELL_ORIGIN[1]
+    for row, values in enumerate(pattern):
+        for col, value in enumerate(values):
+            left = origin_x + col * CELL
+            top = origin_y + row * CELL
+            fill = INK if int(value) else PAPER
+            draw.rectangle(_box((left, top, left + CELL - 1, top + CELL - 1)), fill=fill)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one compact, translated cassette with all decisive evidence."""
+
+    reference, panels = _validate_scene(scene)
+    ax, ay = (int(scene["cassette_anchor"][0]), int(scene["cassette_anchor"][1]))
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        _box((ax, ay, ax + FRAME_WIDTH, ay + FRAME_HEIGHT)),
+        radius=12 * SCALE,
+        fill=CASSETTE,
+        outline=CASSETTE_EDGE,
+        width=2 * SCALE,
+    )
+    _draw_badge(draw, ax + PANEL_RELS["R"][0], ay + PANEL_RELS["R"][1], "R", reference, "neutral")
+    for slot in ("A", "B"):
+        record = panels[slot]
+        rx, ry = PANEL_RELS[slot]
+        _draw_badge(draw, ax + rx, ay + ry, slot, record["pattern"], record["seal"])
+    # The unused lower-right cassette quadrant is intentionally plain: it is a
+    # connected local carrier, not a second answer-bearing cue.
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Reverse slot-addressed candidate records without changing the raster."""
+
+    twin = copy.deepcopy(scene)
+    twin["candidate_panels"] = list(reversed(twin["candidate_panels"]))
+    return [("candidate_record_order", twin)]

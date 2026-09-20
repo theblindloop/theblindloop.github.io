@@ -1,0 +1,177 @@
+"""Independent inverse arm for the final RGB PNG.
+
+This module knows only the public palette and question contract.  It segments
+the circular junction components, estimates their centroids, traces dark ink
+between every centroid pair, reconstructs an unlabeled graph, identifies the
+green and purple components, and exhaustively removes each recovered edge.  It
+does not receive latent state and intentionally imports no candidate module.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+PALETTE = np.asarray(
+    [
+        (247, 245, 239),  # warm white background
+        (38, 49, 63),     # dark link
+        (76, 159, 203),   # neutral junction
+        (24, 168, 107),   # green marked junction
+        (141, 85, 199),   # purple marked junction
+        (20, 32, 44),     # dark circle outline
+    ],
+    dtype=np.int32,
+)
+
+
+class OracleAbstention(ValueError):
+    """The raster does not support an unambiguous public-contract decision."""
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int32)
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.shape[0] < 200 or rgb.shape[1] < 300:
+        raise OracleAbstention("unexpected raster shape")
+    delta = rgb[:, :, None, :] - PALETTE[None, None, :, :]
+    return np.sum(delta * delta, axis=3, dtype=np.int32).argmin(axis=2)
+
+
+def _components(mask: np.ndarray, minimum: int = 120) -> list[np.ndarray]:
+    """Four-connected components represented as (y,x) integer arrays."""
+    height, width = mask.shape
+    ys, xs = np.nonzero(mask)
+    remaining = {int(y) * width + int(x) for y, x in zip(ys, xs, strict=True)}
+    output: list[np.ndarray] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        component = [start]
+        while stack:
+            value = stack.pop()
+            y, x = divmod(value, width)
+            for neighbor in (value - 1, value + 1, value - width, value + width):
+                if neighbor not in remaining:
+                    continue
+                ny, nx = divmod(neighbor, width)
+                if abs(nx - x) + abs(ny - y) != 1:
+                    continue
+                remaining.remove(neighbor)
+                stack.append(neighbor)
+                component.append(neighbor)
+        if len(component) >= minimum:
+            points = np.asarray([divmod(value, width) for value in component], dtype=np.float64)
+            output.append(points)
+    return output
+
+
+def _recover_nodes(label_map: np.ndarray) -> tuple[list[tuple[float, float]], int, int, list[float]]:
+    records: list[tuple[float, float, str, float]] = []
+    for label, name in ((2, "neutral"), (3, "green"), (4, "purple")):
+        for points in _components(label_map == label):
+            y, x = points.mean(axis=0)
+            radius = float(np.sqrt(len(points) / np.pi)) + 3.0
+            records.append((float(x), float(y), name, radius))
+
+    if len(records) != 11:
+        raise OracleAbstention(f"expected 11 circular junctions, recovered {len(records)}")
+    if sum(record[2] == "green" for record in records) != 1:
+        raise OracleAbstention("expected exactly one green junction")
+    if sum(record[2] == "purple" for record in records) != 1:
+        raise OracleAbstention("expected exactly one purple junction")
+
+    # Sorting is only a deterministic local indexing convention; no expected
+    # coordinate or layout is used by the decision.
+    records.sort(key=lambda record: (record[0], record[1]))
+    centers = [(record[0], record[1]) for record in records]
+    radii = [record[3] for record in records]
+    green = next(i for i, record in enumerate(records) if record[2] == "green")
+    purple = next(i for i, record in enumerate(records) if record[2] == "purple")
+    return centers, green, purple, radii
+
+
+def _trace_score(dark: np.ndarray, a: tuple[float, float], b: tuple[float, float],
+                 endpoint_gap: float) -> float:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    distance = float(np.hypot(dx, dy))
+    if distance <= 2.0 * endpoint_gap + 5.0:
+        return 0.0
+    ux, uy = dx / distance, dy / distance
+    nx, ny = -uy, ux
+    start = endpoint_gap / distance
+    stop = 1.0 - endpoint_gap / distance
+    sample_count = max(24, int(distance * 0.65))
+    ts = np.linspace(start, stop, sample_count)
+    height, width = dark.shape
+    hits = 0
+    total = 0
+    for offset in (-2.0, 0.0, 2.0):
+        xs = np.rint(a[0] + ts * dx + offset * nx).astype(int)
+        ys = np.rint(a[1] + ts * dy + offset * ny).astype(int)
+        valid = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        if valid.any():
+            hits += int(dark[ys[valid], xs[valid]].sum())
+            total += int(valid.sum())
+    return hits / total if total else 0.0
+
+
+def _recover_graph(label_map: np.ndarray, centers: list[tuple[float, float]],
+                   radii: list[float]) -> list[tuple[int, int]]:
+    dark = (label_map == 1) | (label_map == 5)
+    scored: list[tuple[float, int, int]] = []
+    for u, a in enumerate(centers):
+        for v in range(u + 1, len(centers)):
+            score = _trace_score(dark, a, centers[v], max(radii[u], radii[v]) + 2.0)
+            scored.append((score, u, v))
+
+    # The public question states that exactly thirteen links are present.  Use
+    # that visible count as a consistency constraint, then require a substantial
+    # trace-score gap between the last accepted and first rejected pair.  This
+    # rejects nearly collinear two-edge walks rather than silently treating them
+    # as one long link through an intermediate circle.
+    ranked = sorted(scored, reverse=True)
+    accepted, rejected = ranked[:13], ranked[13:]
+    if len(accepted) != 13 or accepted[-1][0] < 0.93:
+        raise OracleAbstention("fewer than 13 strong straight dark-link traces")
+    if rejected and accepted[-1][0] - rejected[0][0] < 0.07:
+        raise OracleAbstention(
+            f"ambiguous 13-link boundary: {accepted[-1][0]:.3f} vs {rejected[0][0]:.3f}"
+        )
+    return [(u, v) for _score, u, v in accepted]
+
+
+def _reachable(n: int, edges: list[tuple[int, int]], source: int, target: int,
+               skipped: int | None = None) -> bool:
+    adjacency = [[] for _ in range(n)]
+    for index, (u, v) in enumerate(edges):
+        if index == skipped:
+            continue
+        adjacency[u].append(v)
+        adjacency[v].append(u)
+    queue = deque([source])
+    seen = {source}
+    while queue:
+        u = queue.popleft()
+        if u == target:
+            return True
+        for v in adjacency[u]:
+            if v not in seen:
+                seen.add(v)
+                queue.append(v)
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return ``yes`` iff every recovered one-link deletion preserves the pair."""
+    label_map = _labels(image)
+    centers, green, purple, radii = _recover_nodes(label_map)
+    edges = _recover_graph(label_map, centers, radii)
+    if not _reachable(len(centers), edges, green, purple):
+        raise OracleAbstention("marked junctions are not initially connected")
+    for index in range(len(edges)):
+        if not _reachable(len(centers), edges, green, purple, skipped=index):
+            return "no"
+    return "yes"

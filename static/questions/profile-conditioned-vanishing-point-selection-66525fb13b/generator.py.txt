@@ -1,0 +1,211 @@
+"""Vanishing-point selection world: which color marker sits at the convergence point.
+
+Several colored straight line segments are drawn on a white canvas and, when
+their supporting lines are extended, all pass through one shared vanishing point
+V. A set of colored marker dots is shown; exactly one of them (drawn in a
+distinct color) sits exactly on V. The decision is which color that marker is.
+
+The global Gestalt structure is the single shared intersection point of the
+family of line segments (a continuity/extrapolation grouping). The renderer owns
+latent-scene sampling, rasterization, and the structural analytic gold. The
+independent pixel-only inverse arm (``oracle.py``) recovers the same decision
+from the final PNG alone: it segments each colored line, fits each supporting
+line, computes their shared (least-squares) intersection, and selects the color
+marker nearest that point.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+BACKGROUND = (255, 255, 255)
+
+LINE_WIDTH = 5
+LINE_HALF = 170  # half-length; V range keeps every line inside the canvas
+MARKER_RADIUS = 11
+
+# Four line colors; all extended lines share one vanishing point.
+LINE_COLORS = {
+    "magenta": (220, 40, 220),
+    "teal": (20, 190, 200),
+    "amber": (240, 190, 40),
+    "lime": (110, 220, 70),
+}
+LINE_NAMES = ["magenta", "teal", "amber", "lime"]
+
+# Four marker colors; the true marker sits on the vanishing point.
+MARKER_COLORS = {
+    "red": (230, 50, 50),
+    "green": (50, 190, 90),
+    "blue": (50, 90, 230),
+    "purple": (170, 60, 200),
+}
+MARKER_NAMES = ["red", "green", "blue", "purple"]
+
+# Vanishing point is sampled inside this central box so every line half and
+# every marker stays within the 512x512 canvas.
+_V_MIN = 176
+_V_MAX = 336
+
+# Distractor markers sit between these distances (px) from the vanishing point.
+_DIST_MIN = 45.0
+_DIST_MAX = 140.0
+
+# Quarantine band on the decision margin (px from the recovered convergence point
+# to the nearest distractor marker; the true marker is at distance near 0).
+QUAR_MIN = 60.0
+
+
+def _unit(angle: float) -> tuple[float, float]:
+    return (math.cos(angle), math.sin(angle))
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``."""
+    rng = np.random.default_rng(seed)
+
+    vx = float(rng.uniform(_V_MIN, _V_MAX))
+    vy = float(rng.uniform(_V_MIN, _V_MAX))
+    vanishing_point = [vx, vy]
+
+    # Four line directions roughly equally spaced (well conditioned joint
+    # intersection) with mild jitter so no two lines are near-parallel.
+    base = float(rng.uniform(0.0, 2.0 * math.pi))
+    line_angles = []
+    for i in range(4):
+        jitter = float(rng.uniform(-0.22, 0.22))
+        line_angles.append(base + i * (2.0 * math.pi / 4.0) + jitter)
+
+    line_colors = list(LINE_NAMES)
+    rng.shuffle(line_colors)
+
+    # Ordered marker colors; markers[0] is the true marker placed on V. This is
+    # the only field the analytic gold reads.
+    markers = list(MARKER_NAMES)
+    rng.shuffle(markers)
+
+    # Three distractor markers: distances and directions away from V.
+    dist_vals = [float(rng.uniform(_DIST_MIN, _DIST_MAX)) for _ in range(3)]
+    dirs = [float(rng.uniform(0.0, 2.0 * math.pi)) for _ in range(3)]
+    distractors = []
+    for d, a in zip(dist_vals, dirs):
+        dx, dy = _unit(a)
+        distractors.append([vx + d * dx, vy + d * dy])
+
+    return {
+        "vanishing_point": vanishing_point,
+        "line_angles": line_angles,
+        "line_colors": line_colors,
+        "markers": markers,
+        "distractors": distractors,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the latent scene (a deterministic RGB PNG)."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    d = ImageDraw.Draw(img)
+    vx, vy = scene["vanishing_point"]
+
+    # Lines: each passes through V and extends LINE_HALF on both sides.
+    for color, angle in zip(scene["line_colors"], scene["line_angles"]):
+        ux, uy = _unit(angle)
+        d.line(
+            [
+                (vx - LINE_HALF * ux, vy - LINE_HALF * uy),
+                (vx + LINE_HALF * ux, vy + LINE_HALF * uy),
+            ],
+            fill=LINE_COLORS[color],
+            width=LINE_WIDTH,
+        )
+
+    # Distractor markers (colors markers[1:]), then the true marker last on top
+    # at V so it always covers any line crossing at the center.
+    for (mx, my), color in zip(scene["distractors"], scene["markers"][1:]):
+        d.ellipse(
+            [mx - MARKER_RADIUS, my - MARKER_RADIUS, mx + MARKER_RADIUS, my + MARKER_RADIUS],
+            fill=MARKER_COLORS[color],
+        )
+    true_color = scene["markers"][0]
+    d.ellipse(
+        [vx - MARKER_RADIUS, vy - MARKER_RADIUS, vx + MARKER_RADIUS, vy + MARKER_RADIUS],
+        fill=MARKER_COLORS[true_color],
+    )
+    return img
+
+
+def _line_from_mask(mask: np.ndarray) -> tuple[float, float, float, float, float] | None:
+    """Fit a supporting line over a color mask.
+
+    Returns (ux, uy, px, py, c) representing the line p(t) = p0 + t*u, where
+    (px, py) is a point on the line and (ux, uy) is the unit direction. Returns
+    None when the mask is too small.
+    """
+    coords = np.argwhere(mask)
+    if len(coords) < 30:
+        return None
+    ys = coords[:, 0].astype(float)
+    xs = coords[:, 1].astype(float)
+    px, py = xs.mean(), ys.mean()
+    cov = np.cov(np.stack([xs, ys]))
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    u = eigvecs[:, int(np.argmax(eigvals))]
+    norm = math.hypot(u[0], u[1])
+    if norm == 0.0:
+        return None
+    u = u / norm
+    return (float(u[0]), float(u[1]), float(px), float(py), 1.0)
+
+
+def _convergence_point(lines) -> tuple[float, float]:
+    """Least-squares best common intersection of the fitted lines."""
+    ux = np.array([line[0] for line in lines])
+    uy = np.array([line[1] for line in lines])
+    px = np.array([line[2] for line in lines])
+    py = np.array([line[3] for line in lines])
+    # Each line contributes equations: n . x = n . p  with n = perp(u).
+    nx = -uy
+    ny = ux
+    b = nx * px + ny * py
+    A = np.stack([nx, ny], axis=1)
+    AtA = A.T @ A
+    Atb = A.T @ b
+    try:
+        x, y = np.linalg.solve(AtA, Atb)
+    except np.linalg.LinAlgError:
+        x, y = px.mean(), py.mean()
+    return (float(x), float(y))
+
+
+def _marker_center(mask: np.ndarray) -> tuple[float, float] | None:
+    coords = np.argwhere(mask)
+    if len(coords) < 20:
+        return None
+    return (float(coords[:, 1].mean()), float(coords[:, 0].mean()))
+
+
+def analytic_gold(scene: dict) -> str:
+    """Structural gold: the color name of the marker sitting on the vanishing point."""
+    return scene["markers"][0]
+
+
+def margin(scene: dict) -> float:
+    """Decision margin: distance from the vanishing point to the nearest distractor."""
+    vx, vy = scene["vanishing_point"]
+    dists = [math.hypot(mx - vx, my - vy) for (mx, my) in scene["distractors"]]
+    return float(min(dists))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine scenes whose nearest distractor is too close to the vanishing point."""
+    return margin(scene) < QUAR_MIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """The scene is injectively rendered; no latent aliases are declared."""
+    return []

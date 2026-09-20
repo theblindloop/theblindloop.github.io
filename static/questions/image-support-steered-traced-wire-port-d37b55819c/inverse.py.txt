@@ -1,0 +1,152 @@
+"""Pixel-only inverse arm for the traced-wire-port world.
+
+Receives one rendered RGB image and nothing else. It rebuilds the contour
+grouping of the picture from scratch:
+
+1. segment the flat ink colour and the four flat port colours;
+2. locate the single thick dark blob (the marked end) by morphological erosion,
+   which no thin wire stroke can survive;
+3. flood the ink-plus-port mask from that blob to recover the one connected
+   route that the marked end belongs to;
+4. report which port colours that route actually reaches, and refuse to answer
+   when the route runs closer than the declared tolerance to any other ink.
+
+It never imports the renderer, the generator, the prompts, the verifier or any
+analytic gold, and it never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "traced_wire_port-oracle-0.1.0"
+
+INK = (34, 34, 40)
+PORT_COLORS = {
+    "red": (214, 62, 48),
+    "green": (34, 132, 70),
+    "blue": (40, 86, 190),
+    "orange": (232, 152, 26),
+}
+
+# thick-blob detector: a wire stroke is 5 px across, the marked end is 21 px
+BLOB_ERODE = 6
+# separation test radius; the sampler leaves the band between 9 px and 18 px
+# of measured clearance empty, so any radius inside it reproduces the declared
+# two-wire-width rule without sitting on a raster tie
+SEPARATION_RADIUS = 13
+MIN_PORT_PIXELS = 60
+
+
+def _disk_offsets(radius: int) -> list[tuple[int, int]]:
+    out = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx * dx + dy * dy <= radius * radius:
+                out.append((dx, dy))
+    return out
+
+
+def _shift(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    out = np.zeros_like(mask)
+    height, width = mask.shape
+    if abs(dx) >= width or abs(dy) >= height:
+        return out
+    src_x = slice(max(0, -dx), width - max(0, dx))
+    dst_x = slice(max(0, dx), width - max(0, -dx))
+    src_y = slice(max(0, -dy), height - max(0, dy))
+    dst_y = slice(max(0, dy), height - max(0, -dy))
+    out[dst_y, dst_x] = mask[src_y, src_x]
+    return out
+
+
+def _erode(mask: np.ndarray, radius: int) -> np.ndarray:
+    out = mask.copy()
+    for dx, dy in _disk_offsets(radius):
+        if not out.any():
+            break
+        out &= _shift(mask, dx, dy)
+    return out
+
+
+def _flood(mask: np.ndarray, seeds: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    grid = mask.tolist()
+    seen = [[False] * width for _ in range(height)]
+    queue: deque[tuple[int, int]] = deque()
+    for y, x in seeds:
+        y = int(y)
+        x = int(x)
+        if grid[y][x] and not seen[y][x]:
+            seen[y][x] = True
+            queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            ny = y + dy
+            if ny < 0 or ny >= height:
+                continue
+            row = grid[ny]
+            seen_row = seen[ny]
+            for dx in (-1, 0, 1):
+                nx = x + dx
+                if nx < 0 or nx >= width:
+                    continue
+                if row[nx] and not seen_row[nx]:
+                    seen_row[nx] = True
+                    queue.append((ny, nx))
+    return np.array(seen, dtype=bool)
+
+
+def _too_close(component: np.ndarray, others: np.ndarray, radius: int) -> bool:
+    ys, xs = np.nonzero(component)
+    if ys.size == 0:
+        return False
+    y0 = max(0, int(ys.min()) - radius - 1)
+    y1 = min(component.shape[0], int(ys.max()) + radius + 2)
+    x0 = max(0, int(xs.min()) - radius - 1)
+    x1 = min(component.shape[1], int(xs.max()) + radius + 2)
+    near = component[y0:y1, x0:x1]
+    rest = others[y0:y1, x0:x1]
+    if not rest.any():
+        return False
+    for dx, dy in _disk_offsets(radius):
+        if (_shift(near, dx, dy) & rest).any():
+            return True
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB")).astype(np.int16)
+    ink = np.all(array == np.array(INK, dtype=np.int16), axis=2)
+    port_masks = {
+        name: np.all(array == np.array(rgb, dtype=np.int16), axis=2)
+        for name, rgb in PORT_COLORS.items()
+    }
+    ports_any = np.zeros_like(ink)
+    for mask in port_masks.values():
+        ports_any |= mask
+    paint = ink | ports_any
+    if not ink.any():
+        return "unclear"
+
+    core = _erode(ink, BLOB_ERODE)
+    if not core.any():
+        return "unclear"
+
+    component = _flood(paint, np.argwhere(core))
+    reached = [
+        name
+        for name, mask in port_masks.items()
+        if int(np.count_nonzero(mask & component)) >= MIN_PORT_PIXELS
+    ]
+    if len(reached) != 1:
+        return "unclear"
+
+    others = paint & ~component
+    if _too_close(component, others, SEPARATION_RADIUS):
+        return "unclear"
+    return reached[0]

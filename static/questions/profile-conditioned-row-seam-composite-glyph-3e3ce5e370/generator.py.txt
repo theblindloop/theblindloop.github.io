@@ -1,0 +1,254 @@
+"""Deterministic renderer for a visibly keyed row-seam composite."""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+GRID_N = 5
+PANEL_DARK_COUNT = 12
+IMAGE_SIZE = (900, 680)
+
+
+def _pattern(rows: tuple[str, ...]) -> np.ndarray:
+    mask = np.array([[value == "1" for value in row] for row in rows], dtype=bool)
+    assert mask.shape == (GRID_N, GRID_N)
+    assert int(mask.sum()) == 9
+    return mask
+
+
+# Equal-ink reference glyphs with a minimum pairwise Hamming distance of eight.
+PATTERNS = (
+    _pattern(("00100", "00100", "11111", "00100", "00100")),
+    _pattern(("10001", "01010", "00100", "01010", "10001")),
+    _pattern(("00100", "01010", "10101", "01010", "00100")),
+    _pattern(("11111", "00100", "00100", "00100", "00100")),
+)
+
+PALETTES = (
+    ((31, 48, 73), (239, 242, 237)),
+    ((62, 43, 92), (243, 239, 231)),
+    ((23, 74, 67), (236, 243, 239)),
+    ((83, 42, 49), (244, 239, 234)),
+)
+BACKGROUNDS = ((250, 248, 242), (244, 249, 250), (249, 246, 251))
+GRID_COLOR = (184, 193, 198)
+CYAN = (27, 169, 194)
+CORAL = (220, 72, 126)
+GOLD = (232, 171, 45)
+LABEL = (43, 48, 54)
+CARD_FILL = (253, 252, 248)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one JSON-serializable scene from an integer seed."""
+    rng = random.Random((int(seed) << 1) ^ 0x5EA6C017)
+    reference_order = list(range(4))
+    rng.shuffle(reference_order)
+    return {
+        "pattern_id": int(seed) % 4,
+        "reference_order": reference_order,
+        "fill_seed": rng.randrange(1, 2**31 - 1),
+        "source_x": rng.randint(43, 66),
+        "source_y": rng.randint(34, 48),
+        "cell_size": rng.randint(31, 34),
+        "vertical_gap": rng.randint(31, 39),
+        "reference_x": rng.randint(414, 438),
+        "reference_y": rng.randint(116, 134),
+        "palette_index": rng.randrange(len(PALETTES)),
+        "canvas_variant": rng.randrange(len(BACKGROUNDS)),
+    }
+
+
+def _font(size: int) -> ImageFont.ImageFont:
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _direct_reference_gap(mask: np.ndarray, pattern_id: int) -> tuple[bool, int]:
+    """Report whether the raw panel selects the target and by what gap."""
+    scores = [int(np.count_nonzero(mask != pattern)) for pattern in PATTERNS]
+    order = sorted(range(4), key=lambda index: (scores[index], index))
+    return order[0] == pattern_id, scores[order[1]] - scores[order[0]]
+
+
+def panel_masks(scene: dict) -> tuple[np.ndarray, np.ndarray, tuple[int, ...]]:
+    """Create equal-ink camouflage panels and their visible row cut positions."""
+    pattern_id = int(scene["pattern_id"]) % len(PATTERNS)
+    target = PATTERNS[pattern_id]
+    rng = random.Random(int(scene["fill_seed"]) ^ 0xC05EA6)
+    for _ in range(5000):
+        # k is the number of cells taken from the upper panel in this row.
+        cuts = tuple(rng.randint(1, GRID_N - 1) for _ in range(GRID_N))
+        select_upper = np.zeros((GRID_N, GRID_N), dtype=bool)
+        for row, cut in enumerate(cuts):
+            select_upper[row, :cut] = True
+        selected_ink = int((target & select_upper).sum())
+        if not 2 <= selected_ink <= 7:
+            continue
+
+        panels: list[np.ndarray] = []
+        feasible = True
+        for selected, available in (
+            (target & select_upper, ~select_upper),
+            (target & ~select_upper, select_upper),
+        ):
+            needed = PANEL_DARK_COUNT - int(selected.sum())
+            locations = list(zip(*np.nonzero(available)))
+            if needed < 0 or needed > len(locations):
+                feasible = False
+                break
+            rng.shuffle(locations)
+            panel = selected.copy()
+            for position in locations[:needed]:
+                panel[position] = True
+            panels.append(panel)
+        if not feasible:
+            continue
+
+        # Neither uncomposited panel may reveal the target with a useful
+        # reference-matching margin. This is checked, not merely asserted.
+        shortcuts = [_direct_reference_gap(panel, pattern_id) for panel in panels]
+        if any(is_target and gap >= 4 for is_target, gap in shortcuts):
+            continue
+        upper, lower = panels
+        recovered = np.where(select_upper, upper, lower)
+        if np.array_equal(recovered, target):
+            return upper, lower, cuts
+    raise ValueError("could not construct shortcut-resistant seam panels")
+
+
+def _draw_grid(
+    image: Image.Image,
+    x: int,
+    y: int,
+    cell: int,
+    frame_color: tuple[int, int, int],
+    mask: np.ndarray,
+    foreground: tuple[int, int, int],
+    empty: tuple[int, int, int],
+) -> None:
+    draw = ImageDraw.Draw(image)
+    border = 6
+    side = GRID_N * cell
+    draw.rectangle((x, y, x + side + 2 * border - 1, y + side + 2 * border - 1), fill=frame_color)
+    for row in range(GRID_N):
+        for column in range(GRID_N):
+            x0 = x + border + column * cell
+            y0 = y + border + row * cell
+            draw.rectangle(
+                (x0, y0, x0 + cell - 1, y0 + cell - 1),
+                fill=foreground if mask[row, column] else empty,
+                outline=GRID_COLOR,
+                width=1,
+            )
+
+
+def _draw_sources(
+    scene: dict,
+    image: Image.Image,
+    foreground: tuple[int, int, int],
+    empty: tuple[int, int, int],
+) -> None:
+    upper, lower, cuts = panel_masks(scene)
+    x = int(scene["source_x"])
+    top = int(scene["source_y"])
+    cell = int(scene["cell_size"])
+    framed_side = GRID_N * cell + 12
+    gap = int(scene["vertical_gap"])
+    key_y = top + framed_side + gap
+    lower_y = key_y + framed_side + gap
+    _draw_grid(image, x, top, cell, CYAN, upper, foreground, empty)
+    _draw_grid(image, x, lower_y, cell, CYAN, lower, foreground, empty)
+
+    # The gold grid is a visible seam key. One dot in each row marks the last
+    # column supplied by the upper panel.
+    blank = np.zeros((GRID_N, GRID_N), dtype=bool)
+    _draw_grid(image, x, key_y, cell, GOLD, blank, empty, empty)
+    draw = ImageDraw.Draw(image)
+    radius = max(6, cell // 5)
+    for row, cut in enumerate(cuts):
+        cx = x + 6 + (cut - 0.5) * cell
+        cy = key_y + 6 + (row + 0.5) * cell
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=GOLD)
+
+
+def _draw_references(
+    scene: dict,
+    image: Image.Image,
+    foreground: tuple[int, int, int],
+    empty: tuple[int, int, int],
+) -> None:
+    draw = ImageDraw.Draw(image)
+    origin_x = int(scene["reference_x"])
+    origin_y = int(scene["reference_y"])
+    order = list(scene["reference_order"])
+    cell = 18
+    border = 5
+    side = GRID_N * cell
+    x_gap = 154
+    y_gap = 211
+    font = _font(31)
+    for card_index in range(4):
+        card_row, card_column = divmod(card_index, 2)
+        x = origin_x + card_column * x_gap
+        y = origin_y + card_row * y_gap
+        draw.rounded_rectangle(
+            (x - 16, y - 47, x + side + 2 * border + 16, y + side + 2 * border + 16),
+            radius=9,
+            fill=CARD_FILL,
+            outline=(207, 211, 210),
+            width=2,
+        )
+        draw.text(
+            (x + (side + 2 * border) / 2, y - 26),
+            "ABCD"[card_index],
+            fill=LABEL,
+            anchor="mm",
+            font=font,
+        )
+        _draw_grid(
+            image,
+            x,
+            y,
+            cell,
+            CORAL,
+            PATTERNS[int(order[card_index]) % len(PATTERNS)],
+            foreground,
+            empty,
+        )
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one RGB scene deterministically."""
+    foreground, empty = PALETTES[int(scene["palette_index"]) % len(PALETTES)]
+    background = BACKGROUNDS[int(scene["canvas_variant"]) % len(BACKGROUNDS)]
+    image = Image.new("RGB", IMAGE_SIZE, background)
+    _draw_sources(scene, image, foreground, empty)
+    _draw_references(scene, image, foreground, empty)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    pattern_id = int(scene["pattern_id"]) % len(PATTERNS)
+    return "ABCD"[list(scene["reference_order"]).index(pattern_id)]
+
+
+def margin(scene: dict) -> float:
+    chosen = PATTERNS[int(scene["pattern_id"]) % len(PATTERNS)]
+    distances = sorted(int(np.count_nonzero(chosen != pattern)) for pattern in PATTERNS)
+    return float(distances[1] - distances[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 6.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = dict(scene)
+    twin["palette_index"] = int(scene["palette_index"]) + len(PALETTES)
+    return [("palette_period", twin)]

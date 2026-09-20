@@ -1,0 +1,187 @@
+"""Independent pixel-only oracle for the isometry-transfer world.
+
+Receives a rendered PNG and nothing else: no latent scene, no renderer import,
+no analytic gold. It locates the three gray-framed squares by their frame color,
+reads the two black glyphs as cell sets, recovers the unique motion of the
+square that carries the left glyph onto the middle one, reads the four colored
+disks of the third square, and reports the color that the same motion brings to
+the top-left corner.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_FRAME = (150, 150, 150)
+_LATTICE = 4
+
+# The disk palette is duplicated here on purpose; the oracle never reads scene
+# data and classifies each disk by nearest reference color.
+_PALETTE = {
+    "red": (220, 40, 40),
+    "blue": (40, 80, 220),
+    "green": (30, 150, 60),
+    "yellow": (240, 190, 20),
+}
+
+_ELEMENTS = (
+    "identity",
+    "turn_right",
+    "half_turn",
+    "turn_left",
+    "mirror_vertical",
+    "mirror_horizontal",
+    "mirror_main",
+    "mirror_anti",
+)
+
+
+def _apply(cells, element, rows, cols):
+    out = []
+    for r, c in cells:
+        if element == "identity":
+            out.append((r, c))
+        elif element == "turn_right":
+            out.append((c, rows - 1 - r))
+        elif element == "half_turn":
+            out.append((rows - 1 - r, cols - 1 - c))
+        elif element == "turn_left":
+            out.append((cols - 1 - c, r))
+        elif element == "mirror_vertical":
+            out.append((r, cols - 1 - c))
+        elif element == "mirror_horizontal":
+            out.append((rows - 1 - r, c))
+        elif element == "mirror_main":
+            out.append((c, r))
+        elif element == "mirror_anti":
+            out.append((cols - 1 - c, rows - 1 - r))
+        else:
+            raise ValueError(element)
+    if element in ("turn_right", "turn_left", "mirror_main", "mirror_anti"):
+        return sorted(out), cols, rows
+    return sorted(out), rows, cols
+
+
+def _normalize(cells):
+    if not cells:
+        return ((), 0, 0)
+    rs = [r for r, _ in cells]
+    cs = [c for _, c in cells]
+    r0, c0 = min(rs), min(cs)
+    return (
+        tuple(sorted((r - r0, c - c0) for r, c in cells)),
+        max(rs) - r0 + 1,
+        max(cs) - c0 + 1,
+    )
+
+
+def _runs(indices):
+    runs = []
+    start = prev = None
+    for value in indices:
+        if start is None:
+            start = prev = value
+        elif value - prev <= 2:
+            prev = value
+        else:
+            runs.append((start, prev))
+            start = prev = value
+    if start is not None:
+        runs.append((start, prev))
+    return runs
+
+
+def _frame_boxes(arr):
+    frame = np.all(arr == np.array(_FRAME, dtype=arr.dtype), axis=-1)
+    cols = np.where(frame.any(axis=0))[0]
+    boxes = []
+    for x0, x1 in _runs(cols.tolist()):
+        band = frame[:, x0 : x1 + 1]
+        rows = np.where(band.any(axis=1))[0]
+        if rows.size == 0:
+            continue
+        boxes.append((int(x0), int(rows[0]), int(x1), int(rows[-1])))
+    return boxes
+
+
+def _frame_thickness(arr, box):
+    x0, y0, x1, y1 = box
+    mid = (x0 + x1) // 2
+    thickness = 0
+    for y in range(y0, y1 + 1):
+        if tuple(int(v) for v in arr[y, mid]) == _FRAME:
+            thickness += 1
+        else:
+            break
+    return max(thickness, 1)
+
+
+def _inner(arr, box):
+    x0, y0, x1, y1 = box
+    t = _frame_thickness(arr, box)
+    return (x0 + t, y0 + t, x1 - t, y1 - t)
+
+
+def _glyph_cells(arr, box):
+    x0, y0, x1, y1 = _inner(arr, box)
+    width = (x1 - x0 + 1) / _LATTICE
+    height = (y1 - y0 + 1) / _LATTICE
+    cells = []
+    for r in range(_LATTICE):
+        for c in range(_LATTICE):
+            px = int(x0 + (c + 0.5) * width)
+            py = int(y0 + (r + 0.5) * height)
+            pixel = arr[py, px]
+            if int(pixel[0]) + int(pixel[1]) + int(pixel[2]) < 200:
+                cells.append((r, c))
+    return _normalize(cells)
+
+
+def _corner_colors(arr, box):
+    x0, y0, x1, y1 = _inner(arr, box)
+    region = arr[y0 : y1 + 1, x0 : x1 + 1].astype(np.int32)
+    mid_y = (y1 - y0) / 2.0
+    mid_x = (x1 - x0) / 2.0
+    found = {}
+    for name, rgb in _PALETTE.items():
+        hit = np.all(np.abs(region - np.array(rgb)) <= 12, axis=-1)
+        if hit.sum() < 40:
+            continue
+        ys, xs = np.nonzero(hit)
+        cy, cx = ys.mean(), xs.mean()
+        corner = (0 if cy < mid_y else 1, 0 if cx < mid_x else 1)
+        found[corner] = name
+    return found
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.array(image.convert("RGB"))
+    boxes = _frame_boxes(arr)
+    if len(boxes) != 3:
+        return "blue"
+    boxes.sort(key=lambda box: box[0])
+
+    left = _glyph_cells(arr, boxes[0])
+    right = _glyph_cells(arr, boxes[1])
+    if not left[0] or not right[0]:
+        return "blue"
+
+    hits = []
+    for element in _ELEMENTS:
+        cells, rows, cols = _apply(list(left[0]), element, left[1], left[2])
+        if _normalize(cells) == right:
+            hits.append(element)
+    if len(hits) != 1:
+        return "blue"
+    element = hits[0]
+
+    corners = _corner_colors(arr, boxes[2])
+    if len(corners) != 4:
+        return "blue"
+
+    for source, name in corners.items():
+        moved, _, _ = _apply([source], element, 2, 2)
+        if moved[0] == (0, 0):
+            return name
+    return "blue"

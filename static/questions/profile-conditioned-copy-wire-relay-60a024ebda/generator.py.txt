@@ -1,0 +1,341 @@
+"""Scene sampler, renderer, analytic gold, margin and latent symmetries for copy_wire_relay.
+
+Five vertical lanes are drawn. Each lane starts holding one coloured disc, drawn
+at the top of its lane; the five starting colours are all different. Between the
+lanes, five black one-way copy arrows are drawn at five different heights. An
+arrow reaching from one lane to another copies the colour currently held by the
+lane at its tail into the lane at its head: the head lane's colour is replaced,
+the tail lane keeps its own colour. The arrows act one at a time from top to
+bottom. A red ring at the bottom marks one lane, and the colour any lane holds
+after the arrows have acted is never drawn.
+
+The operation is a copy, not a swap: colours are duplicated and destroyed, so the
+final assignment is not a permutation of the starting one and cannot be read off
+the drawn discs by any matching argument. The answer is the endpoint of a causal
+chain that must be walked backwards through the drawn order.
+
+The scene stores the lanes and the arrows as unordered bags. A lane's drawn
+position comes from its own ``lane`` field, an arrow's moment from its own
+``level`` field, and the marked lane is recovered from the drawn ring geometry,
+so gold depends on what the image shows and never on Python list position;
+``latent_symmetries`` exercises that directly.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "copy_wire_relay-renderer-0.1.0"
+
+WHITE = (255, 255, 255)
+BLACK = (15, 15, 15)
+LANE_LINE = (176, 176, 176)
+SOCKET_FILL = (232, 232, 232)
+SOCKET_EDGE = (95, 95, 95)
+RED = (214, 38, 38)
+GUIDE = (120, 120, 120)
+
+# The five carried values. Every scene draws each of them exactly once at the
+# top, so colour, count and total ink are constant across the whole dataset.
+COLOURS: dict[str, tuple[int, int, int]] = {
+    "blue": (36, 84, 200),
+    "green": (26, 150, 72),
+    "orange": (232, 124, 20),
+    "purple": (128, 54, 168),
+    "yellow": (232, 200, 24),
+}
+COLOUR_NAMES = tuple(sorted(COLOURS))
+
+N_LANES = 5
+N_OPS = 5
+
+CANVAS = (900, 520)
+LANE_X0 = 170
+LANE_PITCH = 140
+DISC_Y = 62
+DISC_R = 24
+LEV_Y0 = 140
+LEV_PITCH = 68
+SOCK_Y = 470
+SOCK_W = 46
+SOCK_H = 30
+RING_R = 30
+RING_W = 5
+
+STROKE = 5
+HEAD_L = 24  # arrowhead length along the wire
+HEAD_H = 28  # arrowhead base height (the head is the thick end)
+TAIL_H = 10  # tail nub height (the tail is the thin end)
+TAIL_W = 12
+
+QUARANTINE_MARGIN = 6.0
+
+# Sampling shape: how deep the causal chain that fixes the answer should be.
+_DEPTHS = (0, 1, 2, 3)
+_DEPTH_W = (0.15, 0.30, 0.35, 0.20)
+
+
+# --------------------------------------------------------------------------- geometry
+
+
+def _lane_x(i: int) -> float:
+    return float(LANE_X0 + i * LANE_PITCH)
+
+
+def _socket_center(i: int) -> tuple[float, float]:
+    return (_lane_x(i), float(SOCK_Y))
+
+
+def _level_y(k: int) -> float:
+    return float(LEV_Y0 + k * LEV_PITCH)
+
+
+def _ring_center(scene: dict) -> tuple[float, float]:
+    ring = scene["ring"]
+    cx, cy = _socket_center(int(ring["lane"]))
+    return cx + float(ring["dx"]), cy + float(ring["dy"])
+
+
+def _marked_lane(scene: dict) -> int:
+    """The marked lane is the lane whose bottom socket is nearest the ring centre."""
+    rx, ry = _ring_center(scene)
+    best = None
+    for i in range(N_LANES):
+        sx, sy = _socket_center(i)
+        d = math.hypot(rx - sx, ry - sy)
+        if best is None or d < best[0]:
+            best = (d, i)
+    return best[1]
+
+
+def _ops_in_drawn_order(scene: dict) -> list[dict]:
+    return sorted(scene["ops"], key=lambda o: int(o["level"]))
+
+
+def _start_colours(scene: dict) -> list[str]:
+    out = [None] * N_LANES
+    for rec in scene["lanes"]:
+        out[int(rec["lane"])] = str(rec["colour"])
+    if any(c is None for c in out):
+        raise ValueError("scene does not give every lane a starting colour")
+    return out
+
+
+def _replay(scene: dict, marked: int) -> tuple[str, int]:
+    """Run the copies top to bottom; return the marked lane's colour and how
+    many copies actually changed it."""
+    values = _start_colours(scene)
+    changes = 0
+    for op in _ops_in_drawn_order(scene):
+        src, tgt = int(op["src"]), int(op["tgt"])
+        new = values[src]
+        if tgt == marked and new != values[marked]:
+            changes += 1
+        values[tgt] = new
+    return values[marked], changes
+
+
+def _chain_depth(ops: list[dict], marked: int) -> tuple[int, int]:
+    """Walk the causal chain backwards: how many copies fix the marked lane's
+    final colour, and which lane's starting colour it ultimately is."""
+    ordered = sorted(ops, key=lambda o: int(o["level"]))
+    lane = marked
+    cutoff = len(ordered)
+    depth = 0
+    while True:
+        found = None
+        for pos in range(cutoff - 1, -1, -1):
+            if int(ordered[pos]["tgt"]) == lane:
+                found = pos
+                break
+        if found is None:
+            return depth, lane
+        depth += 1
+        lane = int(ordered[found]["src"])
+        cutoff = found
+
+
+# --------------------------------------------------------------------------- sampling
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    # marker band: an explicit tight mode that pushes the ring far enough toward a
+    # neighbouring socket to be uncertifiable, an explicit near-boundary mode just
+    # above the quarantine threshold, and the ordinary well-clear mode.
+    roll = rng.random()
+    band = "tight" if roll < 0.12 else ("near" if roll < 0.24 else "clear")
+    want_colour = rng.choice(COLOUR_NAMES)
+    want_depth = rng.choices(_DEPTHS, weights=_DEPTH_W, k=1)[0]
+
+    accepted = None
+    for _ in range(20_000):
+        start = list(COLOUR_NAMES)
+        rng.shuffle(start)
+        marked = rng.randrange(N_LANES)
+        ops = []
+        for k in range(N_OPS):
+            src = rng.randrange(N_LANES)
+            tgt = rng.choice([v for v in range(N_LANES) if v != src])
+            ops.append({"level": k, "src": src, "tgt": tgt})
+
+        depth, origin = _chain_depth(ops, marked)
+        if depth != want_depth:
+            continue
+        final = start[origin]
+        if final != want_colour:
+            continue
+        if depth > 0:
+            # the answer must not be readable off the marked lane's own disc
+            if final == start[marked]:
+                continue
+            # evidence erasure: dropping the last copy into the marked lane
+            # must move the answer
+            writes = [o for o in ops if int(o["tgt"]) == marked]
+            last = max(int(o["level"]) for o in writes)
+            erased = [o for o in ops if int(o["level"]) != last]
+            d2, o2 = _chain_depth(erased, marked)
+            if start[o2] == final:
+                continue
+        accepted = (start, marked, ops)
+        break
+
+    if accepted is None:
+        raise RuntimeError(f"scene sampling failed for seed {seed}")
+    start, marked, ops = accepted
+
+    if band == "clear":
+        off = rng.randrange(0, 7)
+        dirs = [(off, 0), (-off, 0), (0, off), (0, -off)]
+    else:
+        # the ring stops short of the bisector, so the marked lane is unchanged
+        # while the drawn separation from the bisector is sep pixels
+        sep = rng.randrange(1, 6) if band == "tight" else rng.randrange(6, 9)
+        off = LANE_PITCH // 2 - sep
+        dirs = []
+        if marked > 0:
+            dirs.append((-off, 0))
+        if marked < N_LANES - 1:
+            dirs.append((off, 0))
+    dx, dy = dirs[rng.randrange(len(dirs))]
+
+    lanes = [{"lane": i, "colour": start[i]} for i in range(N_LANES)]
+    rng.shuffle(lanes)
+    bag = list(ops)
+    rng.shuffle(bag)
+
+    return {
+        "canvas": list(CANVAS),
+        "lane_x0": LANE_X0,
+        "lane_pitch": LANE_PITCH,
+        "n_lanes": N_LANES,
+        "n_ops": N_OPS,
+        "lanes": lanes,
+        "ops": bag,
+        "ring": {"lane": marked, "dx": dx, "dy": dy},
+    }
+
+
+# --------------------------------------------------------------------------- gold
+
+
+def analytic_gold(scene: dict) -> str:
+    marked = _marked_lane(scene)
+    colour, changes = _replay(scene, marked)
+    return f"{colour}|{changes}"
+
+
+def margin(scene: dict) -> float:
+    """Smallest drawn clearance that any reading the answer depends on has to
+    the discrete boundary at which that reading flips."""
+    rx, ry = _ring_center(scene)
+    dists = sorted(
+        math.hypot(rx - _socket_center(i)[0], ry - _socket_center(i)[1]) for i in range(N_LANES)
+    )
+    # how far the ring centre is from the bisector between the two nearest sockets
+    ring_sep = (dists[1] - dists[0]) / 2.0
+    # vertical clearance between neighbouring copy levels: below zero their
+    # drawn order would be unreadable
+    level_clear = (LEV_PITCH - HEAD_H) / 2.0
+    # thickness evidence separating an arrow's head end from its tail end, which
+    # is what fixes the direction of every copy
+    head_evidence = (HEAD_H - TAIL_H) / 2.0
+    # clearance between the drawn ring stroke and the nearest socket centre, so
+    # a socket is never identified on top of the marker
+    ring_clear = min(abs(d - RING_R) for d in dists)
+    return round(min(ring_sep, level_clear, head_evidence, ring_clear), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Bag re-orderings that must redraw the identical raster and keep gold fixed."""
+    lanes = list(scene["lanes"])
+    ops = list(scene["ops"])
+    return [
+        ("lanes_reversed", dict(scene, lanes=list(reversed(lanes)))),
+        ("lanes_rotated", dict(scene, lanes=lanes[2:] + lanes[:2])),
+        ("ops_reversed", dict(scene, ops=list(reversed(ops)))),
+        ("ops_rotated", dict(scene, ops=ops[3:] + ops[:3])),
+    ]
+
+
+# --------------------------------------------------------------------------- render
+
+
+def _arrow(d: ImageDraw.ImageDraw, x_src: float, x_tgt: float, y: float) -> None:
+    sign = 1.0 if x_tgt > x_src else -1.0
+    base = x_tgt - sign * HEAD_L
+    d.line([x_src, y, base, y], fill=BLACK, width=STROKE)
+    d.polygon(
+        [(x_tgt, y), (base, y - HEAD_H / 2.0), (base, y + HEAD_H / 2.0)],
+        fill=BLACK,
+    )
+    d.rectangle(
+        [x_src - TAIL_W / 2.0, y - TAIL_H / 2.0, x_src + TAIL_W / 2.0, y + TAIL_H / 2.0],
+        fill=BLACK,
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    w, h = int(scene["canvas"][0]), int(scene["canvas"][1])
+    img = Image.new("RGB", (w, h), WHITE)
+    d = ImageDraw.Draw(img)
+
+    for i in range(N_LANES):
+        x = _lane_x(i)
+        d.line([x, DISC_Y + DISC_R + 8, x, SOCK_Y - SOCK_H / 2.0 - 8], fill=LANE_LINE, width=3)
+
+    for i in range(N_LANES):
+        sx, sy = _socket_center(i)
+        d.rectangle(
+            [sx - SOCK_W / 2.0, sy - SOCK_H / 2.0, sx + SOCK_W / 2.0, sy + SOCK_H / 2.0],
+            fill=SOCKET_FILL,
+            outline=SOCKET_EDGE,
+            width=3,
+        )
+
+    for rec in sorted(scene["lanes"], key=lambda r: int(r["lane"])):
+        x = _lane_x(int(rec["lane"]))
+        d.ellipse(
+            [x - DISC_R, DISC_Y - DISC_R, x + DISC_R, DISC_Y + DISC_R],
+            fill=COLOURS[str(rec["colour"])],
+        )
+
+    for op in _ops_in_drawn_order(scene):
+        _arrow(d, _lane_x(int(op["src"])), _lane_x(int(op["tgt"])), _level_y(int(op["level"])))
+
+    rx, ry = _ring_center(scene)
+    d.ellipse([rx - RING_R, ry - RING_R, rx + RING_R, ry + RING_R], outline=RED, width=RING_W)
+
+    # order indicator in the left margin: the copies act from top to bottom
+    ax = 62
+    y0, y1 = _level_y(0) - 14, _level_y(N_OPS - 1) + 14
+    d.line([ax, y0, ax, y1 - 20], fill=GUIDE, width=5)
+    d.polygon([(ax, y1), (ax - 11, y1 - 22), (ax + 11, y1 - 22)], fill=GUIDE)
+    return img

@@ -1,0 +1,216 @@
+"""Mirror-versus-repeat world.
+
+A grey vertical rule splits the canvas. The left side carries a random dot
+cloud; the right side carries the SAME cloud under exactly one of two rigid
+maps, both of which are declared in the question:
+
+  * reflection across the grey rule            -> decision "mirror"
+  * pure horizontal translation (a shifted copy) -> decision "copy"
+
+The translation offset is chosen so that the translated cloud has the same
+centroid as the reflected cloud would have, and left clouds are rejected unless
+their centroid and bounding-box centre agree to within 1 px.  Consequently the
+two classes are matched on dot count, total ink, colour, dot size, vertical
+extent, horizontal extent, centroid and bounding box: only the internal
+correspondence structure of the cloud differs.
+
+Gold is recomputed, never stored: both maps are applied to the latent left
+cloud and scored against the latent right cloud with the same assignment
+residual the pixel oracle uses.  The smaller residual names the class.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "mirror_versus_repeat-0.1.0"
+
+WIDTH = 640
+HEIGHT = 440
+BG = (255, 255, 255)
+AXIS_COLOR = (176, 176, 176)
+AXIS_WIDTH = 3
+DOT_RADIUS = 8
+SUPERSAMPLE = 3
+
+# Dark dot inks.  The ink is sampled independently of the class; the pixel arm
+# only ever thresholds on darkness, so the palette carries no answer.
+INKS = [(28, 28, 32), (24, 52, 120), (112, 26, 34)]
+
+# Below this pixel margin the loser map fits nearly as well as the winner and a
+# finite-resolution reader cannot certify the class.
+QUARANTINE_MARGIN_PX = 12.0
+# Rejection-sampling floor, comfortably above the quarantine rule.
+SAMPLING_FLOOR_PX = 26.0
+
+N_RANGE = (7, 10)
+PAD = 26.0
+MIN_DOT_SEP = 3.1 * DOT_RADIUS  # keeps every blob a separate component
+
+
+def _assignment_residual(src, dst):
+    """Greedy one-to-one matching cost: the largest matched displacement.
+
+    ``src`` and ``dst`` are equal-length point lists.  Pairs are consumed in
+    globally increasing distance order, so an exact isometry gives ~0 and a
+    wrong map gives a large value.  Order-independent by construction.
+    """
+    if len(src) != len(dst) or not src:
+        return float("inf")
+    pairs = []
+    for i, (ax, ay) in enumerate(src):
+        for j, (bx, by) in enumerate(dst):
+            pairs.append((math.hypot(ax - bx, ay - by), i, j))
+    pairs.sort()
+    used_i, used_j = set(), set()
+    worst = 0.0
+    for d, i, j in pairs:
+        if i in used_i or j in used_j:
+            continue
+        used_i.add(i)
+        used_j.add(j)
+        worst = max(worst, d)
+        if len(used_i) == len(src):
+            break
+    return worst
+
+
+def _reflect(points, axis_x):
+    return [(2.0 * axis_x - x, y) for x, y in points]
+
+
+def _translate(points, tx):
+    return [(x + tx, y) for x, y in points]
+
+
+def _copy_offset(points, axis_x):
+    """Translation that lands the copy on the reflected cloud's centroid."""
+    mean_x = sum(x for x, _ in points) / len(points)
+    return 2.0 * (axis_x - mean_x)
+
+
+def residuals(scene) -> tuple[float, float]:
+    """(mirror residual, copy residual) recomputed from the latent clouds."""
+    left = [tuple(p) for p in scene["left"]]
+    right = [tuple(p) for p in scene["right"]]
+    axis_x = float(scene["axis_x"])
+    r_mirror = _assignment_residual(_reflect(left, axis_x), right)
+    r_copy = _assignment_residual(_translate(left, _copy_offset(left, axis_x)), right)
+    return r_mirror, r_copy
+
+
+def analytic_gold(scene: dict) -> str:
+    r_mirror, r_copy = residuals(scene)
+    return "mirror" if r_mirror < r_copy else "copy"
+
+
+def margin(scene: dict) -> float:
+    r_mirror, r_copy = residuals(scene)
+    return abs(r_copy - r_mirror)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN_PX
+
+
+def latent_symmetries(scene: dict):
+    """Declared pixel-identical relabelings of the latent state.
+
+    The two clouds are unordered sets of identical dots: the renderer paints
+    every dot with the same brush and no dot overlaps another, so permuting a
+    cloud's point list cannot move a pixel.  Gold scores an order-free
+    assignment residual, so it is invariant too.  Nothing else in the latent
+    state is hidden from the picture: axis position, dot radius, ink and every
+    dot centre are painted, so these permutations are the whole alias group.
+    """
+    left = list(scene["left"])
+    right = list(scene["right"])
+    rev = dict(scene)
+    rev["left"] = list(reversed(left))
+    rev["right"] = list(reversed(right))
+    rot = dict(scene)
+    rot["left"] = left[1:] + left[:1]
+    rot["right"] = right[2:] + right[:2]
+    return [
+        ("reverse_dot_lists", rev),
+        ("cyclic_shift_dot_lists", rot),
+    ]
+
+
+def _sample_left(rng: random.Random, n: int, axis_x: float) -> list[tuple[float, float]]:
+    """Random cloud in the left band whose centroid sits on its bbox centre."""
+    lo_x, hi_x = PAD, axis_x - PAD
+    lo_y, hi_y = PAD, HEIGHT - PAD
+    for _ in range(4000):
+        pts: list[tuple[float, float]] = []
+        for _ in range(600):
+            if len(pts) == n:
+                break
+            p = (rng.uniform(lo_x, hi_x), rng.uniform(lo_y, hi_y))
+            if all(math.dist(p, q) >= MIN_DOT_SEP for q in pts):
+                pts.append(p)
+        if len(pts) != n:
+            continue
+        xs = [x for x, _ in pts]
+        span = max(xs) - min(xs)
+        if span < 0.55 * (hi_x - lo_x):
+            continue  # keep the cloud wide, so the two maps differ strongly
+        if abs(sum(xs) / n - 0.5 * (max(xs) + min(xs))) > 1.0:
+            continue  # centroid == bbox centre: matches both classes' x cues
+        return pts
+    raise RuntimeError("could not sample a left cloud")
+
+
+def sample_scene(seed: int) -> dict:
+    """Balanced sampler: the class is fixed by seed parity, geometry is not."""
+    rng = random.Random(0x5EED ^ (seed * 2654435761 % (1 << 32)))
+    target = "mirror" if seed % 2 == 0 else "copy"
+    ink = INKS[rng.randrange(len(INKS))]
+    for _ in range(400):
+        axis_x = rng.uniform(0.47 * WIDTH, 0.53 * WIDTH)
+        n = rng.randint(*N_RANGE)
+        left = _sample_left(rng, n, axis_x)
+        if target == "mirror":
+            right = _reflect(left, axis_x)
+        else:
+            right = _translate(left, _copy_offset(left, axis_x))
+        if any(x > WIDTH - PAD or x < axis_x + PAD for x, _ in right):
+            continue
+        scene = {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "axis_x": axis_x,
+            "dot_radius": float(DOT_RADIUS),
+            "ink": list(ink),
+            "left": [list(p) for p in left],
+            "right": [list(p) for p in right],
+        }
+        r_mirror, r_copy = residuals(scene)
+        if min(r_mirror, r_copy) > 1e-6:
+            continue  # one map must be exact
+        if abs(r_copy - r_mirror) < SAMPLING_FLOOR_PX:
+            continue  # loser map too close to fitting: unreadable stimulus
+        if analytic_gold(scene) != target:
+            continue
+        return scene
+    raise RuntimeError(f"could not sample scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    ss = SUPERSAMPLE
+    img = Image.new("RGB", (scene["width"] * ss, scene["height"] * ss), BG)
+    draw = ImageDraw.Draw(img)
+    ax = scene["axis_x"] * ss
+    draw.line(
+        [(ax, 0), (ax, scene["height"] * ss)],
+        fill=AXIS_COLOR,
+        width=max(1, AXIS_WIDTH * ss),
+    )
+    r = scene["dot_radius"] * ss
+    ink = tuple(scene["ink"])
+    for x, y in list(scene["left"]) + list(scene["right"]):
+        draw.ellipse([x * ss - r, y * ss - r, x * ss + r, y * ss + r], fill=ink)
+    return img.resize((scene["width"], scene["height"]), Image.LANCZOS)

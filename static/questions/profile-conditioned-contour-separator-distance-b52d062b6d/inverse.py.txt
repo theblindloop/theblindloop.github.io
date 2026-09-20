@@ -1,0 +1,125 @@
+"""Independent pixel-only inverse arm for closed-contour separation."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """Raised when the raster does not expose a robust closed-contour world."""
+
+
+def _marker_center(mask: np.ndarray, name: str) -> tuple[int, int]:
+    points = np.argwhere(mask)
+    if len(points) < 80:
+        raise OracleAbstention(f"{name} marker is missing or too small")
+    y = int(round(float(points[:, 0].mean())))
+    x = int(round(float(points[:, 1].mean())))
+    if int(mask.sum()) > 260:
+        raise OracleAbstention(f"{name} marker mask is implausibly large")
+    return x, y
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, np.ndarray]]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[tuple[int, int, np.ndarray]] = []
+    for start_y, start_x in np.argwhere(mask):
+        sy, sx = int(start_y), int(start_x)
+        if visited[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        visited[sy, sx] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) < 80:
+            continue
+        ys = [item[0] for item in points]
+        xs = [item[1] for item in points]
+        y0, y1 = min(ys), max(ys)
+        x0, x1 = min(xs), max(xs)
+        local = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=bool)
+        for y, x in points:
+            local[y - y0, x - x0] = True
+        if local.shape[0] < 25 or local.shape[1] < 25:
+            raise OracleAbstention("dark component is too small to be a robust contour")
+        components.append((x0, y0, local))
+    if not 4 <= len(components) <= 10:
+        raise OracleAbstention(f"expected 4-10 closed contours, found {len(components)}")
+    return components
+
+
+def _runs(bits: np.ndarray) -> int:
+    if bits.size == 0:
+        return 0
+    values = bits.astype(np.int8, copy=False)
+    return int(values[0]) + int(np.count_nonzero((values[1:] == 1) & (values[:-1] == 0)))
+
+
+def _ray_parities(
+    component: tuple[int, int, np.ndarray],
+    point: tuple[int, int],
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    x0, y0, local = component
+    width, height = image_size
+    x, y = point
+    horizontal = np.zeros(width, dtype=bool)
+    vertical = np.zeros(height, dtype=bool)
+    if y0 <= y < y0 + local.shape[0]:
+        horizontal[x0 : x0 + local.shape[1]] = local[y - y0]
+    if x0 <= x < x0 + local.shape[1]:
+        vertical[y0 : y0 + local.shape[0]] = local[:, x - x0]
+    return (
+        _runs(horizontal[x + 1 :]) % 2,
+        _runs(horizontal[:x][::-1]) % 2,
+        _runs(vertical[y + 1 :]) % 2,
+        _runs(vertical[:y][::-1]) % 2,
+    )
+
+
+def _is_enclosed(
+    component: tuple[int, int, np.ndarray],
+    point: tuple[int, int],
+    image_size: tuple[int, int],
+) -> bool:
+    parities = _ray_parities(component, point, image_size)
+    if len(set(parities)) != 1:
+        raise OracleAbstention(f"open, touching, or ambiguous contour rays: {parities}")
+    return bool(parities[0])
+
+
+def separator_count_from_image(image: Image.Image) -> int:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = array[..., 0], array[..., 1], array[..., 2]
+    green_mask = (green > red + 35) & (green > blue + 20) & (green > 115)
+    purple_mask = (red > green + 30) & (blue > green + 30) & ((red > 110) | (blue > 110))
+    dark_mask = (array.max(axis=2) < 100) & ((array.max(axis=2) - array.min(axis=2)) < 35)
+
+    green_center = _marker_center(green_mask, "green")
+    purple_center = _marker_center(purple_mask, "purple")
+    for point, name in ((green_center, "green"), (purple_center, "purple")):
+        x, y = point
+        if dark_mask[max(0, y - 9) : y + 10, max(0, x - 9) : x + 10].any():
+            raise OracleAbstention(f"{name} marker touches contour ink")
+
+    components = _components(dark_mask)
+    size = image.size
+    green_signature = tuple(_is_enclosed(item, green_center, size) for item in components)
+    purple_signature = tuple(_is_enclosed(item, purple_center, size) for item in components)
+    return sum(first != second for first, second in zip(green_signature, purple_signature))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the answer from final pixels alone, or abstain on ambiguity."""
+
+    return "yes" if separator_count_from_image(image) == 2 else "no"

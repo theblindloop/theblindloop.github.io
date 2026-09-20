@@ -1,0 +1,121 @@
+"""Independent pixel-only inverse for paired baseline-crossing plots.
+
+This module intentionally knows only the public raster layout and the visual
+palette classes.  It does not import the renderer, prompts, generator, verifier,
+or any analytic scene representation.  It detects the saturated trace pixels,
+fits their centerline row at every available column, locates the dark dashed
+baseline, and interpolates the unique sign change.
+"""
+
+from __future__ import annotations
+
+import math
+from PIL import Image
+
+ORACLE_VERSION = "paired_crossing_offset-oracle-0.1.0"
+PLOT_Y0 = 112
+PLOT_Y1 = 350
+PLOT_PAD_X = 24
+PANELS = ((42, 300), (468, 726))
+
+
+class OracleFitError(ValueError):
+    """Raised when destructive evidence loss prevents a pixel decision."""
+
+
+def _saturated(pixel: tuple[int, int, int]) -> bool:
+    r, g, b = pixel
+    return max(pixel) - min(pixel) >= 45 and max(pixel) <= 245 and min(pixel) <= 220
+
+
+def _dark_neutral(pixel: tuple[int, int, int]) -> bool:
+    r, g, b = pixel
+    return max(pixel) - min(pixel) <= 28 and max(pixel) <= 185
+
+
+def _baseline_y(image: Image.Image, x0: int, x1: int) -> float:
+    pixels = image.load()
+    start, end = x0 + PLOT_PAD_X, x1 - PLOT_PAD_X
+    counts: list[tuple[int, int]] = []
+    for y in range(PLOT_Y0 + 18, PLOT_Y1 - 18):
+        count = sum(_dark_neutral(pixels[x, y]) for x in range(start, end + 1))
+        counts.append((y, count))
+    best_count = max((count for _, count in counts), default=0)
+    if best_count < 30:
+        raise OracleFitError("dashed baseline is not recoverable")
+    # A colored trace occludes a few baseline pixels at the intersection, so
+    # selecting only the single highest row would bias the reference by a pixel.
+    # Average the contiguous three-pixel stroke band using its surviving ink.
+    band = [(y, count) for y, count in counts if count >= 0.60 * best_count]
+    if not band:
+        raise OracleFitError("baseline stroke band is not recoverable")
+    return float(sum(y * count for y, count in band) / sum(count for _, count in band))
+
+
+def _trace_center_samples(image: Image.Image, x0: int, x1: int) -> list[tuple[int, float]]:
+    pixels = image.load()
+    start, end = x0 + PLOT_PAD_X, x1 - PLOT_PAD_X
+    samples: list[tuple[int, float]] = []
+    for x in range(start, end + 1):
+        ys = [y for y in range(PLOT_Y0, PLOT_Y1 + 1) if _saturated(pixels[x, y])]
+        if ys:
+            samples.append((x, sum(ys) / len(ys)))
+    expected = end - start + 1
+    if len(samples) < max(35, int(0.92 * expected)):
+        raise OracleFitError("trace is incomplete; its centerline support is missing")
+    if any(right[0] - left[0] > 3 for left, right in zip(samples, samples[1:])):
+        raise OracleFitError("trace has a destructive gap")
+    return samples
+
+
+def _crossing_fraction(image: Image.Image, x0: int, x1: int) -> float:
+    baseline = _baseline_y(image, x0, x1)
+    samples = _trace_center_samples(image, x0, x1)
+    signs: list[tuple[int, float]] = []
+    for x, y in samples:
+        value = y - baseline
+        if abs(value) <= 1.4:
+            signs.append((x, 0.0))
+        else:
+            signs.append((x, -1.0 if value < 0 else 1.0))
+
+    # The renderer guarantees an above-to-below crossing.  Treat a short run of
+    # zero-valued center samples as the crossing interval, not as a second event.
+    for index in range(len(signs)):
+        x, sign = signs[index]
+        if sign == 0.0:
+            previous = next((value for _, value in reversed(signs[:index]) if value), 0.0)
+            following = next((value for _, value in signs[index + 1 :] if value), 0.0)
+            if previous < 0.0 and following > 0.0:
+                return (x - (x0 + PLOT_PAD_X)) / float((x1 - PLOT_PAD_X) - (x0 + PLOT_PAD_X))
+        if sign < 0.0:
+            for x2, sign2 in signs[index + 1 :]:
+                if sign2 > 0.0:
+                    # Refine with the nearest actual centerline values around the
+                    # transition.  Pixel quantization is intentionally averaged,
+                    # not replaced with a renderer coordinate.
+                    left = next((item for item in reversed(samples[:index + 1]) if item[0] <= x), None)
+                    right = next((item for item in samples[index + 1 :] if item[0] >= x2), None)
+                    if left is None or right is None or right[1] == left[1]:
+                        crossing_x = (x + x2) / 2.0
+                    else:
+                        fraction = (baseline - left[1]) / (right[1] - left[1])
+                        crossing_x = left[0] + fraction * (right[0] - left[0])
+                    start = x0 + PLOT_PAD_X
+                    end = x1 - PLOT_PAD_X
+                    return (crossing_x - start) / float(end - start)
+    raise OracleFitError("trace does not have one recoverable above-to-below crossing")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return ``yes`` iff the left card's measured crossing is earlier."""
+    if not isinstance(image, Image.Image):
+        raise TypeError("decision_from_image expects a PIL image")
+    raster = image.convert("RGB")
+    left = _crossing_fraction(raster, *PANELS[0])
+    right = _crossing_fraction(raster, *PANELS[1])
+    if not (0.0 < left < 1.0 and 0.0 < right < 1.0):
+        raise OracleFitError("crossing falls outside the declared plot interior")
+    if abs(left - right) < 0.008:
+        raise OracleFitError("crossing-order margin is below raster resolution")
+    return "yes" if left < right else "no"

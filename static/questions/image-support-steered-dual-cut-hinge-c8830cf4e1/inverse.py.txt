@@ -1,0 +1,157 @@
+"""Independent pixel-only inverse for the dual foreground/complement change."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+_COLOR_CENTERS = np.asarray(
+    [
+        [248, 250, 252], [13, 100, 110], [245, 158, 11], [203, 213, 225],
+        [250, 248, 244], [30, 84, 122], [226, 124, 40], [211, 211, 216],
+    ],
+    dtype=np.int32,
+)
+_CATEGORIES = np.asarray([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.uint8)
+_BACKGROUND, _SHEET, _PATCH, _DECORATION = range(4)
+_FACTOR = 4
+
+
+class OracleAbstention(ValueError):
+    """The PNG no longer exposes a safe instance of the declared topology."""
+
+
+@dataclass(frozen=True)
+class PixelMeasurement:
+    decision: str
+    runner_up_margin_px: float
+    foreground_components_before: int
+    foreground_components_after: int
+    bounded_pockets_before: int
+    bounded_pockets_after: int
+
+
+def _nearest_labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    if array.shape != (512, 512, 3):
+        raise OracleAbstention(f"expected a 512x512 RGB raster, got {array.shape}")
+    distance = ((array[:, :, None, :] - _COLOR_CENTERS[None, None, :, :]) ** 2).sum(axis=3)
+    nearest = distance.argmin(axis=2)
+    if int((distance.min(axis=2) > 3600).sum()) > 32:
+        raise OracleAbstention("too many pixels are outside the declared visible palettes")
+    return _CATEGORIES[nearest]
+
+
+def _block_majority(mask: np.ndarray) -> np.ndarray:
+    blocks = mask.reshape(128, _FACTOR, 128, _FACTOR)
+    return blocks.mean(axis=(1, 3)) >= 0.5
+
+
+def _components(mask: np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
+    height, width = mask.shape
+    labels = np.zeros((height, width), dtype=np.int32)
+    areas: dict[int, int] = {}
+    component = 0
+    for raw_y, raw_x in np.argwhere(mask):
+        y, x = int(raw_y), int(raw_x)
+        if labels[y, x]:
+            continue
+        component += 1
+        labels[y, x] = component
+        queue = deque([(y, x)])
+        area = 0
+        while queue:
+            cy, cx = queue.popleft()
+            area += 1
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and labels[ny, nx] == 0:
+                    labels[ny, nx] = component
+                    queue.append((ny, nx))
+        areas[component] = area
+    return labels, areas
+
+
+def _border_ids(labels: np.ndarray) -> set[int]:
+    values = set(map(int, labels[0, :])) | set(map(int, labels[-1, :]))
+    values |= set(map(int, labels[:, 0])) | set(map(int, labels[:, -1]))
+    values.discard(0)
+    return values
+
+
+def _bounded_areas(solid: np.ndarray) -> list[int]:
+    labels, areas = _components(~solid)
+    border = _border_ids(labels)
+    return sorted(area for key, area in areas.items() if key not in border)
+
+
+def measure(image: Image.Image) -> PixelMeasurement:
+    """Segment the final PNG, erase amber, and recompute both planar topologies."""
+
+    labels = _nearest_labels(image)
+    raw_patch = labels == _PATCH
+    raw_sheet = labels == _SHEET
+    patch = _block_majority(raw_patch)
+    sheet = _block_majority(raw_sheet)
+    if np.any(patch & sheet):
+        raise OracleAbstention("sheet and patch masks overlap after segmentation")
+    patch_points = np.argwhere(patch)
+    if not len(patch_points):
+        raise OracleAbstention("the amber patch is missing")
+    ph = int(patch_points[:, 0].max() - patch_points[:, 0].min() + 1)
+    pw = int(patch_points[:, 1].max() - patch_points[:, 1].min() + 1)
+    unit = math.gcd(ph, pw) // 2
+    if unit not in {6, 7} or sorted((ph, pw)) != [6 * unit, 8 * unit]:
+        raise OracleAbstention(f"amber patch extent is unsafe: {(pw, ph)}")
+    expected_patch = 48 * unit * unit
+    expected_sheet = 80 * unit * unit
+    if abs(int(patch.sum()) - expected_patch) > 8:
+        raise OracleAbstention("amber patch area is materially corrupted")
+    if abs(int(sheet.sum()) - expected_sheet) > 8:
+        raise OracleAbstention("teal sheet area is materially corrupted")
+
+    solid = sheet | patch
+    solid_points = np.argwhere(solid)
+    sh = int(solid_points[:, 0].max() - solid_points[:, 0].min() + 1)
+    sw = int(solid_points[:, 1].max() - solid_points[:, 1].min() + 1)
+    if sorted((sh, sw)) != [12 * unit, 16 * unit]:
+        raise OracleAbstention(f"sheet extent is corrupted: {(sw, sh)}")
+
+    before_labels, before_areas = _components(solid)
+    after_labels, after_areas = _components(sheet)
+    before_components = len(before_areas)
+    after_components = len(after_areas)
+    if before_components != 1 or after_components not in {1, 2}:
+        raise OracleAbstention(
+            f"foreground component structure is unsafe: {before_components}->{after_components}"
+        )
+    before_pocket_areas = _bounded_areas(solid)
+    after_pocket_areas = _bounded_areas(sheet)
+    if len(before_pocket_areas) != 2 or len(after_pocket_areas) not in {0, 2}:
+        raise OracleAbstention(
+            f"white-pocket structure is unsafe: {len(before_pocket_areas)}->{len(after_pocket_areas)}"
+        )
+    expected_pocket = 24 * unit * unit
+    if any(abs(area - expected_pocket) > 8 for area in before_pocket_areas):
+        raise OracleAbstention("baseline pocket area is materially corrupted")
+    if after_pocket_areas and any(abs(area - expected_pocket) > 8 for area in after_pocket_areas):
+        raise OracleAbstention("post-erasure pocket area is materially corrupted")
+
+    split = after_components > before_components
+    opened = len(after_pocket_areas) < len(before_pocket_areas)
+    return PixelMeasurement(
+        decision="yes" if split and opened else "no",
+        runner_up_margin_px=float(unit * _FACTOR),
+        foreground_components_before=before_components,
+        foreground_components_after=after_components,
+        bounded_pockets_before=len(before_pocket_areas),
+        bounded_pockets_after=len(after_pocket_areas),
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure(image).decision

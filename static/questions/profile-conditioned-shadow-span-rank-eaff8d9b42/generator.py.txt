@@ -1,0 +1,239 @@
+"""Deterministic scene sampling and rasterization for shadow_span_rank.
+
+The world draws four bent coloured rods, one per horizontal lane, above a black
+measuring axis. Each rod is a two-segment polyline. The decided quantity is the
+width of the vertical projection (the SHADOW) each rod casts on the axis, which
+is the extent of the rod in x. Because a rod may turn back on itself, the two
+visible endpoints of a rod do not determine its shadow, and neither the drawn
+length of a rod nor its ink decides the answer.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS = (640, 440)
+AXIS_Y = 408
+AXIS_H = 4
+TICK_STEP = 25
+STROKE = 5
+DOT_R = 2
+LANE_Y = (70, 160, 250, 340)
+X_MIN = 30
+X_MAX = 610
+
+COLOUR_NAMES = ("red", "green", "blue", "orange")
+COLOUR_RGB = {
+    "red": (214, 30, 34),
+    "green": (23, 138, 62),
+    "blue": (36, 66, 204),
+    "orange": (240, 140, 12),
+}
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+
+QUARANTINE_MARGIN = 20.0
+MARGIN_CAP = 40.0
+
+
+def _spans(rng: random.Random, tight: bool) -> list[int]:
+    """Four descending shadow widths with a controlled top-two gap."""
+
+    while True:
+        gap = rng.randint(14, 19) if tight else rng.randint(22, 70)
+        s1 = rng.randint(300, 400)
+        s2 = s1 - gap
+        s3 = s2 - rng.randint(20, 45)
+        s4 = s3 - rng.randint(20, 45)
+        if s4 >= 150 and s4 >= 0.72 * s1:
+            return [s1, s2, s3, s4]
+
+
+def _vertices(rng: random.Random, span: int, shape: str, depth: str = "normal") -> list[int]:
+    """Three x coordinates realizing one shadow width under a shape family."""
+
+    left = rng.randint(X_MIN, X_MAX - span)
+    if shape == "open":
+        mid = rng.randint(int(0.25 * span), int(0.75 * span))
+        return [left, left + mid, left + span]
+    lo, hi = {"deep": (0.85, 0.97), "shallow": (0.22, 0.32), "normal": (0.30, 0.65)}[depth]
+    back = rng.randint(int(lo * span), int(hi * span))
+    if shape == "back_left":
+        return [left + back, left, left + span]
+    return [left, left + span, left + span - back]
+
+
+def _length(xs: list[int], ys: list[int]) -> float:
+    total = 0.0
+    for i in range(len(xs) - 1):
+        total += ((xs[i + 1] - xs[i]) ** 2 + (ys[i + 1] - ys[i]) ** 2) ** 0.5
+    return total
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from an integer seed."""
+
+    rng = random.Random(seed)
+    target_colour = COLOUR_NAMES[seed % 4]
+    target_lane = (seed // 4) % 4
+    tight = seed % 6 == 0
+
+    spans = _spans(rng, tight)
+    shapes = [rng.choice(("open", "back_left", "back_right")) for _ in range(4)]
+    if sum(1 for s in shapes if s != "open") < 2:
+        for rank in rng.sample(range(4), 2):
+            shapes[rank] = rng.choice(("back_left", "back_right"))
+
+    lanes = [lane for lane in range(4) if lane != target_lane]
+    rng.shuffle(lanes)
+    lane_of_rank = [target_lane] + lanes
+
+    others = [name for name in COLOUR_NAMES if name != target_colour]
+    rng.shuffle(others)
+    colour_of_rank = [target_colour] + others
+
+    amps = [rng.randint(10, 26) for _ in range(4)]
+    leader_rank = rng.randrange(4)
+    shapes[leader_rank] = rng.choice(("back_left", "back_right"))
+    # The widest rod itself doubles back most of the time, so that the rod whose
+    # two loose ends are farthest apart is the answer only at about chance.
+    shapes[0] = rng.choice(("back_left", "back_right")) if rng.random() < 0.62 else "open"
+
+    def build(rank: int, amp: int) -> dict:
+        xs = xs_by_rank[rank]
+        yc = LANE_Y[lane_of_rank[rank]]
+        if flips[rank]:
+            ys = [yc - amp, yc + amp, yc - amp]
+        else:
+            ys = [yc + amp, yc - amp, yc + amp]
+        return {"colour": colour_of_rank[rank], "xs": xs, "ys": ys}
+
+    xs_by_rank = [
+        _vertices(rng, spans[rank], shapes[rank], "deep" if rank == leader_rank else "normal")
+        for rank in range(4)
+    ]
+    flips = [rng.random() < 0.5 for _ in range(4)]
+
+    rods = [build(rank, amps[rank]) for rank in range(4)]
+    shallowed = [False] * 4
+    # Push the chosen rod to be the longest drawn polyline, so that stroke
+    # length and ink are decorrelated from the decided shadow width.
+    for _ in range(40):
+        lengths = [_length(rod["xs"], rod["ys"]) for rod in rods]
+        best_other = max(v for i, v in enumerate(lengths) if i != leader_rank)
+        if lengths[leader_rank] >= best_other + 10:
+            break
+        if amps[leader_rank] < 38:
+            amps[leader_rank] += 2
+            rods[leader_rank] = build(leader_rank, amps[leader_rank])
+            continue
+        loser = max(
+            (i for i in range(4) if i != leader_rank), key=lambda i: lengths[i]
+        )
+        if shapes[loser] != "open" and not shallowed[loser]:
+            shallowed[loser] = True
+            xs_by_rank[loser] = _vertices(rng, spans[loser], shapes[loser], "shallow")
+            rods[loser] = build(loser, amps[loser])
+            continue
+        if shapes[loser] != "open":
+            shapes[loser] = "open"
+            xs_by_rank[loser] = _vertices(rng, spans[loser], "open")
+            rods[loser] = build(loser, amps[loser])
+            continue
+        if amps[loser] <= 6:
+            break
+        amps[loser] -= 2
+        rods[loser] = build(loser, amps[loser])
+
+    rods.sort(key=lambda rod: min(rod["ys"]))
+    return {
+        "rods": rods,
+        "canvas": list(CANVAS),
+        "axis_y": AXIS_Y,
+        "stroke": STROKE,
+        "tick_step": TICK_STEP,
+    }
+
+
+def _draw_rod(draw: ImageDraw.ImageDraw, rod: dict) -> None:
+    """Draw one rod in a vertex-order-independent canonical form."""
+
+    rgb = COLOUR_RGB[rod["colour"]]
+    points = list(zip(rod["xs"], rod["ys"]))
+    segments = []
+    for i in range(len(points) - 1):
+        a, b = points[i], points[i + 1]
+        segments.append((a, b) if a <= b else (b, a))
+    for a, b in sorted(segments):
+        draw.line([a, b], fill=rgb, width=STROKE)
+    for x, y in sorted(points):
+        draw.ellipse([x - DOT_R, y - DOT_R, x + DOT_R, y + DOT_R], fill=rgb)
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize a scene to a hard-edged RGB image."""
+
+    image = Image.new("RGB", tuple(scene["canvas"]), WHITE)
+    draw = ImageDraw.Draw(image)
+    axis_y = int(scene["axis_y"])
+    draw.rectangle([20, axis_y, scene["canvas"][0] - 20, axis_y + AXIS_H - 1], fill=BLACK)
+    for x in range(20, scene["canvas"][0] - 19, int(scene["tick_step"])):
+        draw.rectangle([x, axis_y + AXIS_H, x + 1, axis_y + AXIS_H + 7], fill=BLACK)
+    for rod in sorted(scene["rods"], key=lambda r: r["colour"]):
+        _draw_rod(draw, rod)
+    return image
+
+
+def _shadow_widths(scene: dict) -> list[tuple[int, str]]:
+    return sorted(
+        ((max(rod["xs"]) - min(rod["xs"]), rod["colour"]) for rod in scene["rods"]),
+        reverse=True,
+    )
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour of the rod whose vertical projection on the axis is widest."""
+
+    return _shadow_widths(scene)[0][1]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up gap in pixels between the widest and second widest shadow."""
+
+    widths = _shadow_widths(scene)
+    return float(min(MARGIN_CAP, widths[0][0] - widths[1][0]))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Near-boundary scenes whose top-two shadow widths are close."""
+
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical latent transforms that must preserve the answer."""
+
+    reversed_all = {
+        **scene,
+        "rods": [
+            {**rod, "xs": list(reversed(rod["xs"])), "ys": list(reversed(rod["ys"]))}
+            for rod in scene["rods"]
+        ],
+    }
+    reversed_odd = {
+        **scene,
+        "rods": [
+            {**rod, "xs": list(reversed(rod["xs"])), "ys": list(reversed(rod["ys"]))}
+            if index % 2
+            else dict(rod)
+            for index, rod in enumerate(scene["rods"])
+        ],
+    }
+    relisted = {**scene, "rods": list(reversed([dict(rod) for rod in scene["rods"]]))}
+    return [
+        ("rod_vertex_order_reversal", reversed_all),
+        ("odd_rod_vertex_order_reversal", reversed_odd),
+        ("rod_list_order_reversal", relisted),
+    ]

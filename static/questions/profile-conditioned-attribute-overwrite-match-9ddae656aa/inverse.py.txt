@@ -1,0 +1,119 @@
+"""Scene-free pixel inverse arm for attribute_overwrite_match.
+
+Receives only the rendered RGB image. It re-discovers the two rows of panels
+from their drawn cream backgrounds, reads the starting token in the leftmost
+panel of the top row, reads each machine card left to right (a grey shape is a
+shape assignment, a wide colour bar is a colour assignment), replays the
+assignments onto the two registers, and finally picks the bottom slot whose
+drawn object carries both the resulting shape and the resulting colour.
+
+Shapes are recognised from the fraction of their bounding box that the drawn ink
+covers, so no character recognition and no fixed coordinates are used.
+
+It imports no renderer, prompt, generator, verifier or gold code and never sees
+latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "attribute_overwrite_match-oracle-0.1.0"
+
+_CREAM = (252, 246, 228)
+_SLOT_WORDS = ("one", "two", "three", "four")
+_RATIOS = {"triangle": 0.50, "circle": 0.785, "square": 1.0}
+_UNREADABLE = "unreadable|unreadable"
+
+
+def _runs(flags: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, on in enumerate(flags):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            if i - start >= min_len:
+                out.append((start, i - 1))
+            start = None
+    if start is not None and len(flags) - start >= min_len:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def _classify_shape(ratio: float) -> str:
+    return min(_RATIOS, key=lambda s: abs(_RATIOS[s] - ratio))
+
+
+def _read_panel(arr: np.ndarray, r0: int, r1: int, c0: int, c1: int):
+    """Return a description of the single glyph drawn inside one panel."""
+    pad = 8
+    sub = arr[r0 + pad : r1 - pad + 1, c0 + pad : c1 - pad + 1]
+    if sub.size == 0:
+        return None
+    diff = np.abs(sub - np.array(_CREAM)).sum(axis=2)
+    ink = diff > 40
+    ys, xs = np.nonzero(ink)
+    if ys.size < 200:
+        return None
+    top, bot = int(ys.min()), int(ys.max())
+    left, right = int(xs.min()), int(xs.max())
+    h = bot - top + 1
+    w = right - left + 1
+    ratio = float(ink.sum()) / float(h * w)
+    px = sub[ink]
+    mean = px.mean(axis=0)
+    chroma = float(mean.max() - mean.min())
+    if chroma < 25.0:
+        return {"kind": "grey_shape", "shape": _classify_shape(ratio)}
+    if w >= 1.6 * h:
+        return {"kind": "colour_bar", "rgb": mean}
+    return {"kind": "token", "shape": _classify_shape(ratio), "rgb": mean}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.float64)
+    cream = (np.abs(arr - np.array(_CREAM)).sum(axis=2) <= 24)
+
+    bands = _runs(cream.any(axis=1), min_len=40)
+    if len(bands) != 2:
+        return _UNREADABLE
+    rows: list[list[dict]] = []
+    for r0, r1 in bands:
+        strip = cream[r0 : r1 + 1]
+        cols = _runs(strip.any(axis=0), min_len=40)
+        panels = []
+        for c0, c1 in cols:
+            info = _read_panel(arr, r0, r1, c0, c1)
+            if info is None:
+                return _UNREADABLE
+            panels.append(info)
+        rows.append(panels)
+
+    top, bottom = rows
+    if len(top) < 2 or len(bottom) != 4:
+        return _UNREADABLE
+    if top[0]["kind"] != "token":
+        return _UNREADABLE
+
+    shape = top[0]["shape"]
+    rgb = top[0]["rgb"]
+    for card in top[1:]:
+        if card["kind"] == "grey_shape":
+            shape = card["shape"]
+        elif card["kind"] == "colour_bar":
+            rgb = card["rgb"]
+        else:
+            return _UNREADABLE
+
+    best, best_cost = None, None
+    for i, slot in enumerate(bottom):
+        if slot["kind"] != "token":
+            return _UNREADABLE
+        cost = float(np.abs(slot["rgb"] - rgb).sum())
+        if slot["shape"] != shape:
+            cost += 10_000.0
+        if best_cost is None or cost < best_cost:
+            best, best_cost = i, cost
+    return f"{_SLOT_WORDS[best]}|{shape}"

@@ -1,0 +1,234 @@
+"""Pixel-only inverse arm for the cord-walk turn-echo world.
+
+Receives a rendered PNG and nothing else. It segments the slate cord and the two
+black square markers by colour, decides which black marker splits the cord (the
+relay) and which caps a free end, traces both stretches geodesically, recovers
+the intrinsic left/right turn word of each stretch, locates the single corner at
+which the second word disagrees with the first, and only then reads the bead
+colour sitting under the cord at that corner.
+
+It imports no renderer, prompt, generator, verifier or gold code and never sees
+latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "cordwalk_turn_echo_bind-oracle-0.1.0"
+
+_SLATE = (84, 94, 110)
+_BLACK = (18, 18, 20)
+_PALETTE = {
+    "blue": (44, 96, 196),
+    "green": (48, 150, 66),
+    "orange": (226, 124, 32),
+    "purple": (140, 62, 180),
+    "red": (208, 54, 46),
+    "yellow": (222, 190, 40),
+}
+
+_TOL = 14
+_MIN_CORD_AREA = 300
+_MIN_MARKER_AREA = 120
+_WINDOW = 7
+_MIN_RUN = 5
+_BEAD_RADIUS = 11
+
+
+class OracleAbstention(RuntimeError):
+    """Raised when the picture does not present a readable cord structure."""
+
+
+def _mask(arr: np.ndarray, colour: tuple[int, int, int]) -> np.ndarray:
+    diff = np.abs(arr.astype(np.int16) - np.array(colour, dtype=np.int16))
+    return (diff.max(axis=2) <= _TOL)
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[list[tuple[int, int]]]:
+    pixels = {(int(y), int(x)) for y, x in np.argwhere(mask)}
+    out: list[list[tuple[int, int]]] = []
+    while pixels:
+        seed = next(iter(pixels))
+        pixels.discard(seed)
+        queue = deque([seed])
+        comp = [seed]
+        while queue:
+            y, x = queue.popleft()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    nb = (y + dy, x + dx)
+                    if nb in pixels:
+                        pixels.discard(nb)
+                        queue.append(nb)
+                        comp.append(nb)
+        if len(comp) >= min_area:
+            out.append(comp)
+    return out
+
+
+def _centroid(comp: list[tuple[int, int]]) -> tuple[float, float]:
+    ys = sum(p[0] for p in comp) / len(comp)
+    xs = sum(p[1] for p in comp) / len(comp)
+    return (ys, xs)
+
+
+def _touches(marker: list[tuple[int, int]], cord: set[tuple[int, int]], reach: int = 4) -> bool:
+    for y, x in marker:
+        for dy in range(-reach, reach + 1):
+            for dx in range(-reach, reach + 1):
+                if (y + dy, x + dx) in cord:
+                    return True
+    return False
+
+
+def _trace(comp: set[tuple[int, int]], start: tuple[int, int]) -> list[tuple[float, float]]:
+    """Ordered centre-line of a thin simple curve, as centroids per geodesic level."""
+    dist = {start: 0}
+    queue = deque([start])
+    levels: dict[int, list[tuple[int, int]]] = {0: [start]}
+    while queue:
+        y, x = queue.popleft()
+        d = dist[(y, x)] + 1
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                nb = (y + dy, x + dx)
+                if nb in comp and nb not in dist:
+                    dist[nb] = d
+                    levels.setdefault(d, []).append(nb)
+                    queue.append(nb)
+    if len(dist) < len(comp) * 0.9:
+        raise OracleAbstention("cord stretch is not traversable")
+    ordered = []
+    for d in range(max(levels) + 1):
+        pts = levels.get(d)
+        if not pts:
+            continue
+        ys = sum(p[0] for p in pts) / len(pts)
+        xs = sum(p[1] for p in pts) / len(pts)
+        ordered.append((xs, ys))
+    return ordered
+
+
+def _direction_runs(path: list[tuple[float, float]]) -> list[tuple[tuple[int, int], int, int]]:
+    raw: list[tuple[int, int] | None] = []
+    for i in range(len(path) - _WINDOW):
+        dx = path[i + _WINDOW][0] - path[i][0]
+        dy = path[i + _WINDOW][1] - path[i][1]
+        if abs(dx) >= abs(dy):
+            raw.append((1 if dx > 0 else -1, 0) if abs(dx) > 0.5 else None)
+        else:
+            raw.append((0, 1 if dy > 0 else -1) if abs(dy) > 0.5 else None)
+    runs: list[tuple[tuple[int, int], int, int]] = []
+    i = 0
+    while i < len(raw):
+        if raw[i] is None:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(raw) and raw[j + 1] == raw[i]:
+            j += 1
+        if j - i + 1 >= _MIN_RUN:
+            runs.append((raw[i], i, j))
+        i = j + 1
+    merged: list[tuple[tuple[int, int], int, int]] = []
+    for run in runs:
+        if merged and merged[-1][0] == run[0]:
+            merged[-1] = (run[0], merged[-1][1], run[2])
+        else:
+            merged.append(run)
+    return merged
+
+
+def _turns_and_corners(
+    path: list[tuple[float, float]]
+) -> tuple[str, list[tuple[float, float]]]:
+    runs = _direction_runs(path)
+    if len(runs) < 2:
+        raise OracleAbstention("cord stretch shows no readable corner")
+    word = ""
+    corners: list[tuple[float, float]] = []
+    for (d0, s0, e0), (d1, s1, e1) in zip(runs, runs[1:]):
+        cross = d0[0] * d1[1] - d0[1] * d1[0]
+        if cross == 0:
+            raise OracleAbstention("cord stretch reverses on itself")
+        word += "R" if cross > 0 else "L"
+        seg0 = path[s0 : min(e0 + _WINDOW + 1, len(path))]
+        seg1 = path[s1 : min(e1 + _WINDOW + 1, len(path))]
+        if d0[0] != 0:  # first leg horizontal, second leg vertical
+            cy = float(np.median([p[1] for p in seg0]))
+            cx = float(np.median([p[0] for p in seg1]))
+        else:
+            cx = float(np.median([p[0] for p in seg0]))
+            cy = float(np.median([p[1] for p in seg1]))
+        corners.append((cx, cy))
+    return word, corners
+
+
+def _bead_colour(arr: np.ndarray, corner: tuple[float, float]) -> str:
+    cx, cy = int(round(corner[0])), int(round(corner[1]))
+    y0, y1 = max(0, cy - _BEAD_RADIUS), min(arr.shape[0], cy + _BEAD_RADIUS + 1)
+    x0, x1 = max(0, cx - _BEAD_RADIUS), min(arr.shape[1], cx + _BEAD_RADIUS + 1)
+    window = arr[y0:y1, x0:x1].reshape(-1, 3).astype(np.int16)
+    counts: dict[str, int] = {}
+    for name, colour in _PALETTE.items():
+        hits = int(
+            np.count_nonzero(
+                np.abs(window - np.array(colour, dtype=np.int16)).max(axis=1) <= _TOL
+            )
+        )
+        if hits:
+            counts[name] = hits
+    if not counts:
+        raise OracleAbstention("no bead colour under the disagreeing corner")
+    best = max(sorted(counts), key=lambda k: counts[k])
+    if counts[best] < 12:
+        raise OracleAbstention("bead colour evidence is too weak")
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.array(image.convert("RGB"))
+
+    cords = _components(_mask(arr, _SLATE), _MIN_CORD_AREA)
+    if len(cords) != 2:
+        raise OracleAbstention(f"expected two cord stretches, found {len(cords)}")
+    markers = _components(_mask(arr, _BLACK), _MIN_MARKER_AREA)
+    cord_sets = [set(c) for c in cords]
+
+    relay = cap = None
+    for marker in markers:
+        touched = [i for i, cs in enumerate(cord_sets) if _touches(marker, cs)]
+        if len(touched) == 2:
+            if relay is not None:
+                raise OracleAbstention("more than one relay marker")
+            relay = marker
+        elif len(touched) == 1:
+            if cap is not None:
+                raise OracleAbstention("more than one cap marker")
+            cap = (marker, touched[0])
+    if relay is None or cap is None:
+        raise OracleAbstention("cap and relay markers are not both identifiable")
+
+    first_index = cap[1]
+    second_index = 1 - first_index
+    cap_c = _centroid(cap[0])
+    relay_c = _centroid(relay)
+
+    def nearest(comp: list[tuple[int, int]], target: tuple[float, float]) -> tuple[int, int]:
+        return min(comp, key=lambda p: (p[0] - target[0]) ** 2 + (p[1] - target[1]) ** 2)
+
+    path_a = _trace(cord_sets[first_index], nearest(cords[first_index], cap_c))
+    path_b = _trace(cord_sets[second_index], nearest(cords[second_index], relay_c))
+
+    word_a, _ = _turns_and_corners(path_a)
+    word_b, corners_b = _turns_and_corners(path_b)
+    if len(word_a) != len(word_b):
+        raise OracleAbstention(f"turn words differ in length: {word_a} vs {word_b}")
+    diffs = [i for i, (u, v) in enumerate(zip(word_a, word_b)) if u != v]
+    if len(diffs) != 1:
+        raise OracleAbstention(f"turn words disagree at {len(diffs)} corners")
+    return _bead_colour(arr, corners_b[diffs[0]])

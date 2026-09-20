@@ -1,0 +1,377 @@
+"""Renderer and analytic arm for the plate-cut area balance world.
+
+One irregular grey plate of medium span is cut all the way across by a single
+dark curve that has exactly one height at every horizontal position. The
+decision is which side of that curve carries the greater grey plate area.
+
+The analytic arm never rasterises: it integrates the plate polygon column by
+column in continuous coordinates with an exact vertical scanline, subtracts the
+curve band, and compares the two side areas. The pixel arm in oracle.py works
+from the PNG alone.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "plate_cut_balance-renderer-0.1.0"
+
+WIDTH = 720
+HEIGHT = 560
+POLY_VERTICES = 240
+CURVE_HALF_WIDTH = 2.5
+CURVE_OVERHANG = 12.0
+QUARANTINE_FRACTION = 0.05
+
+_BACKGROUND = (252, 252, 250)
+
+
+# ---------------------------------------------------------------- sampling
+
+
+def _candidate_scene(rng: random.Random) -> dict:
+    """Draw one unvalidated scene dictionary."""
+    radius = rng.uniform(115.0, 135.0)
+    amps = [rng.uniform(0.06, 0.15) for _ in range(3)]
+    scale = 0.30 / sum(amps)
+    if scale < 1.0:
+        amps = [a * scale for a in amps]
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "plate_cx": rng.uniform(310.0, 410.0),
+        "plate_cy": rng.uniform(250.0, 310.0),
+        "plate_radius": radius,
+        "plate_amp": [round(a, 6) for a in amps],
+        "plate_phase": [round(rng.uniform(0.0, 2.0 * math.pi), 6) for _ in range(3)],
+        "plate_spin": round(rng.uniform(0.0, 2.0 * math.pi), 6),
+        "curve_offset": round(rng.uniform(-0.28, 0.28) * radius, 6),
+        "curve_amp1": round(rng.uniform(0.05, 0.16) * radius, 6),
+        "curve_amp2": round(rng.uniform(0.03, 0.10) * radius, 6),
+        "curve_period1": round(rng.uniform(1.1, 2.2) * 2.0 * radius, 6),
+        "curve_period2": round(rng.uniform(0.5, 0.9) * 2.0 * radius, 6),
+        "curve_phase1": round(rng.uniform(0.0, 2.0 * math.pi), 6),
+        "curve_phase2": round(rng.uniform(0.0, 2.0 * math.pi), 6),
+        "plate_grey": rng.randint(160, 186),
+        "curve_dark": rng.randint(26, 46),
+        "vertex_offset": 0,
+        "marks": [],
+    }
+    scene["plate_cx"] = round(scene["plate_cx"], 6)
+    scene["plate_cy"] = round(scene["plate_cy"], 6)
+    scene["plate_radius"] = round(radius, 6)
+    scene["marks"] = _sample_marks(rng, scene)
+    return scene
+
+
+_MARK_COLORS = ((14, 116, 128), (120, 40, 140), (176, 92, 12), (26, 96, 176))
+
+
+def _sample_marks(rng: random.Random, scene: dict) -> list[dict]:
+    """Decorative saturated marks placed clear of the plate and the curve."""
+    poly = plate_polygon(scene)
+    marks: list[dict] = []
+    attempts = 0
+    wanted = rng.randint(3, 6)
+    while len(marks) < wanted and attempts < 400:
+        attempts += 1
+        size = float(rng.randint(9, 16))
+        cx = rng.uniform(24.0 + size, WIDTH - 24.0 - size)
+        cy = rng.uniform(24.0 + size, HEIGHT - 24.0 - size)
+        half_diag = 0.5 * size * math.sqrt(2.0) + 8.0
+        if _point_in_polygon(cx, cy, poly):
+            continue
+        if min(math.hypot(cx - px, cy - py) for px, py in poly) < half_diag:
+            continue
+        if abs(cy - _curve_y(scene, cx)) < 0.5 * size * math.sqrt(2.0) + 12.0:
+            continue
+        if any(
+            math.hypot(cx - m["cx"], cy - m["cy"]) < 0.5 * (size + m["size"]) + 10.0
+            for m in marks
+        ):
+            continue
+        marks.append(
+            {
+                "cx": round(cx, 6),
+                "cy": round(cy, 6),
+                "size": size,
+                "kind": rng.choice(("square", "diamond")),
+                "color": list(_MARK_COLORS[rng.randrange(len(_MARK_COLORS))]),
+            }
+        )
+    return marks
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one geometrically admissible scene."""
+    for attempt in range(600):
+        rng = random.Random((int(seed) * 7919 + attempt * 104729) & 0x7FFFFFFF)
+        scene = _candidate_scene(rng)
+        if _curve_cuts_interior(scene) and len(scene["marks"]) >= 3:
+            return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+# ---------------------------------------------------------------- geometry
+
+
+def plate_polygon(scene: dict) -> list[tuple[float, float]]:
+    """Closed star-shaped plate outline as an ordered vertex list."""
+    cx = float(scene["plate_cx"])
+    cy = float(scene["plate_cy"])
+    base = float(scene["plate_radius"])
+    amps = [float(a) for a in scene["plate_amp"]]
+    phases = [float(p) for p in scene["plate_phase"]]
+    spin = float(scene["plate_spin"])
+    points: list[tuple[float, float]] = []
+    for k in range(POLY_VERTICES):
+        theta = spin + 2.0 * math.pi * k / POLY_VERTICES
+        radial = 1.0
+        for j, (amp, phase) in enumerate(zip(amps, phases), start=2):
+            radial += amp * math.cos(j * theta + phase)
+        radius = base * radial
+        points.append((cx + radius * math.cos(theta), cy + radius * math.sin(theta)))
+    offset = int(scene.get("vertex_offset", 0)) % POLY_VERTICES
+    if offset:
+        points = points[offset:] + points[:offset]
+    return points
+
+
+def _curve_y(scene: dict, x: float) -> float:
+    """Height of the cutting curve at horizontal position `x`."""
+    cx = float(scene["plate_cx"])
+    return (
+        float(scene["plate_cy"])
+        + float(scene["curve_offset"])
+        + float(scene["curve_amp1"])
+        * math.sin(2.0 * math.pi * (x - cx) / float(scene["curve_period1"]) + float(scene["curve_phase1"]))
+        + float(scene["curve_amp2"])
+        * math.sin(2.0 * math.pi * (x - cx) / float(scene["curve_period2"]) + float(scene["curve_phase2"]))
+    )
+
+
+def _point_in_polygon(x: float, y: float, poly: list[tuple[float, float]]) -> bool:
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        if (y0 > y) != (y1 > y):
+            xc = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+            if x < xc:
+                inside = not inside
+    return inside
+
+
+def _column_spans(poly: list[tuple[float, float]], x: float) -> list[tuple[float, float]]:
+    """Vertical interior spans of the polygon on the vertical line at `x`."""
+    crossings: list[float] = []
+    n = len(poly)
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        if (x0 > x) != (x1 > x):
+            crossings.append(y0 + (x - x0) * (y1 - y0) / (x1 - x0))
+    crossings.sort()
+    return [
+        (crossings[i], crossings[i + 1])
+        for i in range(0, len(crossings) - 1, 2)
+        if crossings[i + 1] > crossings[i]
+    ]
+
+
+def plate_bounds(scene: dict) -> tuple[float, float]:
+    poly = plate_polygon(scene)
+    xs = [p[0] for p in poly]
+    return min(xs), max(xs)
+
+
+def _curve_cuts_interior(scene: dict) -> bool:
+    """The curve band must run inside the plate across its central span."""
+    poly = plate_polygon(scene)
+    x0, x1 = plate_bounds(scene)
+    inset = 0.08 * (x1 - x0)
+    xs = [x0 + inset + (x1 - x0 - 2.0 * inset) * i / 40.0 for i in range(41)]
+    for x in xs:
+        spans = _column_spans(poly, x)
+        target = _curve_y(scene, x)
+        ok = any(
+            span[0] + 4.0 <= target - CURVE_HALF_WIDTH
+            and target + CURVE_HALF_WIDTH <= span[1] - 4.0
+            for span in spans
+        )
+        if not ok:
+            return False
+    return True
+
+
+_SCAN_KEYS = (
+    "plate_cx",
+    "plate_cy",
+    "plate_radius",
+    "plate_amp",
+    "plate_phase",
+    "plate_spin",
+    "curve_offset",
+    "curve_amp1",
+    "curve_amp2",
+    "curve_period1",
+    "curve_period2",
+    "curve_phase1",
+    "curve_phase2",
+)
+_SCAN_CACHE: dict[str, dict] = {}
+
+
+def _scan(scene: dict) -> dict:
+    """Column scan of the plate: side areas and per-side extents."""
+    key = repr([scene[k] for k in _SCAN_KEYS])
+    hit = _SCAN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    poly = plate_polygon(scene)
+    x0, x1 = plate_bounds(scene)
+    above = 0.0
+    below = 0.0
+    box_a = [float("inf"), float("inf"), float("-inf"), float("-inf")]
+    box_b = [float("inf"), float("inf"), float("-inf"), float("-inf")]
+    start = int(math.floor(x0))
+    stop = int(math.ceil(x1))
+    for column in range(start, stop + 1):
+        x = column + 0.5
+        if x < x0 or x > x1:
+            continue
+        top = _curve_y(scene, x) - CURVE_HALF_WIDTH
+        bottom = _curve_y(scene, x) + CURVE_HALF_WIDTH
+        for span_top, span_bottom in _column_spans(poly, x):
+            part_a = min(span_bottom, top) - span_top
+            if part_a > 0.0:
+                above += part_a
+                box_a[0] = min(box_a[0], x)
+                box_a[1] = min(box_a[1], span_top)
+                box_a[2] = max(box_a[2], x)
+                box_a[3] = max(box_a[3], min(span_bottom, top))
+            part_b = span_bottom - max(span_top, bottom)
+            if part_b > 0.0:
+                below += part_b
+                box_b[0] = min(box_b[0], x)
+                box_b[1] = min(box_b[1], max(span_top, bottom))
+                box_b[2] = max(box_b[2], x)
+                box_b[3] = max(box_b[3], span_bottom)
+    result = {"above": above, "below": below, "box_above": box_a, "box_below": box_b}
+    if len(_SCAN_CACHE) > 4096:
+        _SCAN_CACHE.clear()
+    _SCAN_CACHE[key] = result
+    return result
+
+
+def side_areas(scene: dict) -> tuple[float, float]:
+    """Analytic grey area strictly above and strictly below the curve band."""
+    scan = _scan(scene)
+    return scan["above"], scan["below"]
+
+
+# ---------------------------------------------------------------- gold
+
+
+def analytic_gold(scene: dict) -> str:
+    """`above` or `below`: the side of the curve holding the greater grey area."""
+    above, below = side_areas(scene)
+    return "above" if above > below else "below"
+
+
+def margin(scene: dict) -> float:
+    """Absolute grey-area difference between the two sides, in square pixels."""
+    above, below = side_areas(scene)
+    return abs(above - below)
+
+
+def fraction_margin(scene: dict) -> float:
+    """Area difference as a fraction of the total uncovered grey area."""
+    above, below = side_areas(scene)
+    total = above + below
+    if total <= 0.0:
+        return 0.0
+    return abs(above - below) / total
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Near-balance scenes are excluded from headline claims."""
+    return fraction_margin(scene) < QUARANTINE_FRACTION
+
+
+def bbox_cue(scene: dict) -> str:
+    """Cheap cue: which side owns the larger axis-aligned bounding box."""
+    scan = _scan(scene)
+    box_a = scan["box_above"]
+    box_b = scan["box_below"]
+    area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+    area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+    return "above" if area_a > area_b else "below"
+
+
+def midline_cue(scene: dict) -> str:
+    """Cheap cue: the side that looks taller from the curve's mean height."""
+    poly = plate_polygon(scene)
+    ys = [p[1] for p in poly]
+    x0, x1 = plate_bounds(scene)
+    samples = [x0 + (x1 - x0) * i / 32.0 for i in range(33)]
+    mean_curve = sum(_curve_y(scene, x) for x in samples) / len(samples)
+    return "above" if (mean_curve - min(ys)) > (max(ys) - mean_curve) else "below"
+
+
+# ---------------------------------------------------------------- rendering
+
+
+def _curve_polygon(scene: dict) -> list[tuple[float, float]]:
+    x0, x1 = plate_bounds(scene)
+    left = x0 - CURVE_OVERHANG
+    right = x1 + CURVE_OVERHANG
+    steps = int(math.ceil(right - left))
+    upper = []
+    lower = []
+    for i in range(steps + 1):
+        x = left + (right - left) * i / steps
+        y = _curve_y(scene, x)
+        upper.append((x, y - CURVE_HALF_WIDTH))
+        lower.append((x, y + CURVE_HALF_WIDTH))
+    return upper + list(reversed(lower))
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterise the scene: grey plate, decorative marks, then the dark curve."""
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), _BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    grey = int(scene["plate_grey"])
+    draw.polygon(plate_polygon(scene), fill=(grey, grey - 2, grey + 2))
+    for mark in scene["marks"]:
+        cx = float(mark["cx"])
+        cy = float(mark["cy"])
+        half = 0.5 * float(mark["size"])
+        color = tuple(int(c) for c in mark["color"])
+        if mark["kind"] == "square":
+            draw.rectangle([cx - half, cy - half, cx + half, cy + half], fill=color)
+        else:
+            draw.polygon(
+                [(cx, cy - half), (cx + half, cy), (cx, cy + half), (cx - half, cy)],
+                fill=color,
+            )
+    dark = int(scene["curve_dark"])
+    draw.polygon(_curve_polygon(scene), fill=(dark, dark + 3, dark + 6))
+    return image
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical latent aliases that must preserve the analytic gold."""
+    rotated = dict(scene)
+    rotated["vertex_offset"] = (int(scene.get("vertex_offset", 0)) + 97) % POLY_VERTICES
+    permuted = dict(scene)
+    marks = list(scene["marks"])
+    permuted["marks"] = marks[1:] + marks[:1]
+    return [
+        ("plate_vertex_rotation", rotated),
+        ("decoration_reordering", permuted),
+    ]

@@ -1,0 +1,349 @@
+"""Procedural negative-space maze world.
+
+The latent maze is a tree. Exactly two visible wall closures partition it into
+three white components; exactly one component contains two colored gates. The
+decision is that unordered color pair. Rendering and analytic graph reasoning
+are deliberately separate from the raster-only implementation in oracle.py.
+"""
+
+from __future__ import annotations
+
+import copy
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+CANVAS = 512
+ROWS = 17
+COLS = 17
+COLOR_ORDER = ("red", "blue", "green", "yellow")
+COLOR_PAIRS = (
+    ("red", "blue"),
+    ("red", "green"),
+    ("red", "yellow"),
+    ("blue", "green"),
+    ("blue", "yellow"),
+    ("green", "yellow"),
+)
+GATE_RGB = {
+    "red": (232, 68, 83),
+    "blue": (43, 121, 235),
+    "green": (31, 161, 104),
+    "yellow": (242, 177, 52),
+}
+PALETTES = (
+    {"background": [221, 226, 231], "wall": [24, 31, 41], "path": [253, 252, 248], "decoration": [151, 160, 170]},
+    {"background": [229, 222, 216], "wall": [38, 31, 35], "path": [255, 253, 247], "decoration": [166, 153, 148]},
+    {"background": [217, 226, 221], "wall": [25, 39, 36], "path": [251, 254, 249], "decoration": [143, 161, 153]},
+)
+
+
+def _canon_edge(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int, int, int]:
+    if a > b:
+        a, b = b, a
+    return (a[0], a[1], b[0], b[1])
+
+
+def _all_grid_edges(rows: int, cols: int) -> list[tuple[int, int, int, int]]:
+    edges: list[tuple[int, int, int, int]] = []
+    for r in range(rows):
+        for c in range(cols):
+            if r + 1 < rows:
+                edges.append((r, c, r + 1, c))
+            if c + 1 < cols:
+                edges.append((r, c, r, c + 1))
+    return edges
+
+
+def _spanning_tree(rows: int, cols: int, rng: random.Random) -> list[tuple[int, int, int, int]]:
+    parent = list(range(rows * cols))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    edges = _all_grid_edges(rows, cols)
+    rng.shuffle(edges)
+    tree: list[tuple[int, int, int, int]] = []
+    for edge in edges:
+        r1, c1, r2, c2 = edge
+        a, b = find(r1 * cols + c1), find(r2 * cols + c2)
+        if a == b:
+            continue
+        parent[a] = b
+        tree.append(edge)
+        if len(tree) == rows * cols - 1:
+            break
+    return sorted(tree)
+
+
+def _edge_paths(
+    tree: list[tuple[int, int, int, int]],
+    gates: list[tuple[int, int]],
+) -> dict[tuple[int, int], set[int]]:
+    adjacency: dict[tuple[int, int], list[tuple[tuple[int, int], int]]] = {}
+    for index, (r1, c1, r2, c2) in enumerate(tree):
+        a, b = (r1, c1), (r2, c2)
+        adjacency.setdefault(a, []).append((b, index))
+        adjacency.setdefault(b, []).append((a, index))
+    paths: dict[tuple[int, int], set[int]] = {}
+    for start_index in range(4):
+        start = gates[start_index]
+        parent: dict[tuple[int, int], tuple[tuple[int, int] | None, int]] = {start: (None, -1)}
+        queue = deque([start])
+        while queue:
+            node = queue.popleft()
+            for neighbor, edge_index in adjacency[node]:
+                if neighbor not in parent:
+                    parent[neighbor] = (node, edge_index)
+                    queue.append(neighbor)
+        for end_index in range(start_index + 1, 4):
+            node = gates[end_index]
+            used: set[int] = set()
+            while node != start:
+                previous, edge_index = parent[node]
+                used.add(edge_index)
+                assert previous is not None
+                node = previous
+            paths[(start_index, end_index)] = used
+    return paths
+
+
+def _component_sizes(
+    rows: int,
+    cols: int,
+    tree: list[tuple[int, int, int, int]],
+    cut_indices: tuple[int, int],
+) -> tuple[dict[tuple[int, int], int], list[int]]:
+    adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {
+        (r, c): [] for r in range(rows) for c in range(cols)
+    }
+    cuts = set(cut_indices)
+    for index, (r1, c1, r2, c2) in enumerate(tree):
+        if index in cuts:
+            continue
+        a, b = (r1, c1), (r2, c2)
+        adjacency[a].append(b)
+        adjacency[b].append(a)
+    labels: dict[tuple[int, int], int] = {}
+    sizes: list[int] = []
+    for cell in adjacency:
+        if cell in labels:
+            continue
+        label = len(sizes)
+        queue = deque([cell])
+        labels[cell] = label
+        count = 0
+        while queue:
+            node = queue.popleft()
+            count += 1
+            for neighbor in adjacency[node]:
+                if neighbor not in labels:
+                    labels[neighbor] = label
+                    queue.append(neighbor)
+        sizes.append(count)
+    return labels, sizes
+
+
+def _choose_cuts(
+    rows: int,
+    cols: int,
+    tree: list[tuple[int, int, int, int]],
+    gates: list[tuple[int, int]],
+    target: tuple[int, int],
+    rng: random.Random,
+) -> tuple[int, int] | None:
+    paths = _edge_paths(tree, gates)
+
+    def path(i: int, j: int) -> set[int]:
+        return paths[(min(i, j), max(i, j))]
+
+    target_path = path(*target)
+    eligible = [index for index in range(len(tree)) if index not in target_path]
+    valid: list[tuple[int, int, int]] = []
+    for left_pos, left in enumerate(eligible):
+        for right in eligible[left_pos + 1 :]:
+            cuts = {left, right}
+
+            def connected(i: int, j: int) -> bool:
+                return not bool(path(i, j) & cuts)
+
+            pair = [i for i in range(4) if i not in target]
+            if connected(target[0], pair[0]) or connected(target[0], pair[1]):
+                continue
+            if connected(pair[0], pair[1]):
+                continue
+            labels, sizes = _component_sizes(rows, cols, tree, (left, right))
+            gate_labels = [labels[cell] for cell in gates]
+            if gate_labels[target[0]] != gate_labels[target[1]]:
+                continue
+            if len(set(gate_labels)) != 3:
+                continue
+            minimum = min(sizes[label] for label in set(gate_labels))
+            if minimum >= 16:
+                valid.append((minimum, left, right))
+    if not valid:
+        return None
+    valid.sort(reverse=True)
+    pool = valid[: min(24, len(valid))]
+    _, left, right = rng.choice(pool)
+    return tuple(sorted((left, right)))
+
+
+def _decorations(rng: random.Random) -> list[list[int]]:
+    # Disjoint, same-colored peripheral dots: their draw order is a real alias.
+    anchors = [(24, 44), (47, 24), (465, 31), (487, 60), (31, 464), (56, 487), (461, 480), (487, 449)]
+    result = []
+    for x, y in anchors:
+        result.append([x + rng.randint(-3, 3), y + rng.randint(-3, 3), rng.randint(3, 6)])
+    return result
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    rows, cols = ROWS, COLS
+    gate_colors = list(COLOR_ORDER)
+    rng.shuffle(gate_colors)
+    desired = COLOR_PAIRS[abs(int(seed)) % len(COLOR_PAIRS)]
+    target = tuple(sorted(gate_colors.index(color) for color in desired))
+    for _ in range(80):
+        gates = [
+            (0, rng.randrange(2, cols - 2)),
+            (rng.randrange(2, rows - 2), cols - 1),
+            (rows - 1, rng.randrange(2, cols - 2)),
+            (rng.randrange(2, rows - 2), 0),
+        ]
+        tree = _spanning_tree(rows, cols, rng)
+        cuts = _choose_cuts(rows, cols, tree, gates, target, rng)
+        if cuts is None:
+            continue
+        wall = rng.choice([3, 4, 5, 6, 7])
+        cell = rng.choice([13, 14, 15])
+        closed = [tree[index] for index in cuts]
+        return {
+            "rows": rows,
+            "cols": cols,
+            "cell": cell,
+            "wall": wall,
+            "tree_edges": [list(edge) for edge in tree],
+            "closed_edges": [list(edge) for edge in closed],
+            "gate_cells": [list(cell_xy) for cell_xy in gates],
+            "gate_colors": gate_colors,
+            "palette": copy.deepcopy(rng.choice(PALETTES)),
+            "offset": [rng.randint(-10, 10), rng.randint(-10, 10)],
+            "decorations": _decorations(rng),
+        }
+    raise RuntimeError("could not sample a balanced three-component gate maze")
+
+
+def _layout(scene: dict) -> tuple[int, int, int, int, int, int]:
+    rows = int(scene["rows"])
+    cols = int(scene["cols"])
+    cell = int(scene["cell"])
+    wall = int(scene["wall"])
+    width = cols * cell + (cols + 1) * wall
+    height = rows * cell + (rows + 1) * wall
+    offset_x, offset_y = map(int, scene["offset"])
+    return (CANVAS - width) // 2 + offset_x, (CANVAS - height) // 2 + offset_y, width, height, cell, wall
+
+
+def render(scene: dict) -> Image.Image:
+    palette = scene["palette"]
+    background = tuple(palette["background"])
+    wall_color = tuple(palette["wall"])
+    path_color = tuple(palette["path"])
+    decoration_color = tuple(palette["decoration"])
+    image = Image.new("RGB", (CANVAS, CANVAS), background)
+    draw = ImageDraw.Draw(image)
+    for x, y, radius in scene["decorations"]:
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=decoration_color)
+    origin_x, origin_y, width, height, cell, wall = _layout(scene)
+    draw.rectangle((origin_x, origin_y, origin_x + width - 1, origin_y + height - 1), fill=wall_color)
+    rows, cols = int(scene["rows"]), int(scene["cols"])
+
+    def cell_box(r: int, c: int) -> tuple[int, int, int, int]:
+        x = origin_x + wall + c * (cell + wall)
+        y = origin_y + wall + r * (cell + wall)
+        return x, y, x + cell - 1, y + cell - 1
+
+    for r in range(rows):
+        for c in range(cols):
+            draw.rectangle(cell_box(r, c), fill=path_color)
+    closed = {_canon_edge((e[0], e[1]), (e[2], e[3])) for e in scene["closed_edges"]}
+    for r1, c1, r2, c2 in scene["tree_edges"]:
+        if _canon_edge((r1, c1), (r2, c2)) in closed:
+            continue
+        x1, y1, x2, y2 = cell_box(r1, c1)
+        if r1 == r2:
+            draw.rectangle((x2 + 1, y1, x2 + wall, y2), fill=path_color)
+        else:
+            draw.rectangle((x1, y2 + 1, x2, y2 + wall), fill=path_color)
+    for gate_cell, color in zip(scene["gate_cells"], scene["gate_colors"]):
+        x1, y1, x2, y2 = cell_box(int(gate_cell[0]), int(gate_cell[1]))
+        inset = max(2, cell // 5)
+        draw.ellipse((x1 + inset, y1 + inset, x2 - inset, y2 - inset), fill=GATE_RGB[color])
+    return image
+
+
+def _gate_component_labels(scene: dict) -> tuple[list[int], list[int]]:
+    tree = [tuple(map(int, edge)) for edge in scene["tree_edges"]]
+    closed = {_canon_edge((e[0], e[1]), (e[2], e[3])) for e in scene["closed_edges"]}
+    gates = [tuple(map(int, value)) for value in scene["gate_cells"]]
+    adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for r1, c1, r2, c2 in tree:
+        a, b = (r1, c1), (r2, c2)
+        adjacency.setdefault(a, [])
+        adjacency.setdefault(b, [])
+        if _canon_edge(a, b) not in closed:
+            adjacency[a].append(b)
+            adjacency[b].append(a)
+    labels: dict[tuple[int, int], int] = {}
+    sizes: list[int] = []
+    for cell_xy in adjacency:
+        if cell_xy in labels:
+            continue
+        label = len(sizes)
+        queue = deque([cell_xy])
+        labels[cell_xy] = label
+        size = 0
+        while queue:
+            node = queue.popleft()
+            size += 1
+            for neighbor in adjacency[node]:
+                if neighbor not in labels:
+                    labels[neighbor] = label
+                    queue.append(neighbor)
+        sizes.append(size)
+    return [labels[cell_xy] for cell_xy in gates], sizes
+
+
+def analytic_gold(scene: dict) -> str:
+    labels, _ = _gate_component_labels(scene)
+    gate_colors = list(scene["gate_colors"])
+    matches = [(i, j) for i in range(4) for j in range(i + 1, 4) if labels[i] == labels[j]]
+    if len(matches) != 1:
+        raise ValueError(f"expected one connected gate pair, found {matches}")
+    colors = [gate_colors[index] for index in matches[0]]
+    colors.sort(key=COLOR_ORDER.index)
+    return "-".join(colors)
+
+
+def margin(scene: dict) -> float:
+    return float(scene["wall"])
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        labels, sizes = _gate_component_labels(scene)
+        return int(scene["wall"]) < 3 or len(set(labels)) != 3 or sorted(labels.count(value) for value in set(labels)) != [1, 1, 2] or min(sizes[label] for label in set(labels)) < 12
+    except Exception:
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["decorations"] = list(reversed(twin["decorations"]))
+    return [("reverse_disjoint_decoration_order", twin)]

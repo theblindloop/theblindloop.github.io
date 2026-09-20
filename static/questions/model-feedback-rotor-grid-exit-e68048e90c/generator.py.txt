@@ -1,0 +1,222 @@
+"""Rotor-grid-exit world.
+
+Latent scene z = {dirs, start, arrow_size, paint_order}.
+
+A 5x5 grid of cells each carries one arrow pointing N, E, S or W. A token
+starts on the cell with the thick black border. At every step it leaves its
+current cell in the direction that cell's arrow points *at that moment*, and
+that arrow then turns one quarter turn clockwise. The token stops as soon as
+it steps off the grid; the answer is the labelled side it crossed.
+
+The drawn arrows are only the initial state of the machine, so the picture is
+not a route: the sampler forces at least four cells to be re-entered, and a
+re-entered cell no longer points where it is drawn. Reading the arrows as a
+fixed flow field cannot even produce an answer (the static walk closes into a
+cycle), and the sampler additionally rejects any scene where turning the wrong
+way or turning before stepping would land on the same side.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "rotor_grid_exit-0.1.0"
+
+N_SIDE = 5
+N_CELLS = N_SIDE * N_SIDE
+
+WIDTH = 1010
+HEIGHT = 1010
+ORIGIN = 130
+CELL = 150
+
+BG = (255, 255, 255)
+GRID = (198, 200, 206)
+ARROW = (38, 92, 176)
+LABEL = (96, 96, 102)
+BLACK = (0, 0, 0)
+
+GRID_W = 3
+BORDER_W = 8
+BORDER_INSET = 7
+
+ARROW_MIN = 42
+ARROW_MAX = 96
+QUARANTINE_MARGIN = 8.0
+
+DIRS = ("N", "E", "S", "W")
+_CW = {"N": "E", "E": "S", "S": "W", "W": "N"}
+_CCW = {v: k for k, v in _CW.items()}
+_STEP = {"N": (-1, 0), "E": (0, 1), "S": (1, 0), "W": (0, -1)}
+
+
+# --------------------------------------------------------------------------
+# dynamics
+# --------------------------------------------------------------------------
+def _walk(dirs: list[str], start: int, mode: str = "cw", cap: int = 4000):
+    """Run the walk; return (exit side or None, steps, visit counts).
+
+    mode 'cw'    -- use the arrow, then turn it a quarter turn clockwise (the rule);
+    mode 'ccw'   -- turn counter-clockwise instead (mis-read turn direction);
+    mode 'pre'   -- turn first and then leave (mis-read step order);
+    mode 'static'-- never turn (read the arrows as a fixed flow field).
+    """
+    field = list(dirs)
+    r, c = divmod(start, N_SIDE)
+    visits = [0] * N_CELLS
+    for step in range(1, cap + 1):
+        idx = r * N_SIDE + c
+        visits[idx] += 1
+        if mode == "pre":
+            field[idx] = _CW[field[idx]]
+        d = field[idx]
+        if mode == "cw":
+            field[idx] = _CW[d]
+        elif mode == "ccw":
+            field[idx] = _CCW[d]
+        dr, dc = _STEP[d]
+        r, c = r + dr, c + dc
+        if r < 0:
+            return "N", step, visits
+        if r >= N_SIDE:
+            return "S", step, visits
+        if c < 0:
+            return "W", step, visits
+        if c >= N_SIDE:
+            return "E", step, visits
+    return None, cap, visits
+
+
+def analytic_gold(scene: dict) -> str:
+    """Side the token leaves from once the rotor rule is applied."""
+    side, _, _ = _walk(list(scene["dirs"]), int(scene["start"]), "cw")
+    if side is None:
+        raise ValueError("rotor walk did not terminate")
+    return side
+
+
+def _variant_side(scene: dict, mode: str):
+    """Side reached under a mis-read version of the rule."""
+    side, _, _ = _walk(list(scene["dirs"]), int(scene["start"]), mode, cap=300)
+    return side
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def sample_scene(seed: int) -> dict:
+    """Sample one scene. The target exit side cycles with the seed."""
+    rng = random.Random(seed * 6364136223846793005 % (2**61 - 1) + 12345)
+    target = DIRS[seed % 4]
+    for _ in range(40000):
+        dirs = [rng.choice(DIRS) for _ in range(N_CELLS)]
+        start = rng.randrange(N_CELLS)
+        scene = {
+            "dirs": dirs,
+            "start": start,
+            "arrow_size": rng.randrange(ARROW_MIN, ARROW_MAX + 1, 2),
+            "paint_order": list(range(N_CELLS)),
+        }
+        side, steps, visits = _walk(dirs, start, "cw")
+        if side != target:
+            continue
+        if not 12 <= steps <= 60:
+            continue
+        # the machine must really change state: several cells re-entered
+        if sum(1 for v in visits if v >= 2) < 4:
+            continue
+        # mis-reading the turn direction or the step order must give another side
+        if _variant_side(scene, "ccw") == side:
+            continue
+        if _variant_side(scene, "pre") == side:
+            continue
+        order = list(range(N_CELLS))
+        rng.shuffle(order)
+        scene["paint_order"] = order
+        return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+def margin(scene: dict) -> float:
+    """Orientation margin: apex-side offset of the triangle centroid from the
+    centre of its bounding box, in pixels. This is exactly the evidence the
+    pixel arm uses to read each arrow's direction, so it measures how far every
+    cell sits from the orientation decision boundary."""
+    return round(int(scene["arrow_size"]) / 6.0, 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Arrows so small that the centroid offset falls under 8px."""
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict):
+    """``paint_order`` is sampled but photometrically invisible: arrows live in
+    disjoint cells and never overlap, so the order in which they are stroked
+    cannot change a pixel. Rotating and reversing it must be pixel-identical
+    and gold-preserving."""
+    order = list(scene["paint_order"])
+    out = []
+    rotated = dict(scene)
+    rotated["paint_order"] = order[1:] + order[:1]
+    out.append(("rotated_paint_order", rotated))
+    reversed_ = dict(scene)
+    reversed_["paint_order"] = order[::-1]
+    out.append(("reversed_paint_order", reversed_))
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _cell_box(idx: int) -> tuple[int, int, int, int]:
+    r, c = divmod(idx, N_SIDE)
+    x0 = ORIGIN + c * CELL
+    y0 = ORIGIN + r * CELL
+    return x0, y0, x0 + CELL, y0 + CELL
+
+
+def _triangle(idx: int, direction: str, size: int) -> list[tuple[int, int]]:
+    x0, y0, x1, y1 = _cell_box(idx)
+    cx = (x0 + x1) // 2
+    cy = (y0 + y1) // 2
+    h = size // 2
+    if direction == "N":
+        return [(cx, cy - h), (cx - h, cy + h), (cx + h, cy + h)]
+    if direction == "S":
+        return [(cx, cy + h), (cx - h, cy - h), (cx + h, cy - h)]
+    if direction == "E":
+        return [(cx + h, cy), (cx - h, cy - h), (cx - h, cy + h)]
+    return [(cx - h, cy), (cx + h, cy - h), (cx + h, cy + h)]
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(img)
+
+    end = ORIGIN + N_SIDE * CELL
+    for k in range(N_SIDE + 1):
+        p = ORIGIN + k * CELL
+        draw.line([(ORIGIN, p), (end, p)], fill=GRID, width=GRID_W)
+        draw.line([(p, ORIGIN), (p, end)], fill=GRID, width=GRID_W)
+
+    size = int(scene["arrow_size"])
+    for idx in scene["paint_order"]:
+        draw.polygon(_triangle(int(idx), scene["dirs"][int(idx)], size), fill=ARROW)
+
+    x0, y0, x1, y1 = _cell_box(int(scene["start"]))
+    draw.rectangle(
+        [x0 + BORDER_INSET, y0 + BORDER_INSET, x1 - BORDER_INSET, y1 - BORDER_INSET],
+        outline=BLACK,
+        width=BORDER_W,
+    )
+
+    font = ImageFont.load_default(size=62)
+    mid = (ORIGIN + end) // 2
+    draw.text((mid, ORIGIN - 62), "N", fill=LABEL, anchor="mm", font=font)
+    draw.text((mid, end + 62), "S", fill=LABEL, anchor="mm", font=font)
+    draw.text((ORIGIN - 66, mid), "W", fill=LABEL, anchor="mm", font=font)
+    draw.text((end + 66, mid), "E", fill=LABEL, anchor="mm", font=font)
+    return img

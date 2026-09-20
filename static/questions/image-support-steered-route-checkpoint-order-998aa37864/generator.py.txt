@@ -1,0 +1,226 @@
+"""Renderer and analytic arm for directed checkpoint order.
+
+The answer is the color of the checkpoint encountered first while traversing a
+single connected polyline from its marked start to its marked terminal.  The
+route is deliberately meandering so screen-space x/y order is not a substitute
+for route order.  Checkpoint ticks are drawn underneath the route, keeping the
+route itself continuous in the raster.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+ROUTE_COLORS = ("#203b55", "#29455c", "#214b4d", "#3b405b")
+BACKGROUNDS = ("#fbfcf8", "#f7f9fc", "#fffaf2")
+ORANGE = "#d66a2f"
+TEAL = "#198d89"
+CHECKPOINT_COLORS = {"orange": ORANGE, "teal": TEAL}
+START_COLOR = "#7b4bb3"
+TERMINAL_COLOR = "#76848f"
+CHECKPOINT_WIDTH = 11
+CHECKPOINT_HALF_LENGTH = 19
+START_RADIUS = 11
+TERMINAL_RADIUS = 10
+MIN_CERTIFIED_GAP = 88.0
+
+# Both templates stay inside one central region after the bounded affine
+# transform.  They are non-self-intersecting, but their bends break a simple
+# horizontal or vertical reading of the checkpoint positions.
+ROUTE_TEMPLATES = (
+    (
+        (-130, -58),
+        (-95, -25),
+        (-110, 12),
+        (-55, 34),
+        (-5, 7),
+        (35, 48),
+        (90, 24),
+        (78, -18),
+        (130, -50),
+    ),
+    (
+        (-130, -38),
+        (-105, 8),
+        (-62, -42),
+        (-24, -2),
+        (12, -48),
+        (55, -12),
+        (86, -40),
+        (105, -2),
+        (130, 40),
+    ),
+)
+
+
+def _polyline_length(points: list[list[int]] | list[tuple[float, float]]) -> float:
+    return sum(
+        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        for a, b in zip(points, points[1:])
+    )
+
+
+def _make_route(rng: random.Random) -> list[list[int]]:
+    template = ROUTE_TEMPLATES[rng.randrange(len(ROUTE_TEMPLATES))]
+    flip_x = -1 if rng.randrange(2) else 1
+    flip_y = -1 if rng.randrange(2) else 1
+    angle = rng.uniform(-math.pi, math.pi)
+    scale = rng.uniform(0.94, 1.06)
+    center_x = 256.0 + rng.uniform(-18.0, 18.0)
+    center_y = 256.0 + rng.uniform(-18.0, 18.0)
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    points: list[list[int]] = []
+    for base_x, base_y in template:
+        x = float(base_x * flip_x) * scale
+        y = float(base_y * flip_y) * scale
+        # A small deterministic perturbation changes the trace without making
+        # neighboring segments approach a crossing.
+        x += rng.uniform(-3.0, 3.0)
+        y += rng.uniform(-3.0, 3.0)
+        rx = x * cos_a - y * sin_a
+        ry = x * sin_a + y * cos_a
+        points.append([round(center_x + rx), round(center_y + ry)])
+    if len(set(map(tuple, points))) != len(points):
+        raise RuntimeError("route sampling produced duplicate vertices")
+    return points
+
+
+def _point_and_tangent(
+    points: list[list[int]], fraction: float
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    fraction = min(1.0, max(0.0, float(fraction)))
+    target = _polyline_length(points) * fraction
+    traversed = 0.0
+    for left, right in zip(points, points[1:]):
+        dx = float(right[0]) - float(left[0])
+        dy = float(right[1]) - float(left[1])
+        length = math.hypot(dx, dy)
+        if target <= traversed + length or right is points[-1]:
+            ratio = 0.0 if length == 0 else (target - traversed) / length
+            ratio = min(1.0, max(0.0, ratio))
+            point = (float(left[0]) + ratio * dx, float(left[1]) + ratio * dy)
+            return point, (dx / length, dy / length)
+        traversed += length
+    left, right = points[-2], points[-1]
+    dx = float(right[0]) - float(left[0])
+    dy = float(right[1]) - float(left[1])
+    length = math.hypot(dx, dy)
+    return (float(right[0]), float(right[1])), (dx / length, dy / length)
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Sample one balanced, deterministic route scene from an integer seed."""
+
+    rng = random.Random(int(seed))
+    route = _make_route(rng)
+    # Include a near-boundary band for explicit quarantine coverage while
+    # retaining at least a 70-pixel separation for the raster inverse.
+    if rng.random() < 0.28:
+        separation = rng.uniform(0.14, 0.18)
+    else:
+        separation = rng.uniform(0.20, 0.42)
+    first_t = rng.uniform(0.20, min(0.55, 0.82 - separation))
+    second_t = first_t + separation
+    first_color = "orange" if rng.randrange(2) == 0 else "teal"
+    second_color = "teal" if first_color == "orange" else "orange"
+    return {
+        "route": route,
+        "checkpoints": [
+            {"t": round(first_t, 6), "color": first_color},
+            {"t": round(second_t, 6), "color": second_color},
+        ],
+        "route_color": ROUTE_COLORS[rng.randrange(len(ROUTE_COLORS))],
+        "background": BACKGROUNDS[rng.randrange(len(BACKGROUNDS))],
+        "stroke": 9,
+        "checkpoint_width": CHECKPOINT_WIDTH,
+        "checkpoint_half_length": CHECKPOINT_HALF_LENGTH,
+        "start_color": START_COLOR,
+        "terminal_color": TERMINAL_COLOR,
+    }
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    """Render the route and attached colored ticks as a final RGB raster."""
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), scene["background"])
+    draw = ImageDraw.Draw(image)
+    route = [tuple(point) for point in scene["route"]]
+
+    # Ticks go down first, so the dark route remains a single continuous mark.
+    for checkpoint in scene["checkpoints"]:
+        point, tangent = _point_and_tangent(scene["route"], checkpoint["t"])
+        normal = (-tangent[1], tangent[0])
+        start = (
+            point[0] - normal[0] * scene["checkpoint_half_length"],
+            point[1] - normal[1] * scene["checkpoint_half_length"],
+        )
+        end = (
+            point[0] + normal[0] * scene["checkpoint_half_length"],
+            point[1] + normal[1] * scene["checkpoint_half_length"],
+        )
+        draw.line(
+            [start, end],
+            fill=CHECKPOINT_COLORS[checkpoint["color"]],
+            width=scene["checkpoint_width"],
+        )
+
+    start = tuple(scene["route"][0])
+    terminal = tuple(scene["route"][-1])
+    draw.ellipse(
+        (start[0] - START_RADIUS, start[1] - START_RADIUS,
+         start[0] + START_RADIUS, start[1] + START_RADIUS),
+        fill=scene["start_color"],
+    )
+    draw.ellipse(
+        (terminal[0] - TERMINAL_RADIUS, terminal[1] - TERMINAL_RADIUS,
+         terminal[0] + TERMINAL_RADIUS, terminal[1] + TERMINAL_RADIUS),
+        fill=scene["terminal_color"],
+    )
+
+    draw.line(route, fill=scene["route_color"], width=scene["stroke"], joint="curve")
+
+    # A dark arrowhead makes the traversal direction visible without adding a
+    # second label-bearing color.  The purple disk remains the start anchor.
+    dx = float(route[1][0] - route[0][0])
+    dy = float(route[1][1] - route[0][1])
+    length = math.hypot(dx, dy)
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    tip = (start[0] + ux * 24.0, start[1] + uy * 24.0)
+    base = (start[0] + ux * 7.0, start[1] + uy * 7.0)
+    arrow = [tip, (base[0] + nx * 11.0, base[1] + ny * 11.0),
+             (base[0] - nx * 11.0, base[1] - ny * 11.0)]
+    draw.polygon(arrow, fill=scene["route_color"])
+    return image
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    """Return the visible color of the first checkpoint along the route."""
+
+    first = min(scene["checkpoints"], key=lambda checkpoint: checkpoint["t"])
+    return str(first["color"])
+
+
+def margin(scene: dict[str, Any]) -> float:
+    """Return the absolute along-route separation of the two checkpoints."""
+
+    checkpoints = scene["checkpoints"]
+    return abs(float(checkpoints[0]["t"]) - float(checkpoints[1]["t"])) * _polyline_length(scene["route"])
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    """Quarantine near-coincident checkpoint ticks."""
+
+    return margin(scene) < MIN_CERTIFIED_GAP
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """No nontrivial latent aliases are declared for this parametrization."""
+
+    return []

@@ -1,0 +1,201 @@
+"""Dot-loop topology world: a closed loop versus an open chain of isolated dots.
+
+A set of small, dark, isolated dots is laid along one smooth contour. None of
+the dots touch; the contour itself is never drawn. The only global structure is
+the emergent proximity grouping: each dot connects to the dots nearest to it.
+In one arrangement the dots trace one closed loop (every dot has exactly two
+neighbours and the chain closes up into a cycle). In the other the dots trace
+one open chain (a single path with exactly two free ends). The decision is the
+global proximity-graph topology: ``loop`` or ``chain``.
+
+The renderer owns scene sampling + rasterization + the analytic gold. The
+independent pixel-only inverse arm (``oracle.py``) extracts the dot centroids
+from the final PNG, builds the proximity (threshold) graph, and reads off the
+degree structure: all degree-two vertices in one component is a loop, while a
+single component with exactly two degree-one endpoints is a chain.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 384
+HEIGHT = 384
+DOT_R = 6                 # dot disk radius in pixels
+MARGIN = 45               # minimum distance of the contour to the canvas border
+_THRESHOLD_FACTOR = 1.5   # proximity threshold as a multiple of median nearest-neighbour distance
+_QUARANTINE_MARGIN = 0.25
+TOKENS = ["loop", "chain"]
+
+_DARK = (30, 30, 30)
+
+
+def resample_uniform(xs, ys, count):
+    """Place ``count`` points at uniform arc-length spacing along the polyline."""
+    xs = np.asarray(xs, float)
+    ys = np.asarray(ys, float)
+    seg = np.sqrt(np.diff(xs) ** 2 + np.diff(ys) ** 2)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    length = cum[-1]
+    px = []
+    py = []
+    for t in np.arange(count) * length / count:
+        i = min(int(np.searchsorted(cum, t)), len(cum) - 2)
+        lam = (t - cum[i]) / max(seg[i], 1e-9)
+        lam = min(max(lam, 0.0), 1.0)
+        px.append(xs[i] + lam * (xs[i + 1] - xs[i]))
+        py.append(ys[i] + lam * (ys[i + 1] - ys[i]))
+    return np.asarray(px), np.asarray(py)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``."""
+    rng = np.random.default_rng(seed)
+    if rng.integers(0, 2) == 0:
+        topology = "loop"
+    else:
+        topology = "chain"
+    semi_a = float(rng.uniform(110, 146))
+    semi_b = semi_a * float(rng.uniform(0.55, 0.80))
+    cx = float(rng.uniform(semi_a + MARGIN, WIDTH - semi_a - MARGIN))
+    cy = float(rng.uniform(semi_b + MARGIN, HEIGHT - semi_b - MARGIN))
+    count = int(rng.integers(9, 12))
+
+    thetas = np.linspace(0.0, 2.0 * np.pi, 2500)
+    if topology == "loop":
+        xe = cx + semi_a * np.cos(thetas)
+        ye = cy + semi_b * np.sin(thetas)
+        px, py = resample_uniform(xe, ye, count)
+    else:
+        frac = float(rng.uniform(0.50, 0.70))
+        tt = np.linspace(0.0, 2.0 * np.pi * frac, 2500)
+        xe = cx + semi_a * np.cos(tt)
+        ye = cy + semi_b * np.sin(tt)
+        px, py = resample_uniform(xe, ye, count)
+
+    jitter = rng.normal(0.0, 0.7, len(px))
+    dots = [[int(round(px[i] + jitter[i])), int(round(py[i] + jitter[i]))] for i in range(len(px))]
+    return {"dots": dots, "topology": topology}
+
+
+def _paint(arr, x: float, y: float) -> None:
+    r = DOT_R
+    x0, y0 = int(round(x)), int(round(y))
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dx * dx + dy * dy <= r * r:
+                xx, yy = x0 + dx, y0 + dy
+                if 0 <= xx < WIDTH and 0 <= yy < HEIGHT:
+                    arr[yy, xx] = _DARK
+
+
+def _draw_scene(scene: dict) -> Image.Image:
+    arr = np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8)
+    for x, y in scene["dots"]:
+        _paint(arr, x, y)
+    return Image.fromarray(arr, "RGB")
+
+
+def render(scene: dict) -> Image.Image:
+    return _draw_scene(scene)
+
+
+def analytic_gold(scene: dict) -> str:
+    return topology_from_dots(scene["dots"])
+
+
+def _centroids_from_dots(scene: dict) -> list[tuple[float, float]]:
+    # The stored dots already carry the tiny sub-pixel sample jitter and match
+    # the integer-centred disks that are drawn, so they equal the raster
+    # centroids that the independent oracle recovers.
+    return [(float(x), float(y)) for x, y in scene["dots"]]
+
+
+def topology_from_dots(points) -> str:
+    points = [(float(x), float(y)) for x, y in points]
+    n = len(points)
+    if n < 4:
+        return "chain"
+    pts = np.array(points)
+    nn = []
+    for i in range(n):
+        d = np.sqrt(((pts - pts[i]) ** 2).sum(1))
+        d[i] = 1e9
+        nn.append(float(d.min()))
+    s = float(np.median(nn))
+    threshold = _THRESHOLD_FACTOR * s
+    return _structure(pts, threshold, n)
+
+
+def _structure(pts, threshold: float, n: int) -> str:
+    deg = [0] * n
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if float(np.sqrt(((pts[i] - pts[j]) ** 2).sum())) <= threshold:
+                deg[i] += 1
+                deg[j] += 1
+                adj[i].append(j)
+                adj[j].append(i)
+    seen = set()
+    components = 0
+    for i in range(n):
+        if i in seen:
+            continue
+        components += 1
+        stack = [i]
+        seen.add(i)
+        while stack:
+            u = stack.pop()
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+    if components != 1:
+        return "chain"
+    if all(d == 2 for d in deg):
+        return "loop"
+    d1 = sum(1 for d in deg if d == 1)
+    d2 = sum(1 for d in deg if d == 2)
+    if d1 == 2 and d1 + d2 == n:
+        return "chain"
+    return "loop"
+
+
+def margin(scene: dict) -> float:
+    """Relative clearance between the largest connecting and smallest non-connecting gap."""
+    points = _centroids_from_dots(scene)
+    n = len(points)
+    if n < 4:
+        return 0.0
+    pts = np.array(points)
+    nn = []
+    for i in range(n):
+        d = np.sqrt(((pts - pts[i]) ** 2).sum(1))
+        d[i] = 1e9
+        nn.append(float(d.min()))
+    s = float(np.median(nn))
+    threshold = _THRESHOLD_FACTOR * s
+    max_edge = None
+    min_non_edge = None
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = float(np.sqrt(((pts[i] - pts[j]) ** 2).sum()))
+            if d <= threshold:
+                max_edge = d if max_edge is None else max(max_edge, d)
+            else:
+                min_non_edge = d if min_non_edge is None else min(min_non_edge, d)
+    if max_edge is None:
+        return 0.0
+    if min_non_edge is None:
+        return float((threshold - max_edge) / threshold)
+    return float((min_non_edge - max_edge) / max_edge)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < _QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

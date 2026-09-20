@@ -1,0 +1,151 @@
+"""Pixel-only inverse arm for ``moment_arm_balance``.
+
+Input is one rasterized PNG plus the public question contract; nothing else.
+This module imports no renderer, prompt, generator, verifier or gold code, and
+never receives latent scene data.  It rebuilds the drawing from ink:
+
+1. threshold dark ink (the pale guide rows are far lighter) and saturated
+   colour separately;
+2. the rail is the one wide dark row band; the ticks are the dark column runs
+   in the strip immediately under it, and their common spacing is one step;
+3. the pivot is the dark mark below the tick strip, snapped to the nearest
+   tick;
+4. each colour column is a run of saturated columns above the rail; its tick
+   is the nearest tick to its centre and its cell count is the number of
+   colour runs down its middle, which must agree at three sampled abscissae;
+5. apply the declared rule: moment = cells x steps to the pivot, summed per
+   side, and report the larger side.
+
+Any structural surprise (no rail, non-uniform ticks, no pivot, a column on the
+pivot tick, an empty side, disagreeing cell counts, or an exact balance)
+yields ``"abstain"`` rather than a guess.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "moment_arm_balance-oracle-1.0.0"
+
+DARK_MAX = 90             # rail, ticks, pivot and cell outlines
+SATURATION_MIN = 60       # cell fill colours; white, grey guides and ink are neutral
+ABSTAIN = "abstain"
+
+
+def _masks(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int32)
+    luminance = (
+        299 * pixels[:, :, 0] + 587 * pixels[:, :, 1] + 114 * pixels[:, :, 2]
+    ) // 1000
+    spread = pixels.max(axis=2) - pixels.min(axis=2)
+    return luminance <= DARK_MAX, spread >= SATURATION_MIN
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """Inclusive ``(start, end)`` bounds of every maximal true run."""
+    out: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            out.append((start, index - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def measure(image: Image.Image) -> dict:
+    """Structural read-out used by :func:`decision_from_image`; pixels only."""
+    dark, colour = _masks(image)
+    height, width = dark.shape
+
+    wide = dark.sum(axis=1) >= 0.6 * width
+    bands = [band for band in _runs(wide) if band[1] - band[0] + 1 <= 10]
+    if not bands:
+        return {"ok": False, "reason": "no rail"}
+    rail_top, rail_bottom = bands[-1]
+    if rail_top < 40 or rail_bottom > height - 30:
+        return {"ok": False, "reason": "rail is out of place"}
+
+    strip = dark[rail_bottom + 1 : rail_bottom + 14, :]
+    if strip.shape[0] < 8:
+        return {"ok": False, "reason": "no tick strip"}
+    tick_runs = [run for run in _runs(strip.sum(axis=0) >= 6) if run[1] - run[0] + 1 <= 9]
+    if len(tick_runs) < 5:
+        return {"ok": False, "reason": "too few ticks"}
+    centres = [(run[0] + run[1]) / 2.0 for run in tick_runs]
+    gaps = [b - a for a, b in zip(centres, centres[1:])]
+    step = sum(gaps) / len(gaps)
+    if step < 20 or max(abs(gap - step) for gap in gaps) > 1.0:
+        return {"ok": False, "reason": "tick spacing is not uniform"}
+
+    below = dark[rail_bottom + 15 :, :]
+    if below.sum() < 60:
+        return {"ok": False, "reason": "no pivot mark"}
+    columns_with_ink = np.nonzero(below.sum(axis=0) > 0)[0]
+    pivot_x = (float(columns_with_ink.min()) + float(columns_with_ink.max())) / 2.0
+    if float(columns_with_ink.max() - columns_with_ink.min()) > 1.5 * step:
+        return {"ok": False, "reason": "pivot mark is not a single mark"}
+    pivot_index = min(range(len(centres)), key=lambda i: abs(centres[i] - pivot_x))
+    if abs(centres[pivot_index] - pivot_x) > 0.25 * step:
+        return {"ok": False, "reason": "pivot does not point at a tick"}
+
+    above = colour[:rail_top, :]
+    blocks = [run for run in _runs(above.sum(axis=0) > 0) if run[1] - run[0] + 1 >= 8]
+    if not blocks:
+        return {"ok": False, "reason": "no columns"}
+
+    seen: dict[int, int] = {}
+    for x0, x1 in blocks:
+        centre = (x0 + x1) / 2.0
+        index = min(range(len(centres)), key=lambda i: abs(centres[i] - centre))
+        if abs(centres[index] - centre) > 0.25 * step:
+            return {"ok": False, "reason": "a column does not stand on a tick"}
+        offset = max(4, (x1 - x0) // 4)
+        counts = {
+            len(_runs(above[:, int(round(centre)) + delta]))
+            for delta in (-offset, 0, offset)
+        }
+        if len(counts) != 1:
+            return {"ok": False, "reason": "cell count is unstable across the column"}
+        cells = counts.pop()
+        if cells < 1 or index in seen:
+            return {"ok": False, "reason": "degenerate column"}
+        seen[index] = cells
+
+    if pivot_index in seen:
+        return {"ok": False, "reason": "a column stands on the pivot tick"}
+    left = sum(cells * (pivot_index - index) for index, cells in seen.items() if index < pivot_index)
+    right = sum(cells * (index - pivot_index) for index, cells in seen.items() if index > pivot_index)
+    if not any(index < pivot_index for index in seen) or not any(
+        index > pivot_index for index in seen
+    ):
+        return {"ok": False, "reason": "one side of the pivot is empty"}
+    return {
+        "ok": True,
+        "pivot_index": int(pivot_index),
+        "columns": {int(k): int(v) for k, v in sorted(seen.items())},
+        "left_total": int(left),
+        "right_total": int(right),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """``"left"``, ``"right"`` or ``"abstain"``."""
+    read = measure(image)
+    if not read["ok"]:
+        return ABSTAIN
+    if read["left_total"] == read["right_total"]:
+        return ABSTAIN
+    return "left" if read["left_total"] > read["right_total"] else "right"
+
+
+def runner_up_margin(image: Image.Image) -> float:
+    """Distance between the two side totals, in cell-step units."""
+    read = measure(image)
+    if not read["ok"]:
+        return 0.0
+    return float(abs(read["left_total"] - read["right_total"]))

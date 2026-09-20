@@ -1,0 +1,152 @@
+"""Independent pixel-only inverse for the connected contour board.
+
+The inverse does not import the renderer.  It locates the uninterrupted dark
+board, extracts the three card colors by connected-component segmentation, and
+samples the seven-by-seven paper occupancy field from each card's raster bbox.
+Only after the candidate fields are recovered does it rotate A and B clockwise
+and bind the winning slot to its halo color.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_BOARD = np.asarray((42, 85, 96), dtype=np.float32)
+_NEUTRAL = np.asarray((87, 148, 155), dtype=np.float32)
+_AMBER = np.asarray((238, 163, 57), dtype=np.float32)
+_VIOLET = np.asarray((166, 104, 201), dtype=np.float32)
+_PAPER = np.asarray((247, 243, 226), dtype=np.float32)
+
+_GRID = 7
+_TARGET_CELLS = 26
+_CELL = 8
+_CARD_SIZE = 66
+# A clean board has roughly 67k palette-labeled pixels.  Requiring this
+# substantial visible area makes removal of a meaningful board tile an
+# explicit abstention while leaving the intact raster comfortably admissible.
+_MIN_BOARD_AREA = 62000
+_MIN_CARD_AREA = 1200
+_COLOR_TOL = 92.0
+_BOARD_TOL = 110.0
+_PAPER_TOL = 75.0
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float = _COLOR_TOL) -> np.ndarray:
+    return np.linalg.norm(array - color, axis=2) < tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            component = np.zeros_like(mask, dtype=bool)
+            ys, xs = zip(*points, strict=True)
+            component[np.asarray(ys), np.asarray(xs)] = True
+            found.append(component)
+    return found
+
+
+def _bbox(component: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(component)
+    if len(ys) == 0:
+        raise ValueError("empty component")
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _board_component(array: np.ndarray) -> np.ndarray:
+    # The neutral reference card is intentionally close enough to the board
+    # palette to bridge its local cutout; candidate halo colors remain far
+    # away. This recovers the one structural board component after rasterizing
+    # the outlined slot/card overlays.
+    components = _components(_mask(array, _BOARD, _BOARD_TOL), _MIN_BOARD_AREA)
+    if len(components) != 1:
+        raise ValueError("image must contain exactly one intact connected board")
+    x0, y0, x1, y1 = _bbox(components[0])
+    if not (285 <= x1 - x0 + 1 <= 350 and 220 <= y1 - y0 + 1 <= 275):
+        raise ValueError("board has unexpected dimensions")
+    return components[0]
+
+
+def _card_components(array: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    cards: list[tuple[str, np.ndarray]] = []
+    for name, color in (("reference", _NEUTRAL), ("amber", _AMBER), ("violet", _VIOLET)):
+        components = _components(_mask(array, color), _MIN_CARD_AREA)
+        if len(components) != 1:
+            raise ValueError(f"expected one intact {name} card")
+        cards.append((name, components[0]))
+    cards.sort(key=lambda item: _bbox(item[1])[0])
+    if [name for name, _ in cards][0] != "reference":
+        raise ValueError("reference card is not the left card")
+    return cards
+
+
+def _sample_pattern(array: np.ndarray, component: np.ndarray) -> list[list[int]]:
+    x0, y0, x1, y1 = _bbox(component)
+    if not (60 <= x1 - x0 + 1 <= 72 and 60 <= y1 - y0 + 1 <= 72):
+        raise ValueError("card has unexpected dimensions")
+    pattern: list[list[int]] = []
+    for row in range(_GRID):
+        values = []
+        for col in range(_GRID):
+            x = min(array.shape[1] - 1, x0 + 5 + col * _CELL + _CELL // 2)
+            y = min(array.shape[0] - 1, y0 + 5 + row * _CELL + _CELL // 2)
+            values.append(int(np.linalg.norm(array[y, x] - _PAPER) < _PAPER_TOL))
+        pattern.append(values)
+    if sum(sum(row) for row in pattern) != _TARGET_CELLS:
+        raise ValueError("card contour is incomplete or has the wrong area")
+    return pattern
+
+
+def _rotate_cw(pattern: list[list[int]]) -> list[list[int]]:
+    return [list(row) for row in zip(*pattern[::-1])]
+
+
+def _error(left: list[list[int]], right: list[list[int]]) -> int:
+    return sum(int(a != b) for ra, rb in zip(left, right, strict=True) for a, b in zip(ra, rb, strict=True))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return amber or violet, or abstain when the raster evidence is incomplete."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    _board_component(array)
+    cards = _card_components(array)
+    reference = _sample_pattern(array, cards[0][1])
+    candidate_a = None
+    candidate_b = None
+    halo_a = None
+    halo_b = None
+    for index, (name, component) in enumerate(cards[1:], start=1):
+        pattern = _sample_pattern(array, component)
+        if index == 1:
+            candidate_a, halo_a = pattern, name
+        else:
+            candidate_b, halo_b = pattern, name
+    if candidate_a is None or candidate_b is None or halo_a is None or halo_b is None:
+        raise ValueError("candidate cards are missing")
+    errors = {
+        "A": _error(_rotate_cw(candidate_a), reference),
+        "B": _error(_rotate_cw(candidate_b), reference),
+    }
+    if errors["A"] == errors["B"]:
+        raise ValueError("candidate contour errors are tied")
+    return halo_a if errors["A"] < errors["B"] else halo_b

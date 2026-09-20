@@ -1,0 +1,154 @@
+"""Independent pixel-only inverse for a compact directed polyline."""
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _mask_near(arr, rgb, tolerance=38):
+    target = np.array(rgb, dtype=np.int16)
+    return np.max(np.abs(arr.astype(np.int16) - target), axis=2) <= tolerance
+
+
+def _thin(binary):
+    a = binary.astype(np.uint8).copy()
+    changed = True
+    while changed:
+        changed = False
+        for phase in (0, 1):
+            remove = []
+            ys, xs = np.nonzero(a)
+            for y, x in zip(ys, xs):
+                if y == 0 or x == 0 or y == a.shape[0]-1 or x == a.shape[1]-1:
+                    continue
+                p = [a[y-1,x], a[y-1,x+1], a[y,x+1], a[y+1,x+1], a[y+1,x], a[y+1,x-1], a[y,x-1], a[y-1,x-1]]
+                n = sum(p)
+                if n < 2 or n > 6:
+                    continue
+                transitions = sum(p[i] == 0 and p[(i+1)%8] == 1 for i in range(8))
+                if transitions != 1:
+                    continue
+                if phase == 0:
+                    ok = p[0]*p[2]*p[4] == 0 and p[2]*p[4]*p[6] == 0
+                else:
+                    ok = p[0]*p[2]*p[6] == 0 and p[0]*p[4]*p[6] == 0
+                if ok:
+                    remove.append((y,x))
+            if remove:
+                changed = True
+                for y,x in remove:
+                    a[y,x] = 0
+    return a.astype(bool)
+
+
+def _components(mask):
+    seen = np.zeros(mask.shape, bool)
+    out = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y,x]:
+            continue
+        q=[(y,x)]; seen[y,x]=1; comp=[]
+        for cy,cx in q:
+            comp.append((cy,cx))
+            for dy in (-1,0,1):
+                for dx in (-1,0,1):
+                    ny,nx=cy+dy,cx+dx
+                    if 0<=ny<mask.shape[0] and 0<=nx<mask.shape[1] and mask[ny,nx] and not seen[ny,nx]:
+                        seen[ny,nx]=1; q.append((ny,nx))
+        out.append(comp)
+    return out
+
+
+def _centroid(mask):
+    comps = _components(mask)
+    if not comps:
+        raise ValueError("endpoint marker missing")
+    comp=max(comps,key=len)
+    return (sum(x for y,x in comp)/len(comp), sum(y for y,x in comp)/len(comp))
+
+
+def _path(skeleton, start_xy, finish_xy):
+    pts={(int(y),int(x)) for y,x in zip(*np.nonzero(skeleton))}
+    if not pts:
+        raise ValueError("trail missing")
+    def nearest(xy):
+        return min(pts, key=lambda p:(p[1]-xy[0])**2+(p[0]-xy[1])**2)
+    start, goal=nearest(start_xy), nearest(finish_xy)
+    q=deque([start]); parent={start:None}
+    while q:
+        p=q.popleft()
+        if p==goal: break
+        y,x=p
+        neighbors=[]
+        for dy in (-1,0,1):
+            for dx in (-1,0,1):
+                if dx or dy:
+                    n=(y+dy,x+dx)
+                    if n in pts and n not in parent:
+                        neighbors.append(n)
+        # Prefer cardinal steps, reducing corner-cutting ambiguity.
+        neighbors.sort(key=lambda n: abs(n[0]-y)+abs(n[1]-x), reverse=True)
+        for n in neighbors:
+            parent[n]=p; q.append(n)
+    if goal not in parent:
+        raise ValueError("trail disconnected")
+    result=[]; cur=goal
+    while cur is not None:
+        result.append((cur[1],cur[0])); cur=parent[cur]
+    return result[::-1]
+
+
+def _rdp(points, eps=1.35):
+    if len(points)<3: return points
+    a=np.array(points[0],float); b=np.array(points[-1],float); v=b-a
+    arr=np.array(points,float)
+    if float(v@v)==0: d=np.linalg.norm(arr-a,axis=1)
+    else:
+        t=np.clip(((arr-a)@v)/(v@v),0,1)
+        d=np.linalg.norm(arr-(a+t[:,None]*v),axis=1)
+    i=int(np.argmax(d))
+    if d[i]<=eps: return [points[0],points[-1]]
+    return _rdp(points[:i+1],eps)[:-1]+_rdp(points[i:],eps)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr=np.asarray(image.convert("RGB"))
+    red=_mask_near(arr,(209,73,91),24)
+    green=_mask_near(arr,(35,139,87),24)
+    # Blue/cyan ink: blue channel dominates red and is moderately dark.
+    r,g,b=arr[:,:,0].astype(int),arr[:,:,1].astype(int),arr[:,:,2].astype(int)
+    blue=(b-r>35)&(b>95)&(r<75)&(g<145)
+    start, finish = _centroid(red), _centroid(green)
+    # The sampled route is monotone along its dominant axis. Reconstruct its
+    # centerline independently by taking the median blue coordinate in each
+    # successive raster slice. Ignore the endpoint-cap occlusion bands.
+    path=[]
+    missing_run=max_missing=0
+    if abs(finish[0]-start[0]) >= abs(finish[1]-start[1]):
+        for x in range(int(min(start[0],finish[0]))+8, int(max(start[0],finish[0]))-7):
+            ys=np.flatnonzero(blue[:,x])
+            if len(ys):
+                path.append((float(x),float(np.median(ys))))
+                missing_run=0
+            else:
+                missing_run+=1; max_missing=max(max_missing,missing_run)
+        if finish[0] < start[0]: path.reverse()
+    else:
+        for y in range(int(min(start[1],finish[1]))+8, int(max(start[1],finish[1]))-7):
+            xs=np.flatnonzero(blue[y,:])
+            if len(xs):
+                path.append((float(np.median(xs)),float(y)))
+                missing_run=0
+            else:
+                missing_run+=1; max_missing=max(max_missing,missing_run)
+        if finish[1] < start[1]: path.reverse()
+    if len(path)<20 or max_missing>3: raise ValueError("trail centerline missing")
+    clean=_rdp(path)
+    vote=0
+    for a,b,c in zip(clean,clean[1:],clean[2:]):
+        cross=(b[0]-a[0])*(c[1]-b[1])-(b[1]-a[1])*(c[0]-b[0])
+        if abs(cross)>10: vote += 1 if cross<0 else -1
+    if vote==0: raise ValueError("ambiguous bend vote")
+    return "left" if vote>0 else "right"

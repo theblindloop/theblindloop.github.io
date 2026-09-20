@@ -1,0 +1,159 @@
+"""Independent pixel-only inverse arm for the floor-clamped counter.
+
+Receives only the final PNG. From the raster alone it:
+  1. segments the leftmost panel frame and the three smaller arrow frames by
+     their gray border color and by frame height (start panel is tallest);
+  2. recovers the four tick levels as the four gray tick segments and reads the
+     START level from the orange-ringed dark marker's position against those
+     ticks;
+  3. reads each operator arrow by its fill color (green up-arrow = +1, red
+     down-arrow = -1) in left-to-right operator order;
+  4. replays the clamped steps (level = max(0, level + step)) from the marked
+     start and returns the final (never-drawn) level.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+BORDER = (200, 200, 200)
+INK = (0, 0, 0)
+TICK = (95, 95, 95)
+RING_MARK = (240, 150, 20)
+GREEN = (40, 170, 60)
+RED = (200, 45, 45)
+
+PALETTE = [BG, BORDER, INK, TICK, RING_MARK, GREEN, RED]
+_BG, _BRD, _INK, _TICK, _RING, _GREEN, _RED = range(7)
+
+OP_COUNT = 3
+LEVELS = 4
+START_MIN_HEIGHT = 150
+OP_MAX_HEIGHT = 150
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected panel/arrow structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points) -> tuple[int, int, int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _mean(points) -> tuple[int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return round(sum(xs) / len(points)), round(sum(ys) / len(points))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+    h, w = labels.shape
+
+    border_comps = [c for c in _components(labels == _BRD) if len(c) > 40]
+    if not border_comps:
+        raise UnreadableImageError("no panel frames found")
+    frames = [(*_bbox(c), len(c)) for c in border_comps]
+    frames.sort(key=lambda f: f[3], reverse=True)  # largest border component first
+    start_box = frames[0]
+    sx0, sy0, sx1, sy1, _ = start_box
+    if (sy1 - sy0) < START_MIN_HEIGHT:
+        raise UnreadableImageError("start panel too small")
+    op_frames = [
+        f for f in frames[1:]
+        if (f[3] - f[1]) < OP_MAX_HEIGHT and (f[2] - f[0]) > 60 and (f[3] - f[1]) > 60
+    ]
+    op_frames.sort(key=lambda f: f[0])
+    if len(op_frames) < OP_COUNT:
+        raise UnreadableImageError(f"found {len(op_frames)} arrow panels; expected {OP_COUNT}")
+
+    # Start level: nearest tick to the orange-ringed marker.
+    tick_mask = labels == _TICK
+    tick_ys = []
+    for comp in _components(tick_mask):
+        if len(comp) < 8:
+            continue
+        _, ty0, _, ty1 = _bbox(comp)
+        if ty1 - ty0 > 6:  # a horizontal tick line is ~3px tall
+            continue
+        tick_ys.append((ty0 + ty1) // 2)
+    ring_mask = labels == _RING
+    ring_comps = [c for c in _components(ring_mask) if len(c) > 10]
+    if not ring_comps:
+        raise UnreadableImageError("start marker ring not found")
+    rx, ry = _mean(max(ring_comps, key=len))
+    if len(tick_ys) < LEVELS:
+        raise UnreadableImageError("fewer than four tick levels found")
+    tick_ys = sorted(tick_ys)
+    nearest = min(range(LEVELS), key=lambda k: abs(tick_ys[k] - ry))
+    start = LEVELS - 1 - nearest  # ascending y maps to descending level
+
+    # Operators: dominant arrow color inside each panel.
+    ops = []
+    for fx0, fy0, fx1, fy1, _ in op_frames[:OP_COUNT]:
+        region = labels[
+            max(0, fy0) : min(h, fy1 + 1), max(0, fx0) : min(w, fx1 + 1)
+        ]
+        green = int((region == _GREEN).sum())
+        red = int((region == _RED).sum())
+        if green > red:
+            ops.append("up")
+        elif red > green:
+            ops.append("down")
+        else:
+            raise UnreadableImageError("ambiguous arrow operator")
+    if len(ops) < OP_COUNT:
+        raise UnreadableImageError("not enough operator arrows")
+
+    level = start
+    for op in ops:
+        step = 1 if op == "up" else -1
+        level = max(0, min(LEVELS - 1, level + step))
+    return str(level)

@@ -1,0 +1,446 @@
+"""Scene sampling, rendering and analytic gold for `severed_cord_bead_shares`.
+
+One black cord winds along a thin self-avoiding route inside a medium patch of
+the page. Exactly one visible gap is cut through the cord, so the cord falls
+into two black pieces; one piece ends at a green square, the other at a red
+square. Small orange squares are pressed against the side of the cord. An
+orange square belongs to whichever black piece it physically touches, which can
+only be decided by following the cord past every bend between the square and
+the gap. The decision compares how many touching orange squares the green
+piece carries against how many the red piece carries.
+
+Only black cord ink, the two anchor squares and orange squares that touch the
+black cord are decisive. Grey decoy cords, orange squares stuck to grey cords,
+free-floating orange squares and blue squares stuck to the black cord are
+decoration.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS = 1152
+GRID = 8
+CELL = CANVAS // GRID          # 144 -- one ablation window
+REGION = 5                     # decisive route lives in a 5x5 window of cells
+MAX_ROUTE_FILL = 0.42          # occupied share of the route's cell bounding box
+
+WHITE = (255, 255, 255)
+CORD = (16, 16, 16)
+BEAD = (255, 140, 0)
+GREEN = (0, 160, 0)
+RED = (208, 0, 0)
+GREY = (144, 144, 144)
+BLUE = (32, 80, 200)
+
+STROKE_CHOICES = (5, 6, 7)
+GAP_CHOICES = (5, 6, 7, 8)
+SIDE_CHOICES = (13, 15)
+ANCHOR = 30
+N_BEADS = 5
+BEAD_CLEAR = 34.0              # min arclength between decisive attach points
+END_CLEAR = 40.0               # min arclength from an attach point to a cord end
+CORNER_CLEAR = 26.0            # min arclength from an attach point to a bend
+GAP_CLEAR = 30.0               # min arclength from an attach point to the cut
+FLANK_CLEAR = 56.0             # max arclength of the square flanking each side of the cut
+QUARANTINE_MARGIN = 5.0
+
+DECISION_CLASSES = ("green_more", "red_more")
+# green-side square count out of N_BEADS, per decision class; the two sides
+# always differ by exactly one, so losing any single square is visible.
+_CLASS_SPLITS = {
+    "green_more": (3,),
+    "red_more": (2,),
+}
+
+
+# --------------------------------------------------------------------------
+# route sampling: an induced lattice path keeps the decisive support thin
+# --------------------------------------------------------------------------
+def _induced_path(rng: random.Random, length: int) -> list[tuple[int, int]] | None:
+    """Self-avoiding lattice walk in which no two non-consecutive nodes are
+    4-adjacent, so the covered ablation windows form a one-window-wide chain."""
+    start = (rng.randrange(REGION), rng.randrange(REGION))
+    path = [start]
+    for _ in range(length - 1):
+        y, x = path[-1]
+        steps = [(y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)]
+        rng.shuffle(steps)
+        placed = False
+        for ny, nx in steps:
+            if not (0 <= ny < REGION and 0 <= nx < REGION):
+                continue
+            bad = False
+            for i, (py, px) in enumerate(path):
+                touch = abs(py - ny) + abs(px - nx) <= 1
+                if touch and i != len(path) - 1:
+                    bad = True
+                    break
+            if bad:
+                continue
+            path.append((ny, nx))
+            placed = True
+            break
+        if not placed:
+            return None
+    return path
+
+
+def _polyline(path: list[tuple[int, int]], origin: tuple[int, int]) -> list[tuple[int, int]]:
+    oy, ox = origin
+    return [((oy + y) * CELL + CELL // 2, (ox + x) * CELL + CELL // 2) for y, x in path]
+
+
+def _lengths(points: list[tuple[int, int]]) -> list[float]:
+    out = []
+    for (y0, x0), (y1, x1) in zip(points, points[1:]):
+        out.append(float(abs(y1 - y0) + abs(x1 - x0)))
+    return out
+
+
+def _point_at(points: list[tuple[int, int]], t: float) -> tuple[float, float, int]:
+    """Position at arclength t plus the index of the segment carrying it."""
+    remaining = t
+    for index, seg in enumerate(_lengths(points)):
+        if remaining <= seg or index == len(points) - 2:
+            (y0, x0), (y1, x1) = points[index], points[index + 1]
+            frac = min(1.0, max(0.0, remaining / seg))
+            return (y0 + (y1 - y0) * frac, x0 + (x1 - x0) * frac, index)
+        remaining -= seg
+    raise AssertionError
+
+
+def _corner_ts(points: list[tuple[int, int]]) -> list[float]:
+    out, acc = [], 0.0
+    for seg in _lengths(points):
+        acc += seg
+        out.append(acc)
+    return out[:-1]
+
+
+def _sample_attachments(rng: random.Random, points: list[tuple[int, int]],
+                        gap_t: float, before: int, after: int) -> list[float] | None:
+    total = sum(_lengths(points))
+    corners = _corner_ts(points)
+
+    def ok(t: float, chosen: list[float]) -> bool:
+        if t < END_CLEAR or t > total - END_CLEAR:
+            return False
+        if abs(t - gap_t) < GAP_CLEAR:
+            return False
+        if any(abs(t - c) < CORNER_CLEAR for c in corners):
+            return False
+        return all(abs(t - other) >= BEAD_CLEAR for other in chosen)
+
+    chosen: list[float] = []
+    # one square flanks each side of the cut within FLANK_CLEAR, so every
+    # ablation window that reaches the cut also removes a counting square
+    for lo, hi in ((gap_t - FLANK_CLEAR, gap_t - GAP_CLEAR),
+                   (gap_t + GAP_CLEAR, gap_t + FLANK_CLEAR)):
+        for _ in range(200):
+            t = rng.uniform(lo, hi)
+            if ok(t, chosen):
+                chosen.append(t)
+                break
+        else:
+            return None
+    for count, lo, hi in ((before - 1, END_CLEAR, gap_t - GAP_CLEAR),
+                          (after - 1, gap_t + GAP_CLEAR, total - END_CLEAR)):
+        for _ in range(count):
+            for _ in range(200):
+                t = rng.uniform(lo, hi)
+                if ok(t, chosen):
+                    chosen.append(t)
+                    break
+            else:
+                return None
+    if len(chosen) != before + after:
+        return None
+    return chosen
+
+
+def _euclidean_side(points: list[tuple[int, int]], attach: float,
+                    green_end: int) -> str:
+    """Which anchor is closer in straight-line distance (the cheap heuristic)."""
+    y, x, _ = _point_at(points, attach)
+    ends = (points[0], points[-1])
+    d0 = (y - ends[0][0]) ** 2 + (x - ends[0][1]) ** 2
+    d1 = (y - ends[1][0]) ** 2 + (x - ends[1][1]) ** 2
+    near_end = 0 if d0 <= d1 else 1
+    return "green" if near_end == green_end else "red"
+
+
+def _true_side(gap_t: float, attach: float, green_end: int) -> str:
+    end = 0 if attach < gap_t else 1
+    return "green" if end == green_end else "red"
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    decision = DECISION_CLASSES[seed % 2]
+    tight = (seed % 9 == 4)
+    for _ in range(4000):
+        length = rng.randrange(8, 11)
+        path = _induced_path(rng, length)
+        if path is None:
+            continue
+        span_y = max(p[0] for p in path) - min(p[0] for p in path) + 1
+        span_x = max(p[1] for p in path) - min(p[1] for p in path) + 1
+        if min(span_y, span_x) < 4 or max(span_y, span_x) < REGION:
+            continue
+        # the route must stay a sparse thin chain of ablation windows, so the
+        # cells it occupies may fill no more than this share of their box
+        if len(path) / float(span_y * span_x) > MAX_ROUTE_FILL:
+            continue
+        norm = [(p[0] - min(q[0] for q in path), p[1] - min(q[1] for q in path))
+                for p in path]
+        origin = (rng.randrange(0, GRID - span_y + 1), rng.randrange(0, GRID - span_x + 1))
+        points = _polyline(norm, origin)
+        total = sum(_lengths(points))
+        green_end = rng.randrange(2)
+        green_beads = rng.choice(_CLASS_SPLITS[decision])
+        before = green_beads if green_end == 0 else N_BEADS - green_beads
+        gap_t = rng.uniform(0.32 * total, 0.68 * total)
+        corners = _corner_ts(points)
+        if any(abs(gap_t - c) < 34.0 for c in corners):
+            continue
+        if before < 1 or N_BEADS - before < 1:
+            continue
+        attach = _sample_attachments(rng, points, gap_t, before, N_BEADS - before)
+        if attach is None:
+            continue
+        # the straight-line heuristic must misplace at least two decisive
+        # squares, so nearest-anchor proximity cannot stand in for the route
+        fooled = sum(1 for t in attach
+                     if _euclidean_side(points, t, green_end)
+                     != _true_side(gap_t, t, green_end))
+        if fooled < 2:
+            continue
+        stroke = 4 if tight else rng.choice(STROKE_CHOICES)
+        gap = 4 if tight and rng.random() < 0.5 else rng.choice(GAP_CHOICES)
+        beads = [{"t": round(t, 3), "side_sign": rng.choice((-1, 1)),
+                  "size": rng.choice(SIDE_CHOICES)} for t in sorted(attach)]
+        scene = {
+            "canvas": CANVAS,
+            "route": [list(p) for p in norm],
+            "origin": list(origin),
+            "stroke": stroke,
+            "gap": gap,
+            "gap_t": round(gap_t, 3),
+            "green_end": green_end,
+            "beads": beads,
+            "blue_marks": _sample_blue(rng, points, gap_t, attach),
+            "decoys": _sample_decoys(rng, origin, span_y, span_x),
+            "tight": tight,
+        }
+        return scene
+    raise RuntimeError(f"failed to sample a scene for seed {seed}")
+
+
+def _sample_blue(rng: random.Random, points, gap_t: float, attach: list[float]) -> list[dict]:
+    """Blue squares pressed against the decisive cord; declared non-counting."""
+    total = sum(_lengths(points))
+    corners = _corner_ts(points)
+    out = []
+    for _ in range(rng.randrange(1, 4)):
+        for _ in range(120):
+            t = rng.uniform(END_CLEAR, total - END_CLEAR)
+            if abs(t - gap_t) < GAP_CLEAR:
+                continue
+            if any(abs(t - c) < CORNER_CLEAR for c in corners):
+                continue
+            if any(abs(t - other) < BEAD_CLEAR for other in attach + [d["t"] for d in out]):
+                continue
+            out.append({"t": round(t, 3), "side_sign": rng.choice((-1, 1)),
+                        "size": rng.choice(SIDE_CHOICES)})
+            break
+    return _canonical(out)
+
+
+def _sample_decoys(rng: random.Random, origin, span_y: int, span_x: int) -> list[dict]:
+    """Grey decoy cords with their own orange squares, plus loose orange squares."""
+    out = []
+    for _ in range(rng.randrange(2, 4)):
+        for _ in range(200):
+            cy = rng.randrange(GRID)
+            cx = rng.randrange(GRID)
+            if origin[0] - 1 <= cy <= origin[0] + span_y and \
+               origin[1] - 1 <= cx <= origin[1] + span_x:
+                continue
+            horizontal = rng.random() < 0.5
+            run = rng.randrange(1, 3)
+            if horizontal and cx + run >= GRID:
+                continue
+            if not horizontal and cy + run >= GRID:
+                continue
+            out.append({"kind": "grey_cord", "cell": [cy, cx], "horizontal": horizontal,
+                        "run": run, "beads": rng.randrange(1, 3),
+                        "stroke": rng.choice(STROKE_CHOICES),
+                        "size": rng.choice(SIDE_CHOICES)})
+            break
+    for _ in range(rng.randrange(2, 5)):
+        for _ in range(200):
+            cy = rng.randrange(GRID)
+            cx = rng.randrange(GRID)
+            if origin[0] - 1 <= cy <= origin[0] + span_y and \
+               origin[1] - 1 <= cx <= origin[1] + span_x:
+                continue
+            out.append({"kind": "loose_bead", "cell": [cy, cx],
+                        "size": rng.choice(SIDE_CHOICES),
+                        "jitter": [rng.randrange(-30, 31), rng.randrange(-30, 31)]})
+            break
+    return _canonical(out)
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _canonical(items: list[dict]) -> list[dict]:
+    """Total order on a latent list, so list order can never touch the raster."""
+    return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+
+
+def _cord_points(scene: dict) -> list[tuple[int, int]]:
+    route = [(int(p[0]), int(p[1])) for p in scene["route"]]
+    return _polyline(route, (int(scene["origin"][0]), int(scene["origin"][1])))
+
+
+def _square(draw: ImageDraw.ImageDraw, cy: float, cx: float, size: int, color) -> None:
+    half = size // 2
+    draw.rectangle([int(round(cx - half)), int(round(cy - half)),
+                    int(round(cx - half)) + size - 1, int(round(cy - half)) + size - 1],
+                   fill=color)
+
+
+def _attach_center(points, t: float, stroke: int, size: int, sign: int) -> tuple[float, float]:
+    y, x, index = _point_at(points, t)
+    (y0, x0), (y1, x1) = points[index], points[index + 1]
+    if y0 == y1:                     # horizontal segment -> offset vertically
+        return (y + sign * (stroke / 2.0 + size / 2.0 - 1.0), x)
+    return (y, x + sign * (stroke / 2.0 + size / 2.0 - 1.0))
+
+
+def _draw_cord(draw: ImageDraw.ImageDraw, points, stroke: int, color) -> None:
+    half = stroke // 2
+    for (y0, x0), (y1, x1) in zip(points, points[1:]):
+        ya, yb = sorted((y0, y1))
+        xa, xb = sorted((x0, x1))
+        draw.rectangle([xa - half, ya - half, xb + (stroke - 1 - half),
+                        yb + (stroke - 1 - half)], fill=color)
+
+
+def render(scene: dict) -> Image.Image:
+    canvas = int(scene["canvas"])
+    image = Image.new("RGB", (canvas, canvas), WHITE)
+    draw = ImageDraw.Draw(image)
+    points = _cord_points(scene)
+    stroke = int(scene["stroke"])
+
+    # decoration first: grey cords, their orange squares, loose orange squares
+    for decoy in _canonical(scene["decoys"]):
+        cy = decoy["cell"][0] * CELL + CELL // 2
+        cx = decoy["cell"][1] * CELL + CELL // 2
+        if decoy["kind"] == "grey_cord":
+            run = int(decoy["run"])
+            end = (cy, cx + run * CELL) if decoy["horizontal"] else (cy + run * CELL, cx)
+            _draw_cord(draw, [(cy, cx), end], int(decoy["stroke"]), GREY)
+            for k in range(int(decoy["beads"])):
+                frac = (k + 1) / (int(decoy["beads"]) + 1)
+                by = cy + (end[0] - cy) * frac
+                bx = cx + (end[1] - cx) * frac
+                size = int(decoy["size"])
+                off = int(decoy["stroke"]) / 2.0 + size / 2.0 - 1.0
+                if decoy["horizontal"]:
+                    _square(draw, by + off, bx, size, BEAD)
+                else:
+                    _square(draw, by, bx + off, size, BEAD)
+        else:
+            _square(draw, cy + decoy["jitter"][0], cx + decoy["jitter"][1],
+                    int(decoy["size"]), BEAD)
+
+    # decisive orange squares and the non-counting blue squares, under the cord
+    for mark in _canonical(scene["beads"]):
+        cy, cx = _attach_center(points, float(mark["t"]), stroke, int(mark["size"]),
+                                int(mark["side_sign"]))
+        _square(draw, cy, cx, int(mark["size"]), BEAD)
+    for mark in _canonical(scene["blue_marks"]):
+        cy, cx = _attach_center(points, float(mark["t"]), stroke, int(mark["size"]),
+                               int(mark["side_sign"]))
+        _square(draw, cy, cx, int(mark["size"]), BLUE)
+
+    _draw_cord(draw, points, stroke, CORD)
+
+    # the single visible cut, in background colour, across the cord
+    gap = int(scene["gap"])
+    gy, gx, index = _point_at(points, float(scene["gap_t"]))
+    (y0, x0), (y1, x1) = points[index], points[index + 1]
+    reach = stroke // 2 + 2
+    if y0 == y1:
+        draw.rectangle([int(round(gx)) - gap // 2, gy - reach,
+                        int(round(gx)) - gap // 2 + gap - 1, gy + reach], fill=WHITE)
+    else:
+        draw.rectangle([gx - reach, int(round(gy)) - gap // 2,
+                        gx + reach, int(round(gy)) - gap // 2 + gap - 1], fill=WHITE)
+
+    # anchors last, covering each cord end
+    ends = (points[0], points[-1])
+    green_end = int(scene["green_end"])
+    _square(draw, ends[green_end][0], ends[green_end][1], ANCHOR, GREEN)
+    _square(draw, ends[1 - green_end][0], ends[1 - green_end][1], ANCHOR, RED)
+    return image
+
+
+# --------------------------------------------------------------------------
+# analytic gold, margin, quarantine, symmetries
+# --------------------------------------------------------------------------
+def _split_counts(scene: dict) -> tuple[int, int]:
+    gap_t = float(scene["gap_t"])
+    green_end = int(scene["green_end"])
+    green = sum(1 for b in scene["beads"]
+                if _true_side(gap_t, float(b["t"]), green_end) == "green")
+    return green, len(scene["beads"]) - green
+
+
+def analytic_gold(scene: dict) -> str:
+    green, red = _split_counts(scene)
+    return "green_more" if green > red else "red_more"
+
+
+def margin(scene: dict) -> float:
+    smallest_bead = min(int(b["size"]) for b in scene["beads"])
+    gap = int(scene["gap"])
+    clearance = min(abs(float(b["t"]) - float(scene["gap_t"])) - int(b["size"]) / 2.0
+                    - gap / 2.0 for b in scene["beads"])
+    return float(min(int(scene["stroke"]), gap, smallest_bead - 2, int(clearance)))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def nearest_anchor_heuristic(scene: dict) -> str:
+    """Diagnostic: the answer a straight-line-distance shortcut would give."""
+    points = _cord_points(scene)
+    green_end = int(scene["green_end"])
+    green = sum(1 for b in scene["beads"]
+                if _euclidean_side(points, float(b["t"]), green_end) == "green")
+    red = len(scene["beads"]) - green
+    if green == red:
+        return "tie"
+    return "green_more" if green > red else "red_more"
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical, gold-preserving relabelings of the latent scene."""
+    out: list[tuple[str, dict]] = []
+    rotated = dict(scene)
+    rotated["beads"] = scene["beads"][1:] + scene["beads"][:1]
+    out.append(("decisive_square_list_rotation", rotated))
+    reversed_decor = dict(scene)
+    reversed_decor["decoys"] = list(reversed(scene["decoys"]))
+    reversed_decor["blue_marks"] = list(reversed(scene["blue_marks"]))
+    out.append(("decoration_list_reversal", reversed_decor))
+    return out

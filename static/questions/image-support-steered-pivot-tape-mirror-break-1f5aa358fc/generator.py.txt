@@ -1,0 +1,275 @@
+"""Pivot-tape mirror-break world.
+
+One narrow tape lies somewhere on a decorated board. A black diamond marks the
+tape's exact middle and a solid arrow tip marks one of its two ends. The marks
+on either side of the diamond are related by a reflection through it: the mark
+at step ``d`` on one side has the same colour as the mark at step ``d`` on the
+other side -- for every ``d`` except exactly one, where the reflection is
+broken. The answer is the colour of the broken pair's mark on the arrow-tip
+side of the diamond.
+
+Latent state z = (canvas, tape placement and orientation, arrow end, pair
+colours, broken step, broken colour, decoration marks). Everything in z is
+drawn. The analytic label reads only ``pairs``, ``break_step``,
+``break_colour``; the arrow end and orientation only decide which of the two
+broken marks is asked for, and both are rendered.
+
+Counting cannot answer the question. The broken step's own colour occurs in
+exactly two pairs and the replacement colour occurs in exactly one other pair,
+so after the break both mismatching colours occur exactly three times and every
+other used colour an even number of times: colour frequency isolates the broken
+pair but never says which of its two marks lies on the arrow side.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "pivot_tape_mirror_break-0.1.0"
+
+# ---------------------------------------------------------------- contract ---
+# Public question-contract constants. The pixel-only inverse arm is allowed to
+# know these (they are stated in the prompt or are fixed page furniture); it is
+# not allowed to know any scene field.
+CANVAS = 1000
+BOARD = (240, 238, 232)
+TAPE_FILL = (252, 250, 244)
+FRAME = (32, 64, 128)
+PIVOT_INK = (0, 0, 0)
+
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (214, 42, 42),
+    "orange": (232, 124, 26),
+    "yellow": (236, 204, 40),
+    "green": (34, 150, 60),
+    "blue": (40, 84, 208),
+    "purple": (136, 52, 176),
+}
+COLOUR_NAMES: tuple[str, ...] = tuple(PALETTE)
+
+CELL = 18          # centre-to-centre step along the tape
+MARK = 12          # side of a colour mark square
+PIVOT = 11         # diagonal of the black pivot diamond
+TAPE_HALF = 11     # half height of the tape band (band height 22)
+END_PAD = 5        # cream visible beyond the outermost mark centre... + CELL/2
+FRAME_W = 3
+ARROW_LEN = 14     # solid triangle beyond the head end of the tape
+DECOR_CLEAR = 26   # keep decoration this far from the tape bounding box
+
+# A broken pair whose two colours are closer than this in RGB is a
+# near-boundary stimulus: the mismatch is present but faint at this size.
+QUARANTINE_MARGIN = 90.0
+
+
+def _rgb_dist(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    return math.dist(a, b)
+
+
+# ------------------------------------------------------------------ sample ---
+def _pair_colours(rng: random.Random, k: int, target: str) -> tuple[list[str], int, str]:
+    """Sample pair colours, a broken step and the answer colour ``target``.
+
+    Constraints, all of which the question text declares as "counting cannot
+    tell you the answer":
+
+    * the broken step's colour occurs in exactly two of the ``k`` pairs;
+    * ``target`` occurs in exactly one of the ``k`` pairs and differs from it.
+
+    So on the rendered tape both mismatching colours occur three times.
+    """
+    step = rng.randrange(k)          # broken step drawn uniformly, before colours
+    for _ in range(4000):
+        pairs = [rng.choice(COLOUR_NAMES) for _ in range(k)]
+        counts = {c: pairs.count(c) for c in set(pairs)}
+        if counts.get(target, 0) != 1:
+            continue
+        if pairs[step] == target or counts[pairs[step]] != 2:
+            continue
+        return pairs, step, target
+    raise RuntimeError(f"could not sample pair colours for target {target!r}")
+
+
+def _decor(rng: random.Random, keepout: tuple[int, int, int, int]) -> list[dict]:
+    """Non-overlapping decoration marks that avoid the tape's keep-out box."""
+    x0, y0, x1, y1 = keepout
+    boxes: list[tuple[int, int, int, int]] = []
+    marks: list[dict] = []
+    want = rng.randint(46, 60)
+    for _ in range(6000):
+        if len(marks) >= want:
+            break
+        kind = rng.choice(["dot", "ring", "square", "bar", "stud"])
+        colour = FRAME if kind == "stud" else PALETTE[rng.choice(COLOUR_NAMES)]
+        if kind in ("dot", "ring"):
+            w = h = rng.randint(11, 19)
+        elif kind == "stud":
+            w = h = rng.randint(7, 10)
+        elif kind == "square":
+            w = h = rng.randint(11, 17)
+        else:
+            w, h = rng.randint(20, 32), rng.randint(6, 9)
+            if rng.random() < 0.5:
+                w, h = h, w
+        cx = rng.randint(12, CANVAS - 12 - w)
+        cy = rng.randint(12, CANVAS - 12 - h)
+        box = (cx, cy, cx + w, cy + h)
+        if box[0] < x1 and box[2] > x0 and box[1] < y1 and box[3] > y0:
+            continue
+        if any(box[0] < b[2] + 4 and box[2] + 4 > b[0] and box[1] < b[3] + 4 and box[3] + 4 > b[1]
+               for b in boxes):
+            continue
+        boxes.append(box)
+        marks.append({"kind": kind, "box": list(box), "colour": list(colour)})
+    if len(marks) < 34:
+        raise RuntimeError("decoration sampler starved")
+    return marks
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one scene. The answer colour is cycled by seed for balance."""
+    rng = random.Random(seed * 7919 + 13)
+    target = COLOUR_NAMES[seed % len(COLOUR_NAMES)]
+    k = rng.choice([4, 5])
+    pairs, step, break_colour = _pair_colours(rng, k, target)
+
+    n_cells = 2 * k + 1
+    length = n_cells * CELL + 2 * END_PAD
+    vertical = rng.random() < 0.5
+    head_positive = rng.random() < 0.5   # head (arrow) at +u end of the tape
+
+    half_l, half_w = length // 2, TAPE_HALF
+    lo, hi = 40 + half_l + ARROW_LEN, CANVAS - 40 - half_l - ARROW_LEN
+    cu = rng.randint(lo, hi)
+    cv = rng.randint(40 + half_w, CANVAS - 40 - half_w)
+    cx, cy = (cv, cu) if vertical else (cu, cv)
+
+    if vertical:
+        keep = (cx - half_w - DECOR_CLEAR, cy - half_l - ARROW_LEN - DECOR_CLEAR,
+                cx + half_w + DECOR_CLEAR, cy + half_l + ARROW_LEN + DECOR_CLEAR)
+    else:
+        keep = (cx - half_l - ARROW_LEN - DECOR_CLEAR, cy - half_w - DECOR_CLEAR,
+                cx + half_l + ARROW_LEN + DECOR_CLEAR, cy + half_w + DECOR_CLEAR)
+
+    return {
+        "canvas": CANVAS,
+        "centre": [cx, cy],
+        "vertical": vertical,
+        "head_positive": head_positive,
+        "k": k,
+        "pairs": pairs,
+        "break_step": step,
+        "break_colour": break_colour,
+        "decor": _decor(rng, keep),
+    }
+
+
+# -------------------------------------------------------------------- gold ---
+def _mark_colour(scene: dict, signed_step: int) -> str:
+    """Colour name at signed step s (s>0 is the arrow-tip side of the pivot)."""
+    d = abs(signed_step)
+    name = scene["pairs"][d - 1]
+    if signed_step > 0 and d - 1 == scene["break_step"]:
+        return scene["break_colour"]
+    return name
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour of the broken pair's mark on the arrow-tip side of the pivot."""
+    return scene["break_colour"]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin, in RGB units.
+
+    Hypothesis space = which step ``d`` breaks the reflection. The score of a
+    step is the RGB distance between its two marks; the true step scores the
+    distance between the broken pair's colours and every other step scores 0.
+    """
+    broken = PALETTE[scene["pairs"][scene["break_step"]]]
+    replacement = PALETTE[scene["break_colour"]]
+    return float(_rgb_dist(broken, replacement))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical latent aliases that must preserve the answer.
+
+    Decoration marks never overlap each other and never touch the tape, so the
+    raster does not depend on the order they are stored in; only the set does.
+    Two nontrivial re-orderings are declared and exercised. No other alias
+    exists: the tape placement, orientation, arrow end, every pair colour, the
+    broken step and the broken colour are all drawn into the picture.
+    """
+    out: list[tuple[str, dict]] = []
+    if len(scene["decor"]) > 1:
+        rev = dict(scene)
+        rev["decor"] = list(reversed(scene["decor"]))
+        out.append(("decor_order_reversed", rev))
+        rot = dict(scene)
+        half = len(scene["decor"]) // 2
+        rot["decor"] = scene["decor"][half:] + scene["decor"][:half]
+        out.append(("decor_order_rotated", rot))
+    return out
+
+
+# ------------------------------------------------------------------ render ---
+def _draw_decor(draw: ImageDraw.ImageDraw, marks: list[dict]) -> None:
+    for m in marks:
+        box = tuple(m["box"])
+        colour = tuple(m["colour"])
+        if m["kind"] == "dot" or m["kind"] == "stud":
+            draw.ellipse(box, fill=colour)
+        elif m["kind"] == "ring":
+            draw.ellipse(box, outline=colour, width=3)
+        else:
+            draw.rectangle(box, fill=colour)
+
+
+def render(scene: dict) -> Image.Image:
+    n = scene["canvas"]
+    img = Image.new("RGB", (n, n), BOARD)
+    draw = ImageDraw.Draw(img)
+    _draw_decor(draw, scene["decor"])
+
+    k = scene["k"]
+    cx, cy = scene["centre"]
+    half_l = ((2 * k + 1) * CELL + 2 * END_PAD) // 2
+    sign = 1 if scene["head_positive"] else -1
+
+    def pt(u: int, v: int) -> tuple[int, int]:
+        """(along-tape, across-tape) offset from the centre -> pixel."""
+        return (cx + v, cy + u) if scene["vertical"] else (cx + u, cy + v)
+
+    # solid arrow tip beyond the head end
+    tip = sign * (half_l + ARROW_LEN)
+    base = sign * half_l
+    draw.polygon(
+        [pt(base, -TAPE_HALF), pt(base, TAPE_HALF), pt(tip, 0)], fill=FRAME
+    )
+    # tape band
+    a, b = pt(-half_l, -TAPE_HALF), pt(half_l, TAPE_HALF)
+    box = (min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1]))
+    draw.rectangle(box, fill=TAPE_FILL, outline=FRAME, width=FRAME_W)
+
+    # pivot diamond at the exact middle
+    h = PIVOT // 2
+    draw.polygon([pt(-h, 0), pt(0, -h), pt(h, 0), pt(0, h)], fill=PIVOT_INK)
+
+    # colour marks, signed step s = -k..k excluding 0
+    for s in range(-k, k + 1):
+        if s == 0:
+            continue
+        u = sign * s * CELL
+        colour = PALETTE[_mark_colour(scene, s)]
+        p, q = pt(u - MARK // 2, -(MARK // 2)), pt(u + MARK // 2, MARK // 2)
+        draw.rectangle(
+            (min(p[0], q[0]), min(p[1], q[1]), max(p[0], q[0]), max(p[1], q[1])),
+            fill=colour,
+        )
+    return img

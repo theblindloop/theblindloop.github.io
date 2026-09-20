@@ -1,0 +1,111 @@
+"""Independent pixel-only inverse for arrow-to-bullseye alignment."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "arrow_target_alignment-oracle-0.1.0"
+
+
+def _largest_component(points: np.ndarray) -> np.ndarray:
+    """Keep the largest 8-connected dark component, dropping resampling specks."""
+
+    coordinates = {(int(point[0]), int(point[1])) for point in points}
+    best: list[tuple[int, int]] = []
+    while coordinates:
+        start = coordinates.pop()
+        stack = [start]
+        component = [start]
+        while stack:
+            x, y = stack.pop()
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if not dx and not dy:
+                        continue
+                    neighbour = (x + dx, y + dy)
+                    if neighbour in coordinates:
+                        coordinates.remove(neighbour)
+                        stack.append(neighbour)
+                        component.append(neighbour)
+        if len(component) > len(best):
+            best = component
+    return np.asarray(best, dtype=np.float64)
+
+
+def _target_centroid(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    spread = array.max(axis=2) - array.min(axis=2)
+    # The target is the only strongly chromatic painted region. The pale card,
+    # gray shaft, and charcoal head are intentionally below this threshold.
+    mask = spread > 48
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 500:
+        raise ValueError("bullseye colour region is not measurable")
+    return np.array([float(xs.mean()), float(ys.mean())], dtype=np.float64)
+
+
+def _head_geometry(image: Image.Image) -> tuple[np.ndarray, np.ndarray, float]:
+    array = np.asarray(image.convert("RGB"), dtype=np.float64)
+    luminance = array.mean(axis=2)
+    # Only the filled triangular head is this dark. The shaft is intentionally
+    # mid-tone, so a separate object is recovered from the final raster.
+    mask = luminance < 92.0
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 300:
+        raise ValueError("arrowhead is not measurable")
+    points = _largest_component(np.column_stack((xs.astype(np.float64), ys.astype(np.float64))))
+    if len(points) < 300:
+        raise ValueError("arrowhead component is not measurable")
+    centroid = points.mean(axis=0)
+    centered = points - centroid
+    covariance = centered.T @ centered / max(1, len(points) - 1)
+    values, vectors = np.linalg.eigh(covariance)
+    axis = vectors[:, int(np.argmax(values))]
+    axis /= np.linalg.norm(axis)
+    projection = centered @ axis
+    lo = float(projection.min())
+    hi = float(projection.max())
+    span = hi - lo
+    if span < 12.0:
+        raise ValueError("arrowhead has insufficient extent")
+    band = max(5.0, min(11.0, span * 0.14))
+    low_count = int(np.count_nonzero(projection <= lo + band))
+    high_count = int(np.count_nonzero(projection >= hi - band))
+    # A filled triangular head is broad at its base and narrow at its tip.
+    if high_count <= low_count:
+        direction = axis
+    else:
+        direction = -axis
+    direction /= np.linalg.norm(direction)
+
+    # Recompute the signed projection after orienting it from base to tip.
+    signed = centered @ direction
+    tip_band = signed >= float(signed.max()) - band
+    base_band = signed <= float(signed.min()) + band
+    tip = points[tip_band].mean(axis=0)
+    base = points[base_band].mean(axis=0)
+    axis_length = float(signed.max() - signed.min())
+    perpendicular = np.abs(centered[:, 0] * direction[1] - centered[:, 1] * direction[0])
+    half_width = float(np.percentile(perpendicular, 99.0))
+    half_angle = math.atan2(max(1.0, half_width), max(1.0, axis_length))
+    # The tip is used as the origin for the target ray; averaging the tiny tip
+    # band is substantially more stable than using a single antialiased pixel.
+    return tip, direction, half_angle
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Measure the target center's angle against the recovered head cone."""
+
+    target = _target_centroid(image)
+    tip, direction, half_angle = _head_geometry(image)
+    vector = target - tip
+    distance = float(np.linalg.norm(vector))
+    if distance < 20.0:
+        raise ValueError("bullseye is too close to arrowhead")
+    cosine = float(np.dot(vector, direction) / distance)
+    cosine = max(-1.0, min(1.0, cosine))
+    target_angle = math.acos(cosine)
+    return "yes" if target_angle <= half_angle else "no"

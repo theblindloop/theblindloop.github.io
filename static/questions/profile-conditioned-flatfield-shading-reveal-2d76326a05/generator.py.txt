@@ -1,0 +1,290 @@
+"""Renderer for the flat-field shading reveal world.
+
+A 5x5 panel of flat grey cells is printed in exactly two ink tones, but the
+sheet is lit unevenly: every cell of the array is multiplied by a separable
+illumination gain, so the *printed* tone of a cell and its *photographed*
+brightness are different quantities.  A blank paper strip along two edges of
+the array records the lighting itself, which makes the declared correction --
+divide each cell by (its column strip value times its row strip value divided
+by the corner value) -- fully determined by the raster.  The scenes are
+sampled so that reading brightness without the correction names a different
+symbol from the closed set.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "flatfield_shading_reveal-renderer-0.1.0"
+
+GRID = 5
+DARK_CELLS_PER_SYMBOL = 9
+
+# Every template marks exactly nine of the twenty-five panel cells, so the
+# number of dark cells, the total printed ink and the number of light cells are
+# constant across the six answers and can never be a shortcut cue.
+_TEMPLATE_ROWS: dict[str, tuple[str, ...]] = {
+    "plus": ("..X..", "..X..", "XXXXX", "..X..", "..X.."),
+    "ex": ("X...X", ".X.X.", "..X..", ".X.X.", "X...X"),
+    "tee": ("XXXXX", "..X..", "..X..", "..X..", "..X.."),
+    "vee": ("X...X", "X...X", ".X.X.", ".X.X.", "..X.."),
+    "eff": ("XXX..", "X....", "XXX..", "X....", "X...."),
+    "zee": ("XXXXX", "...X.", "..X..", ".X...", "X...."),
+}
+
+SYMBOL_NAMES: tuple[str, ...] = tuple(sorted(_TEMPLATE_ROWS))
+
+
+def _template(name: str) -> frozenset[tuple[int, int]]:
+    rows = _TEMPLATE_ROWS[name]
+    return frozenset(
+        (r, c) for r, row in enumerate(rows) for c, ch in enumerate(row) if ch == "X"
+    )
+
+
+TEMPLATES: dict[str, frozenset[tuple[int, int]]] = {
+    name: _template(name) for name in SYMBOL_NAMES
+}
+
+for _name, _cells in TEMPLATES.items():
+    if len(_cells) != DARK_CELLS_PER_SYMBOL:
+        raise AssertionError(f"template {_name} does not carry nine cells")
+
+SIZE = 588
+FRAME_W = 8
+ARRAY = GRID + 1  # one blank calibration row and one blank calibration column
+
+# The two printed reflectances.  Their ratio (about 1.9) is deliberately
+# smaller than the illumination span, so brightness alone cannot order cells.
+DARK_TONE = 0.40
+LIGHT_TONE = 0.77
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _gains(rng, log_span: float, share: float) -> tuple[list[float], list[float]]:
+    """A separable, deliberately non-monotone lighting field of fixed span.
+
+    The column and row factors are drawn independently and are not ordered, so
+    a bright strip can sit next to a dim one: that is what stops raw
+    brightness from being a usable proxy for printed tone.
+    """
+    out: list[list[float]] = []
+    for target in (log_span * share, log_span * (1.0 - share)):
+        while True:
+            u = rng.rand(ARRAY)
+            spread = float(u.max() - u.min())
+            if spread > 0.25:
+                break
+        u = (u - float(u.mean())) * (target / spread)
+        out.append([float(np.exp(v)) for v in u])
+    return out[0], out[1]
+
+
+def _dark_set_from(scene_cells) -> frozenset[tuple[int, int]]:
+    return frozenset((int(r), int(c)) for r, c in scene_cells)
+
+
+def _perturbed(rng, symbol: str, swaps: int) -> frozenset[tuple[int, int]]:
+    """Ink-preserving cell swaps; exact ties are rejected and never printed."""
+    base = TEMPLATES[symbol]
+    for _ in range(24):
+        trial = set(base)
+        for _ in range(swaps):
+            on_list = sorted(trial)
+            off_list = [
+                (r, c) for r in range(GRID) for c in range(GRID) if (r, c) not in trial
+            ]
+            trial.discard(on_list[int(rng.randint(len(on_list)))])
+            trial.add(off_list[int(rng.randint(len(off_list)))])
+        ordered = sorted(len(trial ^ TEMPLATES[n]) for n in SYMBOL_NAMES)
+        if ordered[1] > ordered[0]:
+            return frozenset(trial)
+    return base
+
+
+def sample_scene(seed: int) -> dict:
+    rng = np.random.RandomState(int(seed) % (2 ** 31))
+    symbol = SYMBOL_NAMES[int(rng.randint(len(SYMBOL_NAMES)))]
+    cells = _perturbed(rng, symbol, int(rng.randint(0, 3)))
+    dark_cells = [[int(r), int(c)] for r, c in sorted(cells)]
+
+    cell = int([76, 82, 88][int(rng.randint(3))])
+    span = cell * ARRAY
+    slack = SIZE - span - 2 * (FRAME_W + 5)
+    ox = int(FRAME_W + 5 + rng.randint(0, max(1, slack)))
+    oy = int(FRAME_W + 5 + rng.randint(0, max(1, slack)))
+
+    scene = {
+        "dark_cells": dark_cells,
+        "cell": cell,
+        "ox": ox,
+        "oy": oy,
+        "size": SIZE,
+        "rotation": int(rng.randint(4)),
+        "white": 0.0,
+        "gain_x": [],
+        "gain_y": [],
+        "bg": [int(rng.randint(236, 250))] * 3,
+        "frame": [
+            int(rng.randint(0, 40)),
+            int(rng.randint(40, 96)),
+            int(rng.randint(154, 214)),
+        ],
+        "key": [
+            int(rng.randint(212, 246)),
+            int(rng.randint(104, 150)),
+            int(rng.randint(0, 44)),
+        ],
+    }
+
+    # Draw a lighting field whose span exceeds the printed tone ratio, and keep
+    # only fields under which the *uncorrected* brightness reading names some
+    # other symbol of the closed set.  That rejection is what makes the
+    # declared correction load-bearing rather than decorative.
+    for _ in range(120):
+        log_span = float(np.log(2.15 + 0.60 * float(rng.rand())))
+        share = 0.35 + 0.30 * float(rng.rand())
+        gx, gy = _gains(rng, log_span, share)
+        peak = max(x * y for x in gx for y in gy)
+        white = 250.0 / peak
+        scene["white"] = float(white)
+        scene["gain_x"] = [float(v) for v in gx]
+        scene["gain_y"] = [float(v) for v in gy]
+        if naive_decoy_symbol(scene) != analytic_gold(scene):
+            break
+    return scene
+
+
+# --------------------------------------------------------------------------
+# photometry
+# --------------------------------------------------------------------------
+def _levels(scene: dict) -> np.ndarray:
+    """Rendered 8-bit level of every cell of the (GRID+1)x(GRID+1) array."""
+    gx = [float(v) for v in scene["gain_x"]]
+    gy = [float(v) for v in scene["gain_y"]]
+    white = float(scene["white"])
+    dark = _dark_set_from(scene["dark_cells"])
+    out = np.zeros((ARRAY, ARRAY), dtype=np.float64)
+    for r in range(ARRAY):
+        for c in range(ARRAY):
+            if r == 0 or c == 0:
+                tone = 1.0
+            elif (r - 1, c - 1) in dark:
+                tone = DARK_TONE
+            else:
+                tone = LIGHT_TONE
+            value = white * tone * gx[c] * gy[r]
+            out[r, c] = float(min(255.0, max(0.0, round(value))))
+    return out
+
+
+def _blank_levels(scene: dict) -> np.ndarray:
+    """Level a blank sheet would show at every cell of the array."""
+    gx = [float(v) for v in scene["gain_x"]]
+    gy = [float(v) for v in scene["gain_y"]]
+    white = float(scene["white"])
+    return np.array(
+        [[white * gx[c] * gy[r] for c in range(ARRAY)] for r in range(ARRAY)],
+        dtype=np.float64,
+    )
+
+
+# --------------------------------------------------------------------------
+# rasterisation
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    size = int(scene["size"])
+    cell = int(scene["cell"])
+    ox, oy = int(scene["ox"]), int(scene["oy"])
+    span = cell * ARRAY
+
+    canvas = np.zeros((size, size, 3), dtype=np.uint8)
+    canvas[:, :] = np.array(scene["bg"], dtype=np.uint8)
+
+    fw = FRAME_W
+    canvas[oy - fw : oy + span + fw, ox - fw : ox + span + fw] = np.array(
+        scene["frame"], dtype=np.uint8
+    )
+
+    levels = _levels(scene)
+    for r in range(ARRAY):
+        for c in range(ARRAY):
+            value = np.uint8(levels[r, c])
+            y0, x0 = oy + r * cell, ox + c * cell
+            canvas[y0 : y0 + cell, x0 : x0 + cell] = value
+
+    # Key mark: an orange square inside the corner reference cell.  It is the
+    # only fiducial that tells the two blank strips from the printed panel.
+    side = max(8, cell // 4)
+    pad = (cell - side) // 2
+    canvas[oy + pad : oy + pad + side, ox + pad : ox + pad + side] = np.array(
+        scene["key"], dtype=np.uint8
+    )
+
+    k = int(scene["rotation"]) % 4
+    if k:
+        canvas = np.ascontiguousarray(np.rot90(canvas, k))
+    return Image.fromarray(canvas, mode="RGB")
+
+
+# --------------------------------------------------------------------------
+# analytic gold
+# --------------------------------------------------------------------------
+def _nearest(cells: frozenset) -> tuple[str, int, int]:
+    ranked = sorted((len(cells ^ TEMPLATES[n]), n) for n in SYMBOL_NAMES)
+    return str(ranked[0][1]), int(ranked[0][0]), int(ranked[1][0])
+
+
+def analytic_gold(scene: dict) -> str:
+    return _nearest(_dark_set_from(scene["dark_cells"]))[0]
+
+
+def naive_decoy_symbol(scene: dict) -> str:
+    """Diagnostic: which symbol raw brightness names when correction is skipped."""
+    levels = _levels(scene)[1:, 1:]
+    order = sorted(
+        ((float(levels[r, c]), r, c) for r in range(GRID) for c in range(GRID))
+    )
+    guess = frozenset((r, c) for _, r, c in order[:DARK_CELLS_PER_SYMBOL])
+    return _nearest(guess)[0]
+
+
+def tone_gap(scene: dict) -> float:
+    """Smallest grey-level distance between the two printed tones in the panel."""
+    blank = _blank_levels(scene)[1:, 1:]
+    return float(float(blank.min()) * (LIGHT_TONE - DARK_TONE))
+
+
+def margin(scene: dict) -> float:
+    _, best, runner = _nearest(_dark_set_from(scene["dark_cells"]))
+    return float(round(0.5 * tone_gap(scene) * (runner - best), 6))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < 60.0 or tone_gap(scene) < 30.0)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical rewrites of the latent scene."""
+    twins: list[tuple[str, dict]] = []
+
+    reversed_cells = dict(scene)
+    reversed_cells["dark_cells"] = list(reversed(scene["dark_cells"]))
+    twins.append(("reversed_dark_cell_order", reversed_cells))
+
+    duplicated = dict(scene)
+    duplicated["dark_cells"] = list(scene["dark_cells"]) + [list(scene["dark_cells"][0])]
+    twins.append(("duplicated_dark_cell", duplicated))
+
+    # The raster depends on the separable gain only through its product, and a
+    # factor of two is exact in binary floating point, so trading gain between
+    # the two axes is a genuine pixel-identical alias of the lighting field.
+    traded = dict(scene)
+    traded["gain_x"] = [float(v) * 2.0 for v in scene["gain_x"]]
+    traded["gain_y"] = [float(v) / 2.0 for v in scene["gain_y"]]
+    twins.append(("gain_axis_trade", traded))
+
+    return twins

@@ -1,0 +1,189 @@
+"""Independent image-only inverse arm for clock_cardinal_order.
+
+The oracle segments only near-neutral dark ink. It groups connected glyph
+components into four visible labels, decodes 3/6/9 by enclosed-hole topology
+and 12 by its two glyph components, then binds decoded labels to cardinal slots.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+class OracleError(ValueError):
+    pass
+
+
+@dataclass
+class Component:
+    pixels: np.ndarray
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    cx: float
+    cy: float
+
+
+def _components(mask: np.ndarray) -> list[Component]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[Component] = []
+    for start_y, start_x in np.argwhere(mask):
+        sy, sx = int(start_y), int(start_x)
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(points) < 45:
+            continue
+        pixels = np.asarray(points, dtype=np.int32)
+        ys, xs = pixels[:, 0], pixels[:, 1]
+        output.append(
+            Component(
+                pixels=pixels,
+                x0=int(xs.min()),
+                y0=int(ys.min()),
+                x1=int(xs.max()) + 1,
+                y1=int(ys.max()) + 1,
+                cx=float(xs.mean()),
+                cy=float(ys.mean()),
+            )
+        )
+    return output
+
+
+def _vertically_related(left: Component, right: Component) -> bool:
+    overlap = min(left.y1, right.y1) - max(left.y0, right.y0)
+    min_height = min(left.y1 - left.y0, right.y1 - right.y0)
+    gap = max(0, max(left.x0, right.x0) - min(left.x1, right.x1))
+    return overlap >= 0.55 * min_height and gap <= 12
+
+
+def _group_components(components: list[Component]) -> list[list[Component]]:
+    parent = list(range(len(components)))
+
+    def root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(a: int, b: int) -> None:
+        ra, rb = root(a), root(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for i in range(len(components)):
+        for j in range(i + 1, len(components)):
+            if _vertically_related(components[i], components[j]):
+                union(i, j)
+    groups: dict[int, list[Component]] = {}
+    for index, component in enumerate(components):
+        groups.setdefault(root(index), []).append(component)
+    return list(groups.values())
+
+
+def _hole_centroids(component: Component) -> list[tuple[float, float]]:
+    height = component.y1 - component.y0
+    width = component.x1 - component.x0
+    glyph = np.zeros((height + 2, width + 2), dtype=bool)
+    glyph[
+        component.pixels[:, 0] - component.y0 + 1,
+        component.pixels[:, 1] - component.x0 + 1,
+    ] = True
+    background = ~glyph
+    seen = np.zeros_like(background, dtype=bool)
+    stack: list[tuple[int, int]] = []
+    for y in range(background.shape[0]):
+        for x in (0, background.shape[1] - 1):
+            if background[y, x] and not seen[y, x]:
+                seen[y, x] = True
+                stack.append((y, x))
+    for x in range(background.shape[1]):
+        for y in (0, background.shape[0] - 1):
+            if background[y, x] and not seen[y, x]:
+                seen[y, x] = True
+                stack.append((y, x))
+    while stack:
+        y, x = stack.pop()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if (
+                0 <= ny < background.shape[0]
+                and 0 <= nx < background.shape[1]
+                and background[ny, nx]
+                and not seen[ny, nx]
+            ):
+                seen[ny, nx] = True
+                stack.append((ny, nx))
+    enclosed = background & ~seen
+    holes = _components(enclosed)
+    return [(item.cx - 1.0, item.cy - 1.0) for item in holes if len(item.pixels) >= 20]
+
+
+def _decode(group: list[Component]) -> tuple[str, float, float]:
+    total_area = sum(len(item.pixels) for item in group)
+    cx = sum(item.cx * len(item.pixels) for item in group) / total_area
+    cy = sum(item.cy * len(item.pixels) for item in group) / total_area
+    if len(group) == 2:
+        ordered = sorted(group, key=lambda item: item.cx)
+        if ordered[1].cx - ordered[0].cx < 12 or abs(ordered[1].cy - ordered[0].cy) > 12:
+            raise OracleError("two-component label is not a legible 12")
+        return "12", cx, cy
+    if len(group) != 1:
+        raise OracleError("a label has an unsupported number of glyph components")
+    component = group[0]
+    holes = _hole_centroids(component)
+    if not holes:
+        return "3", cx, cy
+    if len(holes) != 1:
+        raise OracleError("single-digit label has ambiguous enclosed regions")
+    hole_y = holes[0][1]
+    mid_y = (component.y1 - component.y0) / 2.0
+    if abs(hole_y - mid_y) < 1.5:
+        raise OracleError("loop position is too close to the 6/9 boundary")
+    return ("9" if hole_y < mid_y else "6"), cx, cy
+
+
+def visible_sequence(image: Image.Image) -> tuple[str, str, str, str]:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    channel_span = array.max(axis=2) - array.min(axis=2)
+    dark = (array.max(axis=2) < 92) & (channel_span < 24)
+    components = _components(dark)
+    if len(components) != 5:
+        raise OracleError(f"expected five numeral components, found {len(components)}")
+    groups = _group_components(components)
+    if len(groups) != 4:
+        raise OracleError(f"expected four numeral groups, found {len(groups)}")
+    decoded = [_decode(group) for group in groups]
+    if {item[0] for item in decoded} != {"12", "3", "6", "9"}:
+        raise OracleError("the visible numeral multiset is incomplete or duplicated")
+
+    top = min(decoded, key=lambda item: item[2])
+    bottom = max(decoded, key=lambda item: item[2])
+    left = min(decoded, key=lambda item: item[1])
+    right = max(decoded, key=lambda item: item[1])
+    if len({top[0], right[0], bottom[0], left[0]}) != 4:
+        raise OracleError("cardinal slot assignment is ambiguous")
+    horizontal_gap = right[1] - left[1]
+    vertical_gap = bottom[2] - top[2]
+    if min(horizontal_gap, vertical_gap) < 110:
+        raise OracleError("cardinal labels lack regional separation")
+    return top[0], right[0], bottom[0], left[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return "yes" if visible_sequence(image) == ("12", "3", "6", "9") else "no"
+

@@ -1,0 +1,154 @@
+"""Independent PNG-only inverse arm for equal-stride checkpoint search.
+
+This module deliberately duplicates the public palette and contains no import
+from any candidate world module.  It segments six visible marker regions,
+orders them from the gold endpoint along the single connected route, measures
+both incident center distances for every colored checkpoint, and abstains unless
+there is one near-zero mismatch separated from all runners-up.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+_BACKGROUND = np.array((250, 248, 242), dtype=np.float32)
+_PALETTE = {
+    "gold": (224, 164, 35),
+    "gray": (126, 137, 148),
+    "red": (210, 61, 69),
+    "blue": (53, 105, 196),
+    "green": (42, 145, 94),
+    "purple": (139, 77, 177),
+}
+_CANDIDATES = ("red", "blue", "green", "purple")
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose a unique certified decision."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 8-connected components as arrays of (y, x) pixels."""
+
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        output.append(np.asarray(pixels, dtype=np.int32))
+    return output
+
+
+def _marker_center(array: np.ndarray, name: str) -> tuple[float, float]:
+    target = np.asarray(_PALETTE[name], dtype=np.float32)
+    distance = np.linalg.norm(array.astype(np.float32) - target, axis=2)
+    components = [component for component in _components(distance < 42.0) if len(component) >= 55]
+    if len(components) != 1:
+        raise OracleAbstention(f"expected one visible {name} marker, found {len(components)}")
+    component = components[0]
+    if len(component) < 90 or len(component) > 260:
+        raise OracleAbstention(f"{name} marker area is outside the calibrated range")
+    cy, cx = component.mean(axis=0)
+    return float(cx), float(cy)
+
+
+def _foreground_is_one_route(array: np.ndarray) -> np.ndarray:
+    distance = np.linalg.norm(array.astype(np.float32) - _BACKGROUND, axis=2)
+    mask = distance > 48.0
+    components = [component for component in _components(mask) if len(component) >= 25]
+    if len(components) != 1:
+        raise OracleAbstention("the visible ink is not one connected route")
+    if len(components[0]) < 800:
+        raise OracleAbstention("the connected route is materially incomplete")
+    return mask
+
+
+def _ordered_centers(
+    centers: dict[str, tuple[float, float]],
+) -> list[tuple[str, tuple[float, float]]]:
+    points = np.asarray(list(centers.values()), dtype=np.float64)
+    span_x = float(np.ptp(points[:, 0]))
+    span_y = float(np.ptp(points[:, 1]))
+    if max(span_x, span_y) < 90.0 or min(span_x, span_y) > 2.0:
+        raise OracleAbstention("markers do not form one resolvable straight route")
+    axis = 0 if span_x > span_y else 1
+    ordered = sorted(centers.items(), key=lambda item: item[1][axis])
+    if ordered[0][0] == "gray" and ordered[-1][0] == "gold":
+        ordered.reverse()
+    if ordered[0][0] != "gold" or ordered[-1][0] != "gray":
+        raise OracleAbstention("gold and gray do not bound the route")
+    if tuple(name for name, _ in ordered[1:-1]) == ():
+        raise OracleAbstention("route has no checkpoints")
+    if set(name for name, _ in ordered[1:-1]) != set(_CANDIDATES):
+        raise OracleAbstention("route checkpoints are incomplete or duplicated")
+    return ordered
+
+
+def _validate_visible_sections(
+    foreground: np.ndarray,
+    ordered: list[tuple[str, tuple[float, float]]],
+) -> None:
+    height, width = foreground.shape
+    for (_, first), (_, second) in zip(ordered, ordered[1:]):
+        for fraction in np.linspace(0.18, 0.82, 9):
+            x = int(round(first[0] + fraction * (second[0] - first[0])))
+            y = int(round(first[1] + fraction * (second[1] - first[1])))
+            y0, y1 = max(0, y - 2), min(height, y + 3)
+            x0, x1 = max(0, x - 2), min(width, x + 3)
+            if not foreground[y0:y1, x0:x1].any():
+                raise OracleAbstention("a straight route section has a visible gap")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the selected checkpoint color from the final image alone."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 200:
+        raise OracleAbstention("unsupported raster")
+    foreground = _foreground_is_one_route(array)
+    centers = {name: _marker_center(array, name) for name in _PALETTE}
+    ordered = _ordered_centers(centers)
+    _validate_visible_sections(foreground, ordered)
+
+    points = [point for _, point in ordered]
+    lengths = [math.dist(points[index], points[index + 1]) for index in range(5)]
+    if min(lengths) < 15.0:
+        raise OracleAbstention("route sections are too short to compare")
+    mismatch_by_name = {
+        ordered[index][0]: abs(lengths[index - 1] - lengths[index])
+        for index in range(1, 5)
+    }
+    ranking = sorted(mismatch_by_name.items(), key=lambda item: (item[1], item[0]))
+    winner, best = ranking[0]
+    runner_up = ranking[1][1]
+    if best > 1.5:
+        raise OracleAbstention("no checkpoint has equal incident lengths")
+    if runner_up - best < 6.0:
+        raise OracleAbstention("equality winner lacks a runner-up margin")
+    return winner

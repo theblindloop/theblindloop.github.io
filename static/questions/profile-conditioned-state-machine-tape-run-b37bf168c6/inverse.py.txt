@@ -1,0 +1,191 @@
+"""Scene-free pixel inverse arm for state_machine_tape_run.
+
+Receives one rendered RGB image and nothing else: no scene, no latent
+parameters, no analytic gold, and no import of the renderer, prompts,
+generator or verifier.  It re-finds the transition table (state discs, symbol
+column headers, transition cells), the black start ring and the ordered tape
+from pixels, replays the tape, and returns ``"<final state colour>|<moves>"``.
+
+Ambiguous or unparseable rasters return ``"abstain"``.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "state_machine_tape_run-oracle-0.1.0"
+
+# the visible colour vocabulary named by the question
+STATE_REFS = {
+    "red": (205, 35, 45),
+    "blue": (35, 75, 200),
+    "green": (30, 145, 70),
+    "orange": (240, 150, 25),
+}
+SYMBOL_REFS = {
+    "violet": (150, 40, 190),
+    "teal": (25, 185, 195),
+    "yellow": (245, 225, 55),
+}
+_REFS = list(STATE_REFS.items()) + list(SYMBOL_REFS.items())
+_MATCH_TOL = 70.0
+_MIN_AREA = 250
+ABSTAIN = "abstain"
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Four-connected components of a boolean mask, as bbox/area records."""
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out: list[dict] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pix) < _MIN_AREA:
+            continue
+        pys = [p[0] for p in pix]
+        pxs = [p[1] for p in pix]
+        y0, y1, x0, x1 = min(pys), max(pys), min(pxs), max(pxs)
+        bw, bh = x1 - x0 + 1, y1 - y0 + 1
+        out.append(
+            {
+                "area": len(pix),
+                "x0": x0,
+                "x1": x1,
+                "y0": y0,
+                "y1": y1,
+                "cx": (x0 + x1) / 2.0,
+                "cy": (y0 + y1) / 2.0,
+                "fill": len(pix) / float(bw * bh),
+                "w": bw,
+                "h": bh,
+            }
+        )
+    return out
+
+
+def _palette_masks(rgb: np.ndarray) -> dict[str, np.ndarray]:
+    """Nearest-reference colour assignment, with unmatched pixels dropped."""
+    flat = rgb.reshape(-1, 3).astype(np.float64)
+    best = np.full(flat.shape[0], -1, dtype=np.int64)
+    bestd = np.full(flat.shape[0], np.inf)
+    for k, (_, ref) in enumerate(_REFS):
+        d = np.linalg.norm(flat - np.array(ref, dtype=np.float64), axis=1)
+        hit = d < bestd
+        bestd[hit] = d[hit]
+        best[hit] = k
+    best[bestd > _MATCH_TOL] = -1
+    lab = best.reshape(rgb.shape[:2])
+    return {name: (lab == k) for k, (name, _) in enumerate(_REFS)}
+
+
+def _cluster(values: list[float], tol: float) -> list[float]:
+    """Collapse near-equal coordinates into sorted cluster centres."""
+    out: list[list[float]] = []
+    for v in sorted(values):
+        if out and v - out[-1][-1] <= tol:
+            out[-1].append(v)
+        else:
+            out.append([v])
+    return [sum(c) / len(c) for c in out]
+
+
+def _index_of(centres: list[float], v: float, tol: float) -> int | None:
+    for i, c in enumerate(centres):
+        if abs(c - v) <= tol:
+            return i
+    return None
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB"))
+    masks = _palette_masks(rgb)
+
+    discs: list[tuple[dict, str]] = []
+    state_squares: list[tuple[dict, str]] = []
+    for name in STATE_REFS:
+        for comp in _components(masks[name]):
+            if comp["fill"] >= 0.92:
+                state_squares.append((comp, name))
+            elif 0.6 <= comp["fill"] <= 0.88 and abs(comp["w"] - comp["h"]) <= 4:
+                discs.append((comp, name))
+    if len(discs) < 2 or not state_squares:
+        return ABSTAIN
+
+    discs.sort(key=lambda d: d[0]["cy"])
+    row_y = [d[0]["cy"] for d in discs]
+    row_colour = [d[1] for d in discs]
+    n_rows = len(discs)
+
+    cell_top = min(c["y0"] for c, _ in state_squares)
+    cell_bot = max(c["y1"] for c, _ in state_squares)
+
+    sym_squares: list[tuple[dict, str]] = []
+    for name in SYMBOL_REFS:
+        for comp in _components(masks[name]):
+            if comp["fill"] >= 0.92:
+                sym_squares.append((comp, name))
+    heads = [(c, n) for c, n in sym_squares if c["y1"] < cell_top]
+    tape = [(c, n) for c, n in sym_squares if c["y0"] > cell_bot]
+    if not heads or not tape or len(heads) + len(tape) != len(sym_squares):
+        return ABSTAIN
+
+    heads.sort(key=lambda t: t[0]["cx"])
+    tape.sort(key=lambda t: t[0]["cx"])
+    col_x = [h[0]["cx"] for h in heads]
+    n_cols = len(heads)
+    if len(state_squares) != n_rows * n_cols:
+        return ABSTAIN
+
+    table: list[list[str | None]] = [[None] * n_cols for _ in range(n_rows)]
+    for comp, name in state_squares:
+        r = _index_of(row_y, comp["cy"], 12.0)
+        c = _index_of(col_x, comp["cx"], 14.0)
+        if r is None or c is None or table[r][c] is not None:
+            return ABSTAIN
+        table[r][c] = name
+    if any(v is None for row in table for v in row):
+        return ABSTAIN
+
+    # the black start ring: the only pure-dark ink in the figure
+    dark = np.all(rgb < 60, axis=2)
+    rings = [c for c in _components(dark) if c["fill"] < 0.75]
+    if len(rings) != 1:
+        return ABSTAIN
+    ring = rings[0]
+    dists = sorted(
+        (abs(ring["cy"] - y) ** 2 + (ring["cx"] - x) ** 2, i)
+        for i, (y, x) in enumerate(zip(row_y, [d[0]["cx"] for d in discs]))
+    )
+    cur = dists[0][1]
+
+    # every column header colour must be distinct, else the tape is unreadable
+    if len(set(n for _, n in heads)) != n_cols:
+        return ABSTAIN
+    head_colour = [n for _, n in heads]
+    if len(set(row_colour)) != n_rows:
+        return ABSTAIN
+
+    moves = 0
+    for _, sym_name in tape:
+        if sym_name not in head_colour:
+            return ABSTAIN
+        j = head_colour.index(sym_name)
+        nxt_colour = table[cur][j]
+        nxt = row_colour.index(nxt_colour)
+        if nxt != cur:
+            moves += 1
+        cur = nxt
+    return f"{row_colour[cur]}|{moves}"

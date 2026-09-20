@@ -1,0 +1,132 @@
+"""Pixel-only inverse arm for `dial_scale_direction`.
+
+Input is one rasterised PNG and nothing else: no latent scene data and no code
+or answers from the forward arm.  The arm segments the coloured dots by chroma,
+labels them, fits the circle they lie on, sorts them by angle about that centre,
+cuts the circle at its five widest blank arcs, and reads the number of dots in
+each group.  The direction in which those numbers ascend is the decision.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "dial_scale_direction-oracle-0.1.0"
+ABSTAIN = "abstain"
+
+CHROMA_MIN = 40
+MIN_DOT_AREA = 30
+MAX_DOT_AREA = 600
+TOTAL_DOTS = 15
+GROUPS = 5
+SEPARATION_MIN_DEG = 1.0
+STEP_MIN_DEG = 15.0
+
+
+def _components(mask: np.ndarray) -> list:
+    """(area, mean_x, mean_y) for every 4-connected component of a boolean mask."""
+    h, w = mask.shape
+    flat = mask.reshape(-1).copy()
+    out = []
+    for start in np.flatnonzero(flat):
+        if not flat[start]:
+            continue
+        stack = [int(start)]
+        flat[start] = False
+        area = 0
+        sx = 0
+        sy = 0
+        while stack:
+            p = stack.pop()
+            r, c = divmod(p, w)
+            area += 1
+            sx += c
+            sy += r
+            if c > 0 and flat[p - 1]:
+                flat[p - 1] = False
+                stack.append(p - 1)
+            if c < w - 1 and flat[p + 1]:
+                flat[p + 1] = False
+                stack.append(p + 1)
+            if r > 0 and flat[p - w]:
+                flat[p - w] = False
+                stack.append(p - w)
+            if r < h - 1 and flat[p + w]:
+                flat[p + w] = False
+                stack.append(p + w)
+        out.append((area, sx / area, sy / area))
+    return out
+
+
+def _fit_center(xs: np.ndarray, ys: np.ndarray):
+    a = np.stack([2.0 * xs, 2.0 * ys, np.ones_like(xs)], axis=1)
+    b = xs * xs + ys * ys
+    sol, *_ = np.linalg.lstsq(a, b, rcond=None)
+    return float(sol[0]), float(sol[1])
+
+
+def _circular_mean(degrees: list) -> float:
+    s = sum(math.sin(math.radians(d)) for d in degrees)
+    c = sum(math.cos(math.radians(d)) for d in degrees)
+    return math.degrees(math.atan2(s, c)) % 360.0
+
+
+def _wrap(deg: float) -> float:
+    d = (deg + 180.0) % 360.0 - 180.0
+    return 180.0 if d == -180.0 else d
+
+
+def decision_from_image(image: "Image.Image") -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    chroma = arr.max(axis=-1) - arr.min(axis=-1)
+    comps = [c for c in _components(chroma >= CHROMA_MIN) if c[0] >= MIN_DOT_AREA]
+    if len(comps) != TOTAL_DOTS:
+        return ABSTAIN
+    if any(c[0] > MAX_DOT_AREA for c in comps):
+        return ABSTAIN
+
+    xs = np.array([c[1] for c in comps], dtype=float)
+    ys = np.array([c[2] for c in comps], dtype=float)
+    ccx, ccy = _fit_center(xs, ys)
+    radii = np.hypot(xs - ccx, ys - ccy)
+    if radii.min() < 20.0 or (radii.max() - radii.min()) / radii.mean() > 0.25:
+        return ABSTAIN
+
+    angles = np.degrees(np.arctan2(ys - ccy, xs - ccx)) % 360.0
+    order = np.argsort(angles)
+    ang = angles[order]
+    n = len(ang)
+    gaps = np.array([(ang[(i + 1) % n] - ang[i]) % 360.0 for i in range(n)])
+
+    ranked = np.sort(gaps)[::-1]
+    if ranked[GROUPS - 1] - ranked[GROUPS] < SEPARATION_MIN_DEG:
+        return ABSTAIN  # between-group arcs are not distinguishable from within-group arcs
+    cuts = sorted(int(i) for i in np.argsort(gaps)[-GROUPS:])
+
+    groups = []
+    for j in range(GROUPS):
+        start = (cuts[j] + 1) % n
+        end = cuts[(j + 1) % GROUPS]
+        members = []
+        i = start
+        while True:
+            members.append(float(ang[i]))
+            if i == end:
+                break
+            i = (i + 1) % n
+        groups.append(members)
+
+    counts = sorted(len(g) for g in groups)
+    if counts != [1, 2, 3, 4, 5]:
+        return ABSTAIN
+
+    by_count = {len(g): _circular_mean(g) for g in groups}
+    steps = [_wrap(by_count[v + 1] - by_count[v]) for v in (1, 2, 3, 4)]
+    if all(s >= STEP_MIN_DEG for s in steps):
+        return "clockwise"
+    if all(s <= -STEP_MIN_DEG for s in steps):
+        return "counterclockwise"
+    return ABSTAIN

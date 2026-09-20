@@ -1,0 +1,155 @@
+"""Independent pixel-only inverse arm for alternating-link tracing."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+START_RGB = (38, 166, 91)
+NEUTRAL_RGB = (218, 230, 240)
+TERMINALS = {
+    "red": (218, 62, 62),
+    "blue": (52, 105, 205),
+    "orange": (235, 142, 38),
+}
+TARGET = ("solid", "dashed", "solid", "dashed", "solid")
+
+
+class OracleAbstention(ValueError):
+    """Raised when the raster does not expose one valid, unambiguous decision."""
+
+
+def _components(mask: np.ndarray, minimum: int = 40) -> list[tuple[float, float, int]]:
+    pixels = {tuple(value) for value in np.argwhere(mask)}
+    found: list[tuple[float, float, int]] = []
+    while pixels:
+        origin = pixels.pop()
+        queue = [origin]
+        component = [origin]
+        while queue:
+            y, x = queue.pop()
+            for nxt in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if nxt in pixels:
+                    pixels.remove(nxt)
+                    queue.append(nxt)
+                    component.append(nxt)
+        if len(component) >= minimum:
+            ys = np.fromiter((p[0] for p in component), dtype=float)
+            xs = np.fromiter((p[1] for p in component), dtype=float)
+            found.append((float(xs.mean()), float(ys.mean()), len(component)))
+    return sorted(found, key=lambda item: (item[1], item[0]))
+
+
+def _centers(arr: np.ndarray, rgb: tuple[int, int, int], expected: int) -> list[tuple[float, float]]:
+    target = np.asarray(rgb, dtype=np.int32)
+    delta = arr.astype(np.int32) - target
+    mask = np.sum(delta * delta, axis=2) <= 16
+    components = _components(mask)
+    if len(components) != expected:
+        raise OracleAbstention(
+            f"expected {expected} components of color {rgb}, found {len(components)}"
+        )
+    return [(x, y) for x, y, _ in components]
+
+
+def _ink_occupancy(arr: np.ndarray, a: tuple[float, float], b: tuple[float, float]) -> float:
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy)
+    if length < 40.0:
+        return 0.0
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    count = max(20, int(length * 1.6))
+    distances = np.linspace(16.0, length - 16.0, count)
+    offsets = np.arange(-3.0, 4.0)
+    xs = ax + np.outer(distances, ux) + np.outer(np.ones(count), offsets * nx)
+    ys = ay + np.outer(distances, uy) + np.outer(np.ones(count), offsets * ny)
+    xi = np.clip(np.rint(xs).astype(int), 0, arr.shape[1] - 1)
+    yi = np.clip(np.rint(ys).astype(int), 0, arr.shape[0] - 1)
+    samples = arr[yi, xi].astype(np.int16)
+    dark = np.all(samples < np.array([100, 110, 125], dtype=np.int16), axis=2)
+    return float(np.mean(np.any(dark, axis=1)))
+
+
+def _passes_through_node(
+    a: tuple[float, float], b: tuple[float, float], others: list[tuple[float, float]]
+) -> bool:
+    """Reject a putative direct link visibly interrupted by a third circle."""
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    denom = dx * dx + dy * dy
+    for px, py in others:
+        t = ((px - ax) * dx + (py - ay) * dy) / denom
+        if 0.12 < t < 0.88:
+            qx, qy = ax + t * dx, ay + t * dy
+            if math.hypot(px - qx, py - qy) < 18.0:
+                return True
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover route connectivity and ordered link styles from raster pixels only."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    start = _centers(arr, START_RGB, 1)[0]
+    neutral = _centers(arr, NEUTRAL_RGB, 12)
+    terminal_points: list[tuple[float, float]] = []
+    labels: list[str] = []
+    for label, rgb in TERMINALS.items():
+        terminal_points.append(_centers(arr, rgb, 1)[0])
+        labels.append(label)
+
+    points = [start, *neutral, *terminal_points]
+    kinds = ["start", *(["neutral"] * 12), *labels]
+    adjacency: dict[int, list[tuple[int, str, float]]] = {i: [] for i in range(len(points))}
+    for i, a in enumerate(points):
+        for j in range(i + 1, len(points)):
+            b = points[j]
+            distance = math.dist(a, b)
+            if not 40.0 <= distance <= 112.0:
+                continue
+            others = [point for k, point in enumerate(points) if k not in (i, j)]
+            if _passes_through_node(a, b, others):
+                continue
+            occupancy = _ink_occupancy(arr, a, b)
+            if occupancy < 0.36:
+                continue
+            style = "solid" if occupancy >= 0.82 else "dashed"
+            adjacency[i].append((j, style, occupancy))
+            adjacency[j].append((i, style, occupancy))
+
+    degrees = [len(adjacency[i]) for i in range(len(points))]
+    if degrees[0] != 3:
+        raise OracleAbstention(f"START degree is {degrees[0]}, expected 3")
+    for i, kind in enumerate(kinds[1:], start=1):
+        expected = 2 if kind == "neutral" else 1
+        if degrees[i] != expected:
+            raise OracleAbstention(f"{kind} node degree is {degrees[i]}, expected {expected}")
+    if sum(degrees) != 30:
+        raise OracleAbstention("recovered graph does not contain exactly 15 links")
+
+    winners: list[str] = []
+    for terminal_index in range(13, 16):
+        queue = deque([(0, [], {0})])
+        routes: list[list[str]] = []
+        while queue:
+            node, styles, visited = queue.popleft()
+            if node == terminal_index:
+                routes.append(styles)
+                continue
+            for nxt, style, _ in adjacency[node]:
+                if nxt not in visited:
+                    queue.append((nxt, styles + [style], visited | {nxt}))
+        if len(routes) != 1 or len(routes[0]) != 5:
+            raise OracleAbstention(
+                f"terminal {kinds[terminal_index]} has {len(routes)} five-link route candidates"
+            )
+        if tuple(routes[0]) == TARGET:
+            winners.append(kinds[terminal_index])
+    if len(winners) != 1:
+        raise OracleAbstention(f"expected one alternating route, found {len(winners)}")
+    return winners[0]

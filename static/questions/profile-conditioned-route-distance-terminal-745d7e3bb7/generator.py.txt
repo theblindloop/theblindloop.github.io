@@ -1,0 +1,342 @@
+"""Latent scene sampler and RGB renderer for the route-distance question.
+
+The visible world is a small transit-map-like tree: one green source joins a
+dark track at a junction, and three colored terminal disks sit at the leaves.
+The analytic answer is the terminal with the greatest accumulated track length.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+
+RENDERER_VERSION = "route_distance_terminal-0.1.0"
+WIDTH = 640
+HEIGHT = 480
+BACKGROUND = (248, 247, 242)
+ROUTE_COLOR = (33, 51, 73)
+SOURCE_COLOR = (45, 153, 91)
+DISTRACTOR_COLOR = (190, 198, 207)
+TERMINAL_COLORS = {
+    "red": (215, 70, 78),
+    "blue": (40, 111, 190),
+    "gold": (224, 158, 42),
+}
+COLOR_NAMES = ("red", "blue", "gold")
+SOURCE_RADIUS = 16.0
+DISTRACTOR_WIDTH = 3
+MIN_MARGIN = 40.0
+QUARANTINE_MARGIN = 60.0
+
+
+def _distance(a: Iterable[float], b: Iterable[float]) -> float:
+    ax, ay = a
+    bx, by = b
+    return math.hypot(float(ax) - float(bx), float(ay) - float(by))
+
+
+def _path_length(points: Iterable[Iterable[float]]) -> float:
+    values = [(float(point[0]), float(point[1])) for point in points]
+    return sum(_distance(left, right) for left, right in zip(values, values[1:]))
+
+
+def _sub(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float]:
+    return (a[0] - b[0], a[1] - b[1])
+
+
+def _cross(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def _point_segment_distance(
+    point: tuple[float, float], left: tuple[float, float], right: tuple[float, float]
+) -> float:
+    segment = _sub(right, left)
+    denominator = segment[0] * segment[0] + segment[1] * segment[1]
+    if denominator <= 1e-9:
+        return _distance(point, left)
+    offset = _sub(point, left)
+    t = max(0.0, min(1.0, (offset[0] * segment[0] + offset[1] * segment[1]) / denominator))
+    projection = (left[0] + t * segment[0], left[1] + t * segment[1])
+    return _distance(point, projection)
+
+
+def _segments_intersect(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+    d: tuple[float, float],
+) -> bool:
+    ab = _sub(b, a)
+    ac = _sub(c, a)
+    ad = _sub(d, a)
+    cd = _sub(d, c)
+    ca = _sub(a, c)
+    cb = _sub(b, c)
+    first = _cross(ab, ac)
+    second = _cross(ab, ad)
+    third = _cross(cd, ca)
+    fourth = _cross(cd, cb)
+    eps = 1e-7
+    return first * second < -eps and third * fourth < -eps
+
+
+def _segment_distance(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+    d: tuple[float, float],
+) -> float:
+    if _segments_intersect(a, b, c, d):
+        return 0.0
+    return min(
+        _point_segment_distance(a, c, d),
+        _point_segment_distance(b, c, d),
+        _point_segment_distance(c, a, b),
+        _point_segment_distance(d, a, b),
+    )
+
+
+def _polyline_segments(path: list[list[float]]) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    points = [(float(point[0]), float(point[1])) for point in path]
+    return list(zip(points, points[1:]))
+
+
+def _legal_track(
+    main_path: list[list[float]], branch_paths: dict[str, list[list[float]]]
+) -> bool:
+    all_paths = [main_path, *[branch_paths[key] for key in sorted(branch_paths)]]
+    for path in all_paths:
+        if any(
+            not (28.0 <= float(point[0]) <= WIDTH - 28.0 and 28.0 <= float(point[1]) <= HEIGHT - 28.0)
+            for point in path
+        ):
+            return False
+
+    # Branches may meet at the hub, but non-adjacent ink should have a healthy
+    # gap so the raster inverse never has to guess which route owns a pixel.
+    branch_items = [branch_paths[key] for key in sorted(branch_paths)]
+    for first_index, first in enumerate(branch_items):
+        for second in branch_items[first_index + 1 :]:
+            for left_index, (a, b) in enumerate(_polyline_segments(first)):
+                for right_index, (c, d) in enumerate(_polyline_segments(second)):
+                    if left_index == 0 and right_index == 0:
+                        continue
+                    if _segment_distance(a, b, c, d) < 18.0:
+                        return False
+
+    main_segments = _polyline_segments(main_path)
+    for branch in branch_items:
+        for main_index, (a, b) in enumerate(main_segments):
+            for branch_index, (c, d) in enumerate(_polyline_segments(branch)):
+                if main_index == len(main_segments) - 1 and branch_index == 0:
+                    continue
+                if _segment_distance(a, b, c, d) < 18.0:
+                    return False
+    return True
+
+
+def _rounded_path(points: Iterable[Iterable[float]]) -> list[list[float]]:
+    return [[round(float(point[0]), 3), round(float(point[1]), 3)] for point in points]
+
+
+def _scores(scene: dict) -> dict[str, float]:
+    common = _path_length(scene["main_path"])
+    return {
+        terminal_id: common + _path_length(path)
+        for terminal_id, path in scene["branch_paths"].items()
+    }
+
+
+def _make_distractors(rng: random.Random) -> list[list[list[float]]]:
+    distractors: list[list[list[float]]] = []
+    for _ in range(3):
+        x = rng.uniform(55.0, 510.0)
+        y = rng.uniform(50.0, 430.0)
+        length = rng.uniform(38.0, 90.0)
+        angle = rng.uniform(-math.pi, math.pi)
+        bend = rng.uniform(-0.7, 0.7)
+        middle = [x + 0.48 * length * math.cos(angle), y + 0.48 * length * math.sin(angle)]
+        end_angle = angle + bend
+        end = [x + length * math.cos(end_angle), y + length * math.sin(end_angle)]
+        if all(30.0 <= value[0] <= WIDTH - 30.0 and 30.0 <= value[1] <= HEIGHT - 30.0 for value in (middle, end)):
+            distractors.append(_rounded_path([[x, y], middle, end]))
+    return distractors
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a deterministic, non-crossing track scene."""
+
+    seed = int(seed)
+    rng = random.Random(seed)
+    target_near_boundary = seed % 6 == 0
+    best: tuple[float, dict] | None = None
+
+    for _attempt in range(1600):
+        source = [rng.uniform(72.0, 142.0), rng.uniform(205.0, 275.0)]
+        hub = [rng.uniform(294.0, 344.0), rng.uniform(215.0, 265.0)]
+        main_path = [
+            source,
+            [rng.uniform(178.0, 235.0), rng.uniform(190.0, 290.0)],
+            hub,
+        ]
+
+        lane_y = {
+            "top": rng.uniform(82.0, 142.0),
+            "middle": rng.uniform(212.0, 268.0),
+            "bottom": rng.uniform(338.0, 408.0),
+        }
+        lane_x = {lane: rng.uniform(500.0, 588.0) for lane in lane_y}
+        lane_order = list(lane_y)
+        rng.shuffle(lane_order)
+        branch_paths: dict[str, list[list[float]]] = {}
+        terminal_ids = ("t0", "t1", "t2")
+        for terminal_id, lane in zip(terminal_ids, lane_order):
+            target_y = lane_y[lane]
+            target_x = lane_x[lane]
+            if lane == "top":
+                first_y = rng.uniform(116.0, 188.0)
+                second_y = rng.uniform(72.0, 190.0)
+            elif lane == "middle":
+                first_y = rng.uniform(202.0, 278.0)
+                second_y = rng.uniform(192.0, 292.0)
+            else:
+                first_y = rng.uniform(292.0, 366.0)
+                second_y = rng.uniform(300.0, 428.0)
+            branch_paths[terminal_id] = [
+                hub,
+                [hub[0] + rng.uniform(42.0, 64.0), first_y],
+                [hub[0] + rng.uniform(125.0, 168.0), second_y],
+                [target_x, target_y],
+            ]
+
+        if not _legal_track(main_path, branch_paths):
+            continue
+        radii = {terminal_id: round(rng.uniform(12.5, 16.5), 2) for terminal_id in terminal_ids}
+        centers = {terminal_id: path[-1] for terminal_id, path in branch_paths.items()}
+        if any(
+            _distance(centers[left], centers[right]) < radii[left] + radii[right] + 16.0
+            for left_index, left in enumerate(terminal_ids)
+            for right in terminal_ids[left_index + 1 :]
+        ):
+            continue
+        if any(_distance(source, centers[terminal_id]) < radii[terminal_id] + 34.0 for terminal_id in terminal_ids):
+            continue
+
+        provisional = {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "background": list(BACKGROUND),
+            "route_color": list(ROUTE_COLOR),
+            "route_width": round(rng.uniform(8.0, 10.0), 2),
+            "source": _rounded_path([source])[0],
+            "main_path": _rounded_path(main_path),
+            "branch_paths": {key: _rounded_path(value) for key, value in branch_paths.items()},
+            "terminal_colors": {},
+            "terminal_radii": radii,
+            "distractors": _make_distractors(rng),
+        }
+        scores = _scores(provisional)
+        ordered = sorted(scores.values(), reverse=True)
+        gap = ordered[0] - ordered[1]
+        if gap < MIN_MARGIN:
+            continue
+        best_euclidean = max(terminal_ids, key=lambda key: _distance(source, centers[key]))
+        farthest = max(scores, key=scores.get)
+        # A small number of intentionally detoured routes break the cheap
+        # straight-line shortcut.  Do not require this for every scene.
+        if _attempt < 900 and farthest == best_euclidean:
+            continue
+        if target_near_boundary:
+            target_error = 0.0 if 45.0 <= gap <= 58.0 else abs(gap - 52.0)
+        else:
+            target_error = 0.0 if 70.0 <= gap <= 120.0 else min(abs(gap - 70.0), abs(gap - 120.0))
+        if best is None or target_error < best[0]:
+            best = (target_error, provisional)
+        if target_error == 0.0:
+            break
+
+    if best is None:
+        raise RuntimeError(f"could not sample a legal track for seed {seed}")
+
+    scene = best[1]
+    scores = _scores(scene)
+    farthest = max(scores, key=scores.get)
+    target_color = COLOR_NAMES[seed % len(COLOR_NAMES)]
+    other_colors = [color for color in COLOR_NAMES if color != target_color]
+    rng.shuffle(other_colors)
+    terminal_colors: dict[str, str] = {farthest: target_color}
+    remaining = [terminal_id for terminal_id in ("t0", "t1", "t2") if terminal_id != farthest]
+    for terminal_id, color in zip(remaining, other_colors):
+        terminal_colors[terminal_id] = color
+    scene["terminal_colors"] = terminal_colors
+    return scene
+
+
+def _draw_path(draw: ImageDraw.ImageDraw, points: list[list[float]], fill: tuple[int, int, int], width: int) -> None:
+    draw.line([(round(point[0]), round(point[1])) for point in points], fill=fill, width=width, joint="curve")
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only the public raster; no analytic answer is painted."""
+
+    image = Image.new(
+        "RGB",
+        (int(scene["width"]), int(scene["height"])),
+        tuple(int(value) for value in scene["background"]),
+    )
+    draw = ImageDraw.Draw(image)
+    for path in scene["distractors"]:
+        _draw_path(draw, path, DISTRACTOR_COLOR, DISTRACTOR_WIDTH)
+
+    route_color = tuple(int(value) for value in scene["route_color"])
+    route_width = max(6, int(round(float(scene["route_width"]))))
+    _draw_path(draw, scene["main_path"], route_color, route_width)
+    for path in scene["branch_paths"].values():
+        _draw_path(draw, path, route_color, route_width)
+
+    source = scene["source"]
+    source_radius = SOURCE_RADIUS
+    draw.ellipse(
+        (round(source[0] - source_radius), round(source[1] - source_radius), round(source[0] + source_radius), round(source[1] + source_radius)),
+        fill=SOURCE_COLOR,
+    )
+    for terminal_id, path in scene["branch_paths"].items():
+        center = path[-1]
+        radius = float(scene["terminal_radii"][terminal_id])
+        color_name = scene["terminal_colors"][terminal_id]
+        fill = TERMINAL_COLORS[color_name]
+        draw.ellipse(
+            (round(center[0] - radius), round(center[1] - radius), round(center[0] + radius), round(center[1] + radius)),
+            fill=fill,
+        )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return the colored terminal with the greatest latent track distance."""
+
+    scores = _scores(scene)
+    winner = max(scores, key=scores.get)
+    return scene["terminal_colors"][winner]
+
+
+def margin(scene: dict) -> float:
+    """Top-two source-to-terminal path-length gap in pixels."""
+
+    values = sorted(_scores(scene).values(), reverse=True)
+    return round(values[0] - values[1], 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: every answer-bearing field is rendered directly."""
+
+    return []

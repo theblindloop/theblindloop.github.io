@@ -1,0 +1,112 @@
+"""Independent pixel-only inverse for nested-loop parity.
+
+The inverse sees a PNG and public image dimensions only.  It locates the marker
+by colour, segments the dark loop ink, estimates the common centre from the
+complete boundary pixels, clusters their radial distances into closed loop
+components, and counts the boundaries outside the marker radius.  It never
+receives a scene or imports the renderer and does not use analytic gold.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 900
+HEIGHT = 700
+LOOP_RGB = np.asarray((38, 48, 61), dtype=np.float32)
+MARKER_RGB = {
+    "red": np.asarray((214, 66, 77), dtype=np.float32),
+    "blue": np.asarray((49, 112, 205), dtype=np.float32),
+    "green": np.asarray((48, 154, 99), dtype=np.float32),
+}
+
+
+class OracleError(ValueError):
+    """The raster does not provide a stable loop-depth measurement."""
+
+
+def _marker_centroid(array: np.ndarray) -> tuple[np.ndarray, str]:
+    candidates: list[tuple[int, str, np.ndarray]] = []
+    for name, target in MARKER_RGB.items():
+        distance = np.sqrt(((array - target) ** 2).sum(axis=2))
+        # The palette colours are deliberately separated by more than this
+        # core-band threshold; a looser cutoff would make blue and green masks
+        # overlap after antialiasing.
+        if name == "red":
+            chroma = (array[:, :, 0] > array[:, :, 1] + 40.0) & (
+                array[:, :, 0] > array[:, :, 2] + 30.0
+            )
+        elif name == "blue":
+            chroma = (array[:, :, 2] > array[:, :, 0] + 45.0) & (
+                array[:, :, 2] > array[:, :, 1] + 35.0
+            )
+        else:
+            chroma = (array[:, :, 1] > array[:, :, 0] + 40.0) & (
+                array[:, :, 1] > array[:, :, 2] + 25.0
+            )
+        mask = (distance < 100.0) & chroma
+        points = np.argwhere(mask)
+        if len(points) >= 180:
+            # Coordinates returned by argwhere are y,x; retain x,y centres.
+            centroid = points[:, [1, 0]].astype(np.float64).mean(axis=0) + 0.5
+            candidates.append((len(points), name, centroid))
+    if len(candidates) != 1:
+        raise OracleError(f"expected one saturated marker, found {len(candidates)}")
+    _, name, centroid = max(candidates, key=lambda item: item[0])
+    return centroid, name
+
+
+def _loop_pixels(array: np.ndarray) -> np.ndarray:
+    distance = np.sqrt(((array - LOOP_RGB) ** 2).sum(axis=2))
+    # Ring ink is nearly neutral slate.  Requiring low chroma excludes
+    # antialiased fringes of the saturated marker, which can otherwise drift
+    # close to the dark colour in RGB distance.
+    neutral = array.max(axis=2) - array.min(axis=2) < 42.0
+    mask = (distance < 105.0) & neutral
+    points = np.argwhere(mask)
+    if len(points) < 2500:
+        raise OracleError("too few dark boundary pixels")
+    # x,y coordinates at pixel centres.
+    return points[:, [1, 0]].astype(np.float64) + 0.5
+
+
+def _cluster_radii(points: np.ndarray, center: np.ndarray) -> list[float]:
+    radial = np.sqrt(((points - center[None, :]) ** 2).sum(axis=1))
+    values = np.sort(radial)
+    if len(values) < 2500:
+        raise OracleError("insufficient loop support")
+    # Stroke thickness is under 6 px in the final image and loop gaps exceed
+    # 32 px.  A large radial gap therefore separates complete boundaries.
+    breaks = np.flatnonzero(np.diff(values) > 14.0) + 1
+    groups = np.split(values, breaks)
+    radii = [float(np.median(group)) for group in groups if len(group) >= 350]
+    if not 3 <= len(radii) <= 5:
+        raise OracleError(f"expected three to five loop components, found {len(radii)}")
+    if any(b - a < 25.0 for a, b in zip(radii, radii[1:])):
+        raise OracleError("loop components are not separated")
+    return radii
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return yes iff the marker is enclosed by an odd number of loop boundaries."""
+
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        raise OracleError(f"unexpected image size {rgb.size}")
+    array = np.asarray(rgb, dtype=np.float32)
+    marker, _ = _marker_centroid(array)
+    loop_points = _loop_pixels(array)
+    # Complete circles have a shared centre; the mean of their boundary pixels
+    # is an image-derived centre estimate and does not use renderer coordinates.
+    center = loop_points.mean(axis=0)
+    radii = _cluster_radii(loop_points, center)
+    marker_distance = float(np.linalg.norm(marker - center))
+    clearance = min(abs(radius - marker_distance) for radius in radii)
+    if clearance < 10.0:
+        raise OracleError("marker is too close to a recovered loop boundary")
+    depth = sum(radius > marker_distance for radius in radii)
+    return "yes" if depth % 2 else "no"

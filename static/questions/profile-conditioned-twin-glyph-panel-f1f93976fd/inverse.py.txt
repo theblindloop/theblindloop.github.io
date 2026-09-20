@@ -1,0 +1,147 @@
+"""Image-only inverse arm for twin_glyph_panel.
+
+It receives a rendered PNG and nothing else: no scene, no renderer constants,
+no analytic gold. Panels are recovered from the grey frame rulings, coloured
+glyph blobs are recovered by connected components, and every within-panel pair
+is scored by its best translation-aligned overlap. The panel holding the
+best-matching pair wins, and the arm abstains when the top-two panel gap is
+too small or the layout does not parse.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+AMBIGUOUS = "ambiguous"
+COLOUR_SPREAD = 60
+MIN_BLOB = 300
+SHIFT = 6
+MIN_GAP = 12.0
+
+
+def _colour_mask(array: np.ndarray) -> np.ndarray:
+    values = array.astype(np.int16)
+    spread = values.max(axis=2) - values.min(axis=2)
+    return spread > COLOUR_SPREAD
+
+
+def _grey_columns(array: np.ndarray) -> list:
+    values = array.astype(np.int16)
+    spread = values.max(axis=2) - values.min(axis=2)
+    level = values.mean(axis=2)
+    grey = (spread <= 12) & (level > 60) & (level < 215)
+    counts = grey.sum(axis=0)
+    strong = counts > 0.45 * array.shape[0]
+    groups = []
+    start = None
+    for x, flag in enumerate(strong):
+        if flag and start is None:
+            start = x
+        elif not flag and start is not None:
+            groups.append((start + x - 1) / 2.0)
+            start = None
+    if start is not None:
+        groups.append((start + len(strong) - 1) / 2.0)
+    return groups
+
+
+def _panels_from_frames(array: np.ndarray) -> list:
+    rulings = _grey_columns(array)
+    if len(rulings) < 4 or len(rulings) % 2 != 0:
+        return []
+    return [(rulings[i], rulings[i + 1]) for i in range(0, len(rulings), 2)]
+
+
+def _components(mask: np.ndarray) -> list:
+    height, width = mask.shape
+    labels = np.zeros((height, width), dtype=np.int32)
+    blobs = []
+    current = 0
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if labels[y0, x0]:
+            continue
+        current += 1
+        stack = [(y0, x0)]
+        labels[y0, x0] = current
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not labels[ny, nx]:
+                    labels[ny, nx] = current
+                    stack.append((ny, nx))
+        if len(pixels) >= MIN_BLOB:
+            rows = np.array([p[0] for p in pixels])
+            cols = np.array([p[1] for p in pixels])
+            top, bottom = rows.min(), rows.max()
+            left, right = cols.min(), cols.max()
+            crop = np.zeros((bottom - top + 1, right - left + 1), dtype=bool)
+            crop[rows - top, cols - left] = True
+            blobs.append({"cx": float(cols.mean()), "cy": float(rows.mean()), "mask": crop})
+    return blobs
+
+
+def _pair_overlap(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    height = max(mask_a.shape[0], mask_b.shape[0]) + 2 * SHIFT + 2
+    width = max(mask_a.shape[1], mask_b.shape[1]) + 2 * SHIFT + 2
+    canvas_a = np.zeros((height, width), dtype=bool)
+    top_a = (height - mask_a.shape[0]) // 2
+    left_a = (width - mask_a.shape[1]) // 2
+    canvas_a[top_a : top_a + mask_a.shape[0], left_a : left_a + mask_a.shape[1]] = mask_a
+    top_b = (height - mask_b.shape[0]) // 2
+    left_b = (width - mask_b.shape[1]) // 2
+    best = 0.0
+    for dy in range(-SHIFT, SHIFT + 1):
+        for dx in range(-SHIFT, SHIFT + 1):
+            canvas_b = np.zeros((height, width), dtype=bool)
+            y0, x0 = top_b + dy, left_b + dx
+            if y0 < 0 or x0 < 0 or y0 + mask_b.shape[0] > height or x0 + mask_b.shape[1] > width:
+                continue
+            canvas_b[y0 : y0 + mask_b.shape[0], x0 : x0 + mask_b.shape[1]] = mask_b
+            union = np.count_nonzero(canvas_a | canvas_b)
+            if union:
+                best = max(best, np.count_nonzero(canvas_a & canvas_b) / union)
+    return 100.0 * best
+
+
+def panel_scores(image: Image.Image) -> list:
+    """Best within-panel pair overlap for every detected panel, left to right."""
+    array = np.asarray(image.convert("RGB"))
+    spans = _panels_from_frames(array)
+    if not spans:
+        return []
+    blobs = _components(_colour_mask(array))
+    buckets = [[] for _ in spans]
+    for blob in blobs:
+        placed = False
+        for index, (left, right) in enumerate(spans):
+            if left <= blob["cx"] <= right:
+                buckets[index].append(blob)
+                placed = True
+                break
+        if not placed:
+            return []
+    scores = []
+    for bucket in buckets:
+        if len(bucket) < 2:
+            return []
+        best = 0.0
+        for i in range(len(bucket)):
+            for j in range(i + 1, len(bucket)):
+                best = max(best, _pair_overlap(bucket[i]["mask"], bucket[j]["mask"]))
+        scores.append(best)
+    return scores
+
+
+def decision_from_image(image: Image.Image) -> str:
+    scores = panel_scores(image)
+    if len(scores) < 2:
+        return AMBIGUOUS
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    if scores[order[0]] - scores[order[1]] < MIN_GAP:
+        return AMBIGUOUS
+    return f"panel-{order[0] + 1}"

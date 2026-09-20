@@ -1,0 +1,131 @@
+"""Independent inverse measurement for paired nested windows.
+
+Only the final RGB image is accepted.  The inverse segments the two public
+colors, checks that their matched plaque and aperture contours are intact, and
+measures each aperture's top gap from pixels.  It deliberately abstains when a
+component is missing or materially damaged, which makes evidence erasure
+observable to the support probe.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "paired_window_clearance-oracle-0.1.0"
+AMBER = np.asarray((231, 153, 43), dtype=np.int32)
+TEAL = np.asarray((30, 145, 145), dtype=np.int32)
+MIN_PLAQUE_AREA = 5000
+MIN_HOLE_AREA = 1200
+MAX_PAIRED_AREA_ERROR = 90
+MAX_PAIRED_HOLE_ERROR = 120
+MAX_DIMENSION_ERROR = 4
+MIN_CLEARANCE_GAP = 8.0
+
+
+class OracleAbstention(ValueError):
+    """The raster does not contain two intact, comparable window plaques."""
+
+
+def _color_mask(array: np.ndarray, color: np.ndarray) -> np.ndarray:
+    delta = array.astype(np.int32) - color.reshape(1, 1, 3)
+    return np.sum(delta * delta, axis=2) <= 82 * 82
+
+
+def _background_mask(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:3].reshape(-1, 3),
+            array[-3:].reshape(-1, 3),
+            array[:, :3].reshape(-1, 3),
+            array[:, -3:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    background = np.median(border, axis=0).astype(np.int32)
+    delta = array.astype(np.int32) - background.reshape(1, 1, 3)
+    return np.sum(delta * delta, axis=2) <= 52 * 52
+
+
+def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    points = np.argwhere(mask)
+    if len(points) == 0:
+        raise OracleAbstention("missing colored plaque")
+    ys, xs = points[:, 0], points[:, 1]
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _enclosed_background(background: np.ndarray) -> np.ndarray:
+    """Return background pixels not connected to the crop boundary."""
+
+    height, width = background.shape
+    outside = np.zeros_like(background, dtype=bool)
+    queue: deque[tuple[int, int]] = deque()
+    for x in range(width):
+        for y in (0, height - 1):
+            if background[y, x] and not outside[y, x]:
+                outside[y, x] = True
+                queue.append((y, x))
+    for y in range(height):
+        for x in (0, width - 1):
+            if background[y, x] and not outside[y, x]:
+                outside[y, x] = True
+                queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and background[ny, nx] and not outside[ny, nx]:
+                outside[ny, nx] = True
+                queue.append((ny, nx))
+    return background & ~outside
+
+
+def _plaque_measure(array: np.ndarray, color: np.ndarray, background: np.ndarray) -> tuple[float, tuple[int, int, int, int], float]:
+    color_mask = _color_mask(array, color)
+    x0, y0, x1, y1 = _bbox(color_mask)
+    area = int(color_mask.sum())
+    if area < MIN_PLAQUE_AREA or x1 - x0 < 80 or y1 - y0 < 110:
+        raise OracleAbstention("colored plaque is too small")
+
+    crop_background = background[y0 : y1 + 1, x0 : x1 + 1]
+    enclosed = _enclosed_background(crop_background)
+    points = np.argwhere(enclosed)
+    if len(points) < MIN_HOLE_AREA:
+        raise OracleAbstention("internal window is absent or open to the exterior")
+    hole_y0, hole_x0 = points.min(axis=0)
+    hole_y1, hole_x1 = points.max(axis=0)
+    hole_area = int(len(points))
+    if hole_x1 - hole_x0 < 25 or hole_y1 - hole_y0 < 35:
+        raise OracleAbstention("internal window is too small")
+    hole_box = (int(hole_x0 + x0), int(hole_y0 + y0), int(hole_x1 + x0), int(hole_y1 + y0))
+    clearance = float(hole_box[1] - y0)
+    return clearance, (x0, y0, x1, y1), float(hole_area)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return amber or teal from the raster alone, or abstain on damage."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    background = _background_mask(array)
+    amber_clearance, amber_box, amber_hole_area = _plaque_measure(array, AMBER, background)
+    teal_clearance, teal_box, teal_hole_area = _plaque_measure(array, TEAL, background)
+
+    amber_area = int(_color_mask(array, AMBER).sum())
+    teal_area = int(_color_mask(array, TEAL).sum())
+    if abs(amber_area - teal_area) > MAX_PAIRED_AREA_ERROR:
+        raise OracleAbstention("paired plaque areas disagree")
+    if abs(amber_hole_area - teal_hole_area) > MAX_PAIRED_HOLE_ERROR:
+        raise OracleAbstention("paired window areas disagree")
+    amber_width = amber_box[2] - amber_box[0]
+    teal_width = teal_box[2] - teal_box[0]
+    amber_height = amber_box[3] - amber_box[1]
+    teal_height = teal_box[3] - teal_box[1]
+    if abs(amber_width - teal_width) > MAX_DIMENSION_ERROR or abs(amber_height - teal_height) > MAX_DIMENSION_ERROR:
+        raise OracleAbstention("paired plaque dimensions disagree")
+
+    gap = abs(amber_clearance - teal_clearance)
+    if gap < MIN_CLEARANCE_GAP:
+        raise OracleAbstention("clearance comparison is too close to call")
+    return "amber" if amber_clearance < teal_clearance else "teal"

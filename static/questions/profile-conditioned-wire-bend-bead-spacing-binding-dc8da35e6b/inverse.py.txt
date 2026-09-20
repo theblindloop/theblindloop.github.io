@@ -1,0 +1,212 @@
+"""Pixel-only decision arm for wire_bend_bead_spacing_binding.
+
+Receives a rendered PNG and nothing else. It segments the two panels, walks each
+drawn wire as a geodesic mask to recover the arc-length position of every bead,
+compares the lower spacing signature against the upper one in both traversal
+directions, and only then reads the bound colour.
+"""
+
+from __future__ import annotations
+
+import heapq
+import math
+
+from PIL import Image
+
+ORACLE_VERSION = "wire_bend_bead_spacing_binding-oracle-0.1.0"
+
+_WHITE = (255, 255, 255)
+_TOLERANCE = 26
+_REFERENCE_COLORS = {
+    "red": (220, 40, 40),
+    "blue": (40, 80, 220),
+    "green": (30, 150, 60),
+    "orange": (245, 150, 20),
+}
+_GRAY_BEAD = (150, 150, 150)
+_ABSTAIN = "abstain"
+_MIN_SIGNATURE_GAP = 0.04
+
+
+def _close(pixel, target, tol=_TOLERANCE) -> bool:
+    return all(abs(int(pixel[i]) - target[i]) <= tol for i in range(3))
+
+
+def _panels(image: Image.Image):
+    """Split at the solid black separator band; return (top_box, bottom_box)."""
+    width, height = image.size
+    px = image.load()
+    dark_rows = []
+    for y in range(height):
+        solid = True
+        for x in range(0, width, 7):
+            if sum(px[x, y][:3]) > 90:
+                solid = False
+                break
+        if solid:
+            dark_rows.append(y)
+    if not dark_rows:
+        return None
+    return (0, 0, width, dark_rows[0]), (0, dark_rows[-1] + 1, width, height)
+
+
+def _components(mask: dict, keys) -> list[list[tuple[int, int]]]:
+    seen = set()
+    out = []
+    for key in keys:
+        if key in seen or key not in mask:
+            continue
+        stack, blob = [key], []
+        seen.add(key)
+        while stack:
+            x, y = stack.pop()
+            blob.append((x, y))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    nxt = (x + dx, y + dy)
+                    if nxt in mask and nxt not in seen:
+                        seen.add(nxt)
+                        stack.append(nxt)
+        out.append(blob)
+    return out
+
+
+def _centroid(blob) -> tuple[float, float]:
+    return (sum(p[0] for p in blob) / len(blob), sum(p[1] for p in blob) / len(blob))
+
+
+def _geodesic(path: set, source: tuple[int, int]) -> dict:
+    """Weighted BFS (1 orthogonal, sqrt(2) diagonal) restricted to the drawn mask."""
+    dist = {source: 0.0}
+    queue = [(0.0, source)]
+    root2 = math.sqrt(2.0)
+    while queue:
+        d, node = heapq.heappop(queue)
+        if d > dist.get(node, float("inf")) + 1e-9:
+            continue
+        x, y = node
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nxt = (x + dx, y + dy)
+                if nxt not in path:
+                    continue
+                step = root2 if dx and dy else 1.0
+                nd = d + step
+                if nd < dist.get(nxt, float("inf")) - 1e-9:
+                    dist[nxt] = nd
+                    heapq.heappush(queue, (nd, nxt))
+    return dist
+
+
+def _wire_profile(path: set, beads: list[tuple[float, float]]):
+    """Return (total_length, distances-from-one-end) for the bead centres."""
+    if not path:
+        return None
+    start = min(path)
+    first = _geodesic(path, start)
+    if len(first) < len(path):
+        return None
+    end_a = max(first.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    from_a = _geodesic(path, end_a)
+    end_b = max(from_a.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    total = from_a[end_b]
+    if total <= 1.0:
+        return None
+    values = []
+    for bead in beads:
+        key = (int(round(bead[0])), int(round(bead[1])))
+        if key not in from_a:
+            key = min(path, key=lambda p: (p[0] - bead[0]) ** 2 + (p[1] - bead[1]) ** 2)
+        values.append(from_a[key])
+    return total, values
+
+
+def _panel_masks(image: Image.Image, box):
+    px = image.load()
+    x0, y0, x1, y1 = box
+    path = set()
+    color_pixels = {name: [] for name in _REFERENCE_COLORS}
+    gray_pixels = []
+    black_pixels = []
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            pixel = px[x, y][:3]
+            if _close(pixel, _WHITE, 12):
+                continue
+            path.add((x, y))
+            for name, rgb in _REFERENCE_COLORS.items():
+                if _close(pixel, rgb):
+                    color_pixels[name].append((x, y))
+                    break
+            else:
+                if _close(pixel, _GRAY_BEAD, 12):
+                    gray_pixels.append((x, y))
+                elif sum(pixel) < 60:
+                    black_pixels.append((x, y))
+    return path, color_pixels, gray_pixels, black_pixels
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = image.convert("RGB")
+    panels = _panels(rgb)
+    if panels is None:
+        return _ABSTAIN
+    top_box, bottom_box = panels
+
+    top_path, top_colors, _, _ = _panel_masks(rgb, top_box)
+    named = []
+    for name, pixels in top_colors.items():
+        blobs = [b for b in _components(set(pixels), pixels) if len(b) >= 60]
+        if len(blobs) != 1:
+            return _ABSTAIN
+        named.append((name, _centroid(blobs[0])))
+    if len(named) != 4:
+        return _ABSTAIN
+
+    top_profile = _wire_profile(top_path, [c for _, c in named])
+    if top_profile is None:
+        return _ABSTAIN
+    top_total, top_dist = top_profile
+    order = sorted(range(4), key=lambda i: top_dist[i])
+    ref_norm = [top_dist[i] / top_total for i in order]
+    ref_colors = [named[i][0] for i in order]
+
+    bottom_path, _, gray_pixels, black_pixels = _panel_masks(rgb, bottom_box)
+    gray_blobs = [b for b in _components(set(gray_pixels), gray_pixels) if len(b) >= 60]
+    if len(gray_blobs) != 4:
+        return _ABSTAIN
+    gray_centers = [_centroid(b) for b in gray_blobs]
+    ring_blobs = [b for b in _components(set(black_pixels), black_pixels) if len(b) >= 40]
+    if len(ring_blobs) != 1:
+        return _ABSTAIN
+    ring_center = _centroid(ring_blobs[0])
+
+    bottom_profile = _wire_profile(bottom_path, gray_centers)
+    if bottom_profile is None:
+        return _ABSTAIN
+    bottom_total, bottom_dist = bottom_profile
+    border = sorted(range(4), key=lambda i: bottom_dist[i])
+    tgt_norm = [bottom_dist[i] / bottom_total for i in border]
+
+    ranked = sorted(
+        range(4),
+        key=lambda j: (gray_centers[border[j]][0] - ring_center[0]) ** 2
+        + (gray_centers[border[j]][1] - ring_center[1]) ** 2,
+    )
+    query_slot = ranked[0]
+    near, second = (
+        math.dist(gray_centers[border[ranked[0]]], ring_center),
+        math.dist(gray_centers[border[ranked[1]]], ring_center),
+    )
+    if near > 12.0 or second < 40.0:
+        return _ABSTAIN
+
+    forward = sum(abs(tgt_norm[i] - ref_norm[i]) for i in range(4))
+    reverse = sum(abs(tgt_norm[i] - (1.0 - ref_norm[3 - i])) for i in range(4))
+    if abs(forward - reverse) < _MIN_SIGNATURE_GAP:
+        return _ABSTAIN
+    if forward < reverse:
+        return ref_colors[query_slot]
+    return ref_colors[3 - query_slot]

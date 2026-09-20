@@ -1,0 +1,377 @@
+"""Scene sampling, rendering and analytic gold for pipe_sharpest_bend.
+
+Two grey pipes are drawn on a white page. Each pipe is one open stroke made of
+three straight sections, so it has exactly two bends and two loose ends. The two
+pipes never touch or cross. A green disc caps one loose end of one pipe. Every
+one of the four bends carries one coloured square placed just outside the bend,
+separated from the stroke by a visible gap.
+
+The decision is the colour of the square at the sharper of the two bends of the
+green-ended pipe. Ownership of a square is decided by proximity, and the two
+pipes are interleaved, so the sharper-bend comparison cannot be made without
+first following the stroke that carries the green disc.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "pipe_sharpest_bend-renderer-0.1.0"
+
+CANVAS = (900, 620)
+BACKGROUND = (255, 255, 255)
+PIPE_COLOR = (105, 105, 105)
+GREEN_COLOR = (0, 158, 66)
+STROKE_W = 9
+DISC_R = 15
+SQUARE_SIDE = 26
+MARK_GAP = 9
+
+COLOR_NAMES = ("red", "blue", "orange", "purple")
+MARKER_RGB = {
+    "red": (214, 28, 42),
+    "blue": (28, 72, 206),
+    "orange": (242, 146, 10),
+    "purple": (138, 38, 178),
+}
+
+# sampling floors (stricter than the quarantine floors below)
+MIN_CLEAR = 46.0          # free gap between non-consecutive drawn sections
+MIN_MARK_CLEAR = 38.0     # gap from a square to any section that is not its own
+MIN_MARK_MARK = 58.0
+MIN_DISC_OTHER = 75.0
+PAD = 62.0
+
+# quarantine floors
+QUAR_MARGIN_DEG = 15.0
+QUAR_CLEAR_PX = 40.0
+QUAR_OWNER_PX = 24.0
+
+_SQ_HALFDIAG = SQUARE_SIDE * 0.7072
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+def _pt_seg_dist(p, a, b) -> float:
+    px, py = p
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    denom = dx * dx + dy * dy
+    if denom <= 1e-9:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / denom
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _orient(a, b, c) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _segments_cross(a, b, c, d) -> bool:
+    d1 = _orient(a, b, c)
+    d2 = _orient(a, b, d)
+    d3 = _orient(c, d, a)
+    d4 = _orient(c, d, b)
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _seg_seg_dist(a, b, c, d) -> float:
+    if _segments_cross(a, b, c, d):
+        return 0.0
+    return min(
+        _pt_seg_dist(a, c, d),
+        _pt_seg_dist(b, c, d),
+        _pt_seg_dist(c, a, b),
+        _pt_seg_dist(d, a, b),
+    )
+
+
+def _segments_of(points):
+    return [(points[i], points[i + 1]) for i in range(len(points) - 1)]
+
+
+def _unit(vx, vy):
+    n = math.hypot(vx, vy)
+    if n <= 1e-9:
+        return (0.0, 0.0)
+    return (vx / n, vy / n)
+
+
+def bend_deviation_deg(points, bend_index: int) -> float:
+    """Turn angle (180 - interior angle) at bend `bend_index` of a polyline."""
+    v = points[bend_index + 1]
+    a = points[bend_index]
+    b = points[bend_index + 2]
+    u1 = _unit(a[0] - v[0], a[1] - v[1])
+    u2 = _unit(b[0] - v[0], b[1] - v[1])
+    dot = max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1]))
+    interior = math.degrees(math.acos(dot))
+    return 180.0 - interior
+
+
+def _marker_center(points, bend_index: int):
+    """Square centre: just outside the bend, along the outward bisector."""
+    v = points[bend_index + 1]
+    a = points[bend_index]
+    b = points[bend_index + 2]
+    u1 = _unit(a[0] - v[0], a[1] - v[1])
+    u2 = _unit(b[0] - v[0], b[1] - v[1])
+    bis = _unit(u1[0] + u2[0], u1[1] + u2[1])
+    if bis == (0.0, 0.0):
+        bis = _unit(-u1[1], u1[0])
+    off = STROKE_W / 2.0 + MARK_GAP + _SQ_HALFDIAG
+    return (v[0] - bis[0] * off, v[1] - bis[1] * off)
+
+
+def _build_pipe(start, heading_deg, lengths, devs_deg):
+    pts = [(float(start[0]), float(start[1]))]
+    h = math.radians(heading_deg)
+    for i, L in enumerate(lengths):
+        x, y = pts[-1]
+        pts.append((x + L * math.cos(h), y + L * math.sin(h)))
+        if i < len(devs_deg):
+            h += math.radians(devs_deg[i])
+    return pts
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _try_scene(rng: random.Random, seed: int, relax: bool):
+    W, H = CANVAS
+
+    # the answer colour is pinned by the scene index, so colour identity is
+    # exactly balanced and cannot correlate with any geometric property
+    answer_color = COLOR_NAMES[int(seed) % len(COLOR_NAMES)]
+    rest = [c for c in COLOR_NAMES if c != answer_color]
+    rng.shuffle(rest)
+    global_sharpest_decoy = rng.random() < 0.5
+    near_green_decoy = rng.random() < 0.5
+
+    a1 = rng.uniform(52.0, 84.0)
+    gap = rng.uniform(9.0, 40.0)
+    a2 = a1 - gap
+    if a2 < 20.0:
+        return None
+    if global_sharpest_decoy:
+        if a1 + 12.0 > 92.0:
+            return None
+        b_hi = rng.uniform(a1 + 12.0, 92.0)
+        b_lo = rng.uniform(20.0, max(21.0, a1 - 10.0))
+    else:
+        if a1 - 12.0 < 22.0:
+            return None
+        b_hi = rng.uniform(22.0, a1 - 12.0)
+        b_lo = rng.uniform(20.0, max(21.0, b_hi - 6.0))
+
+    sharp_idx_a = rng.randrange(2)
+    devs_a = [0.0, 0.0]
+    devs_a[sharp_idx_a] = a1 * rng.choice((1.0, -1.0))
+    devs_a[1 - sharp_idx_a] = a2 * rng.choice((1.0, -1.0))
+    hi_idx_b = rng.randrange(2)
+    devs_b = [0.0, 0.0]
+    devs_b[hi_idx_b] = b_hi * rng.choice((1.0, -1.0))
+    devs_b[1 - hi_idx_b] = b_lo * rng.choice((1.0, -1.0))
+
+    lens_a = [rng.uniform(105.0, 165.0) for _ in range(3)]
+    lens_b = [rng.uniform(105.0, 165.0) for _ in range(3)]
+    pts_a = _build_pipe(
+        (rng.uniform(PAD, W - PAD), rng.uniform(PAD, H - PAD)),
+        rng.uniform(0.0, 360.0), lens_a, devs_a,
+    )
+    pts_b = _build_pipe(
+        (rng.uniform(PAD, W - PAD), rng.uniform(PAD, H - PAD)),
+        rng.uniform(0.0, 360.0), lens_b, devs_b,
+    )
+
+    for pts in (pts_a, pts_b):
+        for x, y in pts:
+            if not (PAD <= x <= W - PAD and PAD <= y <= H - PAD):
+                return None
+
+    segs_a = _segments_of(pts_a)
+    segs_b = _segments_of(pts_b)
+
+    # non-consecutive sections of one pipe must stay apart
+    for segs in (segs_a, segs_b):
+        if _seg_seg_dist(segs[0][0], segs[0][1], segs[2][0], segs[2][1]) < MIN_CLEAR:
+            return None
+    # the two pipes must stay apart everywhere ...
+    cross = [
+        _seg_seg_dist(p[0], p[1], q[0], q[1]) for p in segs_a for q in segs_b
+    ]
+    min_cross = min(cross)
+    if min_cross < MIN_CLEAR:
+        return None
+    # ... but must interleave somewhere, so proximity alone cannot group them
+    if min_cross > 115.0:
+        return None
+
+    markers = []
+    for bend in range(2):
+        colour = answer_color if bend == sharp_idx_a else rest[0]
+        markers.append({"color": colour, "pipe": 0, "bend": bend,
+                        "center": _marker_center(pts_a, bend)})
+    for bend in range(2):
+        markers.append({"color": rest[1 + bend], "pipe": 1, "bend": bend,
+                        "center": _marker_center(pts_b, bend)})
+
+    all_segs = [("A", s) for s in segs_a] + [("B", s) for s in segs_b]
+    for m in markers:
+        cx, cy = m["center"]
+        if not (18.0 <= cx <= W - 18.0 and 18.0 <= cy <= H - 18.0):
+            return None
+        own = segs_a if m["pipe"] == 0 else segs_b
+        own_arms = (own[m["bend"]], own[m["bend"] + 1])
+        for _tag, seg in all_segs:
+            d = _pt_seg_dist((cx, cy), seg[0], seg[1])
+            if seg in own_arms:
+                if d < STROKE_W / 2.0 + 6.0:
+                    return None
+            elif d < MIN_MARK_CLEAR + _SQ_HALFDIAG:
+                return None
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if math.dist(markers[i]["center"], markers[j]["center"]) < MIN_MARK_MARK:
+                return None
+
+    ends = [0, 3]
+    rng.shuffle(ends)
+    chosen = None
+    for ring_end in ends:
+        disc = pts_a[ring_end]
+        if any(_pt_seg_dist(disc, s[0], s[1]) < MIN_DISC_OTHER for s in segs_b):
+            continue
+        if any(math.dist(disc, m["center"]) < 52.0 for m in markers):
+            continue
+        nearest = min(markers, key=lambda m: math.dist(disc, m["center"]))
+        is_decoy = nearest["pipe"] == 1
+        if relax or is_decoy == near_green_decoy:
+            chosen = (ring_end, is_decoy)
+            break
+    if chosen is None:
+        return None
+    ring_end, nearest_is_decoy = chosen
+
+    return {
+        "seed": int(seed),
+        "canvas": list(CANVAS),
+        "background": list(BACKGROUND),
+        "pipe_color": list(PIPE_COLOR),
+        "green_color": list(GREEN_COLOR),
+        "stroke_width": STROKE_W,
+        "disc_radius": DISC_R,
+        "square_side": SQUARE_SIDE,
+        "pipes": [[list(p) for p in pts_a], [list(p) for p in pts_b]],
+        "ring_pipe": 0,
+        "ring_end": ring_end,
+        "markers": [
+            {"color": m["color"], "pipe": m["pipe"], "bend": m["bend"],
+             "center": list(m["center"])}
+            for m in markers
+        ],
+        "global_sharpest_is_decoy": bool(global_sharpest_decoy),
+        "nearest_marker_to_green_is_decoy": bool(nearest_is_decoy),
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random((int(seed) * 2654435761) % (2 ** 31))
+    for attempt in range(20000):
+        scene = _try_scene(rng, seed, relax=attempt > 6000)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# analytic consequences of the scene
+# --------------------------------------------------------------------------
+def _ring_markers(scene: dict):
+    ring = scene["ring_pipe"]
+    pts = scene["pipes"][ring]
+    out = []
+    for m in scene["markers"]:
+        if m["pipe"] == ring:
+            out.append((bend_deviation_deg(pts, m["bend"]), m["color"]))
+    out.sort(reverse=True)
+    return out
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour of the square at the sharper bend of the green-ended pipe."""
+    return _ring_markers(scene)[0][1]
+
+
+def margin(scene: dict) -> float:
+    """Degrees between the two bends of the green-ended pipe."""
+    ranked = _ring_markers(scene)
+    return float(ranked[0][0] - ranked[1][0])
+
+
+def _min_clearance(scene: dict) -> float:
+    segs = [_segments_of([tuple(p) for p in pipe]) for pipe in scene["pipes"]]
+    vals = [_seg_seg_dist(s[0][0], s[0][1], s[2][0], s[2][1]) for s in segs]
+    vals += [
+        _seg_seg_dist(p[0], p[1], q[0], q[1]) for p in segs[0] for q in segs[1]
+    ]
+    return float(min(vals))
+
+
+def _min_ownership_contrast(scene: dict) -> float:
+    segs = [_segments_of([tuple(p) for p in pipe]) for pipe in scene["pipes"]]
+    worst = float("inf")
+    for m in scene["markers"]:
+        c = tuple(m["center"])
+        d = [min(_pt_seg_dist(c, s[0], s[1]) for s in segs[k]) for k in (0, 1)]
+        own = m["pipe"]
+        worst = min(worst, d[1 - own] - d[own])
+    return float(worst)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(
+        margin(scene) < QUAR_MARGIN_DEG
+        or _min_clearance(scene) < QUAR_CLEAR_PX
+        or _min_ownership_contrast(scene) < QUAR_OWNER_PX
+    )
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent aliases are declared: every label input is drawn."""
+    return []
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    W, H = scene["canvas"]
+    img = Image.new("RGB", (W, H), tuple(scene["background"]))
+    draw = ImageDraw.Draw(img)
+    w = scene["stroke_width"]
+    pipe_rgb = tuple(scene["pipe_color"])
+    for pipe in scene["pipes"]:
+        pts = [(float(x), float(y)) for x, y in pipe]
+        for a, b in _segments_of(pts):
+            draw.line([a, b], fill=pipe_rgb, width=w)
+        for vx, vy in pts[1:-1]:
+            r = w / 2.0
+            draw.ellipse([vx - r, vy - r, vx + r, vy + r], fill=pipe_rgb)
+    dx, dy = scene["pipes"][scene["ring_pipe"]][scene["ring_end"]]
+    r = scene["disc_radius"]
+    draw.ellipse([dx - r, dy - r, dx + r, dy + r], fill=tuple(scene["green_color"]))
+    half = scene["square_side"] / 2.0
+    for m in scene["markers"]:
+        cx, cy = m["center"]
+        draw.rectangle(
+            [cx - half, cy - half, cx + half, cy + half],
+            fill=MARKER_RGB[m["color"]],
+        )
+    return img

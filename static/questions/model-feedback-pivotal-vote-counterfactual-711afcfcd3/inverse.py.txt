@@ -1,0 +1,155 @@
+"""Independent pixel-only inverse arm for the pivotal-vote world.
+
+Receives exactly one rasterized image and nothing else: no latent scene, no
+renderer, no prompts, no analytic gold. It re-derives the aggregator from ink
+alone -- it labels the black connected components, keeps the circular ones,
+takes the bottom row of circles as the fifteen voting disks, reads each disk as
+filled (black) or hollow (white) from its own ink density, recovers the five
+triples from the horizontal gap structure, locates the three colored rings by
+exact hue, and then evaluates the drawn world plus the three single-disk edits
+itself to find which edit changes the two-stage majority.
+
+Only numpy and PIL are imported.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_RINGS = {
+    "amber": (232, 150, 20),
+    "teal": (0, 148, 148),
+    "violet": (150, 60, 200),
+}
+_FALLBACK = "amber"
+
+
+def _components(mask: np.ndarray) -> list:
+    """8-connected components of a boolean mask, as dicts of bbox statistics."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width:
+                        if mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+        arr = np.asarray(pixels)
+        y0, x0 = arr.min(axis=0).tolist()
+        y1, x1 = arr.max(axis=0).tolist()
+        out.append(
+            {
+                "area": len(pixels),
+                "w": x1 - x0 + 1,
+                "h": y1 - y0 + 1,
+                "cx": (x0 + x1) / 2.0,
+                "cy": (y0 + y1) / 2.0,
+            }
+        )
+    return out
+
+
+def _majority(bits) -> int:
+    return 1 if sum(bits) * 2 > len(bits) else 0
+
+
+def _root(groups) -> int:
+    return _majority([_majority(g) for g in groups])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB")).astype(np.int16)
+
+    black = (rgb[:, :, 0] < 40) & (rgb[:, :, 1] < 40) & (rgb[:, :, 2] < 40)
+    if int(black.sum()) < 500:
+        return _FALLBACK
+
+    circles = []
+    for comp in _components(black):
+        w, h = comp["w"], comp["h"]
+        if w < 24 or h < 24:
+            continue
+        if not 0.75 <= w / float(h) <= 1.34:
+            continue
+        density = comp["area"] / float(w * h)
+        if density < 0.18:
+            continue
+        circles.append(comp)
+    if len(circles) < 16:
+        return _FALLBACK
+
+    # the voting disks are the bottom row of circles
+    bottom = max(c["cy"] for c in circles)
+    leaves = sorted([c for c in circles if c["cy"] >= bottom - 60],
+                    key=lambda c: c["cx"])
+    if len(leaves) != 15:
+        return _FALLBACK
+
+    bits = []
+    for leaf in leaves:
+        density = leaf["area"] / float(leaf["w"] * leaf["h"])
+        bits.append(1 if density > 0.55 else 0)
+
+    # five triples: the largest horizontal gaps separate neighbouring triples
+    gaps = [leaves[i + 1]["cx"] - leaves[i]["cx"] for i in range(14)]
+    cut = (min(gaps) + max(gaps)) / 2.0
+    groups = []
+    current = [0]
+    for i, gap in enumerate(gaps):
+        if gap > cut:
+            groups.append(current)
+            current = [i + 1]
+        else:
+            current.append(i + 1)
+    groups.append(current)
+    if len(groups) != 5 or any(len(g) != 3 for g in groups):
+        return _FALLBACK
+
+    slot_of = {}
+    for gi, group in enumerate(groups):
+        for si, index in enumerate(group):
+            slot_of[index] = (gi, si)
+
+    marked = []
+    for name, color in _RINGS.items():
+        hit = (
+            (rgb[:, :, 0] == color[0])
+            & (rgb[:, :, 1] == color[1])
+            & (rgb[:, :, 2] == color[2])
+        )
+        if int(hit.sum()) < 200:
+            return _FALLBACK
+        ys, xs = np.nonzero(hit)
+        cx, cy = float(xs.mean()), float(ys.mean())
+        best = min(
+            range(15),
+            key=lambda i: (leaves[i]["cx"] - cx) ** 2 + (leaves[i]["cy"] - cy) ** 2,
+        )
+        marked.append((name, slot_of[best]))
+    if len({slot for _name, slot in marked}) != 3:
+        return _FALLBACK
+
+    state = [[bits[index] for index in group] for group in groups]
+    base = _root(state)
+    winners = []
+    for name, (gi, si) in marked:
+        edited = [list(g) for g in state]
+        edited[gi][si] = 1 - edited[gi][si]
+        if _root(edited) != base:
+            winners.append(name)
+    if len(winners) != 1:
+        return _FALLBACK
+    return winners[0]

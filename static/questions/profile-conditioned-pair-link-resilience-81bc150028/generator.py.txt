@@ -1,0 +1,254 @@
+"""Deterministic renderer and analytic arm for pairwise link resilience.
+
+The latent graph is a cactus with three visible cycles.  The first two cycles
+share one circular junction, while the third cycle is attached by one ordinary
+link.  Every scene has exactly the same 11 junctions and 13 links.  Only the two
+marked junctions vary with the label:
+
+* positive pairs lie on opposite sides of the shared junction.  They have two
+  edge-disjoint routes despite not lying on one common simple cycle;
+* negative pairs lie on opposite sides of the single bridge.
+
+The final raster is the complete public evidence.  No graph indices or labels
+are printed or embedded in the PNG.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+WIDTH = 640
+HEIGHT = 480
+
+# Three four-cycles.  Cycles 1 and 2 share vertex 0; cycle 3 is joined by edge
+# (5, 7).  Thus |V|=11 and |E|=13 in every scene.
+BASE_POSITIONS = [
+    (200.0, 240.0),  # 0: shared articulation of the two left cycles
+    (140.0, 150.0),
+    (62.0, 240.0),
+    (140.0, 330.0),
+    (270.0, 150.0),
+    (340.0, 240.0),  # 5: left endpoint of the sole bridge
+    (270.0, 330.0),
+    (402.0, 240.0),  # 7: right endpoint of the sole bridge
+    (472.0, 150.0),
+    (568.0, 240.0),
+    (472.0, 330.0),
+]
+
+BASE_EDGES = [
+    (0, 1), (1, 2), (2, 3), (3, 0),
+    (0, 4), (4, 5), (5, 6), (6, 0),
+    (5, 7),
+    (7, 8), (8, 9), (9, 10), (10, 7),
+]
+
+COLORS = {
+    "background": "#f7f5ef",
+    "link": "#26313f",
+    "neutral": "#4c9fcb",
+    "green": "#18a86b",
+    "purple": "#8d55c7",
+    "outline": "#14202c",
+}
+
+
+def _reachable(n: int, edges: list[list[int]] | list[tuple[int, int]], source: int,
+               target: int, skipped: int | None = None) -> bool:
+    adjacency = [[] for _ in range(n)]
+    for index, (u, v) in enumerate(edges):
+        if index == skipped:
+            continue
+        adjacency[u].append(v)
+        adjacency[v].append(u)
+    seen = {source}
+    queue = deque([source])
+    while queue:
+        u = queue.popleft()
+        if u == target:
+            return True
+        for v in adjacency[u]:
+            if v not in seen:
+                seen.add(v)
+                queue.append(v)
+    return False
+
+
+def _edge_connectivity(scene: dict) -> int:
+    edges = scene["edges"]
+    green = int(scene["green"])
+    purple = int(scene["purple"])
+    n = 1 + max(max(edge) for edge in edges)
+    if not _reachable(n, edges, green, purple):
+        return 0
+    for index in range(len(edges)):
+        if not _reachable(n, edges, green, purple, skipped=index):
+            return 1
+    # These cactus scenes never exceed pairwise edge connectivity two; returning
+    # two is also exactly the threshold needed by the public decision.
+    return 2
+
+
+def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced, deterministic scene from an integer seed."""
+    rng = random.Random(int(seed))
+    mirror_x = bool(rng.getrandbits(1))
+    mirror_y = bool(rng.getrandbits(1))
+    scale = rng.uniform(0.96, 1.035)
+    shift_x = rng.uniform(-8.0, 8.0)
+    shift_y = rng.uniform(-7.0, 7.0)
+
+    positions: list[list[float]] = []
+    for x, y in BASE_POSITIONS:
+        if mirror_x:
+            x = WIDTH - x
+        if mirror_y:
+            y = HEIGHT - y
+        x = WIDTH / 2 + (x - WIDTH / 2) * scale + shift_x + rng.uniform(-4.0, 4.0)
+        y = HEIGHT / 2 + (y - HEIGHT / 2) * scale + shift_y + rng.uniform(-4.0, 4.0)
+        positions.append([round(x, 3), round(y, 3)])
+
+    # Pair pools occupy comparable distance ranges.  The positive pool crosses
+    # the vertex-shared cycles; the negative pool crosses the sole bridge.
+    positive_pool = [
+        (u, v) for u in (1, 2, 3) for v in (4, 5, 6)
+        if 142.0 <= _distance(tuple(positions[u]), tuple(positions[v])) <= 242.0
+    ]
+    negative_pool = [
+        (u, v) for u in (4, 5, 6) for v in (7, 8, 9, 10)
+        if 142.0 <= _distance(tuple(positions[u]), tuple(positions[v])) <= 242.0
+    ]
+    if not positive_pool or not negative_pool:
+        raise RuntimeError("balanced marked-pair pool unexpectedly empty")
+
+    resilient = (int(seed) & 1) == 0
+    green, purple = rng.choice(positive_pool if resilient else negative_pool)
+    if rng.random() < 0.5:
+        green, purple = purple, green
+
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "positions": positions,
+        "edges": [list(edge) for edge in BASE_EDGES],
+        "green": green,
+        "purple": purple,
+        "node_radius": 15,
+        "link_width": 10,
+        "colors": dict(COLORS),
+    }
+    if is_quarantined(scene):
+        raise RuntimeError("sampler produced a quarantined scene")
+    if (analytic_gold(scene) == "yes") != resilient:
+        raise RuntimeError("sampled marker pair does not have requested class")
+    return scene
+
+
+def render(scene: dict) -> Image.Image:
+    """Render an antialiased RGB network using only visible scene fields."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    positions = scene["positions"]
+    edges = scene["edges"]
+    green = int(scene["green"])
+    purple = int(scene["purple"])
+    radius = float(scene["node_radius"])
+    link_width = float(scene["link_width"])
+    colors = scene["colors"]
+
+    ss = 4
+    image = Image.new("RGB", (width * ss, height * ss), colors["background"])
+    draw = ImageDraw.Draw(image)
+    for u, v in edges:
+        a, b = positions[u], positions[v]
+        draw.line(
+            [(round(a[0] * ss), round(a[1] * ss)),
+             (round(b[0] * ss), round(b[1] * ss))],
+            fill=colors["link"], width=round(link_width * ss),
+        )
+
+    outline_width = 2.0
+    for index, (x, y) in enumerate(positions):
+        fill = colors["neutral"]
+        if index == green:
+            fill = colors["green"]
+        elif index == purple:
+            fill = colors["purple"]
+        box = [
+            round((x - radius) * ss), round((y - radius) * ss),
+            round((x + radius) * ss), round((y + radius) * ss),
+        ]
+        draw.ellipse(
+            box,
+            fill=fill,
+            outline=colors["outline"],
+            width=round(outline_width * ss),
+        )
+
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    return "yes" if _edge_connectivity(scene) >= 2 else "no"
+
+
+def margin(scene: dict) -> float:
+    """Signed runner-up gap around the visible min-cut threshold 1.5."""
+    return float(_edge_connectivity(scene)) - 1.5
+
+
+def _point_segment_distance(p: tuple[float, float], a: tuple[float, float],
+                            b: tuple[float, float]) -> float:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    denom = dx * dx + dy * dy
+    if denom == 0:
+        return _distance(p, a)
+    t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / denom))
+    return _distance(p, (a[0] + t * dx, a[1] + t * dy))
+
+
+def is_quarantined(scene: dict) -> bool:
+    positions = [tuple(point) for point in scene["positions"]]
+    edges = [tuple(edge) for edge in scene["edges"]]
+    radius = float(scene["node_radius"])
+    width = float(scene["link_width"])
+    if radius < 13.0 or width < 7.0 or len(positions) != 11 or len(edges) != 13:
+        return True
+    if min(_distance(a, b) for i, a in enumerate(positions)
+           for b in positions[i + 1:]) < 48.0:
+        return True
+    # A nonincident node must remain well clear of every link trace.
+    for u, v in edges:
+        a, b = positions[u], positions[v]
+        for index, point in enumerate(positions):
+            if index not in (u, v) and _point_segment_distance(point, a, b) < radius + width:
+                return True
+    return False
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Return one exact-raster neutral-junction reindexing alias."""
+    green, purple = int(scene["green"]), int(scene["purple"])
+    neutral = [i for i in range(len(scene["positions"])) if i not in (green, purple)]
+    a, b = neutral[:2]
+    mapping = list(range(len(scene["positions"])))
+    mapping[a], mapping[b] = mapping[b], mapping[a]
+
+    twin = copy.deepcopy(scene)
+    remapped_positions = [None] * len(scene["positions"])
+    for old, new in enumerate(mapping):
+        remapped_positions[new] = copy.deepcopy(scene["positions"][old])
+    twin["positions"] = remapped_positions
+    twin["edges"] = [[mapping[u], mapping[v]] for u, v in scene["edges"]]
+    twin["green"] = mapping[green]
+    twin["purple"] = mapping[purple]
+    return [(f"swap_neutral_indices_{a}_{b}", twin)]

@@ -1,0 +1,285 @@
+"""Scene sampler, raster renderer and analytic gold for ``moment_arm_balance``.
+
+A horizontal black rail carries a row of evenly spaced black ticks.  A black
+triangle under the rail points at one tick, the pivot.  Columns of stacked
+square cells stand on other ticks.  A column's weight is its number of cells,
+its arm is the number of tick steps to the pivot, and its moment is the
+product of the two.  The answer names the side of the pivot whose columns have
+the greater total moment.
+
+Every mark is an axis-aligned integer rectangle (the pivot triangle is the one
+aliased polygon), so the raster has no antialiasing and every measured extent
+is exact.  All latent fields are integers that are painted exactly: no two
+distinct scenes share a raster, so the world declares no latent aliases and
+``latent_symmetries`` returns an empty list.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "moment_arm_balance-1.0.0"
+
+# --- fixed page geometry (integer raster, no antialiasing, no fonts) ---------
+WIDTH = 860
+HEIGHT = 420
+RAIL_X0 = 34
+RAIL_X1 = 826
+BEAM_Y = 300               # top row of the black rail
+BEAM_H = 4
+TICK_TOP = BEAM_Y + BEAM_H
+TICK_BOT = TICK_TOP + 12
+TICK_HALF_W = 1            # ticks are three pixels wide
+N_TICKS = 13
+TICK_X0 = 70
+TICK_DX = 60
+PIVOT_APEX_Y = TICK_BOT + 6
+PIVOT_BASE_Y = PIVOT_APEX_Y + 28
+PIVOT_HALF_W = 15
+
+CELL_W = 40
+CELL_H = 26
+BORDER = 2
+MAX_CELLS = 5
+MAX_COLS_PER_SIDE = 4
+PIVOT_LO = 4               # pivot tick index range, both sides keep room
+PIVOT_HI = 8
+
+BACKGROUND = (255, 255, 255)
+INK = (20, 20, 20)
+GUIDE = (232, 232, 232)
+PALETTE = (
+    (214, 64, 58),
+    (58, 120, 214),
+    (36, 150, 86),
+    (222, 150, 32),
+    (140, 80, 190),
+    (0, 160, 170),
+)
+
+QUARANTINE_UNITS = 3.0     # |left total - right total| below this is a boundary case
+CLEAN_MARGIN = 5.0         # off-quarantine scenes keep at least this margin
+NEAR_LO = 1                # sampled boundary cases live in [NEAR_LO, NEAR_HI]
+NEAR_HI = 2
+BOUNDARY_EVERY = 5         # one scene in five is deliberately near the boundary
+
+
+# --- analytic consequences ----------------------------------------------------
+def _totals(pivot: int, columns: list[dict]) -> tuple[int, int]:
+    """``(left total moment, right total moment)`` in cell-step units."""
+    left = sum(c["cells"] * (pivot - c["tick"]) for c in columns if c["tick"] < pivot)
+    right = sum(c["cells"] * (c["tick"] - pivot) for c in columns if c["tick"] > pivot)
+    return int(left), int(right)
+
+
+def analytic_gold(scene: dict) -> str:
+    """``"left"`` or ``"right"``: the side with the greater total moment."""
+    left, right = _totals(scene["pivot"], scene["columns"])
+    if left == right:  # never sampled; the sampler rejects exact balance
+        raise ValueError("balanced scene has no gold side")
+    return "left" if left > right else "right"
+
+
+def margin(scene: dict) -> float:
+    left, right = _totals(scene["pivot"], scene["columns"])
+    return float(abs(left - right))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_UNITS
+
+
+# --- diagnostics (never used by gold) ----------------------------------------
+def heavier_side(scene: dict) -> str:
+    """Cheap cue: which side carries more cells in total."""
+    left = sum(c["cells"] for c in scene["columns"] if c["tick"] < scene["pivot"])
+    right = sum(c["cells"] for c in scene["columns"] if c["tick"] > scene["pivot"])
+    if left == right:
+        return "tie"
+    return "left" if left > right else "right"
+
+
+def busier_side(scene: dict) -> str:
+    """Cheap cue: which side carries more columns."""
+    left = sum(1 for c in scene["columns"] if c["tick"] < scene["pivot"])
+    right = sum(1 for c in scene["columns"] if c["tick"] > scene["pivot"])
+    if left == right:
+        return "tie"
+    return "left" if left > right else "right"
+
+
+def tallest_side(scene: dict) -> str:
+    """Cheap cue: which side holds the single tallest column."""
+    best = max(c["cells"] for c in scene["columns"])
+    holders = {
+        "left" if c["tick"] < scene["pivot"] else "right"
+        for c in scene["columns"]
+        if c["cells"] == best
+    }
+    return holders.pop() if len(holders) == 1 else "tie"
+
+
+def farthest_side(scene: dict) -> str:
+    """Cheap cue: which side holds the column with the longest arm."""
+    best = max(abs(c["tick"] - scene["pivot"]) for c in scene["columns"])
+    holders = {
+        "left" if c["tick"] < scene["pivot"] else "right"
+        for c in scene["columns"]
+        if abs(c["tick"] - scene["pivot"]) == best
+    }
+    return holders.pop() if len(holders) == 1 else "tie"
+
+
+def total_cells(scene: dict) -> int:
+    return int(sum(c["cells"] for c in scene["columns"]))
+
+
+# --- latent scene -------------------------------------------------------------
+def sample_scene(seed: int) -> dict:
+    """Deterministic latent scene for ``seed``.
+
+    The cheap cues are counterbalanced by construction: the sampling plan fixes
+    the answer side and whether the side with more cells, the side with more
+    columns and the side with the longest arm agree with it, cycling through
+    all sixteen combinations.
+    """
+    rng = random.Random(0x4D4F ^ (seed * 2654435761 % (1 << 32)))
+    plan = seed % 16
+    want = "left" if plan % 2 == 0 else "right"
+    weight_agrees = (plan // 2) % 2 == 0
+    count_agrees = (plan // 4) % 2 == 0
+    reach_agrees = (plan // 8) % 2 == 0
+    tight = seed % BOUNDARY_EVERY == 0
+
+    for attempt in range(60000):
+        # The longest-arm cue is counterbalanced whenever the other three
+        # constraints leave room for it; a few plans are only satisfiable
+        # without it, and those fall back rather than failing to sample.
+        enforce_reach = attempt < 30000
+        pivot = rng.randint(PIVOT_LO, PIVOT_HI)
+        n_left = rng.randint(1, MAX_COLS_PER_SIDE)
+        n_right = rng.randint(1, MAX_COLS_PER_SIDE)
+        if n_left == n_right:
+            continue  # the column-count cue must be strict so it can be counterbalanced
+        if ((n_left > n_right) == (want == "left")) != count_agrees:
+            continue
+        left_arms = rng.sample(range(1, pivot + 1), n_left)
+        right_arms = rng.sample(range(1, N_TICKS - pivot), n_right)
+        if enforce_reach:
+            if max(left_arms) == max(right_arms):
+                continue  # a strict longest-arm cue is what gets counterbalanced
+            if ((max(left_arms) > max(right_arms)) == (want == "left")) != reach_agrees:
+                continue
+        left_cells = [rng.randint(1, MAX_CELLS) for _ in left_arms]
+        right_cells = [rng.randint(1, MAX_CELLS) for _ in right_arms]
+
+        w_left, w_right = sum(left_cells), sum(right_cells)
+        if w_left == w_right:
+            continue
+        if ((w_left > w_right) == (want == "left")) != weight_agrees:
+            continue
+
+        left_total = sum(c * a for c, a in zip(left_cells, left_arms))
+        right_total = sum(c * a for c, a in zip(right_cells, right_arms))
+        gap = abs(left_total - right_total)
+        if (left_total > right_total) != (want == "left"):
+            continue
+        if tight:
+            if not NEAR_LO <= gap <= NEAR_HI:
+                continue
+        elif gap < CLEAN_MARGIN:
+            continue
+
+        columns = [
+            {"tick": pivot - arm, "cells": cells, "color": rng.randrange(len(PALETTE))}
+            for arm, cells in zip(left_arms, left_cells)
+        ] + [
+            {"tick": pivot + arm, "cells": cells, "color": rng.randrange(len(PALETTE))}
+            for arm, cells in zip(right_arms, right_cells)
+        ]
+        columns.sort(key=lambda c: c["tick"])
+        guides = sorted(rng.sample(range(60, BEAM_Y - 24, 16), rng.randint(3, 5)))
+        return {
+            "pivot": int(pivot),
+            "columns": columns,
+            "guides": [int(g) for g in guides],
+        }
+    raise RuntimeError(f"scene sampling failed for seed {seed}")  # pragma: no cover
+
+
+# --- raster -------------------------------------------------------------------
+def tick_x(index: int) -> int:
+    return TICK_X0 + index * TICK_DX
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    for guide in scene["guides"]:
+        row = int(guide)
+        draw.rectangle([RAIL_X0, row, RAIL_X1, row], fill=GUIDE)
+
+    for index in range(N_TICKS):
+        x = tick_x(index)
+        draw.rectangle([x - TICK_HALF_W, TICK_TOP, x + TICK_HALF_W, TICK_BOT], fill=INK)
+
+    for column in scene["columns"]:
+        x = tick_x(int(column["tick"]))
+        x0, x1 = x - CELL_W // 2, x + CELL_W // 2 - 1
+        fill = PALETTE[int(column["color"]) % len(PALETTE)]
+        for level in range(int(column["cells"])):
+            y1 = BEAM_Y - 1 - level * CELL_H
+            y0 = y1 - CELL_H + 1
+            draw.rectangle([x0, y0, x1, y1], fill=fill)
+            draw.rectangle([x0, y0, x1, y1], outline=INK, width=BORDER)
+
+    draw.rectangle([RAIL_X0, BEAM_Y, RAIL_X1, BEAM_Y + BEAM_H - 1], fill=INK)
+
+    apex = tick_x(int(scene["pivot"]))
+    draw.polygon(
+        [
+            (apex, PIVOT_APEX_Y),
+            (apex - PIVOT_HALF_W, PIVOT_BASE_Y),
+            (apex + PIVOT_HALF_W, PIVOT_BASE_Y),
+        ],
+        fill=INK,
+    )
+    return image
+
+
+# --- declared latent aliases --------------------------------------------------
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases exist: every field is an integer painted exactly.
+
+    The pivot index, each column's tick index and cell count, the decorative
+    colours and the guide rows are all recoverable from the raster, so the
+    scene-to-raster map is injective and no pixel-identical transformation of a
+    scene exists at all.  The declared mode is therefore ``not_applicable``.
+    """
+    return []
+
+
+def mirrored_scene(scene: dict) -> dict:
+    """Declared label-transforming symmetry: mirror the layout about the rail.
+
+    Mirroring maps every tick index ``t`` to ``N_TICKS - 1 - t``, so arms are
+    preserved and the two side totals swap.  Used by the tests, never by gold.
+    """
+    return {
+        "pivot": N_TICKS - 1 - int(scene["pivot"]),
+        "columns": sorted(
+            (
+                {
+                    "tick": N_TICKS - 1 - int(c["tick"]),
+                    "cells": int(c["cells"]),
+                    "color": int(c["color"]),
+                }
+                for c in scene["columns"]
+            ),
+            key=lambda c: c["tick"],
+        ),
+        "guides": [int(g) for g in scene["guides"]],
+    }

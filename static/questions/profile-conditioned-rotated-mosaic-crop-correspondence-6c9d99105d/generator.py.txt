@@ -1,0 +1,316 @@
+"""Deterministic rotated-crop correspondence scenes and Pillow rendering."""
+
+from __future__ import annotations
+
+import copy
+import random
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 1080
+HEIGHT = 670
+GRID_SIZE = 8
+CROP_SIZE = 4
+COLORS = ("red", "green", "blue")
+
+BACKGROUND = (235, 238, 242)
+CARD = (255, 255, 255)
+PAPER = (247, 244, 232)
+INK = (34, 38, 45)
+FRAME = (69, 82, 104)
+TEXT = (31, 36, 46)
+MAGENTA = (210, 38, 142)
+RING_RGB = {
+    "red": (220, 54, 62),
+    "green": (34, 157, 91),
+    "blue": (44, 105, 205),
+}
+
+
+def _rotate_clockwise(grid: list[list[int]], turns: int) -> list[list[int]]:
+    result = [list(row) for row in grid]
+    for _ in range(turns % 4):
+        result = [list(row) for row in zip(*result[::-1])]
+    return result
+
+
+def _rotate_coordinate(row: int, col: int, size: int, turns: int) -> tuple[int, int]:
+    for _ in range(turns % 4):
+        row, col = col, size - 1 - row
+    return row, col
+
+
+def _crop(target: list[list[int]], row: int, col: int) -> list[list[int]]:
+    return [line[col : col + CROP_SIZE] for line in target[row : row + CROP_SIZE]]
+
+
+def _reference(scene: dict) -> list[list[int]]:
+    return _rotate_clockwise(
+        _crop(scene["target_bits"], scene["crop_row"], scene["crop_col"]),
+        scene["rotation"],
+    )
+
+
+def _scores(target: list[list[int]], reference: list[list[int]]) -> list[tuple[int, int, int, int]]:
+    scores: list[tuple[int, int, int, int]] = []
+    for row in range(GRID_SIZE - CROP_SIZE + 1):
+        for col in range(GRID_SIZE - CROP_SIZE + 1):
+            window = _crop(target, row, col)
+            for turns in range(4):
+                candidate = _rotate_clockwise(window, turns)
+                disagreement = sum(
+                    candidate[r][c] != reference[r][c]
+                    for r in range(CROP_SIZE)
+                    for c in range(CROP_SIZE)
+                )
+                scores.append((disagreement, row, col, turns))
+    return sorted(scores)
+
+
+def _runner_gap(target: list[list[int]], reference: list[list[int]]) -> int:
+    scores = _scores(target, reference)
+    return scores[1][0] - scores[0][0]
+
+
+def _balanced_bits(rng: random.Random) -> list[list[int]]:
+    indices = list(range(GRID_SIZE * GRID_SIZE))
+    rng.shuffle(indices)
+    dark = set(indices[: GRID_SIZE * GRID_SIZE // 2])
+    return [
+        [int(row * GRID_SIZE + col in dark) for col in range(GRID_SIZE)]
+        for row in range(GRID_SIZE)
+    ]
+
+
+def _clear_marker_cells(
+    rng: random.Random, correct: tuple[int, int]
+) -> list[tuple[int, int]]:
+    choices = [
+        (row, col)
+        for row in range(GRID_SIZE)
+        for col in range(GRID_SIZE)
+        if (row, col) != correct
+        and abs(row - correct[0]) + abs(col - correct[1]) >= 2
+    ]
+    rng.shuffle(choices)
+    distractors: list[tuple[int, int]] = []
+    for cell in choices:
+        if all(abs(cell[0] - other[0]) + abs(cell[1] - other[1]) >= 2 for other in distractors):
+            distractors.append(cell)
+        if len(distractors) == 2:
+            return [correct, *distractors]
+    raise RuntimeError("could not place separated marker rings")
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one unique crop match, with deliberate near-boundary coverage."""
+
+    rng = random.Random((seed + 1) * 1_000_003 + 97)
+    want_near = seed % 8 == 0
+    for _ in range(20_000):
+        target = _balanced_bits(rng)
+        crop_row = rng.randrange(GRID_SIZE - CROP_SIZE + 1)
+        crop_col = rng.randrange(GRID_SIZE - CROP_SIZE + 1)
+        rotation = rng.randrange(4)
+        reference = _rotate_clockwise(_crop(target, crop_row, crop_col), rotation)
+        scores = _scores(target, reference)
+        true_assignment = (0, crop_row, crop_col, rotation)
+        if scores[0] != true_assignment or scores[1][0] == 0:
+            continue
+        gap = scores[1][0]
+        if want_near and gap > 2:
+            continue
+        if not want_near and gap < 3:
+            continue
+
+        marked_row = rng.randrange(CROP_SIZE)
+        marked_col = rng.randrange(CROP_SIZE)
+        correct_cell = (crop_row + marked_row, crop_col + marked_col)
+        marker_cells = _clear_marker_cells(rng, correct_cell)
+        answer = COLORS[seed % len(COLORS)]
+        remaining = [color for color in COLORS if color != answer]
+        rng.shuffle(remaining)
+        marker_colors = [answer, *remaining]
+        paired = list(zip(marker_cells, marker_colors))
+        rng.shuffle(paired)
+        return {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "target_bits": target,
+            "crop_row": crop_row,
+            "crop_col": crop_col,
+            "rotation": rotation,
+            "marked_row": marked_row,
+            "marked_col": marked_col,
+            "marker_cells": [list(cell) for cell, _ in paired],
+            "marker_colors": [color for _, color in paired],
+        }
+    raise RuntimeError(f"could not sample a separated crop assignment for seed {seed}")
+
+
+def analytic_gold(scene: dict) -> str:
+    """Compute the answer from the latent correspondence, never from a stored label."""
+
+    target = scene["target_bits"]
+    crop_row = scene["crop_row"]
+    crop_col = scene["crop_col"]
+    rotation = scene["rotation"]
+    marked_row = scene["marked_row"]
+    marked_col = scene["marked_col"]
+    marker_cells = scene["marker_cells"]
+    marker_colors = scene["marker_colors"]
+    reference = _rotate_clockwise(_crop(target, crop_row, crop_col), rotation)
+    scores = _scores(target, reference)
+    if scores[0] != (0, crop_row, crop_col, rotation) or scores[1][0] == 0:
+        raise ValueError("scene does not have the declared unique assignment")
+    correct_cell = [crop_row + marked_row, crop_col + marked_col]
+    matches = [
+        color for cell, color in zip(marker_cells, marker_colors) if cell == correct_cell
+    ]
+    if len(matches) != 1 or matches[0] not in COLORS:
+        raise ValueError("registered target cell does not have exactly one answer ring")
+    return matches[0]
+
+
+def margin(scene: dict) -> float:
+    return float(_runner_gap(scene["target_bits"], _reference(scene)))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 3.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Paired marker storage order is invisible because marker cells never overlap."""
+
+    twin = copy.deepcopy(scene)
+    twin["marker_cells"] = list(reversed(twin["marker_cells"]))
+    twin["marker_colors"] = list(reversed(twin["marker_colors"]))
+    return [("reverse_marker_storage", twin)]
+
+
+def _font(size: int, bold: bool = False):
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(name, size)
+    except OSError:
+        return ImageFont.load_default(size=size)
+
+
+def _draw_grid(
+    draw: ImageDraw.ImageDraw,
+    grid: list[list[int]],
+    left: int,
+    top: int,
+    cell: int,
+) -> None:
+    size = len(grid)
+    for row in range(size):
+        for col in range(size):
+            x0 = left + col * cell
+            y0 = top + row * cell
+            fill = INK if grid[row][col] else PAPER
+            draw.rectangle((x0, y0, x0 + cell, y0 + cell), fill=fill)
+    for index in range(size + 1):
+        x = left + index * cell
+        y = top + index * cell
+        draw.line((x, top, x, top + size * cell), fill=FRAME, width=4)
+        draw.line((left, y, left + size * cell, y), fill=FRAME, width=4)
+    draw.rectangle(
+        (left, top, left + size * cell, top + size * cell),
+        outline=FRAME,
+        width=6,
+    )
+
+
+def _ring(
+    draw: ImageDraw.ImageDraw,
+    left: int,
+    top: int,
+    cell: int,
+    row: int,
+    col: int,
+    color: tuple[int, int, int],
+) -> None:
+    cx = left + col * cell + cell // 2
+    cy = top + row * cell + cell // 2
+    radius = max(13, cell // 4)
+    draw.ellipse(
+        (cx - radius, cy - radius, cx + radius, cy + radius),
+        outline=(255, 255, 255),
+        width=12,
+    )
+    draw.ellipse(
+        (cx - radius, cy - radius, cx + radius, cy + radius),
+        outline=color,
+        width=7,
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    width = int(scene["width"])
+    height = int(scene["height"])
+    target = scene["target_bits"]
+    reference = _reference(scene)
+    marked_row = scene["marked_row"]
+    marked_col = scene["marked_col"]
+    rotation = scene["rotation"]
+    marker_cells = scene["marker_cells"]
+    marker_colors = scene["marker_colors"]
+
+    image = Image.new("RGB", (width, height), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((34, 40, 430, 625), radius=18, fill=CARD)
+    draw.rounded_rectangle((470, 40, 1046, 625), radius=18, fill=CARD)
+    draw.text((232, 76), "REFERENCE", fill=TEXT, font=_font(29, True), anchor="mm")
+    draw.text((758, 76), "TARGET", fill=TEXT, font=_font(29, True), anchor="mm")
+    draw.text(
+        (232, 112),
+        "whole-window quarter-turn allowed",
+        fill=TEXT,
+        font=_font(16),
+        anchor="mm",
+    )
+
+    ref_left, ref_top, ref_cell = 70, 180, 80
+    target_left, target_top, target_cell = 518, 115, 60
+    _draw_grid(draw, reference, ref_left, ref_top, ref_cell)
+    shown_row, shown_col = _rotate_coordinate(
+        marked_row, marked_col, CROP_SIZE, rotation
+    )
+    _ring(draw, ref_left, ref_top, ref_cell, shown_row, shown_col, MAGENTA)
+
+    _draw_grid(draw, target, target_left, target_top, target_cell)
+    for cell_rc, color in zip(marker_cells, marker_colors):
+        _ring(
+            draw,
+            target_left,
+            target_top,
+            target_cell,
+            int(cell_rc[0]),
+            int(cell_rc[1]),
+            RING_RGB[color],
+        )
+
+    draw.text(
+        (232, 550),
+        "Find this window in the mosaic",
+        fill=TEXT,
+        font=_font(18, True),
+        anchor="mm",
+    )
+    draw.text(
+        (232, 578),
+        "No mirror reflection",
+        fill=TEXT,
+        font=_font(17),
+        anchor="mm",
+    )
+    draw.text(
+        (758, 610),
+        "Which ring receives the magenta-marked cell?",
+        fill=TEXT,
+        font=_font(17, True),
+        anchor="mm",
+    )
+    return image

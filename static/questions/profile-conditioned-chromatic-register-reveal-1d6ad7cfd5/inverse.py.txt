@@ -1,0 +1,220 @@
+"""Independent image-only inverse for the chromatic registration world.
+
+This module deliberately reconstructs the public operation from RGB pixels:
+it detects four connected fiducial components for each dominant color, infers
+each channel crop, translates all three crops to a common coordinate frame,
+averages them, and scores independent broad-symbol templates.  It does not
+import or inspect renderer state.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+_WIDTH = 512
+_HEIGHT = 512
+_TILE = 240
+_FIDUCIAL_OFFSET = 16
+_FIDUCIAL_SIZE = 11
+_SYMBOLS = ("arch", "kite", "coil", "trident")
+_STROKE = 11
+_MARKER_PALETTES = (
+    ((245, 52, 52), (48, 205, 66), (55, 86, 238)),
+    ((250, 92, 40), (42, 190, 142), (112, 55, 228)),
+    ((228, 58, 124), (70, 214, 60), (48, 122, 242)),
+    ((242, 74, 34), (44, 224, 110), (116, 56, 238)),
+)
+
+
+def _dominant_marker_mask(pixels: np.ndarray, channel: int) -> np.ndarray:
+    """Find saturated marker pixels for one RGB dominant component."""
+
+    # Markers are flat, lossless RGB swatches.  Match the small public palette
+    # by color distance rather than relying on dominance alone: a dark overlap
+    # of two exposure channels can otherwise look blue or red by accident.
+    palette = np.asarray([entry[channel] for entry in _MARKER_PALETTES], dtype=np.float32)
+    distances = np.sqrt(
+        np.sum(
+            (pixels.astype(np.float32)[..., None, :] - palette[None, None, :, :]) ** 2,
+            axis=-1,
+        )
+    )
+    return distances.min(axis=-1) <= 2.0
+
+
+def _components(mask: np.ndarray) -> list[tuple[float, float, int]]:
+    """Return (x centroid, y centroid, area) for connected mask components."""
+
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[tuple[float, float, int]] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.pop()
+            points.append((cy, cx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny = cy + dy
+                nx = cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= 30:
+            ys = np.asarray([point[0] for point in points], dtype=np.float64)
+            xs = np.asarray([point[1] for point in points], dtype=np.float64)
+            components.append((float(xs.mean()), float(ys.mean()), len(points)))
+    return components
+
+
+def _channel_origin(pixels: np.ndarray, channel: int) -> tuple[int, int]:
+    components = _components(_dominant_marker_mask(pixels, channel))
+    if len(components) != 4:
+        raise ValueError(f"channel {channel} needs four visible fiducials, found {len(components)}")
+    xs = sorted(point[0] for point in components)
+    ys = sorted(point[1] for point in components)
+    # The fiducials are a rectangle: the two extreme x/y coordinates identify
+    # its corners without relying on latent offsets or a filename.
+    origin_x = int(round(xs[0] + _FIDUCIAL_OFFSET))
+    origin_y = int(round(ys[0] + _FIDUCIAL_OFFSET))
+    if xs[-1] - xs[0] < _TILE or ys[-1] - ys[0] < _TILE:
+        raise ValueError("fiducial rectangle is too small")
+    return origin_x, origin_y
+
+
+def _paths(symbol: str, cx: float, cy: float) -> list[list[tuple[float, float]]]:
+    definitions: dict[str, list[list[tuple[float, float]]]] = {
+        "arch": [[(-54, 48), (-54, -42), (54, -42), (54, 48)]],
+        "kite": [[(0, -58), (54, 0), (0, 58), (-54, 0), (0, -58)]],
+        "coil": [[(-58, -48), (58, -48), (58, 42), (-30, 42), (-30, -15), (28, -15), (28, 15)]],
+        "trident": [
+            [(0, 56), (0, -30)],
+            [(0, -28), (-54, -56)],
+            [(0, -28), (54, -56)],
+            [(0, -28), (0, -60)],
+        ],
+    }
+    if symbol not in definitions:
+        raise ValueError(f"unknown template {symbol!r}")
+    return [[(cx + x, cy + y) for x, y in path] for path in definitions[symbol]]
+
+
+def _template(symbol: str, width: int = 160) -> np.ndarray:
+    supersample = 3
+    canvas = Image.new("L", (width * supersample, width * supersample), 0)
+    draw = ImageDraw.Draw(canvas)
+    center = width / 2.0
+    for path in _paths(symbol, center, center):
+        draw.line(
+            [(round(x * supersample), round(y * supersample)) for x, y in path],
+            fill=255,
+            width=_STROKE * supersample,
+            joint="curve",
+        )
+    array = np.asarray(canvas.resize((width, width), Image.Resampling.LANCZOS), dtype=np.float32) / 255.0
+    coords = np.argwhere(array > 0.25)
+    if len(coords) == 0:
+        raise ValueError("empty symbol template")
+    target_y = (width - 1) / 2.0
+    target_x = (width - 1) / 2.0
+    current_y, current_x = coords.mean(axis=0)
+    shifted = np.zeros_like(array)
+    shift_y = int(round(target_y - current_y))
+    shift_x = int(round(target_x - current_x))
+    src_y0 = max(0, -shift_y)
+    src_y1 = min(width, width - shift_y)
+    src_x0 = max(0, -shift_x)
+    src_x1 = min(width, width - shift_x)
+    dst_y0 = max(0, shift_y)
+    dst_y1 = dst_y0 + (src_y1 - src_y0)
+    dst_x0 = max(0, shift_x)
+    dst_x1 = dst_x0 + (src_x1 - src_x0)
+    shifted[dst_y0:dst_y1, dst_x0:dst_x1] = array[src_y0:src_y1, src_x0:src_x1]
+    return shifted
+
+
+def _registered_average(pixels: np.ndarray) -> np.ndarray:
+    crops = []
+    for channel in range(3):
+        origin_x, origin_y = _channel_origin(pixels, channel)
+        if origin_x < 0 or origin_y < 0 or origin_x + _TILE > _WIDTH or origin_y + _TILE > _HEIGHT:
+            raise ValueError("fiducial crop is outside the image")
+        crops.append(
+            pixels[origin_y : origin_y + _TILE, origin_x : origin_x + _TILE, channel].astype(
+                np.float32
+            )
+        )
+    return np.mean(np.stack(crops, axis=0), axis=0)
+
+
+def _evidence_crop(average: np.ndarray) -> np.ndarray:
+    # Use the high side of the registered raster as a local base estimate. The
+    # aligned phase carrier cancels, leaving the symbol as positive darkness.
+    interior = average[32:-32, 32:-32]
+    baseline = float(np.percentile(interior, 90.0))
+    darkness = np.maximum(0.0, baseline - average)
+    darkness[:24, :] = 0.0
+    darkness[-24:, :] = 0.0
+    darkness[:, :24] = 0.0
+    darkness[:, -24:] = 0.0
+    energy = float(darkness.sum())
+    if energy < 80.0:
+        raise ValueError("registered raster has no certifiable dark-symbol evidence")
+    yy, xx = np.indices(darkness.shape, dtype=np.float32)
+    center_x = float((xx * darkness).sum() / energy)
+    center_y = float((yy * darkness).sum() / energy)
+    width = 160
+    left = int(round(center_x - width / 2.0))
+    top = int(round(center_y - width / 2.0))
+    crop = np.full((width, width), baseline, dtype=np.float32)
+    src_left = max(0, left)
+    src_top = max(0, top)
+    src_right = min(_TILE, left + width)
+    src_bottom = min(_TILE, top + width)
+    if src_right <= src_left or src_bottom <= src_top:
+        raise ValueError("symbol evidence crop is outside the registered raster")
+    crop[src_top - top : src_bottom - top, src_left - left : src_right - left] = average[
+        src_top:src_bottom, src_left:src_right
+    ]
+    return np.maximum(0.0, baseline - crop)
+
+
+def _scores(image: Image.Image) -> list[tuple[str, float]]:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if pixels.shape != (_HEIGHT, _WIDTH, 3):
+        raise ValueError(f"expected {_WIDTH}x{_HEIGHT} RGB pixels, got {pixels.shape}")
+    average = _registered_average(pixels)
+    evidence = _evidence_crop(average)
+    energy = float(np.sqrt(np.square(evidence).sum()))
+    if energy <= 0.0:
+        raise ValueError("empty registered evidence")
+    scores = []
+    for symbol in _SYMBOLS:
+        template = _template(symbol)
+        score = float((evidence * template).sum() / (energy * np.sqrt(np.square(template).sum())))
+        scores.append((symbol, score))
+    return sorted(scores, key=lambda item: item[1], reverse=True)
+
+
+def confidence_margin(image: Image.Image) -> float:
+    scores = _scores(image)
+    return float(scores[0][1] - scores[1][1])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return a symbol from pixels alone, rejecting missing/ambiguous evidence."""
+
+    scores = _scores(image)
+    gap = float(scores[0][1] - scores[1][1])
+    if gap < 0.015:
+        raise ValueError(f"ambiguous registered symbol, margin={gap:.5f}")
+    return scores[0][0]

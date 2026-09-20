@@ -1,0 +1,186 @@
+"""Image-only inverse arm for the gapped-ring dot verdict world.
+
+The oracle receives one PIL image and nothing else.  It segments ink by colour
+class, checks that what it sees is one intact thin trace with exactly one green
+and one red dot clear of the ink, floods the page background inward from the
+border, and names the dot that the trace shuts in.  It abstains with
+``unresolved`` whenever those structural preconditions fail.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+UNRESOLVED = "unresolved"
+_DARK_MAX = 90
+_MIN_DOT_AREA = 60
+
+
+# ---------------------------------------------------------------------------
+# run based four-connected labelling (no scipy)
+# ---------------------------------------------------------------------------
+
+
+class _Union:
+    def __init__(self) -> None:
+        self.parent = []
+
+    def make(self) -> int:
+        self.parent.append(len(self.parent))
+        return len(self.parent) - 1
+
+    def find(self, a: int) -> int:
+        root = a
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[a] != root:
+            self.parent[a], a = root, self.parent[a]
+        return root
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[max(ra, rb)] = min(ra, rb)
+
+
+def _runs(mask: np.ndarray):
+    height, width = mask.shape
+    padded = np.zeros((height, width + 2), dtype=np.int8)
+    padded[:, 1:-1] = mask.astype(np.int8)
+    delta = np.diff(padded, axis=1)
+    start_rows, start_cols = np.nonzero(delta == 1)
+    end_rows, end_cols = np.nonzero(delta == -1)
+    if start_rows.size != end_rows.size:
+        return None
+    return np.stack([start_rows, start_cols, end_cols], axis=1)
+
+
+def _label(mask: np.ndarray):
+    """Return (runs, union-find, row_index) for four-connected components."""
+    runs = _runs(mask)
+    if runs is None or runs.shape[0] == 0:
+        return None
+    union = _Union()
+    for _ in range(runs.shape[0]):
+        union.make()
+    height = mask.shape[0]
+    row_start = np.searchsorted(runs[:, 0], np.arange(height + 1))
+    for row in range(1, height):
+        upper = range(row_start[row - 1], row_start[row])
+        lower = range(row_start[row], row_start[row + 1])
+        upper_list = list(upper)
+        pointer = 0
+        for low in lower:
+            lo_a, lo_b = runs[low, 1], runs[low, 2]
+            while pointer < len(upper_list) and runs[upper_list[pointer], 2] <= lo_a:
+                pointer += 1
+            probe = pointer
+            while probe < len(upper_list) and runs[upper_list[probe], 1] < lo_b:
+                union.union(low, upper_list[probe])
+                probe += 1
+    return runs, union, row_start
+
+
+def _component_of(labelled, x: int, y: int):
+    runs, union, row_start = labelled
+    for index in range(row_start[y], row_start[y + 1]):
+        if runs[index, 1] <= x < runs[index, 2]:
+            return union.find(index)
+    return None
+
+
+def _component_stats(labelled, shape):
+    runs, union, _ = labelled
+    height, width = shape
+    stats = {}
+    for index in range(runs.shape[0]):
+        root = union.find(index)
+        row, lo, hi = int(runs[index, 0]), int(runs[index, 1]), int(runs[index, 2])
+        entry = stats.setdefault(root, {"area": 0, "sx": 0.0, "sy": 0.0, "border": False})
+        count = hi - lo
+        entry["area"] += count
+        entry["sx"] += (lo + hi - 1) * 0.5 * count
+        entry["sy"] += row * count
+        if row == 0 or row == height - 1 or lo == 0 or hi == width:
+            entry["border"] = True
+    return stats
+
+
+def _dilate(mask: np.ndarray, rounds: int) -> np.ndarray:
+    grown = mask.copy()
+    for _ in range(rounds):
+        shifted = grown.copy()
+        shifted[1:, :] |= grown[:-1, :]
+        shifted[:-1, :] |= grown[1:, :]
+        shifted[:, 1:] |= grown[:, :-1]
+        shifted[:, :-1] |= grown[:, 1:]
+        grown = shifted
+    return grown
+
+
+# ---------------------------------------------------------------------------
+# inverse arm
+# ---------------------------------------------------------------------------
+
+
+def _single_dot(mask: np.ndarray, shape):
+    labelled = _label(mask)
+    if labelled is None:
+        return None
+    stats = _component_stats(labelled, shape)
+    big = [entry for entry in stats.values() if entry["area"] >= _MIN_DOT_AREA]
+    if len(big) != 1:
+        return None
+    entry = big[0]
+    if entry["border"]:
+        return None
+    return int(round(entry["sx"] / entry["area"])), int(round(entry["sy"] / entry["area"]))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = array[:, :, 0], array[:, :, 1], array[:, :, 2]
+    shape = red.shape
+
+    dark = np.maximum(np.maximum(red, green), blue) < _DARK_MAX
+    if not dark.any():
+        return UNRESOLVED
+    if dark[0, :].any() or dark[-1, :].any() or dark[:, 0].any() or dark[:, -1].any():
+        return UNRESOLVED
+
+    dark_labelled = _label(dark)
+    if dark_labelled is None:
+        return UNRESOLVED
+    dark_stats = _component_stats(dark_labelled, shape)
+    if len(dark_stats) != 1:
+        return UNRESOLVED
+
+    green_mask = (green > 120) & (red < 110) & (blue < 110)
+    red_mask = (red > 150) & (green < 100) & (blue < 100)
+    green_dot = _single_dot(green_mask, shape)
+    red_dot = _single_dot(red_mask, shape)
+    if green_dot is None or red_dot is None:
+        return UNRESOLVED
+
+    near_ink = _dilate(dark, 2)
+    if (near_ink & (green_mask | red_mask)).any():
+        return UNRESOLVED
+
+    free_labelled = _label(~dark)
+    if free_labelled is None:
+        return UNRESOLVED
+    outside = _component_of(free_labelled, 0, 0)
+    if outside is None:
+        return UNRESOLVED
+
+    green_component = _component_of(free_labelled, green_dot[0], green_dot[1])
+    red_component = _component_of(free_labelled, red_dot[0], red_dot[1])
+    if green_component is None or red_component is None:
+        return UNRESOLVED
+
+    green_shut = green_component != outside
+    red_shut = red_component != outside
+    if green_shut == red_shut:
+        return UNRESOLVED
+    return "green" if green_shut else "red"

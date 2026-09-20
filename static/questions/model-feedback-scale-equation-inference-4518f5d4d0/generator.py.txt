@@ -1,0 +1,261 @@
+"""Deterministic renderer for coupled exact-balance inference."""
+
+from __future__ import annotations
+
+import itertools
+import math
+import random
+from functools import lru_cache
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 1100
+HEIGHT = 720
+SYMBOLS = ("A", "B", "C", "D")
+BASE_WEIGHTS = (2, 3, 5, 7)
+COLORS = (
+    (43, 104, 189),
+    (207, 78, 68),
+    (43, 148, 103),
+    (145, 79, 176),
+)
+BACKGROUND = (246, 247, 244)
+PAPER = (255, 255, 252)
+INK = (33, 39, 48)
+MUTED = (101, 109, 119)
+QUERY_BLUE = (43, 118, 174)
+ROW_Y = (190, 315, 440)
+QUERY_Y = 615
+LEFT_CENTER = 285
+RIGHT_CENTER = 815
+TOKEN_RADIUS = 23
+TOKEN_GAP = 58
+
+_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+
+def _det3(matrix: list[list[int]]) -> int:
+    a, b, c = matrix
+    return (
+        a[0] * (b[1] * c[2] - b[2] * c[1])
+        - a[1] * (b[0] * c[2] - b[2] * c[0])
+        + a[2] * (b[0] * c[1] - b[1] * c[0])
+    )
+
+
+def _bundle(value: object, name: str) -> tuple[int, int, int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError(f"{name} must contain four symbol counts")
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        raise ValueError(f"{name} counts must be integers")
+    counts = tuple(int(item) for item in value)
+    if any(item < 0 or item > 4 for item in counts) or not 1 <= sum(counts) <= 5:
+        raise ValueError(f"{name} is outside the visible bundle limits")
+    return counts
+
+
+def _equations(value: object) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError("equations must contain exactly three rows")
+    rows = []
+    for index, row in enumerate(value):
+        if not isinstance(row, dict) or set(row) != {"left", "right"}:
+            raise ValueError(f"equation {index + 1} must have left and right bundles")
+        left = _bundle(row["left"], f"equation {index + 1} left")
+        right = _bundle(row["right"], f"equation {index + 1} right")
+        if left == right:
+            raise ValueError("an equation may not repeat the same bundle")
+        rows.append((left, right))
+    return rows
+
+
+def _infer_weights(rows: list[tuple[tuple[int, ...], tuple[int, ...]]]) -> tuple[int, ...]:
+    matrix = [[left[i] - right[i] for i in range(4)] for left, right in rows]
+    cofactors = []
+    for removed in range(4):
+        minor = [[row[i] for i in range(4) if i != removed] for row in matrix]
+        cofactors.append((1 if removed % 2 == 0 else -1) * _det3(minor))
+    if all(value < 0 for value in cofactors):
+        cofactors = [-value for value in cofactors]
+    if not all(value > 0 for value in cofactors):
+        raise ValueError("balance rows do not induce one positive weight ratio")
+    divisor = math.gcd(*cofactors)
+    weights = tuple(value // divisor for value in cofactors)
+    if sorted(weights) != list(BASE_WEIGHTS):
+        raise ValueError("balance rows induce an unsupported or non-primitive ratio")
+    if any(sum((left[i] - right[i]) * weights[i] for i in range(4)) for left, right in rows):
+        raise ValueError("a displayed row is not balanced")
+    return weights
+
+
+def _weights_from_scene(scene: dict) -> tuple[int, ...]:
+    return _infer_weights(_equations(scene["equations"]))
+
+
+def _query_bundles(scene: dict) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    return _bundle(scene["query_left"], "query_left"), _bundle(scene["query_right"], "query_right")
+
+
+def _query_gap(scene: dict) -> int:
+    weights = _weights_from_scene(scene)
+    left, right = _query_bundles(scene)
+    return sum((left[i] - right[i]) * weights[i] for i in range(4))
+
+
+@lru_cache(maxsize=24)
+def _query_pool(weights: tuple[int, ...], target_gap: int) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    bundles = [
+        values
+        for values in itertools.product(range(4), repeat=4)
+        if 3 <= sum(values) <= 5 and max(values) <= 3 and sum(value > 0 for value in values) >= 2
+    ]
+    pairs = []
+    for left in bundles:
+        for right in bundles:
+            if left == right or sum(left) != sum(right):
+                continue
+            if sum(bool(left[i] or right[i]) for i in range(4)) < 3:
+                continue
+            gap = sum((left[i] - right[i]) * weights[i] for i in range(4))
+            if gap == target_gap:
+                pairs.append((left, right))
+    return tuple(pairs)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a permuted full-rank equation system and a close balanced-class query."""
+    rng = random.Random(int(seed) * 130363 + 7919)
+    role_to_symbol = list(range(4))
+    rng.shuffle(role_to_symbol)
+
+    def remap(values: tuple[int, ...]) -> list[int]:
+        result = [0, 0, 0, 0]
+        for role, count in enumerate(values):
+            result[role_to_symbol[role]] = count
+        return result
+
+    base_rows = (
+        ((1, 1, 0, 0), (0, 0, 1, 0)),
+        ((1, 0, 1, 0), (0, 0, 0, 1)),
+        ((4, 0, 0, 0), (0, 1, 1, 0)),
+    )
+    equations = [{"left": remap(left), "right": remap(right)} for left, right in base_rows]
+    rng.shuffle(equations)
+    for row in equations:
+        if rng.randrange(2):
+            row["left"], row["right"] = row["right"], row["left"]
+
+    displayed_weights = [0, 0, 0, 0]
+    for role, symbol in enumerate(role_to_symbol):
+        displayed_weights[symbol] = BASE_WEIGHTS[role]
+    decision = ("left", "right", "same")[int(seed) % 3]
+    target_gap = {"left": 1, "right": -1, "same": 0}[decision]
+    pool = _query_pool(tuple(displayed_weights), target_gap)
+    query_left, query_right = pool[rng.randrange(len(pool))]
+    return {
+        "equations": equations,
+        "query_left": list(query_left),
+        "query_right": list(query_right),
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    gap = _query_gap(scene)
+    if gap > 0:
+        return "left"
+    if gap < 0:
+        return "right"
+    return "same"
+
+
+def margin(scene: dict) -> float:
+    return float(max(1, abs(_query_gap(scene))))
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        left, right = _query_bundles(scene)
+        gap = _query_gap(scene)
+    except (KeyError, TypeError, ValueError):
+        return True
+    return sum(left) != sum(right) or abs(gap) > 1
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []
+
+
+def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(_BOLD_PATH if bold else _FONT_PATH, size=size)
+
+
+def _centered(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, font: ImageFont.ImageFont, fill: tuple[int, int, int]) -> None:
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.text(
+        (xy[0] - (box[2] - box[0]) / 2, xy[1] - (box[3] - box[1]) / 2 - box[1]),
+        text,
+        font=font,
+        fill=fill,
+    )
+
+
+def _draw_token(draw: ImageDraw.ImageDraw, x: int, y: int, symbol_index: int, radius: int = TOKEN_RADIUS) -> None:
+    draw.ellipse(
+        (x - radius, y - radius, x + radius, y + radius),
+        fill=COLORS[symbol_index],
+        outline=INK,
+        width=3,
+    )
+    _centered(draw, (x, y), SYMBOLS[symbol_index], _font(22 if radius >= 22 else 18, bold=True), (255, 255, 255))
+
+
+def _draw_bundle(draw: ImageDraw.ImageDraw, center_x: int, center_y: int, counts: tuple[int, ...]) -> None:
+    tokens = [symbol for symbol, count in enumerate(counts) for _ in range(count)]
+    start = center_x - ((len(tokens) - 1) * TOKEN_GAP) // 2
+    for index, symbol in enumerate(tokens):
+        _draw_token(draw, start + index * TOKEN_GAP, center_y, symbol)
+
+
+def _draw_equals(draw: ImageDraw.ImageDraw, y: int) -> None:
+    draw.line((532, y - 7, 568, y - 7), fill=INK, width=6)
+    draw.line((532, y + 7, 568, y + 7), fill=INK, width=6)
+
+
+def render(scene: dict) -> Image.Image:
+    equations = _equations(scene["equations"])
+    query_left = _bundle(scene["query_left"], "query_left")
+    query_right = _bundle(scene["query_right"], "query_right")
+    _infer_weights(equations)
+    if sum(query_left) != sum(query_right):
+        raise ValueError("query sides must contain the same number of tokens")
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((20, 18, WIDTH - 20, HEIGHT - 18), radius=18, fill=PAPER, outline=(203, 207, 201), width=3)
+    _centered(draw, (WIDTH / 2, 43), "THREE EXACT BALANCES", _font(30, bold=True), INK)
+    _centered(draw, (WIDTH / 2, 75), "same letter = same weight", _font(20, bold=True), MUTED)
+
+    legend_x = (430, 510, 590, 670)
+    for symbol, x in enumerate(legend_x):
+        _draw_token(draw, x, 111, symbol, radius=19)
+
+    for index, ((left, right), y) in enumerate(zip(equations, ROW_Y, strict=True), start=1):
+        draw.rounded_rectangle((48, y - 48, 1052, y + 48), radius=13, fill=(249, 249, 246), outline=(211, 213, 207), width=2)
+        _centered(draw, (72, y), str(index), _font(20, bold=True), MUTED)
+        draw.rounded_rectangle((100, y - 38, 470, y + 38), radius=9, fill=(255, 255, 255), outline=(179, 184, 180), width=2)
+        draw.rounded_rectangle((630, y - 38, 1000, y + 38), radius=9, fill=(255, 255, 255), outline=(179, 184, 180), width=2)
+        _draw_bundle(draw, LEFT_CENTER, y, left)
+        _draw_bundle(draw, RIGHT_CENTER, y, right)
+        _draw_equals(draw, y)
+
+    draw.rounded_rectangle((38, 526, 1062, 699), radius=16, fill=(241, 248, 252), outline=QUERY_BLUE, width=4)
+    _centered(draw, (WIDTH / 2, 551), "QUESTION", _font(23, bold=True), QUERY_BLUE)
+    draw.rounded_rectangle((100, QUERY_Y - 39, 470, QUERY_Y + 39), radius=9, fill=(255, 255, 255), outline=QUERY_BLUE, width=2)
+    draw.rounded_rectangle((630, QUERY_Y - 39, 1000, QUERY_Y + 39), radius=9, fill=(255, 255, 255), outline=QUERY_BLUE, width=2)
+    _draw_bundle(draw, LEFT_CENTER, QUERY_Y, query_left)
+    _draw_bundle(draw, RIGHT_CENTER, QUERY_Y, query_right)
+    _centered(draw, (WIDTH / 2, QUERY_Y), "?", _font(43, bold=True), INK)
+    _centered(draw, (LEFT_CENTER, 674), "LEFT", _font(18, bold=True), MUTED)
+    _centered(draw, (RIGHT_CENTER, 674), "RIGHT", _font(18, bold=True), MUTED)
+    return image

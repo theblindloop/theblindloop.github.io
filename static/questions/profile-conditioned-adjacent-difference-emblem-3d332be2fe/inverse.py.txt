@@ -1,0 +1,139 @@
+"""Independent pixel-only inverse for the neighbor-difference world."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+MARK_SIZE = 16
+MARK_GAP = 8
+FILTER_SIZE = 5
+TEMPLATE_SIZE = 160
+LOW_DIFF = 38.0
+HIGH_DIFF = 132.0
+SYMBOLS = ("wave", "ring", "hook", "crown")
+
+
+def _draw_path(draw: ImageDraw.ImageDraw, points: list[tuple[int, int]], width: int) -> None:
+    draw.line(points, fill=255, width=width, joint="curve")
+
+
+def _mask(name: str, size: int) -> np.ndarray:
+    if name not in SYMBOLS:
+        raise ValueError(f"unknown symbol {name!r}")
+    canvas = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(canvas)
+    width = max(7, int(round(size * 0.062)))
+    q = lambda value: int(round(value * (size - 1)))
+    if name == "wave":
+        _draw_path(
+            draw,
+            [(q(0.15), q(0.56)), (q(0.31), q(0.30)), (q(0.48), q(0.56)),
+             (q(0.65), q(0.80)), (q(0.85), q(0.48))],
+            width,
+        )
+    elif name == "ring":
+        draw.ellipse([q(0.22), q(0.18), q(0.78), q(0.76)], outline=255, width=width)
+        _draw_path(draw, [(q(0.50), q(0.76)), (q(0.50), q(0.88))], width)
+        _draw_path(draw, [(q(0.38), q(0.88)), (q(0.62), q(0.88))], width)
+    elif name == "hook":
+        _draw_path(
+            draw,
+            [(q(0.34), q(0.17)), (q(0.34), q(0.66)), (q(0.45), q(0.80)),
+             (q(0.68), q(0.84)), (q(0.82), q(0.68))],
+            width,
+        )
+        _draw_path(draw, [(q(0.23), q(0.17)), (q(0.45), q(0.17))], width)
+    elif name == "crown":
+        _draw_path(
+            draw,
+            [(q(0.16), q(0.73)), (q(0.24), q(0.28)), (q(0.50), q(0.56)),
+             (q(0.76), q(0.28)), (q(0.84), q(0.73)), (q(0.16), q(0.73))],
+            width,
+        )
+        _draw_path(draw, [(q(0.24), q(0.84)), (q(0.76), q(0.84))], width)
+    return np.asarray(canvas, dtype=np.uint8) > 127
+
+
+def _box_mean(data: np.ndarray) -> np.ndarray:
+    radius = FILTER_SIZE // 2
+    padded = np.pad(data, ((radius, radius), (radius, radius)), mode="edge")
+    view = np.lib.stride_tricks.sliding_window_view(padded, (FILTER_SIZE, FILTER_SIZE))
+    return view.mean(axis=(-1, -2))
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    if values.size == 0:
+        return []
+    result: list[tuple[int, int]] = []
+    start = int(values[0])
+    previous = start
+    for raw in values[1:]:
+        value = int(raw)
+        if value != previous + 1:
+            result.append((start, previous + 1))
+            start = value
+        previous = value
+    result.append((start, previous + 1))
+    return result
+
+
+def _find_tile(rgb: np.ndarray) -> np.ndarray:
+    spread = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+    colored = (spread > 50) & (rgb.min(axis=2) < 230)
+    xr = _runs(np.flatnonzero(colored.any(axis=0)))
+    yr = _runs(np.flatnonzero(colored.any(axis=1)))
+    if len(xr) != 2 or len(yr) != 2:
+        raise ValueError("expected two horizontal and two vertical fiducial runs")
+    left, right = xr
+    top, bottom = yr
+    if any((end - start) != MARK_SIZE for start, end in (left, right, top, bottom)):
+        raise ValueError("fiducial dimensions are ambiguous")
+    x0 = left[1] + MARK_GAP
+    x1 = right[0] - MARK_GAP
+    y0 = top[1] + MARK_GAP
+    y1 = bottom[0] - MARK_GAP
+    if x1 - x0 < 128 or x1 - x0 != y1 - y0:
+        raise ValueError("fiducials do not enclose one square raster")
+    tile = rgb[y0:y1, x0:x1, :]
+    if tile.shape[0] != tile.shape[1] or tile.size == 0:
+        raise ValueError("empty raster")
+    if int(np.max(tile.max(axis=2) - tile.min(axis=2))) > 2:
+        raise ValueError("enclosed raster is not grayscale")
+    return tile[:, :, 0]
+
+
+def _template(name: str) -> np.ndarray:
+    return _box_mean(_mask(name, TEMPLATE_SIZE).astype(np.float32))
+
+
+def _scores(tile: np.ndarray) -> dict[str, float]:
+    values = tile.astype(np.float32)
+    right = np.concatenate((values[:, 1:], values[:, -1:]), axis=1)
+    differential = np.abs(values - right)
+    transformed = _box_mean(differential)
+    resized = Image.fromarray(transformed.astype(np.float32), mode="F").resize(
+        (TEMPLATE_SIZE, TEMPLATE_SIZE), Image.Resampling.BILINEAR
+    )
+    signal = np.clip(
+        (np.asarray(resized, dtype=np.float32) - LOW_DIFF) / (HIGH_DIFF - LOW_DIFF),
+        0.0,
+        1.0,
+    )
+    return {
+        name: float(1.0 - np.mean(np.abs(signal - _template(name))))
+        for name in SYMBOLS
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the symbol from only the final rasterized RGB image."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tile = _find_tile(rgb)
+    scores = _scores(tile)
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    if len(ordered) < 2 or ordered[0][1] - ordered[1][1] < 0.012:
+        raise ValueError("neighbor-difference classification is ambiguous")
+    return ordered[0][0]

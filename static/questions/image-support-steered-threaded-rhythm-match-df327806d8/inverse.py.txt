@@ -1,0 +1,134 @@
+"""Independent image-only inverse arm for threaded interval correspondence."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+CORE = (0, 0, 0)
+CHECKPOINT = (159, 214, 207)
+GOLD = (226, 174, 43)
+TAG_COLORS = {
+    "red": (210, 67, 62),
+    "green": (48, 151, 101),
+    "blue": (55, 103, 184),
+}
+
+
+def _mask(array: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    return np.all(array == np.asarray(color, dtype=np.uint8), axis=2)
+
+
+def _dilate(mask: np.ndarray, rounds: int = 2) -> np.ndarray:
+    result = mask.copy()
+    for _ in range(rounds):
+        padded = np.pad(result, 1)
+        expanded = np.zeros_like(result)
+        for dy in range(3):
+            for dx in range(3):
+                expanded |= padded[dy : dy + result.shape[0], dx : dx + result.shape[1]]
+        result = expanded
+    return result
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny in range(max(0, cy - 1), min(height, cy + 2)):
+                for nx in range(max(0, cx - 1), min(width, cx + 2)):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _marker_components(array: np.ndarray, color: tuple[int, int, int], expected: int) -> list[dict]:
+    original = _mask(array, color)
+    grown = _dilate(original, 2)
+    markers: list[dict] = []
+    for component in _components(grown):
+        if len(component) < 30:
+            continue
+        y0, x0 = component.min(axis=0)
+        y1, x1 = component.max(axis=0)
+        local_points = np.argwhere(original[y0 : y1 + 1, x0 : x1 + 1])
+        if len(local_points) < 60:
+            continue
+        y, x = local_points.mean(axis=0)
+        markers.append({
+            "center": (float(x + x0), float(y + y0)),
+            "area": int(len(local_points)),
+            "fill": float(len(local_points) / ((y1 - y0 + 1) * (x1 - x0 + 1))),
+        })
+    if len(markers) != expected:
+        raise ValueError(f"expected {expected} markers of a required color, found {len(markers)}")
+    return markers
+
+
+def _colored_section(array: np.ndarray, name: str, color: tuple[int, int, int]) -> tuple[str, tuple[float, float], tuple[float, float]]:
+    markers = _marker_components(array, color, 2)
+    # The square has much greater bounding-box fill than the diamond.  This
+    # determines traversal direction without using a row index or coordinates.
+    markers.sort(key=lambda item: item["fill"], reverse=True)
+    if markers[0]["fill"] - markers[1]["fill"] < 0.12:
+        raise ValueError("square start and diamond end are not visually distinguishable")
+    return name, markers[0]["center"], markers[1]["center"]
+
+
+def _normalized_gap_code(start: tuple[float, float], end: tuple[float, float], checkpoints: list[tuple[float, float]]) -> tuple[int, ...]:
+    sx, sy = start
+    ex, ey = end
+    if abs(ey - sy) > 3.0 or abs(ex - sx) < 140.0:
+        raise ValueError("section is not a long visible thread run")
+    direction = 1.0 if ex > sx else -1.0
+    interior = [point for point in checkpoints if abs(point[1] - sy) <= 3.0 and direction * (point[0] - sx) > 8.0 and direction * (ex - point[0]) > 8.0]
+    if len(interior) != 3:
+        raise ValueError("section does not expose exactly three ordered checkpoints")
+    interior.sort(key=lambda point: direction * (point[0] - sx))
+    positions = [start, *interior, end]
+    gaps = [abs(positions[i + 1][0] - positions[i][0]) for i in range(4)]
+    shortest = min(gaps)
+    if shortest < 12.0:
+        raise ValueError("checkpoint gap is below the visible resolution margin")
+    ratios = tuple(int(round(gap / shortest)) for gap in gaps)
+    if sorted(ratios) != [1, 2, 3, 4] or max(abs(gap / shortest - ratio) for gap, ratio in zip(gaps, ratios)) > 0.08:
+        raise ValueError("gaps do not form a clear uniformly scaled 1:2:3:4 rhythm")
+    return ratios
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+    # The black centerline is deliberately one pixel wide. Any destructive grid
+    # crop crossing the long route splits it, so the inverse arm abstains rather
+    # than inferring correspondence from isolated local tags.
+    core_parts = [part for part in _components(_mask(array, CORE)) if len(part) >= 8]
+    if len(core_parts) != 1 or len(core_parts[0]) < 850:
+        raise ValueError("the single connected thread is broken or missing")
+    ys, xs = core_parts[0][:, 0], core_parts[0][:, 1]
+    if int(xs.max() - xs.min()) < 900 or int(ys.max() - ys.min()) > 3:
+        raise ValueError("the thread does not span the visible world")
+
+    sections = [_colored_section(array, "gold", GOLD)]
+    sections.extend(_colored_section(array, name, color) for name, color in TAG_COLORS.items())
+    checkpoints = [item["center"] for item in _marker_components(array, CHECKPOINT, 12)]
+    codes = [(name, _normalized_gap_code(start, end, checkpoints)) for name, start, end in sections]
+    reference = next(code for name, code in codes if name == "gold")
+    matches = [name for name, code in codes if name != "gold" and code == reference]
+    if len(matches) != 1:
+        raise ValueError("pixels do not yield one unique interval-rhythm correspondence")
+    return matches[0]

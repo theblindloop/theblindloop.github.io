@@ -1,0 +1,194 @@
+"""Independent image-only inverse arm for capacity-limited vessel pours."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+CAPACITY = 4
+N_VESSELS = 3
+N_OPS = 7
+
+
+class PixelParseError(ValueError):
+    """The raster does not contain one unambiguous replay."""
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(x), int(y))])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            px, py = queue.popleft()
+            points.append((px, py))
+            for nx, ny in ((px - 1, py), (px + 1, py), (px, py - 1), (px, py + 1)):
+                if 0 <= nx < width and 0 <= ny < height and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((nx, ny))
+        if len(points) >= minimum:
+            found.append(np.asarray(points, dtype=np.float64))
+    return found
+
+
+def _small_round_components(mask: np.ndarray) -> list[np.ndarray]:
+    result: list[np.ndarray] = []
+    for points in _components(mask, minimum=65):
+        xs, ys = points[:, 0], points[:, 1]
+        width = float(xs.max() - xs.min() + 1)
+        height = float(ys.max() - ys.min() + 1)
+        density = len(points) / (width * height)
+        if 10 <= width <= 15 and 10 <= height <= 15 and density >= 0.68:
+            result.append(points)
+    return result
+
+
+def _group_by_x(components: list[np.ndarray], split_gap: float) -> list[list[np.ndarray]]:
+    ordered = sorted(components, key=lambda points: float(points[:, 0].mean()))
+    groups: list[list[np.ndarray]] = []
+    for points in ordered:
+        center = float(points[:, 0].mean())
+        if not groups:
+            groups.append([points])
+            continue
+        prior_center = float(np.mean([part[:, 0].mean() for part in groups[-1]]))
+        if center - prior_center > split_gap:
+            groups.append([points])
+        else:
+            groups[-1].append(points)
+    return groups
+
+
+def _parse_vessels(arr: np.ndarray) -> tuple[list[int], int]:
+    height, width, _ = arr.shape
+
+    # Identity pips occupy a dedicated band beneath the three gauges. Their
+    # component count, rather than an expected coordinate, names each vessel.
+    yy, xx = np.indices((height, width))
+    dark = arr.max(axis=2) < 95
+    identity_band = dark & (xx > 0.035 * width) & (xx < 0.255 * width) & (yy > 0.735 * height) & (yy < 0.825 * height)
+    pip_components = _small_round_components(identity_band)
+    groups = _group_by_x(pip_components, 35.0)
+    if len(groups) != N_VESSELS:
+        raise PixelParseError(f"expected three vessel identity groups, found {len(groups)}")
+    if sorted(len(group) for group in groups) != [1, 2, 3]:
+        raise PixelParseError("vessel pip identities are missing or duplicated")
+    centers = [float(np.mean([part[:, 0].mean() for part in group])) for group in groups]
+    identity_by_slot = [len(group) - 1 for group in groups]
+    if min(centers[index + 1] - centers[index] for index in range(2)) < 60:
+        raise PixelParseError("vessel positions are unresolved")
+
+    # Filled level cells are saturated rectangular components. The fixed total
+    # is checked only after all three independently measured levels are bound to
+    # their pip-coded identities.
+    spread = arr.max(axis=2) - arr.min(axis=2)
+    red = (arr[:, :, 0] > 180) & (arr[:, :, 1] < 95) & (arr[:, :, 2] < 110)
+    level_mask = (
+        (spread >= 55)
+        & (arr.max(axis=2) >= 110)
+        & ~red
+        & (xx > 0.03 * width)
+        & (xx < 0.26 * width)
+        & (yy > 0.30 * height)
+        & (yy < 0.70 * height)
+    )
+    blocks: list[np.ndarray] = []
+    for points in _components(level_mask, minimum=500):
+        xs, ys = points[:, 0], points[:, 1]
+        block_width = float(xs.max() - xs.min() + 1)
+        block_height = float(ys.max() - ys.min() + 1)
+        density = len(points) / (block_width * block_height)
+        if 40 <= block_width <= 49 and 24 <= block_height <= 29 and density >= 0.90:
+            blocks.append(points)
+    levels = [0] * N_VESSELS
+    for points in blocks:
+        block_x = float(points[:, 0].mean())
+        slot = int(np.argmin([abs(block_x - center) for center in centers]))
+        if abs(block_x - centers[slot]) > 18:
+            raise PixelParseError("filled cell cannot be bound to a vessel")
+        levels[identity_by_slot[slot]] += 1
+    if any(level > CAPACITY for level in levels) or sum(levels) != 6:
+        raise PixelParseError(f"invalid measured initial levels {levels}")
+
+    # The query is a single tall red outline; its center binds to one displayed
+    # vessel, then pip identity converts that position into a persistent label.
+    query_components = []
+    for points in _components(red & (xx < 0.29 * width) & (yy > 0.20 * height) & (yy < 0.75 * height), minimum=300):
+        xs, ys = points[:, 0], points[:, 1]
+        box_width = float(xs.max() - xs.min() + 1)
+        box_height = float(ys.max() - ys.min() + 1)
+        density = len(points) / (box_width * box_height)
+        if 65 <= box_width <= 85 and 185 <= box_height <= 215 and density < 0.25:
+            query_components.append(points)
+    if len(query_components) != 1:
+        raise PixelParseError(f"expected one query outline, found {len(query_components)}")
+    query_x = float(query_components[0][:, 0].mean())
+    query_slot = int(np.argmin([abs(query_x - center) for center in centers]))
+    if abs(query_x - centers[query_slot]) > 20:
+        raise PixelParseError("query outline is not aligned with a vessel")
+    return levels, identity_by_slot[query_slot]
+
+
+def _parse_operations(arr: np.ndarray) -> list[tuple[int, int]]:
+    height, width, _ = arr.shape
+    yy, xx = np.indices((height, width))
+    operation_region = (xx > 0.28 * width) & (yy > 0.37 * height) & (yy < 0.61 * height)
+    source_mask = (
+        (arr[:, :, 0] > 75)
+        & (arr[:, :, 0] < 145)
+        & (arr[:, :, 1] < 115)
+        & (arr[:, :, 2] > 135)
+        & ((arr[:, :, 2] - arr[:, :, 1]) > 35)
+        & operation_region
+    )
+    target_mask = (
+        (arr[:, :, 0] > 195)
+        & (arr[:, :, 1] > 85)
+        & (arr[:, :, 1] < 165)
+        & (arr[:, :, 2] < 80)
+        & operation_region
+    )
+    source_groups = _group_by_x(_small_round_components(source_mask), 38.0)
+    target_groups = _group_by_x(_small_round_components(target_mask), 38.0)
+    if len(source_groups) != N_OPS or len(target_groups) != N_OPS:
+        raise PixelParseError(
+            f"expected seven source and target groups, found {len(source_groups)} and {len(target_groups)}"
+        )
+    source_xs = [float(np.mean([part[:, 0].mean() for part in group])) for group in source_groups]
+    target_xs = [float(np.mean([part[:, 0].mean() for part in group])) for group in target_groups]
+    if min(source_xs[index + 1] - source_xs[index] for index in range(N_OPS - 1)) < 80:
+        raise PixelParseError("source-card order is unresolved")
+    if min(target_xs[index + 1] - target_xs[index] for index in range(N_OPS - 1)) < 80:
+        raise PixelParseError("target-card order is unresolved")
+    operations: list[tuple[int, int]] = []
+    for source_group, target_group, source_x, target_x in zip(source_groups, target_groups, source_xs, target_xs, strict=True):
+        if not 45 <= target_x - source_x <= 75:
+            raise PixelParseError("source and target cannot be paired within a card")
+        source = len(source_group) - 1
+        target = len(target_group) - 1
+        if not (0 <= source < N_VESSELS and 0 <= target < N_VESSELS) or source == target:
+            raise PixelParseError("invalid directed pour endpoints")
+        operations.append((source, target))
+    return operations
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if arr.ndim != 3 or arr.shape[0] < 400 or arr.shape[1] < 1000:
+        raise PixelParseError("unexpected raster dimensions")
+    levels, query = _parse_vessels(arr)
+    operations = _parse_operations(arr)
+    for source, target in operations:
+        amount = min(levels[source], CAPACITY - levels[target])
+        levels[source] -= amount
+        levels[target] += amount
+    if sum(levels) != 6 or any(not 0 <= value <= CAPACITY for value in levels):
+        raise PixelParseError("replay violated visible capacity or conservation")
+    return str(levels[query])

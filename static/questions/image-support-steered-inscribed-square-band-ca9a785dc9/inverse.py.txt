@@ -1,0 +1,157 @@
+"""Pixel-only inverse arm for the inscribed-square band world.
+
+Input is the final PNG and nothing else: no latent scene, no renderer import, no
+analytic gold.  The arm segments the flat slate plate colour, keeps the single
+large component, rejects any plate that is broken or perforated, measures the
+plate's full width W and the side S of the largest axis-aligned all-plate square
+by integral image, and reports the band of S against W/3 and W/2.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+PLATE_RGB = (74, 82, 96)
+
+MIN_PLATE_AREA = 400       # smaller slate blobs are speckle, not a plate
+MIN_PLATE_WIDTH = 190      # a legible plate spans a substantial region of sheet
+MIN_PLATE_HEIGHT = 150
+MIN_PLATE_SIDE = 8
+ABSTAIN = "abstain"
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Run-based 4-connected labelling; returns one boolean mask per component."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list[list[tuple[int, int, int]]] = []
+    for y in range(height):
+        row = mask[y]
+        if not row.any():
+            runs.append([])
+            continue
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], row.view(np.int8), [0]))))
+        row_runs = []
+        for start, stop in zip(edges[0::2], edges[1::2]):
+            label = len(parent)
+            parent.append(label)
+            row_runs.append((int(start), int(stop), label))
+        runs.append(row_runs)
+
+    for y in range(1, height):
+        for start, stop, label in runs[y]:
+            for pstart, pstop, plabel in runs[y - 1]:
+                if pstart < stop and start < pstop:
+                    union(label, plabel)
+
+    groups: dict[int, list[tuple[int, int, int]]] = {}
+    for y, row_runs in enumerate(runs):
+        for start, stop, label in row_runs:
+            groups.setdefault(find(label), []).append((y, start, stop))
+
+    out = []
+    for spans in groups.values():
+        comp = np.zeros_like(mask)
+        for y, start, stop in spans:
+            comp[y, start:stop] = True
+        out.append(comp)
+    return out
+
+
+def _has_hole(block: np.ndarray) -> bool:
+    """True when a non-plate pixel inside the bounding box is fully enclosed."""
+    height, width = block.shape
+    open_pixels = ~block
+    seen = np.zeros_like(block)
+    queue: deque[tuple[int, int]] = deque()
+    for y in range(height):
+        for x in (0, width - 1):
+            if open_pixels[y, x] and not seen[y, x]:
+                seen[y, x] = True
+                queue.append((y, x))
+    for x in range(width):
+        for y in (0, height - 1):
+            if open_pixels[y, x] and not seen[y, x]:
+                seen[y, x] = True
+                queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and open_pixels[ny, nx] and not seen[ny, nx]:
+                seen[ny, nx] = True
+                queue.append((ny, nx))
+    return bool((open_pixels & ~seen).any())
+
+
+def _largest_square_side(block: np.ndarray) -> int:
+    """Side of the largest axis-aligned square of plate pixels, by integral image."""
+    integral = np.zeros((block.shape[0] + 1, block.shape[1] + 1), dtype=np.int64)
+    integral[1:, 1:] = np.cumsum(np.cumsum(block.astype(np.int64), axis=0), axis=1)
+
+    def fits(side: int) -> bool:
+        if side <= 0 or side > min(block.shape):
+            return False
+        window = (
+            integral[side:, side:]
+            - integral[:-side, side:]
+            - integral[side:, :-side]
+            + integral[:-side, :-side]
+        )
+        return bool((window == side * side).any())
+
+    low, high = 0, min(block.shape)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if fits(mid):
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
+def decision_from_image(image):
+    """Band of the plate's inscribed-square side against its own width."""
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    mask = np.all(pixels == np.array(PLATE_RGB, dtype=np.uint8), axis=-1)
+    if not mask.any():
+        return ABSTAIN
+
+    bodies = [comp for comp in _components(mask) if int(comp.sum()) >= MIN_PLATE_AREA]
+    if len(bodies) != 1:
+        return ABSTAIN
+    body = bodies[0]
+
+    ys, xs = np.nonzero(body)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    block = body[y0 : y1 + 1, x0 : x1 + 1]
+    if _has_hole(block):
+        return ABSTAIN
+
+    width = x1 - x0 + 1
+    if width < MIN_PLATE_WIDTH or (y1 - y0 + 1) < MIN_PLATE_HEIGHT:
+        return ABSTAIN
+    side = _largest_square_side(block)
+    if side < MIN_PLATE_SIDE:
+        return ABSTAIN
+
+    if 3 * side < width:
+        return "less_than_third"
+    if 2 * side > width:
+        return "more_than_half"
+    return "third_to_half"

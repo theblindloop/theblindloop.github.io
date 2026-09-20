@@ -1,0 +1,190 @@
+"""Independent pixel-only inverse arm for the common-loop-pair world.
+
+Receives a rendered RGB image and nothing else. It segments the ink by colour
+class, recovers the hubs as blobs, recovers each pipe as a connected stroke
+between two hubs, rebuilds the drawn graph, decomposes it into two-edge-connected
+blocks and names the coloured pair that shares a block. No renderer, prompt,
+generator, verifier or analytic-gold code is imported and no latent scene data is
+accepted.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "common_loop_pair-oracle-0.1.0"
+
+_COLOR_NAMES = ("red", "green", "blue")
+_MIN_HUB_AREA = 200
+_MIN_STROKE_AREA = 90
+_HUB_DILATE = 4
+_STROKE_DILATE = 7
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    out = mask.copy()
+    for _ in range(radius):
+        grown = out.copy()
+        grown[1:, :] |= out[:-1, :]
+        grown[:-1, :] |= out[1:, :]
+        grown[:, 1:] |= out[:, :-1]
+        grown[:, :-1] |= out[:, 1:]
+        out = grown
+    return out
+
+
+def _label(mask: np.ndarray, min_area: int) -> tuple[np.ndarray, int]:
+    """Four-connected connected-component labelling; 0 means background."""
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    height, width = mask.shape
+    current = 0
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if labels[sy, sx]:
+            continue
+        current += 1
+        stack = [(sy, sx)]
+        labels[sy, sx] = current
+        pixels = 0
+        while stack:
+            y, x = stack.pop()
+            pixels += 1
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not labels[ny, nx]:
+                    labels[ny, nx] = current
+                    stack.append((ny, nx))
+        if pixels < min_area:
+            labels[labels == current] = 0
+            current -= 1
+    return labels, current
+
+
+def _classify(image: Image.Image):
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    mx = arr.max(axis=2)
+    mn = arr.min(axis=2)
+    value = arr.mean(axis=2)
+
+    ink = mx < 238
+    saturated = (mx - mn) > 45
+    coloured = ink & saturated
+    dark = ink & ~saturated & (value < 110)
+    pipe_raw = ink & ~saturated & ~dark
+    return arr, coloured, dark, pipe_raw
+
+
+def _hub_colour(arr: np.ndarray, coloured: np.ndarray, blob: np.ndarray) -> str | None:
+    sel = blob & coloured
+    if sel.sum() < 40:
+        return None
+    pixels = arr[sel]
+    channel = int(np.bincount(np.argmax(pixels, axis=1), minlength=3).argmax())
+    return _COLOR_NAMES[channel]
+
+
+def _bridges(node_count: int, edges: list[tuple[int, int]]) -> set[int]:
+    adj: dict[int, list[tuple[int, int]]] = {i: [] for i in range(node_count)}
+    for idx, (u, v) in enumerate(edges):
+        adj[u].append((v, idx))
+        adj[v].append((u, idx))
+    disc = [-1] * node_count
+    low = [0] * node_count
+    found: set[int] = set()
+    timer = 0
+    for root in range(node_count):
+        if disc[root] != -1:
+            continue
+        disc[root] = low[root] = timer
+        timer += 1
+        stack = [(root, -1, iter(adj[root]))]
+        while stack:
+            node, parent_edge, it = stack[-1]
+            advanced = False
+            for nxt, eidx in it:
+                if eidx == parent_edge:
+                    continue
+                if disc[nxt] == -1:
+                    disc[nxt] = low[nxt] = timer
+                    timer += 1
+                    stack.append((nxt, eidx, iter(adj[nxt])))
+                    advanced = True
+                    break
+                low[node] = min(low[node], disc[nxt])
+            if advanced:
+                continue
+            stack.pop()
+            if stack:
+                pnode = stack[-1][0]
+                low[pnode] = min(low[pnode], low[node])
+                if low[node] > disc[pnode]:
+                    found.add(parent_edge)
+    return found
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Name the coloured pair sharing a closed loop, from pixels alone."""
+    arr, coloured, dark, pipe_raw = _classify(image)
+
+    hub_seed = coloured | dark
+    hub_labels, hub_count = _label(hub_seed, _MIN_HUB_AREA)
+    if hub_count < 3:
+        return "none"
+
+    marker_of: dict[int, str] = {}
+    for hub in range(1, hub_count + 1):
+        name = _hub_colour(arr, coloured, hub_labels == hub)
+        if name is not None:
+            if name in marker_of.values():
+                return "ambiguous"
+            marker_of[hub] = name
+    if sorted(marker_of.values()) != sorted(_COLOR_NAMES):
+        return "none"
+
+    hub_grown = _dilate(hub_seed, _HUB_DILATE)
+    pipes = pipe_raw & ~hub_grown
+    stroke_labels, stroke_count = _label(pipes, _MIN_STROKE_AREA)
+
+    edges: list[tuple[int, int]] = []
+    for stroke in range(1, stroke_count + 1):
+        reach = _dilate(stroke_labels == stroke, _STROKE_DILATE)
+        touched = np.unique(hub_labels[reach])
+        touched = [int(t) for t in touched if t > 0]
+        if len(touched) != 2:
+            return "ambiguous"
+        edges.append((touched[0] - 1, touched[1] - 1))
+
+    if not edges:
+        return "none"
+
+    bridge_set = _bridges(hub_count, edges)
+    adj: dict[int, list[tuple[int, int]]] = {i: [] for i in range(hub_count)}
+    for idx, (u, v) in enumerate(edges):
+        adj[u].append((v, idx))
+        adj[v].append((u, idx))
+    block = [-1] * hub_count
+    current = 0
+    for start in range(hub_count):
+        if block[start] != -1:
+            continue
+        block[start] = current
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            for nxt, eidx in adj[node]:
+                if eidx in bridge_set or block[nxt] != -1:
+                    continue
+                block[nxt] = current
+                queue.append(nxt)
+        current += 1
+
+    where = {name: block[hub - 1] for hub, name in marker_of.items()}
+    hits = []
+    for i in range(3):
+        for j in range(i + 1, 3):
+            a, b = _COLOR_NAMES[i], _COLOR_NAMES[j]
+            if where[a] == where[b]:
+                hits.append(f"{a}_{b}")
+    if len(hits) != 1:
+        return "none" if not hits else "ambiguous"
+    return hits[0]

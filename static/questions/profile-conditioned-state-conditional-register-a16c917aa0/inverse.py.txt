@@ -1,0 +1,143 @@
+"""Independent pixel-only inverse arm for the value-conditional register.
+
+Receives only the final PNG. From the raster alone it:
+  1. segments the panel frames by their gray border color;
+  2. recovers panel order (left to right);
+  3. reads the starting register value from the leftmost panel's token disk color;
+  4. reads each inter-panel operator glyph by its fill color in the gap region
+     (green circle = inc, blue square = dec, red triangle = cond);
+  5. replays the ordered operators from the ringed start value through the
+     declared conditional/inc/dec transitions and returns the final value.
+
+No latent scene, renderer, prompt, or gold code is accessed; only the fixed
+palette conventions declared in the question are used.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+BORDER = (200, 200, 200)
+RING_MARK = (240, 150, 20)
+GREEN = (0, 150, 40)
+BLUE = (30, 60, 210)
+RED = (210, 40, 40)
+GRAY = (105, 105, 105)
+TEAL = (0, 150, 120)
+MAGENTA = (190, 0, 160)
+
+PALETTE = [BG, BORDER, RING_MARK, GREEN, BLUE, RED, GRAY, TEAL, MAGENTA]
+(_BG, _BRD, _RING, _G, _B, _R, _SV0, _SV1, _SV2) = range(9)
+VALUE_BY_INDEX = {_SV0: "0", _SV1: "1", _SV2: "2"}
+OP_BY_INDEX = {_G: "inc", _B: "dec", _R: "cond"}
+
+MIN_PANELS = 5
+WINDOW = 8
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected five-panel structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points) -> tuple[int, int, int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _value_at(labels: np.ndarray, cx: int, cy: int) -> str:
+    y0 = max(0, cy - WINDOW)
+    y1 = min(labels.shape[0], cy + WINDOW + 1)
+    x0 = max(0, cx - WINDOW)
+    x1 = min(labels.shape[1], cx + WINDOW + 1)
+    win = labels[y0:y1, x0:x1]
+    counts = {idx: int((win == idx).sum()) for idx in (_SV0, _SV1, _SV2)}
+    best, amount = max(counts.items(), key=lambda item: item[1])
+    if amount < 4:
+        raise UnreadableImageError("no clear value token at the panel center")
+    return VALUE_BY_INDEX[best]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+    frames = []
+    for points in _components(labels == _BRD):
+        if len(points) < 40:
+            continue
+        frames.append(_bbox(points))
+    frames.sort(key=lambda box: box[0])
+    if len(frames) < MIN_PANELS:
+        raise UnreadableImageError(f"found {len(frames)} panels; expected >= {MIN_PANELS}")
+
+    centers = [((x0 + x1) // 2, (y0 + y1) // 2) for (x0, y0, x1, y1) in frames]
+    start = _value_at(labels, centers[0][0], centers[0][1])
+
+    ops = []
+    for i in range(len(frames) - 1):
+        _, _, rx, _ = frames[i]
+        lx, _, _, _ = frames[i + 1]
+        x0 = max(0, rx + 1)
+        x1 = min(labels.shape[1], lx)
+        y0 = max(0, centers[i][1] - 30)
+        y1 = min(labels.shape[0], centers[i][1] + 30)
+        region = labels[y0:y1, x0:x1]
+        counts = {idx: int((region == idx).sum()) for idx in (_G, _B, _R)}
+        best, amount = max(counts.items(), key=lambda item: item[1])
+        if amount < 3:
+            raise UnreadableImageError("operator glyph not found in an inter-panel gap")
+        ops.append(OP_BY_INDEX[best])
+    if len(ops) < 4:
+        raise UnreadableImageError("not enough operator glyphs detected")
+
+    value = int(start)
+    for op in ops:
+        if op == "inc":
+            value = (value + 1) % 3
+        elif op == "dec":
+            value = (value - 1) % 3
+        else:
+            value = 1 if value == 0 else 2
+    return str(value)

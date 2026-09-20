@@ -1,0 +1,174 @@
+"""Pixel-only inverse arm for the tally-sort reveal world.
+
+The arm receives one PIL image and the public question contract only.  It
+locates the panel frame and the free-floating tally bars, executes the declared
+reordering, and classifies the reconstructed seven-by-seven bitmap against the
+public symbol alphabet, abstaining by raising ``ValueError`` whenever a
+fiducial, the bar order, or the symbol decision is ambiguous.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "tally_sort_reveal-oracle-0.1.0"
+
+GRID = 7
+BORDER_PX = 4
+PAD_PX = 6
+
+# Public answer alphabet from the question contract.
+SYMBOLS: dict[str, tuple[str, ...]] = {
+    "cross": ("...#...", "...#...", "...#...", "#######", "...#...", "...#...", "...#..."),
+    "tee": ("#######", "...#...", "...#...", "...#...", "...#...", "...#...", "...#..."),
+    "zigzag": (".#####.", "....#..", "...#...", "..#....", ".#####.", ".......", "......."),
+    "corners": ("##...##", "#.....#", ".......", "...#...", ".......", "#.....#", "##...##"),
+    "stripes": (".#####.", ".......", ".......", ".####..", ".......", ".......", ".####.."),
+    "columns": (".......", ".#.#.#.", ".#.#.#.", ".#.#.#.", ".#.#.#.", "...#...", "......."),
+}
+
+
+def _templates() -> dict[str, np.ndarray]:
+    return {
+        name: np.array([[1 if ch == "#" else 0 for ch in row] for row in rows], dtype=np.int8)
+        for name, rows in SYMBOLS.items()
+    }
+
+
+def _luma(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    return np.rint(0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2])
+
+
+def _tones(luma: np.ndarray) -> tuple[float, float]:
+    values, counts = np.unique(luma, return_counts=True)
+    keep = values[counts >= 200]
+    if keep.size < 3:
+        raise ValueError("fewer than three rendered tones: no readable panel")
+    keep = keep[np.argsort([-counts[list(values).index(v)] for v in keep])][:3]
+    keep = np.sort(keep)
+    ink, pale = float(keep[0]), float(keep[1])
+    if pale - ink < 20:
+        raise ValueError("ink and pale tones are not separable")
+    return ink, pale
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    """Label 4-connected runs; return (x0, y0, x1, y1, area) per component."""
+
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list[list[tuple[int, int, int]]] = []  # per row: (x0, x1, label)
+    for y in range(height):
+        row = mask[y]
+        if not row.any():
+            runs.append([])
+            continue
+        xs = np.flatnonzero(np.diff(np.concatenate(([0], row.view(np.int8), [0]))))
+        current: list[tuple[int, int, int]] = []
+        for start, stop in zip(xs[0::2], xs[1::2]):
+            label = len(parent)
+            parent.append(label)
+            for px0, px1, plabel in runs[y - 1] if y else []:
+                if px0 <= stop - 1 and start <= px1:
+                    union(label, plabel)
+            current.append((int(start), int(stop) - 1, label))
+        runs.append(current)
+
+    boxes: dict[int, list[int]] = {}
+    for y, row_runs in enumerate(runs):
+        for x0, x1, label in row_runs:
+            root = find(label)
+            box = boxes.get(root)
+            if box is None:
+                boxes[root] = [x0, y, x1, y, x1 - x0 + 1]
+            else:
+                box[0] = min(box[0], x0)
+                box[1] = min(box[1], y)
+                box[2] = max(box[2], x1)
+                box[3] = max(box[3], y)
+                box[4] += x1 - x0 + 1
+    return [tuple(box) for box in boxes.values()]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the revealed symbol, or raise ValueError to abstain."""
+
+    luma = _luma(image)
+    ink_tone, pale_tone = _tones(luma)
+    mid = 0.5 * (ink_tone + pale_tone)
+    ink = luma <= mid
+    comps = _components(ink)
+    if not comps:
+        raise ValueError("no ink components")
+
+    panel = max(comps, key=lambda b: (b[2] - b[0] + 1) * (b[3] - b[1] + 1))
+    px0, py0, px1, py1 = panel[0], panel[1], panel[2], panel[3]
+    pw, ph = px1 - px0 + 1, py1 - py0 + 1
+    if pw != ph or pw < 120:
+        raise ValueError("no square panel frame found")
+    inner = pw - 2 * (BORDER_PX + PAD_PX)
+    if inner <= 0 or inner % GRID:
+        raise ValueError("panel does not carry a seven-by-seven cell lattice")
+    cell = inner // GRID
+    grid_left = px0 + BORDER_PX + PAD_PX
+    grid_top = py0 + BORDER_PX + PAD_PX
+
+    matrix = np.zeros((GRID, GRID), dtype=np.int8)
+    for row in range(GRID):
+        for col in range(GRID):
+            y0 = grid_top + row * cell + 9
+            x0 = grid_left + col * cell + 9
+            patch = luma[y0 : y0 + cell - 18, x0 : x0 + cell - 18]
+            if patch.size == 0:
+                raise ValueError("cell patch outside the raster")
+            value = float(patch.mean())
+            if abs(value - ink_tone) > 6 and abs(value - pale_tone) > 6:
+                raise ValueError("cell tone is neither of the two rendered tones")
+            matrix[row, col] = 1 if value < mid else 0
+
+    row_centers = [grid_top + row * cell + cell // 2 for row in range(GRID)]
+    bars: list[tuple[int, int]] = []  # (row index, length)
+    for x0, y0, x1, y1, area in comps:
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if not (6 <= height <= 16 and width >= 3 * height):
+            continue
+        if x1 >= px0 or x0 < px0 - 520:
+            continue
+        center = (y0 + y1) // 2
+        best = min(range(GRID), key=lambda r: abs(row_centers[r] - center))
+        if abs(row_centers[best] - center) > cell // 3:
+            continue
+        if area != width * height:
+            continue
+        bars.append((best, width))
+    if len(bars) != GRID or len({row for row, _ in bars}) != GRID:
+        raise ValueError("the gutter does not show exactly one tally bar per panel row")
+
+    lengths = {row: length for row, length in bars}
+    ordered = sorted(range(GRID), key=lambda r: (lengths[r], r))
+    sorted_lengths = sorted(lengths.values())
+    if min(b - a for a, b in zip(sorted_lengths, sorted_lengths[1:])) < 4:
+        raise ValueError("two tally bars are too close in length to order")
+
+    reordered = np.stack([matrix[r] for r in ordered])
+    scores = sorted(
+        (int(np.sum(reordered != template)), name) for name, template in _templates().items()
+    )
+    best_score, best_name = scores[0]
+    if best_score > 2 or scores[1][0] - best_score < 4:
+        raise ValueError("the reordered cells match no symbol unambiguously")
+    return best_name

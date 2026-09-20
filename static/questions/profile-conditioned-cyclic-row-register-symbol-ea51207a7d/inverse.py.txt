@@ -1,0 +1,139 @@
+"""Independent image-only inverse for the public cyclic-registration rule."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_N = 9
+_GRID_RGB = np.array((137, 148, 158), dtype=np.int16)
+
+# Independently stated public answer prototypes.  No renderer or latent module is
+# imported, and every measured input below comes from the raster.
+_PROTOTYPES: dict[str, tuple[int, ...]] = {
+    "slash": (8, 7, 6, 5, 4, 3, 2, 1, 0),
+    "backslash": (0, 1, 2, 3, 4, 5, 6, 7, 8),
+    "left_chevron": (8, 8, 7, 6, 1, 6, 7, 8, 8),
+    "right_chevron": (0, 0, 1, 2, 7, 2, 1, 0, 0),
+}
+
+
+class OracleAbstention(ValueError):
+    """Raised when required visible evidence is absent or ambiguous."""
+
+
+def _components(mask: np.ndarray, minimum_area: int) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[dict] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(xs) >= minimum_area:
+            found.append({"area": len(xs), "cx": float(np.mean(xs)), "cy": float(np.mean(ys))})
+    return found
+
+
+def _cluster_axis(values: np.ndarray) -> list[float]:
+    if len(values) == 0:
+        return []
+    values = np.sort(values.astype(float))
+    groups: list[list[float]] = [[float(values[0])]]
+    for value in values[1:]:
+        if value - groups[-1][-1] <= 2.1:
+            groups[-1].append(float(value))
+        else:
+            groups.append([float(value)])
+    return [float(np.mean(group)) for group in groups]
+
+
+def analyze_image(image: Image.Image) -> dict:
+    """Locate fiducials, execute all nine modular shifts, and report margin."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise OracleAbstention("expected an RGB raster")
+    red, green, blue = arr[..., 0], arr[..., 1], arr[..., 2]
+
+    # Broad semantic-color masks admit both answer-independent renderer palettes.
+    marker_mask = (
+        (red > 175) & (green > 55) & (green < 135) & (blue < 105)
+        & ((red - green) > 75)
+    )
+    payload_mask = (
+        (red < 85) & (green < 115) & (blue < 145) & ((blue - red) > 22)
+    )
+    markers = sorted(_components(marker_mask, minimum_area=25), key=lambda item: item["cy"])
+    payloads = sorted(_components(payload_mask, minimum_area=45), key=lambda item: item["cy"])
+    if len(markers) != _N or len(payloads) != _N:
+        raise OracleAbstention(
+            f"need exactly nine orange markers and nine navy tiles; found {len(markers)} and {len(payloads)}"
+        )
+
+    # Recover the visible grid rather than using latent coordinates or a fixed crop.
+    grid_distance = np.max(np.abs(arr - _GRID_RGB), axis=2)
+    grid_mask = grid_distance <= 3
+    candidate_columns = np.flatnonzero(grid_mask.sum(axis=0) >= 180)
+    verticals = _cluster_axis(candidate_columns)
+    if len(verticals) != _N + 1:
+        raise OracleAbstention(f"grid calibration found {len(verticals)} vertical rules, expected ten")
+    gaps = np.diff(verticals)
+    cell = float(np.median(gaps))
+    if cell < 24 or cell > 42 or float(np.max(np.abs(gaps - cell))) > 1.5:
+        raise OracleAbstention("grid spacing is missing or unstable")
+    left = verticals[0]
+
+    registered: list[int] = []
+    raw_marker_columns: list[int] = []
+    raw_payload_columns: list[int] = []
+    for row, (marker, payload) in enumerate(zip(markers, payloads)):
+        if abs(marker["cy"] - payload["cy"]) > cell * 0.75:
+            raise OracleAbstention(f"row {row} marker and tile cannot be paired")
+        marker_column = int(round((marker["cx"] - (left + cell / 2.0)) / cell))
+        payload_column = int(round((payload["cx"] - (left + cell / 2.0)) / cell))
+        if not (0 <= marker_column < _N and 0 <= payload_column < _N):
+            raise OracleAbstention(f"row {row} evidence lies outside the visible grid")
+        raw_marker_columns.append(marker_column)
+        raw_payload_columns.append(payload_column)
+        registered.append((payload_column - marker_column) % _N)
+
+    scores = {
+        name: sum(left_col != right_col for left_col, right_col in zip(registered, prototype))
+        for name, prototype in _PROTOTYPES.items()
+    }
+    ranking = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    best_name, best_score = ranking[0]
+    runner_name, runner_score = ranking[1]
+    decision_margin = float(runner_score - best_score)
+    if best_score > 1 or decision_margin < 3.0:
+        raise OracleAbstention(
+            f"registered path is ambiguous: best={best_name}/{best_score}, runner={runner_name}/{runner_score}"
+        )
+    return {
+        "decision": best_name,
+        "margin": decision_margin,
+        "best_mismatches": int(best_score),
+        "runner_up": runner_name,
+        "registered_columns": registered,
+        "marker_columns": raw_marker_columns,
+        "payload_columns": raw_payload_columns,
+        "cell_pixels": cell,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

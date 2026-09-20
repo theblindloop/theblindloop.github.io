@@ -1,0 +1,127 @@
+"""Independent pixel-only inverse for the mirror-axis constellation.
+
+This module deliberately knows nothing about scene dictionaries or analytic
+gold.  It extracts the three colored strokes and the gray disks from the final
+PNG, fits each stroke as an infinite line, reflects the measured gray centroids
+across each fitted line, and selects the color with the smallest whole-set
+correspondence error.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+PUBLIC_COLORS = {
+    "red": np.array([214.0, 62.0, 70.0]),
+    "blue": np.array([58.0, 108.0, 218.0]),
+    "green": np.array([46.0, 158.0, 98.0]),
+}
+
+
+def _color_line_pixels(array: np.ndarray, color: np.ndarray) -> np.ndarray:
+    differences = array.astype(np.float32) - color.reshape(1, 1, 3)
+    distance = np.sqrt(np.sum(differences * differences, axis=2))
+    return np.argwhere(distance <= 82.0)
+
+
+def _fit_line(pixel_rows: np.ndarray) -> tuple[np.ndarray, float]:
+    if len(pixel_rows) < 40:
+        raise ValueError("colored candidate line is not observable")
+    # argwhere returns (row, column); convert to (x, y) for geometry.
+    xy = pixel_rows[:, [1, 0]].astype(np.float64)
+    center = xy.mean(axis=0)
+    centered = xy - center
+    covariance = centered.T @ centered
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    direction = eigenvectors[:, int(np.argmax(eigenvalues))]
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-9:
+        raise ValueError("degenerate colored line")
+    direction = direction / norm
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+    return normal, float(normal @ center)
+
+
+def _connected_component_centers(mask: np.ndarray) -> list[tuple[float, float]]:
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    centers: list[tuple[float, float]] = []
+    for row, column in zip(*np.nonzero(mask)):
+        if visited[row, column]:
+            continue
+        queue = deque([(int(row), int(column))])
+        visited[row, column] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            current_row, current_column = queue.popleft()
+            pixels.append((current_row, current_column))
+            for delta_row in (-1, 0, 1):
+                for delta_column in (-1, 0, 1):
+                    if delta_row == 0 and delta_column == 0:
+                        continue
+                    next_row = current_row + delta_row
+                    next_column = current_column + delta_column
+                    if (
+                        0 <= next_row < height
+                        and 0 <= next_column < width
+                        and mask[next_row, next_column]
+                        and not visited[next_row, next_column]
+                    ):
+                        visited[next_row, next_column] = True
+                        queue.append((next_row, next_column))
+        if len(pixels) >= 35:
+            rows = np.asarray([item[0] for item in pixels], dtype=np.float64)
+            columns = np.asarray([item[1] for item in pixels], dtype=np.float64)
+            centers.append((float(columns.mean()), float(rows.mean())))
+    return centers
+
+
+def _gray_centers(array: np.ndarray) -> np.ndarray:
+    spread = array.max(axis=2).astype(np.int16) - array.min(axis=2).astype(np.int16)
+    luminance = array.astype(np.float32).mean(axis=2)
+    # Dark neutral disks are separated from the warm near-white background and
+    # from the saturated colored strokes.  Only their stable cores are used.
+    mask = (spread <= 27) & (luminance >= 25.0) & (luminance <= 205.0)
+    centers = _connected_component_centers(mask)
+    if len(centers) < 10:
+        raise ValueError(f"only {len(centers)} gray constellation marks were found")
+    return np.asarray(centers, dtype=np.float64)
+
+
+def _reflection_error(points: np.ndarray, normal: np.ndarray, constant: float) -> float:
+    signed = points @ normal - constant
+    reflected = points - 2.0 * signed[:, None] * normal[None, :]
+    deltas = reflected[:, None, :] - points[None, :, :]
+    distances = np.sqrt(np.sum(deltas * deltas, axis=2))
+    nearest = np.min(distances, axis=1)
+    for index in range(len(points)):
+        self_distance = float(distances[index, index])
+        # Self matches are valid only for marks lying on the candidate line.
+        if self_distance > 5.0:
+            without_self = np.delete(distances[index], index)
+            if len(without_self) and nearest[index] >= self_distance - 1e-9:
+                nearest[index] = float(np.min(without_self))
+    return float(np.mean(nearest))
+
+
+def _measure(image: Image.Image) -> dict[str, float]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    points = _gray_centers(array)
+    scores: dict[str, float] = {}
+    for name, color in PUBLIC_COLORS.items():
+        pixels = _color_line_pixels(array, color)
+        normal, constant = _fit_line(pixels)
+        scores[name] = _reflection_error(points, normal, constant)
+    return scores
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Classify using only the supplied rasterized PNG."""
+
+    scores = _measure(image)
+    return min(scores, key=lambda name: (scores[name], name))

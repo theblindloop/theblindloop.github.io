@@ -1,0 +1,144 @@
+"""Independent pixel-only arm for ``mirror_spot_orphans``.
+
+Input is a final PNG and nothing else: no latent scene, no renderer, no prompt
+or gold code.  The arm segments the two dark-grey end squares to recover the
+mirror line, segments the chromatic spots, reflects every spot centroid across
+that line, and reports how many spots have no other spot at their reflected
+position.  It abstains whenever the picture is damaged or the pairing is not
+cleanly separable.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "mirror_spot_orphans-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+
+_CHROMA_MIN = 45
+_TICK_MAX_LEVEL = 150
+_TICK_MAX_CHROMA = 30
+
+_MATCH_TOL = 12.0
+_UNMATCH_MIN = 26.0
+_MIN_SELF_MIRROR = 30.0
+_MAX_UNPAIRED = 3
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[list[tuple[int, int]]]:
+    """Four-connected components of a boolean mask, as pixel lists."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), dtype=bool)
+    out: list[list[tuple[int, int]]] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        blob: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            blob.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(blob) >= min_area:
+            out.append(blob)
+    return out
+
+
+def _centroid(blob: list[tuple[int, int]]) -> tuple[float, float]:
+    ys = [p[0] for p in blob]
+    xs = [p[1] for p in blob]
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _bbox_side_ratio(blob: list[tuple[int, int]]) -> float:
+    ys = [p[0] for p in blob]
+    xs = [p[1] for p in blob]
+    dy = max(ys) - min(ys) + 1
+    dx = max(xs) - min(xs) + 1
+    return max(dx, dy) / float(min(dx, dy))
+
+
+def _fill_ratio(blob: list[tuple[int, int]]) -> float:
+    ys = [p[0] for p in blob]
+    xs = [p[1] for p in blob]
+    area = (max(ys) - min(ys) + 1) * (max(xs) - min(xs) + 1)
+    return len(blob) / float(area)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    hi = arr.max(axis=2)
+    lo = arr.min(axis=2)
+    chroma = hi - lo
+
+    tick_mask = (hi < _TICK_MAX_LEVEL) & (chroma < _TICK_MAX_CHROMA)
+    ticks = _components(tick_mask, 90)
+    if len(ticks) != 2:
+        return ABSTAIN
+    for blob in ticks:
+        if not (120 <= len(blob) <= 900):
+            return ABSTAIN
+        if _bbox_side_ratio(blob) > 1.6 or _fill_ratio(blob) < 0.7:
+            return ABSTAIN
+    a = _centroid(ticks[0])
+    b = _centroid(ticks[1])
+    axis_len = math.hypot(b[0] - a[0], b[1] - a[1])
+    if axis_len < 90.0:
+        return ABSTAIN
+    ux, uy = (b[0] - a[0]) / axis_len, (b[1] - a[1]) / axis_len
+
+    spot_mask = chroma >= _CHROMA_MIN
+    spots = _components(spot_mask, 60)
+    if not (3 <= len(spots) <= 12):
+        return ABSTAIN
+    areas = [len(s) for s in spots]
+    if min(areas) < 0.6 * max(areas):
+        return ABSTAIN
+    for blob in spots:
+        if _bbox_side_ratio(blob) > 1.5 or _fill_ratio(blob) < 0.6:
+            return ABSTAIN
+
+    centres = [_centroid(s) for s in spots]
+
+    def reflect(p: tuple[float, float]) -> tuple[float, float]:
+        wx, wy = p[0] - a[0], p[1] - a[1]
+        t = wx * ux + wy * uy
+        px, py = a[0] + t * ux, a[1] + t * uy
+        return (2.0 * px - p[0], 2.0 * py - p[1])
+
+    partner: list[int | None] = []
+    for i, c in enumerate(centres):
+        r = reflect(c)
+        if math.hypot(r[0] - c[0], r[1] - c[1]) < _MIN_SELF_MIRROR:
+            return ABSTAIN
+        best, best_d = None, float("inf")
+        for j, o in enumerate(centres):
+            if i == j:
+                continue
+            d = math.hypot(r[0] - o[0], r[1] - o[1])
+            if d < best_d:
+                best, best_d = j, d
+        if best_d <= _MATCH_TOL:
+            partner.append(best)
+        elif best_d >= _UNMATCH_MIN:
+            partner.append(None)
+        else:
+            return ABSTAIN
+
+    for i, j in enumerate(partner):
+        if j is not None and partner[j] != i:
+            return ABSTAIN
+
+    unpaired = sum(1 for p in partner if p is None)
+    if unpaired > _MAX_UNPAIRED:
+        return ABSTAIN
+    return str(unpaired)

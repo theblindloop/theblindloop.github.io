@@ -1,0 +1,142 @@
+"""Independent PNG-only inverse for the double-unfold punch world."""
+
+from __future__ import annotations
+
+import itertools
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_REFERENCE = np.array((166, 63, 132), dtype=np.int16)
+_CANDIDATE = np.array((39, 112, 142), dtype=np.int16)
+_INK = np.array((25, 29, 35), dtype=np.int16)
+_LABELS = ("A", "B", "C")
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int, float, float]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[tuple[int, int, int, int, int, float, float]] = []
+    for y, x in zip(*np.nonzero(mask), strict=True):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        output.append((min(xs), min(ys), max(xs), max(ys), len(xs), float(np.mean(xs)), float(np.mean(ys))))
+    return output
+
+
+def _color_mask(arr: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    delta = arr.astype(np.int32) - color.astype(np.int32)
+    return np.sqrt((delta * delta).sum(axis=2)) < tolerance
+
+
+def _frames(arr: np.ndarray, color: np.ndarray) -> list[tuple[int, int, int, int]]:
+    frames = []
+    for x0, y0, x1, y1, area, _, _ in _components(_color_mask(arr, color, 48.0)):
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if area > 2200 and 200 <= width <= 280 and 200 <= height <= 280 and abs(width - height) <= 5:
+            frames.append((x0, y0, x1, y1))
+    return sorted(frames, key=lambda box: box[0])
+
+
+def _holes(arr: np.ndarray, box: tuple[int, int, int, int]) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = box
+    mask = _color_mask(arr, _INK, 45.0)
+    interior = np.zeros_like(mask)
+    interior[y0 + 8 : y1 - 7, x0 + 8 : x1 - 7] = True
+    holes = []
+    for bx0, by0, bx1, by1, area, cx, cy in _components(mask & interior):
+        width, height = bx1 - bx0 + 1, by1 - by0 + 1
+        if 95 <= area <= 230 and 11 <= width <= 18 and 11 <= height <= 18:
+            holes.append((cx, cy))
+    return holes
+
+
+def _normalized(
+    holes: list[tuple[float, float]], box: tuple[int, int, int, int]
+) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = box
+    width, height = x1 - x0, y1 - y0
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    return [((x - cx) / width, (y - cy) / height) for x, y in holes]
+
+
+def _assignment_cost(left: list[tuple[float, float]], right: list[tuple[float, float]]) -> float:
+    if len(left) != len(right):
+        return float("inf")
+    return min(
+        sum(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5 for a, b in zip(left, perm, strict=True))
+        for perm in itertools.permutations(right)
+    )
+
+
+def _set_residual(left: list[tuple[float, float]], right: list[tuple[float, float]]) -> float:
+    """Symmetric nearest-neighbor residual for well-separated visible holes."""
+    if len(left) != len(right) or not left:
+        return float("inf")
+
+    def directed(source: list[tuple[float, float]], target: list[tuple[float, float]]) -> float:
+        return sum(
+            min(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5 for b in target)
+            for a in source
+        )
+
+    return max(directed(left, right), directed(right, left))
+
+
+def _quarter_signature(
+    arr: np.ndarray,
+    box: tuple[int, int, int, int],
+    expected_count: int,
+) -> list[tuple[float, float]]:
+    points = _normalized(_holes(arr, box), box)
+    if len(points) != expected_count:
+        raise OracleAbstention(f"expected {expected_count} holes, found {len(points)}")
+    top_right = [(abs(x), abs(y)) for x, y in points if x > 0.035 and y < -0.035]
+    if expected_count == 3:
+        if len(top_right) != 3:
+            raise OracleAbstention("folded holes are not all within the shown quarter")
+        return top_right
+    if len(top_right) != 3:
+        raise OracleAbstention("candidate does not contain three top-right orbit members")
+
+    # Require the remaining eleven points to be the visible reflection closure,
+    # not merely a convenient matching top-right subset.
+    expected = [(sx * x, sy * y) for x, y in top_right for sx in (-1, 1) for sy in (-1, 1)]
+    if _set_residual(points, expected) > 0.035:
+        raise OracleAbstention("candidate holes do not form a two-axis reflection closure")
+    return top_right
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    reference_frames = _frames(arr, _REFERENCE)
+    candidate_frames = _frames(arr, _CANDIDATE)
+    if len(reference_frames) != 1 or len(candidate_frames) != 3:
+        raise OracleAbstention(
+            f"expected one reference and three candidates, found {len(reference_frames)} and {len(candidate_frames)}"
+        )
+    reference = _quarter_signature(arr, reference_frames[0], 3)
+    candidates = [_quarter_signature(arr, box, 12) for box in candidate_frames]
+    costs = [_assignment_cost(reference, candidate) for candidate in candidates]
+    order = sorted(range(3), key=lambda index: costs[index])
+    if costs[order[0]] > 0.018 or costs[order[1]] - costs[order[0]] < 0.07:
+        raise OracleAbstention(f"no unique exact reflected match: {costs}")
+    return _LABELS[order[0]]

@@ -1,0 +1,165 @@
+"""Cross-panel dash-to-gap duty-ratio correspondence renderer.
+
+A single reference dashed bar (gray) is drawn near the top. Below it, three
+candidate dashed bars (red, green, blue) are each drawn with a *different*
+dash-to-gap ratio. The dashed pattern of every bar is a horizontal strip of
+solid rectangular dashes separated by empty gaps: ``dash`` pixels of ink then
+``gap`` pixels of blank, repeating ``ndash`` times and ending on a dash.
+
+Each bar is assigned one of three discrete duty-ratio classes (the ratio of a
+solid dash length to the empty gap to its right):
+
+    class 0: dash:gap = 8:16  -> ratio 0.5 (short dashes, long gaps)
+    class 1: dash:gap = 12:12 -> ratio 1.0 (equal dash and gap)
+    class 2: dash:gap = 16:8  -> ratio 2.0 (long dashes, short gaps)
+
+The reference bar's class is randomized. The three candidates cover all three
+distinct classes, so exactly one candidate reproduces the reference's class.
+The task asks which colored bar has the same dash-to-gap ratio as the gray
+reference bar; the answer is that bar's color (red, green, or blue).
+
+Every bar independently randomizes its horizontal left offset, its vertical
+position (small jitter around its band), a per-bar ``scale`` (1x or 2x applied
+to BOTH the dash and the gap, so the ratio is preserved) and its number of
+dashes ``ndash`` (3, 4, or 5). These decorrelate absolute dash length, total
+ink, bar width, and position from the answer: only the *normalized ratio* of a
+dash to its gap is invariant to scale, and only that ratio identifies the
+matching candidate.
+
+Latent fields that influence the analytic gold (``ref_class`` and
+``color_class``) are drawn verbatim into the raster as dash/gap pixel ratios;
+per-bar geometry lives in ``geom`` and carries no decision information.
+
+Scene:
+
+    ref_class   : int in {0,1,2}, the reference bar's duty class.
+    color_class : dict color("red"/"green"/"blue") -> duty class in {0,1,2},
+                  a permutation, so all three classes appear exactly once.
+    geom        : dict key -> per-bar {left, yc, dash, gap, ndash} drawn geometry.
+
+The analytic gold is the color whose duty class equals the reference's class.
+The raster uniquely determines each bar's dash:gap ratio, so it uniquely
+determines the matching color; no hidden gold-only field exists.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "dash_duty_correspondence-0.1.0"
+
+BACKGROUND = (255, 255, 255)
+REF_DASH = (120, 120, 120)
+CANDIDATE_PALETTE = {
+    "red": (225, 45, 45),
+    "green": (0, 170, 85),
+    "blue": (45, 65, 225),
+}
+
+WIDTH = 900
+HEIGHT = 900
+THICKNESS = 14
+BAND_CY = {"ref": 210, "red": 470, "green": 655, "blue": 840}
+YC_JITTER = 12
+MIN_LEFT = 110
+MAX_LEFT = 300
+SCALES = (1, 2)
+NDASH_CHOICES = (3, 4, 5)
+
+CLASS_GEOM = ((8, 16), (12, 12), (16, 8))
+CLASS_RATIO = (0.5, 1.0, 2.0)
+_MARGIN_THRESHOLD = 0.5
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    ref_class = rng.randrange(3)
+    colors = ["red", "green", "blue"]
+    rng.shuffle(colors)
+    classes = [0, 1, 2]
+    rng.shuffle(classes)
+    color_class = {color: cls for color, cls in zip(colors, classes)}
+    geom: dict = {}
+    entries = [("ref", ref_class)] + [(color, color_class[color]) for color in colors]
+    for key, cls in entries:
+        scale = rng.choice(SCALES)
+        ndash = rng.choice(NDASH_CHOICES)
+        dash, gap = CLASS_GEOM[cls]
+        dash *= scale
+        gap *= scale
+        left = rng.randint(MIN_LEFT, MAX_LEFT)
+        yc = BAND_CY[key] + rng.randint(-YC_JITTER, YC_JITTER)
+        geom[key] = {"left": left, "yc": yc, "dash": dash, "gap": gap, "ndash": ndash}
+    return {"ref_class": ref_class, "color_class": color_class, "geom": geom}
+
+
+def _draw_bar(draw: ImageDraw.ImageDraw, params: dict, color: tuple) -> None:
+    y0 = params["yc"] - THICKNESS // 2
+    x = params["left"]
+    dash = params["dash"]
+    gap = params["gap"]
+    for i in range(params["ndash"]):
+        draw.rectangle((x, y0, x + dash, y0 + THICKNESS), fill=color)
+        x += dash
+        if i < params["ndash"] - 1:
+            x += gap
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(img)
+    geom = scene["geom"]
+    _draw_bar(draw, geom["ref"], REF_DASH)
+    ref_class = scene["ref_class"]
+    color_class = scene["color_class"]
+    for color in ("red", "green", "blue"):
+        _draw_bar(draw, geom[color], CANDIDATE_PALETTE[color])
+    # reference bar drawn as the class read of the label field (rendered verbatim)
+    if ref_class not in (0, 1, 2):
+        raise ValueError("invalid reference class")
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Decision: color of the candidate bar whose dash-to-gap ratio class
+    equals the reference bar's class."""
+    ref_class = scene["ref_class"]
+    color_class = scene["color_class"]
+    for color, cls in color_class.items():
+        if cls == ref_class:
+            return color
+    raise ValueError("no candidate reproduced the reference dash ratio")
+
+
+def margin(scene: dict) -> float:
+    """Two-sided verifiability margin in log2 ratio units between the matched
+    candidate's class and its nearest non-matching candidate class. Adjacent
+    classes are 1.0 log2 apart, so this is always >= 1.0."""
+    ref_class = scene["ref_class"]
+    matched_log2 = math.log2(CLASS_RATIO[ref_class])
+    best: float | None = None
+    for cls in range(3):
+        if cls == ref_class:
+            continue
+        distance = abs(math.log2(CLASS_RATIO[cls]) - matched_log2)
+        best = distance if best is None else min(best, distance)
+    return float(best)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine only a genuinely ambiguous duty-ratio boundary. Adjacent
+    classes are separated by a factor of 2 in ratio (1.0 in log2 units); the
+    per-bar scale is always applied to both dash and gap so the ratio is exact
+    and never lands on a boundary, so no sampled scene is ambiguous."""
+    return margin(scene) < _MARGIN_THRESHOLD
+
+
+def latent_symmetries(scene: dict) -> list:
+    """not_applicable: the only label-influencing fields (ref_class and
+    color_class) are drawn verbatim as dash:gap pixel ratios, so the raster
+    uniquely determines each bar's duty ratio and therefore the matching color;
+    no pixel-identical transform is declared."""
+    return []

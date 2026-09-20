@@ -1,0 +1,136 @@
+"""Independent pixel-only inverse arm for state_max_dwell.
+
+Receives only the final PNG. From the raster alone it:
+  1. segments the four ordered panel frames by their gray border outline;
+  2. orders panels left to right (P1..P4);
+  3. detects each panel's shaded middle-slot region by its light-gray fill;
+  4. for each panel, locates each coloured token and records whether its
+     centroid lies inside that panel's shaded region;
+  5. sums each colour's in-region dwell count across the four panels and
+     returns the colour with the strict maximum.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BORDER = (200, 200, 200)
+REGION_FILL = (235, 235, 235)
+BG = (255, 255, 255)
+COLOR_NAMES = ["red", "green", "blue", "orange"]
+COLORS = {
+    "red": (220, 40, 40),
+    "green": (40, 170, 80),
+    "blue": (40, 80, 220),
+    "orange": (235, 150, 20),
+}
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected four-panel ordered structure."""
+
+
+def _mask_equal(arr: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    return (
+        (arr[:, :, 0] == color[0])
+        & (arr[:, :, 1] == color[1])
+        & (arr[:, :, 2] == color[2])
+    )
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points) -> tuple[int, int, int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _region_xrange(arr: np.ndarray, box: tuple[int, int, int, int]) -> tuple[int, int]:
+    """Columns in the panel dominated by the shaded light-gray region fill."""
+    x0, y0, x1, y1 = box
+    gray = _mask_equal(arr, REGION_FILL)[y0 + 4 : y1 - 3, x0 + 4 : x1 - 3]
+    cols = [
+        x0 + 4 + x for x in range(gray.shape[1]) if int(gray[:, x].sum()) > 0
+    ]
+    if not cols:
+        raise UnreadableImageError("panel has no detectable shaded region")
+    return (min(cols) - 2, max(cols) + 2)
+
+
+def _panel_centers(arr: np.ndarray, box: tuple[int, int, int, int]) -> dict[str, tuple[int, int]]:
+    x0, y0, x1, y1 = box
+    centers = {}
+    for name in COLOR_NAMES:
+        mask = np.zeros((arr.shape[0], arr.shape[1]), dtype=bool)
+        mask[y0:y1, x0:x1] = _mask_equal(arr, COLORS[name])[y0:y1, x0:x1]
+        comps = _components(mask)
+        if not comps:
+            raise UnreadableImageError(f"panel missing colour {name}")
+        largest = max(comps, key=len)
+        ys = [p[0] for p in largest]
+        xs = [p[1] for p in largest]
+        centers[name] = (int(np.mean(xs)), int(np.mean(ys)))
+    return centers
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    boxes = []
+    for comp in _components(_mask_equal(arr, BORDER)):
+        if len(comp) < 50:
+            continue
+        boxes.append(_bbox(comp))
+    boxes.sort(key=lambda box: box[0])
+    if len(boxes) < 4:
+        raise UnreadableImageError(f"found {len(boxes)} panels; expected 4")
+
+    counts = {name: 0 for name in COLOR_NAMES}
+    for box in boxes[:4]:
+        # Inset to avoid the border outline pixels.
+        inner = (box[0] + 2, box[1] + 2, box[2] - 2, box[3] - 2)
+        r0, r1 = _region_xrange(arr, inner)
+        centers = _panel_centers(arr, inner)
+        for name in COLOR_NAMES:
+            cx, _ = centers[name]
+            if r0 <= cx <= r1:
+                counts[name] += 1
+
+    best = max(COLOR_NAMES, key=lambda name: counts[name])
+    runner_up = sorted(counts.values(), reverse=True)
+    if len(runner_up) < 2 or runner_up[0] == runner_up[1]:
+        raise UnreadableImageError("the maximum dwell count is not unique")
+    return best

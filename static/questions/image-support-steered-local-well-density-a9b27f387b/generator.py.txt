@@ -1,0 +1,258 @@
+"""Deterministic local sampling-well renderer and analytic density arm."""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 640
+HEIGHT = 640
+CELL = 80
+BACKGROUND = (249, 248, 244)
+INK = (58, 62, 66)
+GRID = (205, 209, 207)
+PAPER_TONES = (
+    (239, 242, 240),
+    (242, 239, 235),
+    (237, 240, 243),
+)
+ROLE_PALETTES = (
+    ((20, 130, 150), (220, 96, 40)),
+    ((36, 116, 164), (214, 92, 50)),
+    ((20, 144, 126), (224, 105, 32)),
+    ((46, 112, 154), (202, 78, 52)),
+)
+
+# Cell-center pairs have delta (2, 1). At the public 8x8 ablation resolution,
+# their normalized span is sqrt(5)/sqrt(98) ~= 0.226 (focal), while the cells
+# remain disconnected under four-neighbor connectivity (multipart).
+PLACEMENTS = (
+    ((2, 2), (4, 3)),
+    ((3, 2), (5, 3)),
+    ((2, 5), (4, 4)),
+    ((3, 5), (5, 4)),
+)
+
+# ((outer width, outer height, particles), (...)). Frame border is two pixels,
+# so visible interior area is (w-4)*(h-4). Some recipes make the higher count
+# denser; others make the lower count denser, defeating raw-count shortcuts.
+DENSITY_RECIPES = (
+    ((29, 29, 3), (37, 35, 6)),  # higher count wins
+    ((29, 27, 3), (37, 35, 5)),  # lower count wins (near boundary)
+    ((31, 29, 4), (37, 33, 5)),  # lower count wins
+    ((29, 31, 3), (35, 35, 5)),  # higher count wins
+    ((27, 27, 2), (37, 35, 5)),  # higher count wins
+    ((27, 31, 3), (37, 35, 4)),  # lower count wins
+)
+
+PARTICLE_RADIUS = 2
+DENSITY_SCALE = 1000.0
+VISIBILITY_MARGIN_PX = 1.0
+QUARANTINE_MARGIN = 0.25
+
+
+def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(name, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Return deterministic side-paired scenes with balanced decision identity."""
+
+    seed = int(seed)
+    pair_seed = seed // 2
+    rng = random.Random(0xD351_7A11 + pair_seed * 1_000_003)
+    (left_cell_x, left_cell_y), (right_cell_x, right_cell_y) = PLACEMENTS[
+        pair_seed % len(PLACEMENTS)
+    ]
+    first, second = DENSITY_RECIPES[pair_seed % len(DENSITY_RECIPES)]
+    # Odd members swap complete wells across the same two positions. This flips
+    # the answer while holding counts, areas, palette, total ink, and placement.
+    left_recipe, right_recipe = (first, second) if seed % 2 == 0 else (second, first)
+    frame_rgb, particle_rgb = ROLE_PALETTES[pair_seed % len(ROLE_PALETTES)]
+    return {
+        "left_x": left_cell_x * CELL + CELL // 2,
+        "left_y": left_cell_y * CELL + CELL // 2,
+        "left_w": left_recipe[0],
+        "left_h": left_recipe[1],
+        "left_count": left_recipe[2],
+        "right_x": right_cell_x * CELL + CELL // 2,
+        "right_y": right_cell_y * CELL + CELL // 2,
+        "right_w": right_recipe[0],
+        "right_h": right_recipe[1],
+        "right_count": right_recipe[2],
+        "frame_rgb": list(frame_rgb),
+        "particle_rgb": list(particle_rgb),
+        "paper_rgb": list(PAPER_TONES[(pair_seed // 2) % len(PAPER_TONES)]),
+    }
+
+
+def _density_values(scene: dict[str, Any]) -> tuple[float, float]:
+    left_w = int(scene["left_w"])
+    left_h = int(scene["left_h"])
+    left_count = int(scene["left_count"])
+    right_w = int(scene["right_w"])
+    right_h = int(scene["right_h"])
+    right_count = int(scene["right_count"])
+    left_area = (left_w - 4) * (left_h - 4)
+    right_area = (right_w - 4) * (right_h - 4)
+    if left_area <= 0 or right_area <= 0:
+        raise ValueError("sampling-well interior area must be positive")
+    if left_count <= 0 or right_count <= 0:
+        raise ValueError("each sampling well must contain at least one particle")
+    left_density = left_count / left_area
+    right_density = right_count / right_area
+    if left_density == right_density:
+        raise ValueError("sampling-well densities must not tie")
+    return left_density, right_density
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    left_density, right_density = _density_values(scene)
+    return "left" if left_density > right_density else "right"
+
+
+def margin(scene: dict[str, Any]) -> float:
+    """Minimum of density decision distance and fixed component clearance."""
+
+    left_density, right_density = _density_values(scene)
+    decision_distance = abs(left_density - right_density) * DENSITY_SCALE
+    return float(min(decision_distance, VISIBILITY_MARGIN_PX))
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    return margin(scene) <= QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    return []
+
+
+def _validate_scene(scene: dict[str, Any]) -> None:
+    _density_values(scene)
+    left_x = int(scene["left_x"])
+    left_y = int(scene["left_y"])
+    right_x = int(scene["right_x"])
+    right_y = int(scene["right_y"])
+    if not (80 <= left_x < right_x <= WIDTH - 80):
+        raise ValueError("well centers must be ordered left-to-right inside the canvas")
+    if not (80 <= left_y <= HEIGHT - 80 and 80 <= right_y <= HEIGHT - 80):
+        raise ValueError("well centers must stay inside the canvas")
+    if abs(right_x - left_x) < 120 or abs(right_y - left_y) < 40:
+        raise ValueError("well centers must be visibly separated in both axes")
+    for side in ("left", "right"):
+        width = int(scene[f"{side}_w"])
+        height = int(scene[f"{side}_h"])
+        count = int(scene[f"{side}_count"])
+        if width % 2 != 1 or height % 2 != 1 or not (25 <= width <= 37 and 25 <= height <= 37):
+            raise ValueError("frame extents must be calibrated odd values from 25 to 37 pixels")
+        if not 2 <= count <= 6:
+            raise ValueError("particle count is outside the calibrated range")
+    for key in ("frame_rgb", "particle_rgb", "paper_rgb"):
+        value = scene[key]
+        if not isinstance(value, list) or len(value) != 3:
+            raise ValueError(f"{key} must have three RGB channels")
+
+
+def _particle_offsets(count: int) -> tuple[tuple[int, int], ...]:
+    ordered = ((-8, -6), (8, 6), (8, -6), (-8, 6), (0, -6), (0, 6))
+    if not 2 <= count <= len(ordered):
+        raise ValueError("unsupported particle count")
+    return ordered[:count]
+
+
+def _draw_well(
+    draw: ImageDraw.ImageDraw,
+    *,
+    center_x: int,
+    center_y: int,
+    width: int,
+    height: int,
+    count: int,
+    frame: tuple[int, int, int],
+    particle: tuple[int, int, int],
+) -> None:
+    half_w, half_h = width // 2, height // 2
+    draw.rectangle(
+        (center_x - half_w, center_y - half_h, center_x + half_w, center_y + half_h),
+        outline=frame,
+        width=2,
+    )
+    for dx, dy in _particle_offsets(count):
+        x, y = center_x + dx, center_y + dy
+        draw.ellipse(
+            (x - PARTICLE_RADIUS, y - PARTICLE_RADIUS, x + PARTICLE_RADIUS, y + PARTICLE_RADIUS),
+            fill=particle,
+        )
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    _validate_scene(scene)
+    left_x = int(scene["left_x"])
+    left_y = int(scene["left_y"])
+    left_w = int(scene["left_w"])
+    left_h = int(scene["left_h"])
+    left_count = int(scene["left_count"])
+    right_x = int(scene["right_x"])
+    right_y = int(scene["right_y"])
+    right_w = int(scene["right_w"])
+    right_h = int(scene["right_h"])
+    right_count = int(scene["right_count"])
+    frame = tuple(int(value) for value in scene["frame_rgb"])
+    particle = tuple(int(value) for value in scene["particle_rgb"])
+    paper = tuple(int(value) for value in scene["paper_rgb"])
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    plate_left = left_x - 48
+    plate_right = right_x + 48
+    plate_top = min(left_y, right_y) - 54
+    plate_bottom = max(left_y, right_y) + 54
+    draw.rounded_rectangle(
+        (plate_left, plate_top, plate_right, plate_bottom),
+        radius=13,
+        fill=paper,
+        outline=GRID,
+        width=2,
+    )
+    draw.text(
+        (plate_left + 14, plate_top + 9),
+        "LOCAL PARTICLE SURVEY",
+        font=_font(12, bold=True),
+        fill=INK,
+    )
+    draw.text((left_x - 13, left_y + left_h // 2 + 7), "LEFT", font=_font(9), fill=INK)
+    draw.text((right_x - 16, right_y + right_h // 2 + 7), "RIGHT", font=_font(9), fill=INK)
+
+    # Remote grayscale registration marks add nondiagnostic scientific context;
+    # the independent inverse segments only the two saturated role colors.
+    for x, y in ((72, 72), (568, 72), (72, 568), (568, 568)):
+        draw.line((x - 5, y, x + 5, y), fill=GRID, width=1)
+        draw.line((x, y - 5, x, y + 5), fill=GRID, width=1)
+
+    _draw_well(
+        draw,
+        center_x=left_x,
+        center_y=left_y,
+        width=left_w,
+        height=left_h,
+        count=left_count,
+        frame=frame,
+        particle=particle,
+    )
+    _draw_well(
+        draw,
+        center_x=right_x,
+        center_y=right_y,
+        width=right_w,
+        height=right_h,
+        count=right_count,
+        frame=frame,
+        particle=particle,
+    )
+    return image

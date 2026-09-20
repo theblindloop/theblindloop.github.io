@@ -1,0 +1,147 @@
+"""Pixel-only inverse arm for the compass-needle world.
+
+This module receives a PNG and nothing else. It never imports the renderer,
+prompts, generator, verifier or any analytic-gold code, and it never accepts a
+latent scene. It shares no geometry constants with the renderer beyond the
+PUBLIC visual contract stated in the question text itself (the answer-bearing
+element is the one solid saturated triangle; the frame and the mirrored half are
+achromatic grey).
+
+Method, independent of how the image was produced:
+
+1. Label every pixel chromatic iff ``max(R,G,B) - min(R,G,B) >= SAT_MIN``. White
+   background, grey rim, grey ticks, the grey ``N`` mark, the grey pips and the
+   grey outlined half of the needle are all achromatic and drop out. What
+   survives is the solid triangle plus its antialiased rim.
+2. Keep the largest 4-connected component; if the discarded chromatic ink is a
+   sizeable fraction of the total, the raster is corrupted -> abstain.
+3. The surviving blob's apex is its extremity: for a triangle of height L the
+   centroid sits L/3 from the base, so the apex is ~2L/3 away while the base
+   corners are only ~L/3 away. Average the farthest ``APEX_FRAC`` of the blob to
+   get a robust apex estimate and take the direction from the centroid to it.
+4. Convert to a compass bearing (clockwise from up) and round to the nearest of
+   up/right/down/left.
+
+The oracle abstains (returns ``"abstain"``) instead of guessing whenever the
+evidence is missing, too small, too large, fragmented, or not needle-shaped.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "compass_needle_heading-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+
+# Chroma threshold. The renderer palette has chroma >= 130; grey frame ink has
+# chroma 0. 60 sits at the midpoint of the antialiased colour->white ramp, so the
+# extracted mask is unbiased around the true silhouette and has >2x headroom
+# against every achromatic element.
+SAT_MIN = 60
+MIN_VALUE = 60          # reject near-black chromatic mush
+MIN_BLOB_PX = 700       # the solid triangle covers ~2350 px at 448x448
+MAX_BLOB_PX = 30000
+STRAY_FRAC_MAX = 0.08   # chromatic ink outside the main blob, as a fraction
+APEX_FRAC = 0.04        # fraction of blob pixels averaged to locate the apex
+APEX_SPREAD_MAX = 0.35  # apex-cloud radius / apex distance; a triangle is tight
+
+_DIRECTIONS = (("up", 0.0), ("right", 90.0), ("down", 180.0), ("left", 270.0))
+
+
+def _chromatic_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    hi = arr.max(axis=-1)
+    lo = arr.min(axis=-1)
+    return ((hi - lo) >= SAT_MIN) & (hi >= MIN_VALUE)
+
+
+def _largest_component(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    """Largest 4-connected component of ``mask`` and the total mask area."""
+    total = int(mask.sum())
+    if total == 0:
+        return mask, 0
+    ys, xs = np.nonzero(mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = mask[y0:y1, x0:x1]
+    h, w = sub.shape
+    ids = np.where(sub, np.arange(h * w).reshape(h, w) + 1, 0)
+    # Label propagation: each ink pixel repeatedly adopts the max id among its
+    # 4-neighbours. Converges in at most the component's geodesic diameter.
+    for _ in range(4 * (h + w)):
+        prev = ids
+        nb = ids.copy()
+        nb[:, :-1] = np.maximum(nb[:, :-1], ids[:, 1:])
+        nb[:, 1:] = np.maximum(nb[:, 1:], ids[:, :-1])
+        nb[:-1, :] = np.maximum(nb[:-1, :], ids[1:, :])
+        nb[1:, :] = np.maximum(nb[1:, :], ids[:-1, :])
+        ids = np.where(sub, nb, 0)
+        if np.array_equal(ids, prev):
+            break
+    labels = ids[sub]
+    vals, counts = np.unique(labels, return_counts=True)
+    best = int(vals[int(counts.argmax())])
+    out = np.zeros_like(mask)
+    out[y0:y1, x0:x1] = ids == best
+    return out, total
+
+
+def measure(image: Image.Image) -> dict:
+    """Everything recoverable from the raster alone. Never sees a scene."""
+    mask = _chromatic_mask(image)
+    blob, total = _largest_component(mask)
+    area = int(blob.sum())
+    report: dict = {"chromatic_px": total, "blob_px": area, "reason": None}
+    if area < MIN_BLOB_PX:
+        report["reason"] = f"chromatic evidence too small ({area}px < {MIN_BLOB_PX})"
+        return report
+    if area > MAX_BLOB_PX:
+        report["reason"] = f"chromatic evidence too large ({area}px > {MAX_BLOB_PX})"
+        return report
+    stray = (total - area) / float(total)
+    if stray > STRAY_FRAC_MAX:
+        report["reason"] = f"fragmented chromatic ink (stray fraction {stray:.3f})"
+        return report
+
+    ys, xs = np.nonzero(blob)
+    pts = np.stack([xs + 0.5, ys + 0.5], axis=-1).astype(np.float64)
+    centroid = pts.mean(axis=0)
+    rel = pts - centroid
+    dist = np.hypot(rel[:, 0], rel[:, 1])
+    k = max(8, int(round(APEX_FRAC * len(pts))))
+    idx = np.argpartition(dist, len(dist) - k)[len(dist) - k:]
+    apex = pts[idx].mean(axis=0)
+    vec = apex - centroid
+    norm = float(np.hypot(vec[0], vec[1]))
+    if norm < 1.0:
+        report["reason"] = "no dominant extremity: shape is not a pointed needle"
+        return report
+    spread = float(np.hypot(*(pts[idx] - apex).std(axis=0)))
+    if spread / norm > APEX_SPREAD_MAX:
+        report["reason"] = f"apex cloud not tight (spread ratio {spread / norm:.3f})"
+        return report
+
+    bearing = math.degrees(math.atan2(vec[0], -vec[1])) % 360.0
+    name, delta = min(
+        ((n, abs((bearing - a + 180.0) % 360.0 - 180.0)) for n, a in _DIRECTIONS),
+        key=lambda t: t[1],
+    )
+    report.update(
+        {
+            "centroid": [round(float(centroid[0]), 3), round(float(centroid[1]), 3)],
+            "apex": [round(float(apex[0]), 3), round(float(apex[1]), 3)],
+            "bearing_deg": round(bearing, 3),
+            "margin_deg": round(45.0 - delta, 3),
+            "decision": name,
+        }
+    )
+    return report
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """The public inverse arm: one of up / right / down / left, or "abstain"."""
+    return measure(image).get("decision", ABSTAIN)

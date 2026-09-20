@@ -1,0 +1,155 @@
+"""Independent pixel-only inverse for bounded-face incidence.
+
+The inverse sees only an RGB raster.  It segments the exact dark/colored node
+disks and gray link strokes, recovers link endpoints by a renderer-free PCA
+fit, then traverses the recovered planar embedding to count bounded faces.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+NODE_RGB = np.array((31, 36, 45), dtype=np.int16)
+EDGE_RGB = np.array((92, 100, 112), dtype=np.int16)
+MARK_RGB = {
+    "red": np.array((218, 60, 65), dtype=np.int16),
+    "green": np.array((43, 155, 91), dtype=np.int16),
+    "blue": np.array((59, 103, 199), dtype=np.int16),
+}
+
+
+def _mask(pixels: np.ndarray, color: np.ndarray) -> np.ndarray:
+    return np.max(np.abs(pixels.astype(np.int16) - color[None, None, :]), axis=2) <= 3
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask & ~visited)):
+        if visited[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        visited[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            result.append(np.asarray(points, dtype=np.int32))
+    return result
+
+
+def _node_centers(pixels: np.ndarray) -> tuple[list[np.ndarray], list[str]]:
+    centers: list[np.ndarray] = []
+    labels: list[str] = []
+    for label, color, minimum in (
+        ("none", NODE_RGB, 300),
+        ("red", MARK_RGB["red"], 300),
+        ("green", MARK_RGB["green"], 300),
+        ("blue", MARK_RGB["blue"], 300),
+    ):
+        for component in _components(_mask(pixels, color), minimum):
+            centers.append(component[:, [1, 0]].mean(axis=0))
+            labels.append(label)
+    if len(centers) != 8 or labels.count("red") != 1 or labels.count("green") != 1 or labels.count("blue") != 1 or labels.count("none") != 5:
+        raise ValueError(f"expected 8 visible nodes, got {len(centers)} with labels {labels}")
+    return centers, labels
+
+
+def _line_endpoints(component: np.ndarray, centers: list[np.ndarray]) -> tuple[int, int]:
+    points = component[:, [1, 0]].astype(np.float64)
+    if len(points) < 20:
+        raise ValueError("link component is too small")
+    center = points.mean(axis=0)
+    covariance = np.cov(points, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    direction = direction / np.linalg.norm(direction)
+    projection = (points - center) @ direction
+    first_point = center + direction * float(projection.min())
+    second_point = center + direction * float(projection.max())
+    first = min(range(len(centers)), key=lambda index: float(np.linalg.norm(centers[index] - first_point)))
+    second = min(range(len(centers)), key=lambda index: float(np.linalg.norm(centers[index] - second_point)))
+    if first == second:
+        raise ValueError("link has only one endpoint")
+    first_error = float(np.linalg.norm(centers[first] - first_point))
+    second_error = float(np.linalg.norm(centers[second] - second_point))
+    if first_error > 42.0 or second_error > 42.0:
+        raise ValueError(f"link endpoint fit is ambiguous: {first_error:.1f}, {second_error:.1f}")
+    return tuple(sorted((first, second)))
+
+
+def _recover_edges(pixels: np.ndarray, centers: list[np.ndarray]) -> list[tuple[int, int]]:
+    components = _components(_mask(pixels, EDGE_RGB), 80)
+    if len(components) != 9:
+        raise ValueError(f"expected 9 isolated links, found {len(components)}")
+    edges = [_line_endpoints(component, centers) for component in components]
+    if len(set(edges)) != 9:
+        raise ValueError("recovered duplicate link endpoints")
+    return edges
+
+
+def _face_walks(centers: list[np.ndarray], edges: list[tuple[int, int]]) -> list[tuple[list[int], float]]:
+    adjacency: list[list[int]] = [[] for _ in centers]
+    for first, second in edges:
+        adjacency[first].append(second)
+        adjacency[second].append(first)
+    for index, neighbors in enumerate(adjacency):
+        px, py = centers[index]
+        neighbors.sort(key=lambda other: math.atan2(centers[other][1] - py, centers[other][0] - px))
+    directed = [(first, second) for first, second in edges] + [(second, first) for first, second in edges]
+    visited: set[tuple[int, int]] = set()
+    faces: list[tuple[list[int], float]] = []
+    for start in directed:
+        if start in visited:
+            continue
+        current = start
+        walk: list[int] = []
+        while current not in visited:
+            visited.add(current)
+            first, second = current
+            walk.append(first)
+            neighbors = adjacency[second]
+            position = neighbors.index(first)
+            current = (second, neighbors[(position - 1) % len(neighbors)])
+        area = 0.0
+        for index, first in enumerate(walk):
+            second = walk[(index + 1) % len(walk)]
+            area += centers[first][0] * centers[second][1] - centers[second][0] * centers[first][1]
+        faces.append((walk, 0.5 * float(area)))
+    return faces
+
+
+def _incidences(centers: list[np.ndarray], labels: list[str], edges: list[tuple[int, int]]) -> dict[str, int]:
+    faces = _face_walks(centers, edges)
+    if not faces:
+        raise ValueError("recovered graph has no faces")
+    outside = max(range(len(faces)), key=lambda index: abs(faces[index][1]))
+    bounded = [set(walk) for index, (walk, area) in enumerate(faces) if index != outside and abs(area) > 1e-3]
+    result: dict[str, int] = {}
+    for index, label in enumerate(labels):
+        if label in MARK_RGB:
+            result[label] = sum(index in face for face in bounded)
+    return result
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the colored junction incident to exactly two bounded faces."""
+
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    centers, labels = _node_centers(pixels)
+    edges = _recover_edges(pixels, centers)
+    incidences = _incidences(centers, labels, edges)
+    if sorted(incidences.values()) != [0, 1, 2]:
+        raise ValueError(f"unexpected recovered face incidences: {incidences}")
+    return next(label for label, count in incidences.items() if count == 2)

@@ -1,0 +1,190 @@
+"""Independent pixel-only inverse arm for the abductive gate-selection world.
+
+Reads only the rasterized RGB image.  It re-segments the cups, the goal swatch,
+the four colored rings and the fifteen black wedges, rebuilds the routing tree
+from wedge geometry alone, runs the drawn route and then each of the four
+one-gate counterfactual routes, and reports the ring color of the unique gate
+whose reversal lands the ball in a cup of the goal color.
+
+It imports nothing from the renderer, the generator, the prompts or the gold.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_RING_RGB = {
+    "blue": (30, 70, 205),
+    "crimson": (200, 20, 50),
+    "green": (25, 145, 60),
+    "violet": (135, 40, 185),
+}
+_CUP_RGB = {
+    "orange": (250, 150, 20),
+    "pink": (240, 90, 175),
+    "teal": (0, 160, 165),
+    "yellow": (245, 220, 45),
+}
+_BLACK = (0, 0, 0)
+
+_DEPTH = 4
+_N_GATES = 15
+_N_CUPS = 16
+_FALLBACK = "blue"
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Four-connected components of a boolean mask, via run-length union-find."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs_by_row: list[list[tuple[int, int, int]]] = []
+    for y in range(height):
+        row = mask[y]
+        if not row.any():
+            runs_by_row.append([])
+            continue
+        idx = np.flatnonzero(np.diff(np.concatenate(([0], row.view(np.int8), [0]))))
+        runs = []
+        for start, stop in zip(idx[0::2], idx[1::2]):
+            label = len(parent)
+            parent.append(label)
+            runs.append((int(start), int(stop), label))
+        for start, stop, label in runs:
+            for pstart, pstop, plabel in runs_by_row[y - 1] if y else []:
+                if pstart < stop and start < pstop:
+                    union(label, plabel)
+        runs_by_row.append(runs)
+
+    buckets: dict[int, dict] = {}
+    for y, runs in enumerate(runs_by_row):
+        for start, stop, label in runs:
+            root = find(label)
+            entry = buckets.setdefault(
+                root,
+                {"area": 0, "sx": 0.0, "sy": 0.0, "x0": width, "x1": -1, "y0": height, "y1": -1},
+            )
+            count = stop - start
+            entry["area"] += count
+            entry["sx"] += (start + stop - 1) / 2.0 * count
+            entry["sy"] += y * count
+            entry["x0"] = min(entry["x0"], start)
+            entry["x1"] = max(entry["x1"], stop - 1)
+            entry["y0"] = min(entry["y0"], y)
+            entry["y1"] = max(entry["y1"], y)
+
+    out = []
+    for entry in buckets.values():
+        if entry["area"] < 40:
+            continue
+        entry["cx"] = entry["sx"] / entry["area"]
+        entry["cy"] = entry["sy"] / entry["area"]
+        entry["w"] = entry["x1"] - entry["x0"] + 1
+        entry["h"] = entry["y1"] - entry["y0"] + 1
+        entry["fill"] = entry["area"] / float(entry["w"] * entry["h"])
+        out.append(entry)
+    return out
+
+
+def _exact(arr: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    return (
+        (arr[:, :, 0] == rgb[0]) & (arr[:, :, 1] == rgb[1]) & (arr[:, :, 2] == rgb[2])
+    )
+
+
+def _route(dirs: list[int], cups: list[str], flip: int | None) -> str:
+    node = 0
+    for depth in range(_DEPTH):
+        step = dirs[node]
+        if flip is not None and node == flip:
+            step = 1 - step
+        row_index = node - (2 ** depth - 1)
+        if depth == _DEPTH - 1:
+            return cups[2 * row_index + step]
+        node = 2 * node + 1 + step
+    raise AssertionError
+
+
+def decision_from_image(image: Image.Image) -> str:
+    try:
+        return _decide(np.asarray(image.convert("RGB"), dtype=np.uint8))
+    except Exception:
+        return _FALLBACK
+
+
+def _decide(arr: np.ndarray) -> str:
+    height = arr.shape[0]
+
+    # cups (bottom band) and the goal swatch (upper band)
+    cup_parts: list[tuple[float, str]] = []
+    goal = None
+    for name, rgb in _CUP_RGB.items():
+        for comp in _components(_exact(arr, rgb)):
+            if comp["cy"] > height * 0.55:
+                cup_parts.append((comp["cx"], name))
+            else:
+                goal = name
+    if goal is None or len(cup_parts) != _N_CUPS:
+        return _FALLBACK
+    cups = [name for _, name in sorted(cup_parts)]
+
+    # rings
+    ring_centers: list[tuple[float, float, str]] = []
+    for name, rgb in _RING_RGB.items():
+        comps = _components(_exact(arr, rgb))
+        if len(comps) != 1:
+            return _FALLBACK
+        comp = comps[0]
+        ring_centers.append((comp["cx"], comp["cy"], name))
+    if len(ring_centers) != 4:
+        return _FALLBACK
+
+    # wedges: black components minus the release ball (a near-round blob)
+    blobs = _components(_exact(arr, _BLACK))
+    wedges = [c for c in blobs if c["fill"] < 0.65]
+    if len(wedges) != _N_GATES:
+        return _FALLBACK
+
+    wedges.sort(key=lambda c: c["cy"])
+    rows: list[list[dict]] = [[wedges[0]]]
+    for comp in wedges[1:]:
+        if comp["cy"] - rows[-1][-1]["cy"] > 50:
+            rows.append([comp])
+        else:
+            rows[-1].append(comp)
+    if [len(r) for r in rows] != [1, 2, 4, 8]:
+        return _FALLBACK
+
+    dirs = [0] * _N_GATES
+    centers: dict[int, tuple[float, float]] = {}
+    for depth, row in enumerate(rows):
+        row.sort(key=lambda c: c["cx"])
+        for index, comp in enumerate(row):
+            node = 2 ** depth - 1 + index
+            box_center = (comp["x0"] + comp["x1"]) / 2.0
+            dirs[node] = 1 if comp["cx"] < box_center else 0
+            centers[node] = (comp["cx"], comp["cy"])
+
+    factual = _route(dirs, cups, None)
+    winners = []
+    for cx, cy, name in ring_centers:
+        node = min(
+            centers, key=lambda n: (centers[n][0] - cx) ** 2 + (centers[n][1] - cy) ** 2
+        )
+        if _route(dirs, cups, node) == goal:
+            winners.append(name)
+    if len(winners) != 1 or factual == goal:
+        return _FALLBACK
+    return winners[0]

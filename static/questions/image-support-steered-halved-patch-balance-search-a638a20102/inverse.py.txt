@@ -1,0 +1,150 @@
+"""Pixel-only oracle for the halved-patch area-balance search world.
+
+The module receives one RGB image and the public question contract. It never
+imports the renderer, prompts, generator or verifier and never receives latent
+scene data.
+
+Route: the modal colour is the background; among the remaining colours the more
+frequent one is the dark patch ink and the other is the cut bar. Connected
+components of all non-background ink are taken, and only components far larger
+than a background speck are kept, so scattered specks drop out. Each surviving
+component must contain one bar; the bar's own shape fixes the cut direction and
+position, the component's dark pixels are counted on each side of the bar, and
+the component with the smallest area imbalance wins provided the runner-up
+imbalance is clearly larger. The four component centroids are ranked to name the
+winner's position in the two-by-two cluster.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "halved_patch_balance_search-oracle-0.1.0"
+
+WORDS = ("upper-left", "upper-right", "lower-left", "lower-right")
+ABSTAIN = "abstain"
+
+MIN_COMPONENT = 900      # a patch is far larger; a speck is far smaller
+MIN_BAR = 60             # a cut bar covers many more pixels than this
+BALANCED_TOLERANCE = 100  # a balanced patch splits exactly, up to raster noise
+MIN_PIXEL_MARGIN = 200   # the runner-up must be clearly less balanced
+
+
+def _colour_layers(image: Image.Image):
+    arr = np.asarray(image.convert("RGB")).astype(np.int32)
+    keys = (arr[:, :, 0] << 16) + (arr[:, :, 1] << 8) + arr[:, :, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    order = np.argsort(-counts)
+    if len(values) < 3:
+        return None
+    background = values[order[0]]
+    ink = values[order[1]]
+    bar = values[order[2]]
+    if counts[order[1]] < counts[order[2]]:
+        ink, bar = bar, ink
+    return keys, background, ink, bar
+
+
+def _components(mask: np.ndarray) -> list:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    blobs = []
+    for start in zip(*np.nonzero(mask)):
+        if seen[start]:
+            continue
+        stack = [start]
+        seen[start] = True
+        cells = []
+        while stack:
+            y, x = stack.pop()
+            cells.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        blobs.append(cells)
+    return blobs
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Per-patch area imbalance and the runner-up pixel margin, or ``None``."""
+
+    layers = _colour_layers(image)
+    if layers is None:
+        return None
+    keys, background, ink_key, bar_key = layers
+    ink_mask = keys == ink_key
+    bar_mask = keys == bar_key
+    blobs = [cells for cells in _components(ink_mask | bar_mask) if len(cells) >= MIN_COMPONENT]
+    if len(blobs) != 4:
+        return None
+
+    records = []
+    for cells in blobs:
+        ys = np.array([y for y, _ in cells])
+        xs = np.array([x for _, x in cells])
+        is_bar = bar_mask[ys, xs]
+        is_ink = ink_mask[ys, xs]
+        if int(is_bar.sum()) < MIN_BAR or int(is_ink.sum()) < MIN_COMPONENT // 2:
+            return None
+        bar_ys, bar_xs = ys[is_bar], xs[is_bar]
+        bar_h = int(bar_ys.max() - bar_ys.min()) + 1
+        bar_w = int(bar_xs.max() - bar_xs.min()) + 1
+        if bar_h == bar_w:
+            return None
+        ink_ys, ink_xs = ys[is_ink], xs[is_ink]
+        if bar_h > bar_w:
+            before = int((ink_xs < bar_xs.min()).sum())
+            after = int((ink_xs > bar_xs.max()).sum())
+            direction = "vertical"
+        else:
+            before = int((ink_ys < bar_ys.min()).sum())
+            after = int((ink_ys > bar_ys.max()).sum())
+            direction = "horizontal"
+        if before <= 0 or after <= 0 or before + after != int(is_ink.sum()):
+            return None
+        records.append(
+            {
+                "centre_x": float(xs.mean()),
+                "centre_y": float(ys.mean()),
+                "direction": direction,
+                "before": before,
+                "after": after,
+                "imbalance": abs(before - after),
+                "ink": before + after,
+            }
+        )
+
+    ranked = sorted(range(4), key=lambda i: records[i]["imbalance"])
+    best, second = records[ranked[0]], records[ranked[1]]
+    pixel_margin = float(second["imbalance"] - best["imbalance"])
+    by_x = sorted(range(4), key=lambda i: records[i]["centre_x"])
+    by_y = sorted(range(4), key=lambda i: records[i]["centre_y"])
+    columns = {index: (0 if position < 2 else 1) for position, index in enumerate(by_x)}
+    rows = {index: (0 if position < 2 else 1) for position, index in enumerate(by_y)}
+    slots = {2 * rows[i] + columns[i] for i in range(4)}
+    if len(slots) != 4:
+        return None
+    return {
+        "records": records,
+        "winner": ranked[0],
+        "winner_imbalance": float(best["imbalance"]),
+        "pixel_margin": pixel_margin,
+        "slot": 2 * rows[ranked[0]] + columns[ranked[0]],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Name the cluster position of the patch cut into two equal dark areas."""
+
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    if report["winner_imbalance"] > BALANCED_TOLERANCE:
+        return ABSTAIN
+    if report["pixel_margin"] < MIN_PIXEL_MARGIN:
+        return ABSTAIN
+    return WORDS[int(report["slot"])]

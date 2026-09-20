@@ -1,0 +1,174 @@
+"""Independent pixel-only inverse for nested-box hierarchy correspondence.
+
+The inverse segments rectangle outlines and colored dots from the final raster,
+recovers direct containment by the smallest enclosing rectangle, canonicalizes
+each unordered subtree, maps the marked reference branch, and reads color last.
+It imports no candidate module and receives no scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "magenta": np.array((190, 50, 150), dtype=np.int16),
+    "red": np.array((218, 68, 73), dtype=np.int16),
+    "green": np.array((43, 157, 104), dtype=np.int16),
+    "blue": np.array((54, 105, 204), dtype=np.int16),
+}
+COLORS = ("red", "green", "blue")
+
+
+def _components(mask: np.ndarray) -> list[dict[str, float]]:
+    height, width = mask.shape
+    remaining = set(np.flatnonzero(mask).tolist())
+    found: list[dict[str, float]] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        x0 = x1 = start % width
+        y0 = y1 = start // width
+        area = 0
+        while stack:
+            value = stack.pop()
+            y, x = divmod(value, width)
+            area += 1
+            x0, x1 = min(x0, x), max(x1, x)
+            y0, y1 = min(y0, y), max(y1, y)
+            for other in (value - 1, value + 1, value - width, value + width):
+                if other in remaining:
+                    oy, ox = divmod(other, width)
+                    if abs(oy - y) + abs(ox - x) == 1:
+                        remaining.remove(other)
+                        stack.append(other)
+        found.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "area": area})
+    return found
+
+
+def _rectangles(arr: np.ndarray) -> list[dict[str, float]]:
+    dark = np.max(arr, axis=2) < 90
+    components = _components(dark)
+    rectangles = []
+    for item in components:
+        width = item["x1"] - item["x0"] + 1
+        height = item["y1"] - item["y0"] + 1
+        if item["area"] >= 500 and width >= 45 and height >= 45:
+            rectangles.append(item)
+    if len(rectangles) != 22:
+        raise ValueError(f"expected 22 visible box outlines, found {len(rectangles)}")
+    return rectangles
+
+
+def _contains(outer: dict[str, float], inner: dict[str, float]) -> bool:
+    return (
+        outer["x0"] + 4 < inner["x0"]
+        and outer["y0"] + 4 < inner["y0"]
+        and outer["x1"] - 4 > inner["x1"]
+        and outer["y1"] - 4 > inner["y1"]
+    )
+
+
+def _box_area(box: dict[str, float]) -> float:
+    return (box["x1"] - box["x0"] + 1) * (box["y1"] - box["y0"] + 1)
+
+
+def _tree_for_panel(rectangles: list[dict[str, float]]) -> tuple[int, dict[int, list[int]]]:
+    if len(rectangles) != 11:
+        raise ValueError(f"panel must contain 11 boxes, found {len(rectangles)}")
+    parents: dict[int, int] = {}
+    children = {index: [] for index in range(len(rectangles))}
+    for index, box in enumerate(rectangles):
+        containers = [
+            other for other, candidate in enumerate(rectangles)
+            if other != index and _contains(candidate, box)
+        ]
+        if containers:
+            parent = min(containers, key=lambda other: _box_area(rectangles[other]))
+            parents[index] = parent
+            children[parent].append(index)
+    roots = [index for index in range(len(rectangles)) if index not in parents]
+    if len(roots) != 1:
+        raise ValueError(f"panel has {len(roots)} hierarchy roots")
+    root = roots[0]
+    if len(children[root]) != 3:
+        raise ValueError("hierarchy root must directly contain three branches")
+    return root, children
+
+
+def _code(node: int, children: dict[int, list[int]]) -> tuple:
+    return tuple(sorted((_code(child, children) for child in children[node]), key=repr))
+
+
+def _dot_center(arr: np.ndarray, name: str) -> tuple[float, float]:
+    rgb = PALETTE[name]
+    distance = np.linalg.norm(arr.astype(np.int16) - rgb, axis=2)
+    ys, xs = np.nonzero(distance < 30)
+    if not 180 <= len(xs) <= 520:
+        raise ValueError(f"{name} dot is missing or has implausible area {len(xs)}")
+    return float(xs.mean()), float(ys.mean())
+
+
+def _smallest_enclosing(
+    point: tuple[float, float],
+    rectangles: list[dict[str, float]],
+) -> int:
+    x, y = point
+    containing = [
+        index for index, box in enumerate(rectangles)
+        if box["x0"] < x < box["x1"] and box["y0"] < y < box["y1"]
+    ]
+    if not containing:
+        raise ValueError("dot is not enclosed by a visible box")
+    return min(containing, key=lambda index: _box_area(rectangles[index]))
+
+
+def _measure(image: Image.Image) -> tuple[str, dict]:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.shape[1] < 200:
+        raise ValueError("image is too narrow to contain two panels")
+    midpoint = arr.shape[1] / 2
+    all_rectangles = _rectangles(arr)
+    left = [box for box in all_rectangles if (box["x0"] + box["x1"]) / 2 < midpoint]
+    right = [box for box in all_rectangles if (box["x0"] + box["x1"]) / 2 > midpoint]
+    left_root, left_children = _tree_for_panel(left)
+    right_root, right_children = _tree_for_panel(right)
+
+    left_codes = {_code(child, left_children): child for child in left_children[left_root]}
+    right_codes = {_code(child, right_children): child for child in right_children[right_root]}
+    if len(left_codes) != 3 or set(left_codes) != set(right_codes):
+        raise ValueError("root-child subtree correspondence is non-unique or inconsistent")
+
+    magenta = _dot_center(arr, "magenta")
+    marked_box = _smallest_enclosing(magenta, left)
+    marked_code = _code(marked_box, left_children)
+    if marked_code not in left_codes or left_codes[marked_code] != marked_box:
+        raise ValueError("magenta dot does not mark a direct reference branch")
+    matched_target = right_codes[marked_code]
+
+    color_boxes = {}
+    for color in COLORS:
+        point = _dot_center(arr, color)
+        box = _smallest_enclosing(point, right)
+        if box not in right_children[right_root]:
+            raise ValueError(f"{color} dot is not on a direct target branch")
+        color_boxes[color] = box
+    if len(set(color_boxes.values())) != 3:
+        raise ValueError("target colors do not bind one-to-one to the three branches")
+    matches = [color for color, box in color_boxes.items() if box == matched_target]
+    if len(matches) != 1:
+        raise ValueError("matched target branch has no unique color")
+
+    other_codes = [code for code in right_codes if code != marked_code]
+    runner_gap = min(abs(len(repr(marked_code)) - len(repr(code))) + (code != marked_code) for code in other_codes)
+    return matches[0], {
+        "reference_branch_codes": [repr(code) for code in left_codes],
+        "target_branch_codes": [repr(code) for code in right_codes],
+        "matched_code": repr(marked_code),
+        "runner_up_gap": float(runner_gap),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return red, green, or blue using only the final raster."""
+    return _measure(image)[0]

@@ -1,0 +1,174 @@
+"""Pixel-only oracle for the folded-wire echo-run world.
+
+The module sees one RGB image and the public question contract. It never imports
+the renderer, prompts, generator or verifier, and it never receives latent scene
+data.
+
+Route: the modal colour is background; the largest connected ink component is the
+wire and its block, so stray specks drop out; the block is the densest local
+patch and fixes the walking direction; column height profiles of the component
+split it into vertical runs (groups of columns with a tall unbroken ink stretch) and horizontal runs (the column
+gaps between them); each measured run length is reported on the same pixel scale;
+the neighbouring pair among runs three to six with the smallest length difference
+wins and the runner-up difference is the pixel margin.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "wire_walk_echo_search-oracle-0.1.0"
+
+WORDS = ("third", "fourth", "fifth", "sixth")
+ABSTAIN = "abstain"
+INK_TOLERANCE = 24
+TALL_COLUMN = 13          # a column taller than this belongs to a vertical run
+JOINT_BIAS = 3            # shared additive offset of both run measurements
+WINDOW = 9                # block detector window
+EDGE_SLACK = 6            # tolerance for deciding the leftmost run orientation
+RUN_COUNT = 8
+FIRST_CANDIDATE_RUN = 3
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    flat = arr.reshape(-1, 3)
+    keys = (flat[:, 0].astype(np.int32) << 16) + (flat[:, 1].astype(np.int32) << 8) + flat[:, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    background = int(values[int(np.argmax(counts))])
+    bg = np.array(
+        [(background >> 16) & 255, (background >> 8) & 255, background & 255], dtype=np.int16
+    )
+    return np.abs(arr - bg).max(axis=2) > INK_TOLERANCE
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray | None:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for start in zip(*np.nonzero(mask)):
+        if seen[start]:
+            continue
+        stack = [start]
+        seen[start] = True
+        blob: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            blob.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(blob) > len(best):
+            best = blob
+    if not best:
+        return None
+    out = np.zeros(mask.shape, dtype=bool)
+    ys, xs = zip(*best)
+    out[np.array(ys), np.array(xs)] = True
+    return out
+
+
+def _block_column(component: np.ndarray) -> int:
+    """Column of the densest WINDOW-by-WINDOW patch: the solid end block."""
+
+    integral = np.cumsum(np.cumsum(component.astype(np.int32), axis=0), axis=1)
+    integral = np.pad(integral, ((1, 0), (1, 0)))
+    box = (
+        integral[WINDOW:, WINDOW:]
+        - integral[:-WINDOW, WINDOW:]
+        - integral[WINDOW:, :-WINDOW]
+        + integral[:-WINDOW, :-WINDOW]
+    )
+    flat = int(np.argmax(box))
+    return int(flat % box.shape[1]) + WINDOW // 2
+
+
+def _geometric_runs(component: np.ndarray) -> list[int | None] | None:
+    """Measured run lengths in left-to-right order; the leftmost run is unmeasured."""
+
+    columns = np.flatnonzero(component.any(axis=0))
+    if columns.size == 0:
+        return None
+    # Height of the tallest unbroken ink stretch in a column. Using the tallest
+    # unbroken stretch rather than the full top-to-bottom extent keeps a column
+    # that merely passes both the end block and a distant horizontal run from
+    # counting as part of a vertical run.
+    extents = np.zeros(int(columns[-1]) + 1, dtype=np.int32)
+    for x in columns:
+        rows = np.flatnonzero(component[:, x])
+        cuts = np.flatnonzero(np.diff(rows) > 1)
+        starts = np.concatenate(([0], cuts + 1))
+        ends = np.concatenate((cuts, [rows.size - 1]))
+        extents[x] = int(max(rows[end] - rows[start] + 1 for start, end in zip(starts, ends)))
+
+    groups: list[list[int]] = []
+    for x in columns:
+        if extents[x] < TALL_COLUMN:
+            continue
+        if groups and x - groups[-1][-1] == 1:
+            groups[-1].append(int(x))
+        else:
+            groups.append([int(x)])
+    if len(groups) != 4:
+        return None
+
+    # A horizontal run that touches the left edge of the component has no tall
+    # column group on its far side, so its length is not measurable; whether the
+    # picture starts with such a run or with a vertical run is read off the gap
+    # between the first ink column and the first tall group.
+    leading_horizontal = groups[0][0] - int(columns[0]) > EDGE_SLACK
+    runs: list[int | None] = [None] if leading_horizontal else []
+    for index, group in enumerate(groups):
+        if index:
+            gap = group[0] - groups[index - 1][-1] - 1
+            runs.append(int(gap + JOINT_BIAS))
+        runs.append(int(max(extents[x] for x in group) - JOINT_BIAS))
+    if not leading_horizontal:
+        runs.append(None)
+    if len(runs) != RUN_COUNT:
+        return None
+    return runs
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Score every candidate neighbouring pair by its length difference."""
+
+    component = _largest_component(_ink_mask(image))
+    if component is None:
+        return None
+    geometric = _geometric_runs(component)
+    if geometric is None:
+        return None
+    block_x = _block_column(component)
+    columns = np.flatnonzero(component.any(axis=0))
+    block_at_left = block_x < 0.5 * (int(columns[0]) + int(columns[-1]))
+    walk = geometric if block_at_left else geometric[::-1]
+
+    scores: list[float] = []
+    for run in range(FIRST_CANDIDATE_RUN, FIRST_CANDIDATE_RUN + len(WORDS)):
+        here, before = walk[run - 1], walk[run - 2]
+        if here is None or before is None:
+            return None
+        scores.append(float(abs(here - before)))
+    order = sorted(range(len(scores)), key=lambda i: (scores[i], i))
+    best = order[0]
+    return {
+        "block_at_left": bool(block_at_left),
+        "walk_lengths": [None if value is None else int(value) for value in walk],
+        "pair_scores": scores,
+        "winner_index": best,
+        "pixel_margin": float(scores[order[1]] - scores[best]),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Ordinal of the run that repeats the length of the run just before it."""
+
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    return WORDS[int(report["winner_index"])]

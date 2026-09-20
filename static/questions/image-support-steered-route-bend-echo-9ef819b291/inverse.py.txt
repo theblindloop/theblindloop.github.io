@@ -1,0 +1,112 @@
+"""Pixel-only inverse arm for the order of bend magnitudes along one route."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _route_mask(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate((array[:3].reshape(-1, 3), array[-3:].reshape(-1, 3),
+                             array[:, :3].reshape(-1, 3), array[:, -3:].reshape(-1, 3)))
+    background = np.median(border, axis=0)
+    data = array.astype(np.float64)
+    distance = np.linalg.norm(data - background, axis=2)
+    high = data.max(axis=2)
+    low = data.min(axis=2)
+    saturation = (high - low) / np.maximum(high, 1.0)
+    # The route is saturated; the visible midpoint ring is deliberately neutral.
+    return (distance > 38.0) & (saturation > 0.24)
+
+
+def _component_sizes(mask: np.ndarray) -> list[int]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    sizes = []
+    for yy, xx in np.argwhere(mask):
+        y, x = int(yy), int(xx)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(y, x)])
+        size = 0
+        while queue:
+            cy, cx = queue.popleft()
+            size += 1
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        sizes.append(size)
+    return sorted(sizes, reverse=True)
+
+
+def _profile(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 1800:
+        raise OracleAbstention("too little route ink")
+    x0, x1 = int(xs.min()), int(xs.max())
+    if x1 - x0 < 0.78 * mask.shape[1]:
+        raise OracleAbstention("route no longer spans the image")
+    centers = np.full(x1 - x0 + 1, np.nan, dtype=np.float64)
+    for x in range(x0, x1 + 1):
+        column = np.flatnonzero(mask[:, x])
+        if len(column):
+            centers[x - x0] = float(np.median(column))
+    missing = np.isnan(centers)
+    if missing.sum() > 2:
+        raise OracleAbstention("route has a missing longitudinal section")
+    if missing.any():
+        good = np.flatnonzero(~missing)
+        centers[missing] = np.interp(np.flatnonzero(missing), good, centers[good])
+    return np.arange(x0, x1 + 1, dtype=np.float64), centers
+
+
+def _bend_magnitudes(xs: np.ndarray, ys: np.ndarray) -> list[float]:
+    span = xs[-1] - xs[0]
+    if span <= 0:
+        raise OracleAbstention("degenerate route extent")
+    baseline = ys[0] + (ys[-1] - ys[0]) * ((xs - xs[0]) / span)
+    residual = ys - baseline
+    values = []
+    for index in range(8):
+        lo = xs[0] + span * (index + 0.16) / 8.0
+        hi = xs[0] + span * (index + 0.84) / 8.0
+        take = (xs >= lo) & (xs <= hi)
+        if take.sum() < 18:
+            raise OracleAbstention("bend slot is incomplete")
+        slot = residual[take]
+        # Robust high quantile avoids antialias outliers while measuring either
+        # upward or downward excursions without using their nuisance signs.
+        values.append(float(np.percentile(np.abs(slot), 96.0)))
+    return values
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    mask = _route_mask(array)
+    sizes = _component_sizes(mask)
+    if not sizes or sizes[0] < 1800:
+        raise OracleAbstention("no usable route")
+    if len(sizes) > 1 and sizes[1] > max(18, int(0.01 * sizes[0])):
+        raise OracleAbstention("route is disconnected")
+    xs, ys = _profile(mask)
+    bends = _bend_magnitudes(xs, ys)
+    left = np.asarray(bends[:4], dtype=np.float64)
+    right = np.asarray(bends[4:], dtype=np.float64)
+    same_error = float(np.sqrt(np.mean((left - right) ** 2)))
+    reverse_error = float(np.sqrt(np.mean((left[::-1] - right) ** 2)))
+    fit_gap = abs(same_error - reverse_error)
+    if min(same_error, reverse_error) > 8.0 or fit_gap < 8.0 or not math.isfinite(fit_gap):
+        raise OracleAbstention("same-versus-reverse fit is ambiguous")
+    return ("same" if same_error < reverse_error else "reverse", fit_gap)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return decision_with_margin(image)[0]

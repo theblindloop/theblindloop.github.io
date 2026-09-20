@@ -1,0 +1,212 @@
+"""Independent pixel-only inverse for the post-turn gate question."""
+
+from __future__ import annotations
+
+import heapq
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ROUTE_RGB = np.asarray((27, 53, 76), dtype=np.float32)
+GREEN_RGB = np.asarray((43, 174, 103), dtype=np.float32)
+RED_RGB = np.asarray((218, 70, 66), dtype=np.float32)
+AMBER_RGB = np.asarray((235, 151, 35), dtype=np.float32)
+VIOLET_RGB = np.asarray((143, 84, 194), dtype=np.float32)
+
+
+class OracleFitError(ValueError):
+    """The raster does not expose a complete, ordered two-segment route."""
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    distance = np.linalg.norm(array.astype(np.float32) - color[None, None, :], axis=2)
+    return distance <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            found.append(np.asarray(pixels, dtype=np.int32))
+    return sorted(found, key=len, reverse=True)
+
+
+def _center(array: np.ndarray, color: np.ndarray, minimum: int = 30) -> np.ndarray:
+    points = np.argwhere(_mask(array, color, 72.0))
+    if len(points) < minimum:
+        raise OracleFitError("required colored marker is absent")
+    return points[:, ::-1].astype(np.float64).mean(axis=0)
+
+
+def _route_component(array: np.ndarray) -> np.ndarray:
+    mask = _mask(array, ROUTE_RGB, 58.0)
+    components = _components(mask, 80)
+    if not components:
+        raise OracleFitError("dark route component is absent")
+    component = np.zeros_like(mask, dtype=bool)
+    component[components[0][:, 0], components[0][:, 1]] = True
+    ys, xs = np.where(component)
+    if int(xs.max() - xs.min()) < 35 or int(ys.max() - ys.min()) < 35:
+        raise OracleFitError("route is too short or not visibly bent")
+    return component
+
+
+def _nearest_route_pixel(
+    route: np.ndarray, center: np.ndarray, radius: float = 28.0
+) -> tuple[int, int]:
+    ys, xs = np.where(route)
+    distances = (xs.astype(np.float64) - center[0]) ** 2 + (
+        ys.astype(np.float64) - center[1]
+    ) ** 2
+    if len(distances) == 0:
+        raise OracleFitError("route has no pixels")
+    index = int(np.argmin(distances))
+    if float(distances[index]) > radius * radius:
+        raise OracleFitError("marker is detached from route")
+    return int(ys[index]), int(xs[index])
+
+
+def _corner(route: np.ndarray, start: np.ndarray, finish: np.ndarray) -> np.ndarray:
+    candidates = (
+        np.asarray((finish[0], start[1]), dtype=np.float64),
+        np.asarray((start[0], finish[1]), dtype=np.float64),
+    )
+    scores: list[int] = []
+    yy, xx = np.indices(route.shape)
+    for candidate in candidates:
+        local = (
+            (xx.astype(np.float64) - candidate[0]) ** 2
+            + (yy.astype(np.float64) - candidate[1]) ** 2
+            <= 22.0**2
+        )
+        scores.append(int(np.count_nonzero(route & local)))
+    order = np.argsort(scores)[::-1]
+    if scores[int(order[0])] < 180 or scores[int(order[0])] < scores[int(order[1])] + 60:
+        raise OracleFitError("unique right-angle corner is not recoverable")
+    return candidates[int(order[0])]
+
+
+def _distance_map(route: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = route.shape
+    distances = np.full((height, width), np.inf, dtype=np.float64)
+    sy, sx = start
+    distances[sy, sx] = 0.0
+    heap: list[tuple[float, int, int]] = [(0.0, sy, sx)]
+    moves = (
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, math.sqrt(2.0)),
+        (-1, 1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)),
+        (1, 1, math.sqrt(2.0)),
+    )
+    while heap:
+        current, y, x = heapq.heappop(heap)
+        if current != distances[y, x]:
+            continue
+        for dy, dx, weight in moves:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and route[ny, nx]:
+                candidate = current + weight
+                if candidate < distances[ny, nx]:
+                    distances[ny, nx] = candidate
+                    heapq.heappush(heap, (candidate, ny, nx))
+    return distances
+
+
+def _route_position(
+    distances: np.ndarray, route: np.ndarray, center: np.ndarray
+) -> float:
+    ys, xs = np.where(route)
+    local = (xs.astype(np.float64) - center[0]) ** 2 + (
+        ys.astype(np.float64) - center[1]
+    ) ** 2
+    keep = (local <= 24.0**2) & np.isfinite(distances[ys, xs])
+    if int(keep.sum()) < 8:
+        raise OracleFitError("marker has no stable route projection")
+    values = np.sort(distances[ys[keep], xs[keep]])
+    trim = max(1, len(values) // 5)
+    return float(np.median(values[trim:-trim] if len(values) > 2 * trim else values))
+
+
+def _post_leg_distance(corner: np.ndarray, finish: np.ndarray, marker: np.ndarray) -> float:
+    dx = abs(float(finish[0] - corner[0]))
+    dy = abs(float(finish[1] - corner[1]))
+    if dx >= dy:
+        perpendicular = abs(float(marker[1] - corner[1]))
+        along = abs(float(marker[0] - corner[0]))
+        span = dx
+    else:
+        perpendicular = abs(float(marker[0] - corner[0]))
+        along = abs(float(marker[1] - corner[1]))
+        span = dy
+    if perpendicular > 28.0 or along < 18.0 or along > span - 18.0:
+        raise OracleFitError("gate is not on the post-turn route leg")
+    return along
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the first colored gate after the visible route corner."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    green = _center(array, GREEN_RGB)
+    red = _center(array, RED_RGB)
+    amber = _center(array, AMBER_RGB)
+    violet = _center(array, VIOLET_RGB)
+    route = _route_component(array)
+    start = _nearest_route_pixel(route, green)
+    finish = _nearest_route_pixel(route, red)
+    corner = _corner(route, green, red)
+    distances = _distance_map(route, start)
+    finish_distance = float(distances[finish])
+    if not np.isfinite(finish_distance) or finish_distance < 110.0:
+        raise OracleFitError("green and red ports are not connected by a route")
+    positions = {
+        "amber": _route_position(distances, route, amber),
+        "violet": _route_position(distances, route, violet),
+    }
+    corner_pixel = _nearest_route_pixel(route, corner, radius=30.0)
+    corner_distance = float(distances[corner_pixel])
+    if not np.isfinite(corner_distance):
+        raise OracleFitError("corner is not on the connected route")
+    post_distances = {
+        "amber": _post_leg_distance(corner, red, amber),
+        "violet": _post_leg_distance(corner, red, violet),
+    }
+    if any(value <= 18.0 for value in post_distances.values()):
+        raise OracleFitError("gate is too close to the corner")
+    if abs(post_distances["amber"] - post_distances["violet"]) < 26.0:
+        raise OracleFitError("gate order margin is too small")
+    # Require the route-distance order to agree with the local post-leg order;
+    # this prevents a disconnected or folded dark component from being treated
+    # as a valid path.
+    first_by_route = min(positions, key=positions.get)
+    first_by_leg = min(post_distances, key=post_distances.get)
+    if first_by_route != first_by_leg or min(positions.values()) <= corner_distance + 10.0:
+        raise OracleFitError("directed post-turn order is inconsistent")
+    return first_by_leg

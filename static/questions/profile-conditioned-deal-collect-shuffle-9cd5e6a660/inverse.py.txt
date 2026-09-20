@@ -1,0 +1,155 @@
+"""Scene-free pixel oracle for deal_collect_shuffle.
+
+Receives one RGB image and nothing else.  It re-derives the whole replay from
+the raster: it segments the coloured strokes by exact colour, splits them into
+horizontal bands, reads the hand of discs and the ringed disc from the dark
+ring, reads the bins (the piles in dealing order) from the middle band and the
+pick-up order from the chips in the bottom band, then deals and collects.
+
+It imports no renderer, prompt, generator, verifier or gold code, receives no
+latent scene, and abstains whenever the drawn evidence is not decisive.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+
+from PIL import Image
+
+ORACLE_VERSION = "deal_collect_shuffle-oracle-0.1.0"
+
+STRIDE = 2
+CHROMA_MIN = 40
+DARK_MAX = 90
+BAND_GAP = 40
+MIN_BLOB = 20
+MIN_RING_PIXELS = 40
+ASSIGN_MARGIN = 0.4
+COLOUR_MATCH = 24.0
+COLOUR_SEPARATION = 60.0
+
+POSITION_WORDS = (
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+)
+ABSTAIN = "abstain"
+
+
+def _scan(image: Image.Image):
+    """Colour blobs (by exact colour, per band) and dark pixels."""
+    rgb = image.convert("RGB")
+    w, h = rgb.size
+    px = rgb.load()
+    chromatic: list[tuple[tuple[int, int, int], int, int]] = []
+    dark: list[tuple[int, int]] = []
+    for y in range(0, h, STRIDE):
+        for x in range(0, w, STRIDE):
+            r, g, b = px[x, y]
+            hi, lo = max(r, g, b), min(r, g, b)
+            if hi - lo > CHROMA_MIN:
+                chromatic.append(((r, g, b), x, y))
+            elif hi < DARK_MAX:
+                dark.append((x, y))
+    return chromatic, dark
+
+
+def _bands(points) -> list[list]:
+    """Split points into horizontal bands separated by empty rows."""
+    if not points:
+        return []
+    ys = sorted({p[2] for p in points})
+    cuts = [ys[0]]
+    edges: list[float] = []
+    for a, b in zip(ys, ys[1:]):
+        if b - a > BAND_GAP:
+            edges.append((a + b) / 2.0)
+    del cuts
+    out: list[list] = [[] for _ in range(len(edges) + 1)]
+    for p in points:
+        idx = 0
+        while idx < len(edges) and p[2] > edges[idx]:
+            idx += 1
+        out[idx].append(p)
+    return out
+
+
+def _blobs(band) -> list[tuple[tuple[int, int, int], float, int]]:
+    """One blob per exact colour present in the band: (colour, cx, count)."""
+    acc: dict[tuple[int, int, int], list[float]] = defaultdict(lambda: [0.0, 0])
+    for colour, x, _y in band:
+        rec = acc[colour]
+        rec[0] += x
+        rec[1] += 1
+    blobs = [
+        (colour, sx / n, n) for colour, (sx, n) in acc.items() if n >= MIN_BLOB
+    ]
+    return sorted(blobs, key=lambda blob: blob[1])
+
+
+def _dist(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    return sum((int(u) - int(v)) ** 2 for u, v in zip(a, b)) ** 0.5
+
+
+def decision_from_image(image: Image.Image) -> str:
+    chromatic, dark = _scan(image)
+    bands = _bands(chromatic)
+    if len(bands) != 3:
+        return ABSTAIN
+
+    discs = _blobs(bands[0])
+    bins = _blobs(bands[1])
+    chips = _blobs(bands[2])
+    n_discs = len(discs)
+    n_piles = len(bins)
+    if n_discs != 9 or n_piles != len(chips) or not 2 <= n_piles <= 4:
+        return ABSTAIN
+
+    # the ringed disc: the dark ring lies in the hand band
+    top = max(y for _c, _x, y in bands[0])
+    bottom = min(y for _c, _x, y in bands[1])
+    ring_pts = [(x, y) for x, y in dark if y < (top + bottom) / 2.0]
+    if len(ring_pts) < MIN_RING_PIXELS:
+        return ABSTAIN
+    ring_cx = sum(x for x, _y in ring_pts) / len(ring_pts)
+
+    gaps = sorted(abs(cx - ring_cx) for _c, cx, _n in discs)
+    if gaps[1] - gaps[0] < ASSIGN_MARGIN:
+        return ABSTAIN
+    slot = min(range(n_discs), key=lambda s: abs(discs[s][1] - ring_cx))
+
+    # pick-up order: each chip names the bin it shares a colour with
+    order: list[int] = []
+    for chip_colour, _cx, _n in chips:
+        ranked = sorted(
+            range(n_piles), key=lambda b: _dist(chip_colour, bins[b][0])
+        )
+        best, second = ranked[0], ranked[1]
+        if _dist(chip_colour, bins[best][0]) > COLOUR_MATCH:
+            return ABSTAIN
+        if _dist(chip_colour, bins[second][0]) < COLOUR_SEPARATION:
+            return ABSTAIN
+        order.append(best)
+    if sorted(order) != list(range(n_piles)):
+        return ABSTAIN
+
+    # deal cyclically left to right, then collect in the chip order
+    sizes = [0] * n_piles
+    for j in range(n_discs):
+        sizes[j % n_piles] += 1
+    pile, rank = slot % n_piles, slot // n_piles
+    before = 0
+    for b in order:
+        if b == pile:
+            break
+        before += sizes[b]
+    position = before + rank + 1
+    if not 1 <= position <= n_discs:
+        return ABSTAIN
+    return POSITION_WORDS[position - 1]

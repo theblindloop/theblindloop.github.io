@@ -1,0 +1,120 @@
+"""Independent pixel-only inverse for boundary-component incidence.
+
+This module intentionally knows no scene geometry and imports no renderer-side
+code. It finds the amber tile by color, labels four-connected white pixels in a
+tile-centered crop, and counts the distinct labels sharing a pixel edge with
+the tile.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """Raised when the visible tile or its incident regions cannot be certified."""
+
+
+def _amber_mask(array: np.ndarray) -> np.ndarray:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    return (
+        (red >= 175)
+        & (green >= 75)
+        & (green <= 195)
+        & (blue <= 105)
+        & ((red - green) >= 45)
+    )
+
+
+def _white_mask(array: np.ndarray) -> np.ndarray:
+    # Both the warm-white canvas and ablation background sit safely above this
+    # threshold; teal, amber, and gray decorations sit far below it.
+    return np.all(array >= np.array([235, 235, 230], dtype=np.uint8), axis=2)
+
+
+def _components(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    height, width = mask.shape
+    labels = np.zeros((height, width), dtype=np.int32)
+    label = 0
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if labels[y, x]:
+            continue
+        label += 1
+        labels[y, x] = label
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        while queue:
+            cy, cx = queue.popleft()
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if (
+                    0 <= ny < height
+                    and 0 <= nx < width
+                    and mask[ny, nx]
+                    and labels[ny, nx] == 0
+                ):
+                    labels[ny, nx] = label
+                    queue.append((ny, nx))
+    return labels, label
+
+
+def _single_tile(mask: np.ndarray) -> tuple[float, float, tuple[int, int, int, int]]:
+    labels, count = _components(mask)
+    if count != 1:
+        raise OracleAbstention(f"expected one amber tile, found {count}")
+    points = np.argwhere(labels == 1)
+    area = len(points)
+    if not 300 <= area <= 440:
+        raise OracleAbstention(f"amber tile area {area} is outside the certified band")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    box_area = int(y1 - y0 + 1) * int(x1 - x0 + 1)
+    if area / box_area < 0.96:
+        raise OracleAbstention("amber tile is not a solid rectangle")
+    if not (16 <= x1 - x0 + 1 <= 22 and 16 <= y1 - y0 + 1 <= 22):
+        raise OracleAbstention("amber tile dimensions are outside the certified band")
+    return (
+        float(points[:, 1].mean()),
+        float(points[:, 0].mean()),
+        (int(x0), int(y0), int(x1), int(y1)),
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return yes iff exactly two white components share an edge with amber."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or min(array.shape[:2]) < 120:
+        raise OracleAbstention("image is too small")
+    amber = _amber_mask(array)
+    center_x, center_y, _ = _single_tile(amber)
+
+    radius = 54
+    x0 = max(0, int(round(center_x)) - radius)
+    x1 = min(array.shape[1], int(round(center_x)) + radius + 1)
+    y0 = max(0, int(round(center_y)) - radius)
+    y1 = min(array.shape[0], int(round(center_y)) + radius + 1)
+    if x0 == 0 or y0 == 0 or x1 == array.shape[1] or y1 == array.shape[0]:
+        raise OracleAbstention("tile neighborhood touches the image boundary")
+
+    local = array[y0:y1, x0:x1]
+    local_amber = amber[y0:y1, x0:x1]
+    white = _white_mask(local)
+    labels, _ = _components(white)
+
+    adjacent = np.zeros_like(local_amber)
+    adjacent[1:, :] |= local_amber[:-1, :]
+    adjacent[:-1, :] |= local_amber[1:, :]
+    adjacent[:, 1:] |= local_amber[:, :-1]
+    adjacent[:, :-1] |= local_amber[:, 1:]
+    incident = sorted(int(value) for value in np.unique(labels[adjacent & white]) if value)
+    if len(incident) not in (1, 2):
+        raise OracleAbstention(
+            f"amber tile has {len(incident)} certified incident white components"
+        )
+    return "yes" if len(incident) == 2 else "no"

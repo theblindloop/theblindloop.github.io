@@ -1,0 +1,394 @@
+"""Rotation-centre-recovery world.
+
+Two congruent solid black heptominoes stand on a white field. One is the other
+after a single quarter turn about a point that the turn leaves fixed. That point
+is never drawn as a mark of its own: four colored disks stand in the free white
+space and exactly one of them sits on it.
+
+The decision is the color of that disk. The quantity to recover is therefore the
+*fixed point* of an unknown rigid motion, not its name: knowing that the motion
+is a quarter turn, and even knowing its sense, does not locate the centre, and
+the centre generally lies far from both glyphs.
+
+Public interface required by question-world@0.4.0: ``sample_scene``, ``render``,
+``analytic_gold``, ``margin``, ``is_quarantined`` and ``latent_symmetries``.
+
+Geometry convention.  Pixel ``(x, y)`` covers the continuous half-open square
+``[x, x+1) x [y, y+1)``.  Cell ``(r, c)`` covers the pixel block
+``[c*CELL, (c+1)*CELL) x [r*CELL, (r+1)*CELL)``.  A quarter turn about the
+lattice vertex ``V = (vx*CELL, vy*CELL)`` therefore maps whole cells onto whole
+cells, so both glyphs are exact unions of lattice cells and nothing is
+antialiased.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+CELL = 42
+COLS = 27
+ROWS = 18
+WIDTH = COLS * CELL   # 1134
+HEIGHT = ROWS * CELL  # 756
+
+DOT_R = 17
+QUARANTINE_PX = 11.0
+
+WHITE = (255, 255, 255)
+INK = (0, 0, 0)
+
+COLOR_NAMES = ("blue", "green", "orange", "purple")
+PALETTE = {
+    "blue": (40, 80, 220),
+    "green": (30, 150, 60),
+    "orange": (240, 140, 20),
+    "purple": (150, 45, 190),
+}
+
+# Heptominoes with a trivial symmetry group: all eight images under the square's
+# symmetry group are distinct, so the motion carrying one drawn glyph onto the
+# other is unique and its fixed point is unique.
+SHAPES = (
+    ((0, 1), (0, 2), (1, 1), (1, 2), (2, 0), (2, 1), (3, 1)),
+    ((0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (3, 0), (3, 1)),
+    ((0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (1, 3), (2, 2)),
+    ((0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1), (3, 1)),
+    ((0, 0), (0, 1), (1, 1), (2, 0), (2, 1), (3, 0), (3, 1)),
+    ((0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (1, 3), (2, 1)),
+    ((0, 1), (0, 2), (1, 2), (2, 1), (2, 2), (3, 0), (3, 1)),
+)
+
+SENSES = ("r1", "r2", "r180")
+OUTER_STEPS = (-3.0, -2.0, 2.0, 3.0)
+
+# Sampling clearances, in pixels unless stated otherwise.
+MIN_GLYPH_GAP_CELLS = 2      # Chebyshev cell gap between the two glyphs.
+MIN_DOT_SEPARATION = 120.0   # centre-to-centre between any two disks.
+MIN_TRUE_SEPARATION = 120.0  # true centre to the nearest decoy disk.
+MIN_DOT_INK_CLEARANCE = 20.0  # disk rim to the nearest black pixel.
+MIN_EDGE_CLEARANCE = 20.0     # disk rim to the canvas edge.
+MAX_ATTEMPTS = 60000
+
+
+# --------------------------------------------------------------------------- #
+# Cell algebra
+# --------------------------------------------------------------------------- #
+def _normalize(cells):
+    r0 = min(r for r, _ in cells)
+    c0 = min(c for _, c in cells)
+    return tuple(sorted((r - r0, c - c0) for r, c in cells))
+
+
+def _d4(cells, element):
+    out = []
+    for r, c in cells:
+        if element == 0:
+            out.append((r, c))
+        elif element == 1:
+            out.append((c, -r))
+        elif element == 2:
+            out.append((-r, -c))
+        elif element == 3:
+            out.append((-c, r))
+        elif element == 4:
+            out.append((r, -c))
+        elif element == 5:
+            out.append((-r, c))
+        elif element == 6:
+            out.append((c, r))
+        else:
+            out.append((-c, -r))
+    return _normalize(out)
+
+
+def rotate_cells(cells, vx, vy, sense):
+    """Turn a cell set about the lattice vertex ``(vx, vy)``.
+
+    ``r1`` and ``r2`` are the two quarter turns; ``r180`` is the half turn.
+    """
+
+    out = []
+    for r, c in cells:
+        if sense == "r1":
+            out.append((vy - c - 1 + vx, vx + r - vy))
+        elif sense == "r2":
+            out.append((vy + c - vx, vx - r - 1 + vy))
+        elif sense == "r180":
+            out.append((2 * vy - r - 1, 2 * vx - c - 1))
+        else:
+            raise ValueError(f"unknown sense {sense!r}")
+    return tuple(sorted(out))
+
+
+def _centroid(cells):
+    n = float(len(cells))
+    cx = sum((c + 0.5) * CELL for _, c in cells) / n
+    cy = sum((r + 0.5) * CELL for r, _ in cells) / n
+    return (cx, cy)
+
+
+def bisector_frame(a, b):
+    """Midpoint, unit perpendicular and half-length of the centroid segment.
+
+    Every centre of a rotation carrying one glyph onto the other is equidistant
+    from the two centroids, so it lies on this perpendicular bisector. The half
+    turn's centre is the midpoint itself; the two quarter turns' centres sit one
+    half-length out on either side. All four drawn disks are placed on this one
+    line, so no candidate can be eliminated by the equidistance test alone.
+    """
+
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy)
+    mid = ((ax + bx) / 2.0, (ay + by) / 2.0)
+    if length == 0.0:
+        return mid, (0.0, 0.0), 0.0
+    normal = (-dy / length, dx / length)
+    return mid, normal, length / 2.0
+
+
+def _cell_gap(cells_a, cells_b):
+    best = 10 ** 6
+    for r1, c1 in cells_a:
+        for r2, c2 in cells_b:
+            best = min(best, max(abs(r1 - r2), abs(c1 - c2)))
+    return best
+
+
+def _ink_clearance(point, cells):
+    """Distance from ``point`` to the nearest black pixel of ``cells``."""
+
+    px, py = point
+    best = float("inf")
+    for r, c in cells:
+        x0, x1 = c * CELL, (c + 1) * CELL
+        y0, y1 = r * CELL, (r + 1) * CELL
+        dx = max(x0 - px, 0.0, px - x1)
+        dy = max(y0 - py, 0.0, py - y1)
+        best = min(best, math.hypot(dx, dy))
+    return best
+
+
+def _dist(p, q):
+    return math.hypot(p[0] - q[0], p[1] - q[1])
+
+
+# --------------------------------------------------------------------------- #
+# Sampling
+# --------------------------------------------------------------------------- #
+def _attempt(rng):
+    base = _d4(rng.choice(SHAPES), rng.randrange(8))
+    rows = max(r for r, _ in base) + 1
+    cols = max(c for _, c in base) + 1
+    off_r = rng.randint(1, ROWS - 1 - rows)
+    off_c = rng.randint(1, COLS - 1 - cols)
+    cells_a = tuple(sorted((r + off_r, c + off_c) for r, c in base))
+
+    sense = rng.choice(SENSES)
+    vx = rng.randint(2, COLS - 2)
+    vy = rng.randint(2, ROWS - 2)
+    cells_b = rotate_cells(cells_a, vx, vy, sense)
+
+    for r, c in cells_b:
+        if not (1 <= r <= ROWS - 2 and 1 <= c <= COLS - 2):
+            return None
+    if _cell_gap(cells_a, cells_b) < MIN_GLYPH_GAP_CELLS:
+        return None
+
+    true_centre = (float(vx * CELL), float(vy * CELL))
+    ca = _centroid(cells_a)
+    cb = _centroid(cells_b)
+    mid, normal, half = bisector_frame(ca, cb)
+    if half < 145.0:
+        return None
+
+    step = rng.choice(OUTER_STEPS)
+    raw = [
+        mid,
+        (mid[0] + half * normal[0], mid[1] + half * normal[1]),
+        (mid[0] - half * normal[0], mid[1] - half * normal[1]),
+        (mid[0] + step * half * normal[0], mid[1] + step * half * normal[1]),
+    ]
+    points = [(float(round(x)), float(round(y))) for x, y in raw]
+
+    # The drawn geometry must actually put the true centre on one of the three
+    # rotation-centre candidates; a disk is snapped to whole pixels, so allow a
+    # sub-pixel tolerance and reject anything looser.
+    hit = min(range(3), key=lambda i: _dist(points[i], true_centre))
+    if _dist(points[hit], true_centre) > 1.0:
+        return None
+    points[hit] = true_centre
+
+    all_cells = tuple(cells_a) + tuple(cells_b)
+    for p in points:
+        if not (
+            MIN_EDGE_CLEARANCE + DOT_R <= p[0] <= WIDTH - MIN_EDGE_CLEARANCE - DOT_R
+            and MIN_EDGE_CLEARANCE + DOT_R <= p[1] <= HEIGHT - MIN_EDGE_CLEARANCE - DOT_R
+        ):
+            return None
+        if _ink_clearance(p, all_cells) - DOT_R < MIN_DOT_INK_CLEARANCE:
+            return None
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if _dist(points[i], points[j]) < MIN_DOT_SEPARATION:
+                return None
+    if min(_dist(points[hit], points[j]) for j in range(4) if j != hit) < (
+        MIN_TRUE_SEPARATION
+    ):
+        return None
+
+    # The true centre must not be the dot nearest the canvas centre, so a
+    # "pick the most central mark" policy never selects the gold.
+    canvas_mid = (WIDTH / 2.0, HEIGHT / 2.0)
+    if min(range(4), key=lambda i: _dist(points[i], canvas_mid)) == hit:
+        return None
+
+    order = [0, 1, 2, 3]
+    rng.shuffle(order)
+    colors = list(COLOR_NAMES)
+    rng.shuffle(colors)
+    dots = [[points[i][0], points[i][1]] for i in order]
+
+    # ``sense`` and ``vx, vy`` are deliberately *not* stored: they are recovered
+    # from the drawn glyph pair by ``recover_turn``, so the gold reads only
+    # fields the renderer draws.
+    return {
+        "cells_a": [[r, c] for r, c in cells_a],
+        "cells_b": [[r, c] for r, c in cells_b],
+        "dots": dots,
+        "colors": colors,
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 1000003 + 40961)
+    for _ in range(MAX_ATTEMPTS):
+        scene = _attempt(rng)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------- #
+# Rendering
+# --------------------------------------------------------------------------- #
+def _cells(scene, key):
+    return tuple(sorted((int(r), int(c)) for r, c in scene[key]))
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
+    draw = ImageDraw.Draw(image)
+
+    for cell_list in (scene["cells_a"], scene["cells_b"]):
+        for r, c in sorted((int(r), int(c)) for r, c in cell_list):
+            draw.rectangle(
+                [c * CELL, r * CELL, (c + 1) * CELL - 1, (r + 1) * CELL - 1], fill=INK
+            )
+
+    for (x, y), name in zip(scene["dots"], scene["colors"]):
+        cx, cy = int(round(x)), int(round(y))
+        draw.ellipse(
+            [cx - DOT_R, cy - DOT_R, cx + DOT_R - 1, cy + DOT_R - 1],
+            fill=PALETTE[name],
+        )
+    return image
+
+
+# --------------------------------------------------------------------------- #
+# Gold, margin, quarantine
+# --------------------------------------------------------------------------- #
+_TURN_CACHE: dict = {}
+
+
+def recover_turn(scene: dict) -> tuple:
+    """The unique ``(sense, vx, vy)`` turn carrying ``cells_a`` onto ``cells_b``.
+
+    Read from the drawn cells only. Every heptomino used has a trivial symmetry
+    group, so this triple exists and is unique; a checked-in test asserts that.
+    """
+
+    a = tuple(sorted((int(r), int(c)) for r, c in scene["cells_a"]))
+    b = frozenset((int(r), int(c)) for r, c in scene["cells_b"])
+    key = (a, b)
+    if key in _TURN_CACHE:
+        return _TURN_CACHE[key]
+    hits = []
+    for sense in SENSES:
+        for vx in range(-2, COLS + 3):
+            for vy in range(-2, ROWS + 3):
+                if frozenset(rotate_cells(a, vx, vy, sense)) == b:
+                    hits.append((sense, vx, vy))
+    if len(hits) != 1:
+        raise ValueError("the drawn glyph pair does not pin down a unique turn")
+    _TURN_CACHE[key] = hits[0]
+    return hits[0]
+
+
+def true_center(scene: dict) -> tuple:
+    _, vx, vy = recover_turn(scene)
+    return (float(vx * CELL), float(vy * CELL))
+
+
+def analytic_gold(scene: dict) -> str:
+    """Color of the disk standing on the fixed point of the drawn turn."""
+
+    centre = true_center(scene)
+    index = min(
+        range(len(scene["dots"])),
+        key=lambda i: _dist(tuple(scene["dots"][i]), centre),
+    )
+    return scene["colors"][index]
+
+
+def margin(scene: dict) -> float:
+    centre = true_center(scene)
+    dots = [tuple(d) for d in scene["dots"]]
+    winner = min(range(len(dots)), key=lambda i: _dist(dots[i], centre))
+
+    # Decisive separation: half the distance from the fixed point to the nearest
+    # disk that is not on it.
+    decisive = min(
+        _dist(dots[i], centre) for i in range(len(dots)) if i != winner
+    ) / 2.0
+
+    all_cells = _cells(scene, "cells_a") + _cells(scene, "cells_b")
+    clearances = [decisive]
+    for p in dots:
+        clearances.append(_ink_clearance(p, all_cells) - DOT_R)
+        clearances.append(p[0] - DOT_R)
+        clearances.append(p[1] - DOT_R)
+        clearances.append(WIDTH - p[0] - DOT_R)
+        clearances.append(HEIGHT - p[1] - DOT_R)
+    for i in range(len(dots)):
+        for j in range(i + 1, len(dots)):
+            clearances.append(_dist(dots[i], dots[j]) - 2 * DOT_R)
+
+    gap_cells = _cell_gap(_cells(scene, "cells_a"), _cells(scene, "cells_b"))
+    clearances.append(float((gap_cells - 1) * CELL))
+
+    return float(min(clearances))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent aliases exist, so no scene transform can preserve the raster.
+
+    Rendering is injective over sampled scenes: ``cells_a`` and ``cells_b`` are
+    drawn cell for cell as black blocks, and each of the four disk centres is
+    drawn where it is recorded in the color it is bound to. Those four fields
+    are the whole scene and every one of them is rendered; the turn and its
+    fixed point are recovered from the drawn cells rather than stored, so no
+    label variable is hidden. Distinct scenes therefore give distinct rasters
+    and every raster carries exactly one decision, so the symmetry gate is
+    ``not_applicable`` rather than passed.
+    """
+
+    return []

@@ -1,0 +1,172 @@
+"""Independent pixel-only inverse arm.
+
+This module intentionally contains its own palette, segmentation, connected
+components, and centerline recovery.  It receives only a final RGB image.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+RIBBON = np.asarray((35, 86, 148), dtype=np.float32)
+SPINE = np.asarray((103, 151, 211), dtype=np.float32)
+AMBER = np.asarray((244, 154, 42), dtype=np.float32)
+VIOLET = np.asarray((176, 72, 182), dtype=np.float32)
+GREEN = np.asarray((38, 168, 104), dtype=np.float32)
+RED = np.asarray((222, 67, 64), dtype=np.float32)
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    return np.linalg.norm(array.astype(np.float32) - color, axis=2) <= tolerance
+
+
+def _largest_component(mask: np.ndarray) -> tuple[float, float, int]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if visited[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        visited[y, x] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            component.append((cy, cx))
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    if len(best) < 80:
+        raise ValueError("marker is absent or fragmented")
+    ys = np.asarray([item[0] for item in best], dtype=np.float64)
+    xs = np.asarray([item[1] for item in best], dtype=np.float64)
+    return float(xs.mean()), float(ys.mean()), len(best)
+
+
+def _marker_centers(array: np.ndarray) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
+    amber = _largest_component(_mask(array, AMBER, 48.0))[:2]
+    violet = _largest_component(_mask(array, VIOLET, 48.0))[:2]
+    green = _largest_component(_mask(array, GREEN, 48.0))[:2]
+    red = _largest_component(_mask(array, RED, 48.0))[:2]
+    return amber, violet, green, red
+
+
+def _require_complete_body(foreground: np.ndarray) -> None:
+    """Reject partial erasure of the broad filled ribbon body."""
+
+    # The public visual contract exposes a large rounded body.  Its six-by-six
+    # interior occupancy is an observable integrity boundary, not latent data;
+    # a destructive grid ablation must leave the oracle without a valid route.
+    x0, x1 = 64, 448
+    y0, y1 = 96, 416
+    for gy in range(6):
+        ya = y0 + (y1 - y0) * gy // 6
+        yb = y0 + (y1 - y0) * (gy + 1) // 6
+        for gx in range(6):
+            xa = x0 + (x1 - x0) * gx // 6
+            xb = x0 + (x1 - x0) * (gx + 1) // 6
+            if float(np.mean(foreground[ya:yb, xa:xb])) < 0.70:
+                raise ValueError("filled ribbon body is incomplete")
+
+
+def _ordered_centerline(array: np.ndarray, green: tuple[float, float], red: tuple[float, float]) -> tuple[np.ndarray, np.ndarray]:
+    ribbon = _mask(array, RIBBON, 58.0)
+    # The narrow spine is kept on a tighter color tolerance than the broad
+    # ribbon; the latter's anti-aliased edge can otherwise masquerade as a
+    # second spine at the ribbon boundary.
+    spine = _mask(array, SPINE, 25.0)
+    foreground = ribbon.copy()
+    for color in (AMBER, VIOLET, GREEN, RED):
+        foreground |= _mask(array, color, 48.0)
+    _require_complete_body(foreground)
+    start_x = min(green[0], red[0]) + 25.0
+    finish_x = max(green[0], red[0]) - 25.0
+    left = max(0, int(math.ceil(start_x)))
+    right = min(array.shape[1] - 1, int(math.floor(finish_x)))
+    if right - left < 180:
+        raise ValueError("ports do not delimit a long ribbon")
+
+    # Validate the whole broad support around the port-delimited route.  This
+    # makes destructive ablations of the ribbon's outer area observable too;
+    # centerline measurement itself remains restricted to the port interval.
+    integrity_left = max(0, int(math.floor(min(green[0], red[0]) - 60.0)))
+    integrity_right = min(array.shape[1] - 1, int(math.ceil(max(green[0], red[0]) + 60.0)))
+    integrity_counts = np.asarray(
+        [int(np.count_nonzero(ribbon[:, x])) for x in range(integrity_left, integrity_right + 1)],
+        dtype=np.int32,
+    )
+    if integrity_counts.size == 0 or int(integrity_counts.min()) < 175:
+        raise ValueError("broad ribbon support is incomplete")
+
+    xs = np.arange(left, right + 1, dtype=np.float64)
+    medians = np.full(len(xs), np.nan, dtype=np.float64)
+    spine_counts = np.zeros(len(xs), dtype=np.int32)
+    counts = np.zeros(len(xs), dtype=np.int32)
+    for index, x in enumerate(range(left, right + 1)):
+        ys = np.flatnonzero(ribbon[:, x])
+        counts[index] = len(ys)
+        spine_ys = np.flatnonzero(spine[:, x])
+        spine_counts[index] = len(spine_ys)
+        if len(spine_ys):
+            medians[index] = float(np.median(spine_ys))
+
+    # A clean broad ribbon has a large vertical cross-section in every column.
+    # A grid erasure removes its central cross-section and makes this test fail,
+    # which is an explicit abstention rather than a guessed answer.
+    valid = counts >= 118
+    if int(valid.sum()) < int(0.985 * len(valid)):
+        raise ValueError("ribbon cross-section is incomplete")
+    invalid = np.flatnonzero(~valid)
+    if len(invalid) and int(np.max(np.diff(invalid, prepend=-2))) > 4:
+        raise ValueError("ribbon has a broken centerline")
+
+    spine_valid = spine_counts > 0
+    if int(spine_valid.sum()) < int(0.55 * len(spine_valid)):
+        raise ValueError("ordered spine is too incomplete")
+    spine_missing = np.flatnonzero(~spine_valid)
+    missing_runs = (
+        np.split(spine_missing, np.where(np.diff(spine_missing) > 1)[0] + 1)
+        if len(spine_missing)
+        else []
+    )
+    if missing_runs and max(len(run) for run in missing_runs) > 70:
+        raise ValueError("ordered spine has a long gap")
+    good = np.flatnonzero(spine_valid)
+    medians[~spine_valid] = np.interp(np.flatnonzero(~spine_valid), good, medians[good])
+
+    # The renderer's green port is the left endpoint.  The orientation check
+    # keeps the inverse explicit if a future scene is horizontally mirrored.
+    if green[0] > red[0]:
+        xs = xs[::-1]
+        medians = medians[::-1]
+    steps = np.hypot(np.diff(xs), np.diff(medians))
+    cumulative = np.concatenate(([0.0], np.cumsum(steps)))
+    if cumulative[-1] < 260.0:
+        raise ValueError("recovered route is too short")
+    return xs, cumulative
+
+
+def _along_distance(x: float, xs: np.ndarray, cumulative: np.ndarray) -> float:
+    if x < xs[0] - 8.0 or x > xs[-1] + 8.0:
+        raise ValueError("checkpoint is outside the recovered route")
+    return float(np.interp(x, xs, cumulative))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    amber, violet, green, red = _marker_centers(array)
+    xs, cumulative = _ordered_centerline(array, green, red)
+    midpoint = float(cumulative[-1] / 2.0)
+    amber_distance = abs(_along_distance(amber[0], xs, cumulative) - midpoint)
+    violet_distance = abs(_along_distance(violet[0], xs, cumulative) - midpoint)
+    gap = abs(amber_distance - violet_distance)
+    if gap < 12.0:
+        raise ValueError("pixel midpoint comparison is too close")
+    return "amber" if amber_distance < violet_distance else "violet"

@@ -1,0 +1,309 @@
+"""Renderer and analytic arm for connected four-key patch correspondence."""
+
+from __future__ import annotations
+
+import copy
+import itertools
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "seam-key-completion-correspondence-0.1.0"
+
+WIDTH = 512
+HEIGHT = 512
+SCALE = 4
+
+BACKGROUND = (248, 247, 242)
+WORKBENCH = (26, 74, 98)
+WORKBENCH_EDGE = (15, 48, 68)
+CARD = (239, 236, 223)
+CARD_EDGE = (179, 184, 176)
+PATCH = (213, 91, 76)
+TEXT = (232, 239, 235)
+TEXT_DARK = (58, 67, 70)
+NEUTRAL_MARKER = (111, 163, 150)
+AMBER_MARKER = (229, 164, 52)
+VIOLET_MARKER = (177, 92, 189)
+
+FRAME_W = 250
+FRAME_H = 230
+PANEL_W = 74
+PANEL_H = 212
+PANEL_RELS = {"R": (8, 9), "A": (88, 9), "B": (168, 9)}
+PATCH_ORIGIN = (10, 52)
+GRID = 9
+CELL = 6
+CORE_START = 3
+CORE_END = 5
+MAX_SIGNATURE_ERROR = 8.0
+QUARANTINE_MARGIN = 1.0 / MAX_SIGNATURE_ERROR
+
+
+def _font(size: int):
+    for name in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ):
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size=size * SCALE)
+    return ImageFont.load_default()
+
+
+def _box(values: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SCALE)) for value in values)  # type: ignore[return-value]
+
+
+def _signature_tuple(value: object) -> tuple[int, int, int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError("key signature must contain four lengths")
+    result = tuple(int(item) for item in value)
+    if any(item not in (1, 2, 3) for item in result):
+        raise ValueError("key lengths must be one, two, or three")
+    return result  # type: ignore[return-value]
+
+
+def _panel_map(scene: dict) -> dict[str, dict]:
+    records = scene["candidate_panels"]
+    if not isinstance(records, list) or len(records) != 2:
+        raise ValueError("there must be exactly two candidate records")
+    panels: dict[str, dict] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("candidate record must be an object")
+        slot = str(record["slot"])
+        if slot in panels or slot not in {"A", "B"}:
+            raise ValueError("candidate slots must be unique A and B")
+        panels[slot] = record
+    if set(panels) != {"A", "B"}:
+        raise ValueError("candidate slots must be A and B")
+    return panels
+
+
+def _validate_scene(scene: dict) -> tuple[tuple[int, int, int, int], dict[str, dict], tuple[int, int]]:
+    reference = _signature_tuple(scene["reference_signature"])
+    panels = _panel_map(scene)
+    total = sum(reference)
+    for record in panels.values():
+        signature = _signature_tuple(record["signature"])
+        if sum(signature) != total:
+            raise ValueError("all patches must have equal total key ink")
+        if record["marker"] not in {"amber", "violet"}:
+            raise ValueError("candidate marker must be amber or violet")
+    anchor = scene["workbench_anchor"]
+    if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
+        raise ValueError("workbench anchor must be an x,y pair")
+    x, y = (int(anchor[0]), int(anchor[1]))
+    if (x, y) != (anchor[0], anchor[1]):
+        raise ValueError("workbench anchor must be integral")
+    if not (70 <= x <= WIDTH - FRAME_W - 70 and 120 <= y <= HEIGHT - FRAME_H - 90):
+        raise ValueError("workbench does not fit the translated canvas")
+    return reference, panels, (x, y)
+
+
+def _rotate_cw(signature: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Map (up,right,down,left) to the same order after a clockwise turn."""
+
+    return (signature[3], signature[0], signature[1], signature[2])
+
+
+def _inverse_rotate_cw(signature: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    return (signature[1], signature[2], signature[3], signature[0])
+
+
+def _error(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+    return sum(abs(a - b) for a, b in zip(left, right, strict=True))
+
+
+def _errors(
+    reference: tuple[int, int, int, int], panels: dict[str, dict]
+) -> dict[str, int]:
+    return {
+        slot: _error(reference, _rotate_cw(_signature_tuple(panels[slot]["signature"])))
+        for slot in ("A", "B")
+    }
+
+
+def _grid_for_signature(signature: tuple[int, int, int, int]) -> list[list[int]]:
+    grid = [[0 for _ in range(GRID)] for _ in range(GRID)]
+    for row in range(CORE_START, CORE_END + 1):
+        for col in range(CORE_START, CORE_END + 1):
+            grid[row][col] = 1
+    center = 4
+    for distance in range(1, signature[0] + 1):
+        grid[CORE_START - distance][center] = 1
+    for distance in range(1, signature[1] + 1):
+        grid[center][CORE_END + distance] = 1
+    for distance in range(1, signature[2] + 1):
+        grid[CORE_END + distance][center] = 1
+    for distance in range(1, signature[3] + 1):
+        grid[center][CORE_START - distance] = 1
+    return grid
+
+
+def _draw_patch(draw: ImageDraw.ImageDraw, x: int, y: int, signature: tuple[int, int, int, int]) -> None:
+    grid = _grid_for_signature(signature)
+    origin_x, origin_y = x + PATCH_ORIGIN[0], y + PATCH_ORIGIN[1]
+    for row, values in enumerate(grid):
+        for col, value in enumerate(values):
+            if not value:
+                continue
+            left = origin_x + col * CELL
+            top = origin_y + row * CELL
+            right = left + CELL
+            bottom = top + CELL
+            draw.rectangle(_box((left, top, right - 0.2, bottom - 0.2)), fill=PATCH)
+
+
+def _marker_color(marker: str) -> tuple[int, int, int]:
+    return AMBER_MARKER if marker == "amber" else VIOLET_MARKER if marker == "violet" else NEUTRAL_MARKER
+
+
+def _draw_panel(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    label: str,
+    signature: tuple[int, int, int, int],
+    marker: str,
+) -> None:
+    draw.rounded_rectangle(
+        _box((x, y, x + PANEL_W, y + PANEL_H)),
+        radius=7 * SCALE,
+        fill=CARD,
+        outline=CARD_EDGE,
+        width=1 * SCALE,
+    )
+    draw.text((int((x + 9) * SCALE), int((y + 12) * SCALE)), label, font=_font(10), fill=TEXT_DARK)
+    draw.rounded_rectangle(
+        _box((x + 55, y + 13, x + 67, y + 25)),
+        radius=3 * SCALE,
+        fill=_marker_color(marker),
+    )
+    _draw_patch(draw, x, y, signature)
+    draw.text(
+        (int((x + 14) * SCALE), int((y + 137) * SCALE)),
+        "4-KEY",
+        font=_font(7),
+        fill=TEXT_DARK,
+    )
+
+
+def _signature_pool() -> tuple[tuple[int, int, int, int], ...]:
+    return tuple(
+        signature
+        for signature in itertools.product((1, 2, 3), repeat=4)
+        if sum(signature) in (8, 9)
+    )
+
+
+_SIGNATURE_POOL = _signature_pool()
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample equal-ink signatures and nuisance permutations."""
+
+    rng = random.Random(int(seed))
+    reference = rng.choice(_SIGNATURE_POOL)
+    wrong_candidates = [
+        candidate
+        for candidate in _SIGNATURE_POOL
+        if sum(candidate) == sum(reference)
+        and _error(reference, _rotate_cw(candidate)) >= 4
+    ]
+    if not wrong_candidates:
+        raise RuntimeError("no separated equal-ink wrong signature")
+    wrong = rng.choice(wrong_candidates)
+    match_raw = _inverse_rotate_cw(reference)
+    matching_slot = "A" if rng.randrange(2) == 0 else "B"
+    matching_marker = "amber" if rng.randrange(2) == 0 else "violet"
+    wrong_marker = "violet" if matching_marker == "amber" else "amber"
+    records = [
+        {
+            "slot": "A",
+            "signature": list(match_raw if matching_slot == "A" else wrong),
+            "marker": matching_marker if matching_slot == "A" else wrong_marker,
+        },
+        {
+            "slot": "B",
+            "signature": list(match_raw if matching_slot == "B" else wrong),
+            "marker": matching_marker if matching_slot == "B" else wrong_marker,
+        },
+    ]
+    rng.shuffle(records)
+    anchor = [rng.randrange(86, 154), rng.randrange(138, 188)]
+    return {
+        "reference_signature": list(reference),
+        "candidate_panels": records,
+        "workbench_anchor": anchor,
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    reference, panels, _ = _validate_scene(scene)
+    errors = _errors(reference, panels)
+    if errors["A"] == errors["B"]:
+        raise ValueError("transformed key errors are tied")
+    best = "A" if errors["A"] < errors["B"] else "B"
+    return str(panels[best]["marker"])
+
+
+def margin(scene: dict) -> float:
+    reference, panels, _ = _validate_scene(scene)
+    values = sorted(_errors(reference, panels).values())
+    return float(values[1] - values[0]) / MAX_SIGNATURE_ERROR
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        reference, panels, _ = _validate_scene(scene)
+        errors = _errors(reference, panels)
+        if errors["A"] == errors["B"]:
+            return True
+        return margin(scene) <= QUARANTINE_MARGIN
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one translated connected workbench with all matching evidence."""
+
+    reference, panels, (ax, ay) = _validate_scene(scene)
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        _box((ax, ay, ax + FRAME_W, ay + FRAME_H)),
+        radius=13 * SCALE,
+        fill=WORKBENCH,
+        outline=WORKBENCH_EDGE,
+        width=2 * SCALE,
+    )
+    draw.text(
+        (int((ax + 10) * SCALE), int((ay + 2) * SCALE)),
+        "SEAM LAB",
+        font=_font(7),
+        fill=TEXT,
+    )
+    rx, ry = PANEL_RELS["R"]
+    _draw_panel(draw, ax + rx, ay + ry, "R", reference, "neutral")
+    for slot in ("A", "B"):
+        rx, ry = PANEL_RELS[slot]
+        record = panels[slot]
+        _draw_panel(
+            draw,
+            ax + rx,
+            ay + ry,
+            slot,
+            _signature_tuple(record["signature"]),
+            str(record["marker"]),
+        )
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Reverse slot-addressed records without changing the visible workbench."""
+
+    twin = copy.deepcopy(scene)
+    twin["candidate_panels"] = list(reversed(twin["candidate_panels"]))
+    return [("candidate_record_order", twin)]

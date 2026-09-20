@@ -1,0 +1,171 @@
+"""Pixel-only inverse arm for `relay_jump_pip_tally`.
+
+Receives one rendered PNG and nothing else: no latent scene, no renderer import,
+no analytic gold. It recovers the relay cards, their address badges, forwarding
+pointers and pip tallies, finds the floating start tab, replays four landings and
+returns the collected pip total as a string, or `"abstain"` when the picture is
+not unambiguously readable.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+
+ABSTAIN = "abstain"
+
+_PALETTE: Dict[str, Tuple[int, int, int]] = {
+    "red": (214, 40, 40),
+    "green": (34, 150, 68),
+    "blue": (40, 82, 214),
+    "purple": (138, 48, 176),
+    "orange": (240, 152, 24),
+    "teal": (0, 156, 156),
+}
+
+_N_LANDINGS = 4
+_MIN_CARD_W, _MIN_CARD_H = 120, 80
+_COLOUR_TOL = 70.0
+
+
+def _components(mask: np.ndarray, min_pixels: int = 12) -> List[np.ndarray]:
+    """4-connected components of a boolean mask, returned as coordinate arrays."""
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out: List[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys, xs):
+        if seen[sy, sx]:
+            continue
+        stack = [(int(sy), int(sx))]
+        seen[sy, sx] = True
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            if y > 0 and mask[y - 1, x] and not seen[y - 1, x]:
+                seen[y - 1, x] = True
+                stack.append((y - 1, x))
+            if y + 1 < h and mask[y + 1, x] and not seen[y + 1, x]:
+                seen[y + 1, x] = True
+                stack.append((y + 1, x))
+            if x > 0 and mask[y, x - 1] and not seen[y, x - 1]:
+                seen[y, x - 1] = True
+                stack.append((y, x - 1))
+            if x + 1 < w and mask[y, x + 1] and not seen[y, x + 1]:
+                seen[y, x + 1] = True
+                stack.append((y, x + 1))
+        if len(pix) >= min_pixels:
+            out.append(np.array(pix, dtype=np.int32))
+    return out
+
+
+def _bbox(pix: np.ndarray) -> Tuple[int, int, int, int]:
+    return (int(pix[:, 0].min()), int(pix[:, 1].min()), int(pix[:, 0].max()), int(pix[:, 1].max()))
+
+
+def _classify(rgb: Tuple[float, float, float]) -> Optional[str]:
+    best, bestd = None, 1e9
+    for name, ref in _PALETTE.items():
+        d = float(sum((a - b) ** 2 for a, b in zip(rgb, ref))) ** 0.5
+        if d < bestd:
+            best, bestd = name, d
+    return best if bestd <= _COLOUR_TOL else None
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    hi = arr.max(axis=2)
+    lo = arr.min(axis=2)
+    sat = (hi - lo) > 55
+    dark = (hi < 70) & ~sat
+    grey_face = (~sat) & (np.abs(arr[:, :, 0] - 232) <= 14)
+    grey_border = (~sat) & (np.abs(arr[:, :, 0] - 96) <= 16)
+
+    # the card frames are thin closed grey rings; each ring is one component
+    card_pix = _components(grey_border, min_pixels=300)
+    cards = []
+    for pix in card_pix:
+        y0, x0, y1, x1 = _bbox(pix)
+        if (x1 - x0) >= _MIN_CARD_W and (y1 - y0) >= _MIN_CARD_H:
+            interior = grey_face[y0 + 6:y1 - 5, x0 + 6:x1 - 5]
+            if interior.size and interior.mean() > 0.35:
+                cards.append((y0, x0, y1, x1))
+    if len(cards) < _N_LANDINGS:
+        return ABSTAIN
+
+    # Parse each card independently. A card that cannot be read is dropped, not
+    # fatal: only cards the relay actually needs must be readable.
+    parsed: List[Optional[Tuple[str, str, int]]] = []
+    for (cy0, cx0, cy1, cx1) in cards:
+        iy0, ix0, iy1, ix1 = cy0 + 5, cx0 + 5, cy1 - 5, cx1 - 5
+        sub_sat = np.zeros_like(sat)
+        sub_sat[iy0:iy1 + 1, ix0:ix1 + 1] = sat[iy0:iy1 + 1, ix0:ix1 + 1]
+        chips = _components(sub_sat, min_pixels=150)
+        if len(chips) != 2:
+            parsed.append(None)
+            continue
+        info = []
+        for pix in chips:
+            rgb = tuple(float(arr[pix[:, 0], pix[:, 1], c].mean()) for c in range(3))
+            info.append((float(pix[:, 1].mean()), _classify(rgb)))
+        info.sort()
+        if info[0][1] is None or info[1][1] is None:
+            parsed.append(None)
+            continue
+
+        sub_dark = np.zeros_like(dark)
+        sub_dark[iy0:iy1 + 1, ix0:ix1 + 1] = dark[iy0:iy1 + 1, ix0:ix1 + 1]
+        pips = _components(sub_dark, min_pixels=40)
+        if not 1 <= len(pips) <= 6:
+            parsed.append(None)
+            continue
+        parsed.append((info[0][1], info[1][1], len(pips)))
+
+    readable = [i for i, p in enumerate(parsed) if p is not None]
+    if len(readable) < _N_LANDINGS:
+        return ABSTAIN
+    seen_addresses = [parsed[i][0] for i in readable]
+    if len(set(seen_addresses)) != len(seen_addresses):
+        return ABSTAIN
+
+    # start tab: a dark blob lying outside every card box
+    tabs = []
+    for pix in _components(dark, min_pixels=40):
+        cy = float(pix[:, 0].mean())
+        cx = float(pix[:, 1].mean())
+        if any(y0 <= cy <= y1 and x0 <= cx <= x1 for (y0, x0, y1, x1) in cards):
+            continue
+        tabs.append((cy, cx))
+    if len(tabs) != 1:
+        return ABSTAIN
+    tcy, tcx = tabs[0]
+
+    dists = sorted(
+        (_point_box_dist(tcy, tcx, cards[i]), i) for i in range(len(cards))
+    )
+    if len(dists) > 1 and (dists[1][0] - dists[0][0]) < 8.0:
+        return ABSTAIN
+    start = dists[0][1]
+    if parsed[start] is None:
+        return ABSTAIN
+
+    by_address = {parsed[i][0]: i for i in readable}
+    cur = start
+    total = parsed[cur][2]
+    for _ in range(_N_LANDINGS - 1):
+        nxt = parsed[cur][1]
+        if nxt not in by_address:
+            return ABSTAIN
+        cur = by_address[nxt]
+        total += parsed[cur][2]
+    return str(total)
+
+
+def _point_box_dist(py: float, px: float, box) -> float:
+    y0, x0, y1, x1 = box
+    dy = max(y0 - py, py - y1, 0.0)
+    dx = max(x0 - px, px - x1, 0.0)
+    return float((dx * dx + dy * dy) ** 0.5)

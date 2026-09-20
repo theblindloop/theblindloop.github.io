@@ -1,0 +1,124 @@
+"""Independent pixel-only inverse for the five-peg slalom."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+COLOR_DISTANCE = 34.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for raw_y, raw_x in np.argwhere(mask):
+        y, x = int(raw_y), int(raw_x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        found.append(np.asarray(points, dtype=np.int32))
+    return found
+
+
+def _segment(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected RGB raster")
+    border = np.concatenate((array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3), array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)), axis=0)
+    background = np.median(border, axis=0)
+    foreground = np.linalg.norm(array - background, axis=2) > COLOR_DISTANCE
+    components = sorted(_components(foreground), key=len, reverse=True)
+    if len(components) < 6:
+        raise ValueError("the slalom must contain one trail and five detached pegs")
+    trail_points = components[0]
+    if len(trail_points) < 5400:
+        raise ValueError("trail is missing or materially broken")
+    trail = np.zeros(foreground.shape, dtype=bool)
+    trail[trail_points[:, 0], trail_points[:, 1]] = True
+
+    peg_parts = [part for part in components[1:] if 130 <= len(part) <= 650]
+    if len(peg_parts) != 5:
+        raise ValueError(f"expected five complete peg rings, found {len(peg_parts)}")
+    peg = np.zeros(foreground.shape, dtype=bool)
+    for part in peg_parts:
+        peg[part[:, 0], part[:, 1]] = True
+
+    # No unexplained foreground is allowed; this also detects most rectangular
+    # ablations whose antialiased boundary fragments the path or a peg.
+    recognized = len(trail_points) + sum(len(part) for part in peg_parts)
+    if int(foreground.sum()) - recognized > 80:
+        raise ValueError("unrecognized or corrupted foreground component")
+    return trail, peg
+
+
+def _fit_peg_row(peg_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    parts = _components(peg_mask)
+    if len(parts) != 5:
+        raise ValueError("peg segmentation is incomplete")
+    centers = np.asarray([[part[:, 1].mean(), part[:, 0].mean()] for part in parts], dtype=np.float64)
+    centered = centers - centers.mean(axis=0)
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    axis = vt[0]
+    if axis[0] < 0:
+        axis = -axis
+    normal = np.asarray([-axis[1], axis[0]])
+    along = centered @ axis
+    across = centered @ normal
+    order = np.argsort(along)
+    centers = centers[order]
+    along = along[order]
+    across = across[order]
+    gaps = np.diff(along)
+    if np.max(np.abs(across)) > 2.0:
+        raise ValueError("pegs do not define one straight row")
+    if not 100.0 <= float(np.median(gaps)) <= 125.0 or float(np.ptp(gaps)) > 3.5:
+        raise ValueError("peg row spacing is incomplete or ambiguous")
+    return centers, axis, normal
+
+
+def decision_from_image(image: Image.Image) -> str:
+    trail, peg_mask = _segment(image)
+    centers, axis, normal = _fit_peg_row(peg_mask)
+    trail_yx = np.argwhere(trail).astype(np.float64)
+    trail_xy = trail_yx[:, ::-1] + 0.5
+    midpoint = centers.mean(axis=0)
+    along = (trail_xy - midpoint) @ axis
+    across = (trail_xy - midpoint) @ normal
+    center_along = (centers - midpoint) @ axis
+    spacing = float(np.median(np.diff(center_along)))
+    sides: list[int] = []
+    clearances: list[float] = []
+    for coordinate in center_along:
+        local = np.abs(along - coordinate) <= 0.36 * spacing
+        values = across[local]
+        if len(values) < 520:
+            raise ValueError("a peg bend is incomplete")
+        upper = float(np.quantile(values, 0.93))
+        lower = float(np.quantile(values, 0.07))
+        side = 1 if upper > -lower else -1
+        chosen = upper if side > 0 else -lower
+        opposite = -lower if side > 0 else upper
+        clearance = chosen - max(opposite, 0.0)
+        if chosen < 30.0 or clearance < 20.0:
+            raise ValueError("a bend side is raster-ambiguous")
+        sides.append(side)
+        clearances.append(clearance)
+
+    equalities = sum(left == right for left, right in zip(sides, sides[1:]))
+    if equalities == 0:
+        return "alternates"
+    if equalities == 1:
+        return "one repeat"
+    raise ValueError("recovered cadence is outside the public two-class grammar")

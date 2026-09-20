@@ -1,0 +1,474 @@
+"""Renderer for the shadow-offset self-overlay reveal world.
+
+One black-bordered plate carries an 11x11 lattice of flat cells, each in one of
+exactly two rendered tones.  A detached gauge of two small marks - a hollow ring
+pip and a solid pip - sits a short distance away inside the same small
+neighbourhood.  The gauge carries no field of its own: the whole-number of plate
+cell widths between the two pips, and the direction from the ring pip to the
+solid pip, declare one slide vector.
+
+The declared raster transform is a self-superposition at that slide: a copy of
+the plate's own dark cells is slid by the gauge vector, laid back over the plate,
+and a cell is marked exactly when it is dark in the plate and dark in the slid
+copy.  The marked cells spell one abstract symbol inside the plate's middle five
+by five block.  Nothing else in the picture is a field: there is no second
+pattern to difference against and no key to match, only the plate compared with
+a displaced copy of itself.
+
+Construction keeps every cheap cue flat.  Each plate carries exactly
+``INK_CELLS`` dark cells whatever the answer is, every declared symbol marks the
+same number of cells, the plate as drawn is far from every declared symbol, and
+filler cells are accepted only when they create no mark at all.  Rejection also
+requires that no other declared slide vector applied to the same plate produces
+the gold symbol, so the gauge is decisive rather than decorative.
+
+Placement is ablation aware.  The plate lies inside the exclusive interior
+window of one cell of an 8x8 lattice, at least 24 px clear of every lattice
+boundary, and the gauge lies equally clear inside the window of a cell two
+lattice steps away, so the decisive support is three disconnected components
+- plate, ring pip, solid pip - inside one small span with plain background
+visible between them.  Lavender decoy plates, lavender decoy pip pairs and the
+remote tone key never affect the decision.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "shadow_offset_reveal-renderer-0.1.0"
+
+CANVAS = 768
+LATTICE = 8
+LATTICE_PX = CANVAS // LATTICE  # 96
+WINDOW_LO = 24
+WINDOW_PX = 48
+
+CELLS = 11
+CELL_PX = 4
+FRAME_PX = 1
+PLATE_PX = CELLS * CELL_PX + 2 * FRAME_PX  # 46
+
+SYMBOL_SIDE = 5
+SYMBOL_OFFSET = (CELLS - SYMBOL_SIDE) // 2  # 3
+
+RING_PX = 7
+RING_SHELL = 2
+SOLID_PX = 5
+
+INK_CELLS = 34
+QUARANTINE_MARGIN = 6.0
+QUARANTINE_CLEARANCE = 17.0
+REFERENCE_HAMMING = 8.0
+MIN_TONE_GAP = 24
+MAX_TONE_GAP = 92
+
+BG_RGB = (247, 245, 241)
+MARK_DARK = (18, 18, 22)
+DECOY_RGB = (196, 186, 228)
+KEY_FRAME = (152, 152, 156)
+
+SYMBOLS = ("plus", "ex", "tee", "ell")
+
+_SYMBOL_ART = {
+    "plus": ("..#..", "..#..", "#####", "..#..", "..#.."),
+    "ex": ("#...#", ".#.#.", "..#..", ".#.#.", "#...#"),
+    "tee": ("#####", "..#..", "..#..", "..#..", "..#.."),
+    "ell": ("#....", "#....", "#....", "#....", "#####"),
+}
+
+
+def _template_cells(art: tuple[str, ...]) -> frozenset[tuple[int, int]]:
+    return frozenset(
+        (SYMBOL_OFFSET + r, SYMBOL_OFFSET + c)
+        for r, row in enumerate(art)
+        for c, char in enumerate(row)
+        if char == "#"
+    )
+
+
+TEMPLATE_CELLS = {name: _template_cells(art) for name, art in _SYMBOL_ART.items()}
+TEMPLATE_BITS = {
+    name: tuple(
+        1 if (r, c) in cells else 0 for r in range(CELLS) for c in range(CELLS)
+    )
+    for name, cells in TEMPLATE_CELLS.items()
+}
+
+# Declared slide vectors: axis aligned or exact diagonal, two or three cells.
+def _vector_set() -> tuple[tuple[int, int], ...]:
+    vectors: list[tuple[int, int]] = []
+    for step in (2, 3):
+        for sign in (1, -1):
+            vectors.append((step * sign, 0))
+            vectors.append((0, step * sign))
+        for sy in (1, -1):
+            for sx in (1, -1):
+                vectors.append((step * sy, step * sx))
+    return tuple(sorted(set(vectors)))
+
+
+VECTORS = _vector_set()
+
+# Gauge cells sit two lattice steps from the plate cell, never 4-connected on the
+# ablation lattice and never further than sqrt(5) steps away.
+OFFSETS = (
+    (0, 2),
+    (0, -2),
+    (2, 0),
+    (-2, 0),
+    (1, 2),
+    (2, 1),
+    (-1, 2),
+    (2, -1),
+    (1, -2),
+    (-2, 1),
+    (-1, -2),
+    (-2, -1),
+)
+
+_LATTICE_MIN = 1
+_LATTICE_MAX = 6
+
+
+def _inside(cell: tuple[int, int]) -> bool:
+    return 0 <= cell[0] < CELLS and 0 <= cell[1] < CELLS
+
+
+def _marks(dark: frozenset[tuple[int, int]], vector: tuple[int, int]):
+    """Cells dark in the plate and dark in the copy slid by ``vector``."""
+    dy, dx = vector
+    return frozenset(
+        cell
+        for cell in dark
+        if (cell[0] - dy, cell[1] - dx) in dark
+    )
+
+
+def _clean_vectors(name: str) -> tuple[tuple[int, int], ...]:
+    """Vectors for which the planted pair reproduces the symbol exactly."""
+    target = TEMPLATE_CELLS[name]
+    clean = []
+    for vector in VECTORS:
+        shifted = frozenset(
+            (cell[0] - vector[0], cell[1] - vector[1]) for cell in target
+        )
+        if any(not _inside(cell) for cell in shifted):
+            continue
+        plate = target | shifted
+        if _marks(plate, vector) == target:
+            clean.append(vector)
+    return tuple(clean)
+
+
+CLEAN_VECTORS = {name: _clean_vectors(name) for name in SYMBOLS}
+for _name, _vectors in CLEAN_VECTORS.items():
+    if len(_vectors) < 4:
+        raise RuntimeError(f"symbol {_name} has too few clean slide vectors")
+
+
+def _bits(cells) -> tuple[int, ...]:
+    return tuple(
+        1 if (r, c) in cells else 0 for r in range(CELLS) for c in range(CELLS)
+    )
+
+
+def _hamming(left, right) -> int:
+    return sum(1 for a, b in zip(left, right) if a != b)
+
+
+def _score_bits(bits) -> tuple[str, int, int]:
+    ranked = sorted((_hamming(bits, tpl), name) for name, tpl in TEMPLATE_BITS.items())
+    return ranked[0][1], ranked[0][0], ranked[1][0]
+
+
+def _pack_fillers(
+    rng: random.Random,
+    plate: set[tuple[int, int]],
+    vector: tuple[int, int],
+    frozen: set[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Add cells that create no mark, in a deterministic shuffled order."""
+    dy, dx = vector
+    order = [(r, c) for r in range(CELLS) for c in range(CELLS)]
+    rng.shuffle(order)
+    added: list[tuple[int, int]] = []
+    for cell in order:
+        if cell in plate:
+            continue
+        ahead = (cell[0] + dy, cell[1] + dx)
+        behind = (cell[0] - dy, cell[1] - dx)
+        if behind in plate or ahead in plate:
+            continue
+        plate.add(cell)
+        added.append(cell)
+    del frozen
+    return added
+
+
+def _sample_plate(rng: random.Random, name: str):
+    """Sample one plate: planted symbol pair plus fillers trimmed to INK_CELLS."""
+    for _attempt in range(256):
+        vector = CLEAN_VECTORS[name][rng.randrange(len(CLEAN_VECTORS[name]))]
+        target = TEMPLATE_CELLS[name]
+        shifted = frozenset(
+            (cell[0] - vector[0], cell[1] - vector[1]) for cell in target
+        )
+        plate = set(target | shifted)
+        frozen = set(plate)
+        fillers = _pack_fillers(rng, plate, vector, frozen)
+        if len(plate) < INK_CELLS:
+            continue
+        removable = [cell for cell in fillers if cell not in frozen]
+        rng.shuffle(removable)
+        while len(plate) > INK_CELLS and removable:
+            plate.discard(removable.pop())
+        if len(plate) != INK_CELLS:
+            continue
+        dark = frozenset(plate)
+        bits = _bits(_marks(dark, vector))
+        best, best_distance, runner_up = _score_bits(bits)
+        if best != name or best_distance != 0 or runner_up < REFERENCE_HAMMING:
+            continue
+        # The gauge must be decisive: no other declared slide vector may read the
+        # gold symbol out of the same plate.
+        confusable = False
+        for other in VECTORS:
+            if other == vector:
+                continue
+            other_best, other_distance, _ = _score_bits(_bits(_marks(dark, other)))
+            if other_best == name and other_distance <= 2:
+                confusable = True
+                break
+        if confusable:
+            continue
+        # The plate as drawn must not be readable as any declared symbol.
+        drawn_best, drawn_distance, _ = _score_bits(_bits(dark))
+        del drawn_best
+        if drawn_distance < 8:
+            continue
+        return sorted(dark), list(vector)
+    raise RuntimeError(f"could not sample a plate for {name!r}")
+
+
+def _ring_center(rng: random.Random, vector: tuple[int, int]) -> tuple[int, int]:
+    """Ring-pip centre inside the gauge window so both pips stay inside it."""
+    centre = []
+    for step in vector:
+        shift = step * CELL_PX
+        low = 4 + max(0, -shift)
+        high = WINDOW_PX - 5 - max(0, shift)
+        centre.append(rng.randint(low, high))
+    return (centre[0], centre[1])
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 104729 + 7)
+    name = SYMBOLS[seed % len(SYMBOLS)]
+    dark, vector = _sample_plate(rng, name)
+
+    while True:
+        plate_cell = (
+            rng.randint(_LATTICE_MIN, _LATTICE_MAX),
+            rng.randint(_LATTICE_MIN, _LATTICE_MAX),
+        )
+        offset = OFFSETS[rng.randrange(len(OFFSETS))]
+        gauge_cell = (plate_cell[0] + offset[0], plate_cell[1] + offset[1])
+        if all(_LATTICE_MIN <= value <= _LATTICE_MAX for value in gauge_cell):
+            break
+
+    plate_span = WINDOW_PX - PLATE_PX
+    scene = {
+        "canvas": CANVAS,
+        "cells": CELLS,
+        "cell_px": CELL_PX,
+        "frame_px": FRAME_PX,
+        "dark": dark,
+        "vector": vector,
+        "plate_cell": list(plate_cell),
+        "plate_jitter": [rng.randint(0, plate_span), rng.randint(0, plate_span)],
+        "gauge_cell": list(gauge_cell),
+        "gauge_center": list(_ring_center(rng, (vector[0], vector[1]))),
+        "tone_gap": rng.randint(MIN_TONE_GAP, MAX_TONE_GAP),
+        "pale_value": rng.randint(206, 228),
+        "tint": [rng.randint(0, 18), rng.randint(0, 18), rng.randint(0, 18)],
+        "decoys": [],
+        "key_origin": [CANVAS - 52 + rng.randint(-4, 4), 24 + rng.randint(-4, 4)],
+    }
+
+    used = {plate_cell, gauge_cell}
+    decoys = []
+    for _ in range(rng.choice((3, 4, 5))):
+        for _attempt in range(64):
+            cell = (
+                rng.randint(_LATTICE_MIN, _LATTICE_MAX),
+                rng.randint(_LATTICE_MIN, _LATTICE_MAX),
+            )
+            if all(
+                max(abs(cell[0] - other[0]), abs(cell[1] - other[1])) >= 2
+                for other in used
+            ):
+                used.add(cell)
+                decoy_vector = VECTORS[rng.randrange(len(VECTORS))]
+                decoys.append(
+                    {
+                        "cell": list(cell),
+                        "jitter": [
+                            rng.randint(0, plate_span),
+                            rng.randint(0, plate_span),
+                        ],
+                        "bits": [rng.randint(0, 1) for _ in range(CELLS * CELLS)],
+                        "kind": "plate" if rng.randint(0, 2) else "gauge",
+                        "vector": list(decoy_vector),
+                        "center": list(_ring_center(rng, decoy_vector)),
+                    }
+                )
+                break
+    scene["decoys"] = decoys
+    return scene
+
+
+def _tones(scene: dict):
+    pale_value = int(scene["pale_value"])
+    dark_value = pale_value - int(scene["tone_gap"])
+    tint = tuple(int(value) for value in scene["tint"])
+    pale = tuple(max(0, min(255, pale_value - shift)) for shift in tint)
+    dark = tuple(max(0, min(255, dark_value - shift)) for shift in tint)
+    return pale, dark
+
+
+def _window_origin(cell, jitter) -> tuple[int, int]:
+    return (
+        cell[0] * LATTICE_PX + WINDOW_LO + jitter[0],
+        cell[1] * LATTICE_PX + WINDOW_LO + jitter[1],
+    )
+
+
+def _draw_plate(array, origin, dark_cells, frame_rgb, pale, dark) -> None:
+    y0, x0 = origin
+    array[y0 : y0 + PLATE_PX, x0 : x0 + PLATE_PX] = frame_rgb
+    for row in range(CELLS):
+        for col in range(CELLS):
+            cy = y0 + FRAME_PX + row * CELL_PX
+            cx = x0 + FRAME_PX + col * CELL_PX
+            colour = dark if (row, col) in dark_cells else pale
+            array[cy : cy + CELL_PX, cx : cx + CELL_PX] = colour
+
+
+def _draw_gauge(array, window, centre, vector, rgb) -> None:
+    wy, wx = window
+    cy, cx = wy + centre[0], wx + centre[1]
+    half = RING_PX // 2
+    array[cy - half : cy + half + 1, cx - half : cx + half + 1] = rgb
+    hole = RING_PX - 2 * RING_SHELL
+    hy = cy - hole // 2
+    hx = cx - hole // 2
+    array[hy : hy + hole, hx : hx + hole] = BG_RGB
+    sy = cy + vector[0] * CELL_PX
+    sx = cx + vector[1] * CELL_PX
+    shalf = SOLID_PX // 2
+    array[sy - shalf : sy + shalf + 1, sx - shalf : sx + shalf + 1] = rgb
+
+
+def render(scene: dict) -> Image.Image:
+    canvas = int(scene["canvas"])
+    array = np.zeros((canvas, canvas, 3), dtype=np.uint8)
+    array[:, :] = BG_RGB
+    pale, dark = _tones(scene)
+
+    for decoy in scene["decoys"]:
+        window = _window_origin(tuple(decoy["cell"]), tuple(decoy["jitter"]))
+        if decoy["kind"] == "plate":
+            bits = decoy["bits"]
+            cells = {
+                (index // CELLS, index % CELLS)
+                for index, bit in enumerate(bits)
+                if bit
+            }
+            _draw_plate(array, window, cells, DECOY_RGB, pale, dark)
+        else:
+            _draw_gauge(
+                array,
+                _window_origin(tuple(decoy["cell"]), (0, 0)),
+                tuple(decoy["center"]),
+                tuple(decoy["vector"]),
+                DECOY_RGB,
+            )
+
+    dark_cells = {(int(cell[0]), int(cell[1])) for cell in scene["dark"]}
+    _draw_plate(
+        array,
+        _window_origin(tuple(scene["plate_cell"]), tuple(scene["plate_jitter"])),
+        dark_cells,
+        MARK_DARK,
+        pale,
+        dark,
+    )
+    _draw_gauge(
+        array,
+        _window_origin(tuple(scene["gauge_cell"]), (0, 0)),
+        tuple(scene["gauge_center"]),
+        tuple(scene["vector"]),
+        MARK_DARK,
+    )
+
+    # Remote tone key: the two cell tones with their exact midpoint between
+    # them, so the per-cell tone boundary is drawn in the image.
+    ky, kx = int(scene["key_origin"][0]), int(scene["key_origin"][1])
+    swatch = 22
+    mid = tuple((int(a) + int(b)) // 2 for a, b in zip(pale, dark))
+    array[ky - 2 : ky + swatch + 2, kx - 2 : kx + 3 * swatch + 2] = KEY_FRAME
+    for index, colour in enumerate((dark, mid, pale)):
+        array[ky : ky + swatch, kx + index * swatch : kx + (index + 1) * swatch] = colour
+    return Image.fromarray(array, mode="RGB")
+
+
+def revealed_bits(scene: dict) -> tuple[int, ...]:
+    dark_cells = frozenset((int(a), int(b)) for a, b in scene["dark"])
+    vector = (int(scene["vector"][0]), int(scene["vector"][1]))
+    return _bits(_marks(dark_cells, vector))
+
+
+def analytic_gold(scene: dict) -> str:
+    best, best_distance, runner_up = _score_bits(revealed_bits(scene))
+    if best_distance != 0 or runner_up - best_distance < QUARANTINE_MARGIN:
+        raise ValueError("sampled mark pattern is not a decidable symbol")
+    return best
+
+
+def tone_clearance(scene: dict) -> float:
+    """Half the rendered tone gap: the per-cell classification clearance."""
+    return float(scene["tone_gap"]) / 2.0
+
+
+def hamming_gap(scene: dict) -> float:
+    """Runner-up Hamming gap of the revealed mark pattern, in grid positions."""
+    _best, best_distance, runner_up = _score_bits(revealed_bits(scene))
+    return float(runner_up - best_distance)
+
+
+def margin(scene: dict) -> float:
+    """Per-cell tone clearance scaled by the runner-up symbol separation."""
+    return round(tone_clearance(scene) * hamming_gap(scene) / REFERENCE_HAMMING, 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return (
+        tone_clearance(scene) < QUARANTINE_CLEARANCE
+        or hamming_gap(scene) < QUARANTINE_MARGIN
+    )
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases exist: every sampled field is rendered.
+
+    Analytic gold reads exactly two scene fields, ``dark`` and ``vector``. The
+    plate renders every one of the 121 cells as one of two flat tones and the
+    gauge renders the slide vector as the displacement between two flat pips, so
+    changing either label input necessarily moves pixels and the scene-to-raster
+    map is injective on all label inputs.
+    """
+    del scene
+    return []

@@ -1,0 +1,121 @@
+"""Independent image-only inverse for the directional sweep reveal."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+SYMBOLS = ("arch", "diamond", "fork", "ring")
+SWEEP_RADIUS = 12
+SWEEP_SAMPLES = 2 * SWEEP_RADIUS + 1
+
+
+def _marker_centers(saturated: np.ndarray) -> list[tuple[float, float]]:
+    height, width = saturated.shape
+    seen = np.zeros_like(saturated, dtype=bool)
+    centers: list[tuple[float, float]] = []
+    for y, x in np.argwhere(saturated):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and saturated[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= 20:
+            values = np.asarray(points, dtype=np.float64)
+            centers.append((float(values[:, 1].mean()), float(values[:, 0].mean())))
+    if len(centers) != 4:
+        raise ValueError(f"expected four colored fiducials, found {len(centers)}")
+    return centers
+
+
+def _crop_square(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    saturation = arr.max(axis=2).astype(np.int16) - arr.min(axis=2).astype(np.int16)
+    centers = _marker_centers(saturation > 55)
+    xs = [point[0] for point in centers]
+    ys = [point[1] for point in centers]
+    x0 = int(round(min(xs) + 10.0))
+    y0 = int(round(min(ys) + 10.0))
+    x1 = int(round(max(xs) - 9.0))
+    y1 = int(round(max(ys) - 9.0))
+    if x1 - x0 != y1 - y0 or not (120 <= x1 - x0 <= 230):
+        raise ValueError(f"fiducials do not bracket one square: {(x0, y0, x1, y1)}")
+    return arr[y0:y1, x0:x1, 0].astype(np.float32)
+
+
+def _segment_distance(
+    x: np.ndarray,
+    y: np.ndarray,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> np.ndarray:
+    x0, y0 = start
+    x1, y1 = end
+    vx, vy = x1 - x0, y1 - y0
+    denominator = vx * vx + vy * vy
+    t = ((x - x0) * vx + (y - y0) * vy) / denominator
+    t = np.clip(t, 0.0, 1.0)
+    return np.hypot(x - (x0 + t * vx), y - (y0 + t * vy))
+
+
+def _symbol_mask(symbol: str, size: int) -> np.ndarray:
+    center = (size - 1) / 2.0
+    yy, xx = np.indices((size, size), dtype=np.float32)
+    x = (xx - center) / (size / 2.0)
+    y = (yy - center) / (size / 2.0)
+    if symbol == "ring":
+        mask = (np.hypot(x, y) >= 0.34) & (np.hypot(x, y) < 0.47)
+    elif symbol == "diamond":
+        radius = np.abs(x) + np.abs(y)
+        mask = (radius >= 0.49) & (radius < 0.61)
+    elif symbol == "arch":
+        uprights = (np.abs(np.abs(x) - 0.34) < 0.085) & (y >= -0.30) & (y <= 0.40)
+        crown = (np.abs(y + 0.34) < 0.085) & (np.abs(x) <= 0.42)
+        mask = uprights | crown
+    elif symbol == "fork":
+        left = _segment_distance(x, y, (-0.55, 0.38), (0.0, -0.24)) < 0.082
+        right = _segment_distance(x, y, (0.55, 0.38), (0.0, -0.24)) < 0.082
+        stem = _segment_distance(x, y, (0.0, -0.24), (0.0, 0.48)) < 0.082
+        mask = left | right | stem
+    else:
+        raise ValueError(symbol)
+    return mask & (np.abs(x) < 0.82) & (np.abs(y) < 0.82)
+
+
+def _horizontal_sweep(tile: np.ndarray) -> np.ndarray:
+    padded = np.pad(tile, ((0, 0), (SWEEP_RADIUS, SWEEP_RADIUS)), mode="edge")
+    kernel = np.full(SWEEP_SAMPLES, 1.0 / SWEEP_SAMPLES, dtype=np.float32)
+    swept = np.empty_like(tile, dtype=np.float32)
+    for row in range(tile.shape[0]):
+        swept[row] = np.convolve(padded[row], kernel, mode="valid")
+    return swept
+
+
+def _score(observed: np.ndarray, template: np.ndarray) -> float:
+    flat_observed = observed.reshape(-1)
+    flat_template = template.reshape(-1)
+    design = np.stack((np.ones_like(flat_template), flat_template), axis=1)
+    coefficients, _, _, _ = np.linalg.lstsq(design, flat_observed, rcond=None)
+    residual = flat_observed - design @ coefficients
+    return -float(np.mean(residual * residual))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Locate fiducials, execute the public sweep, and classify its raster evidence."""
+    tile = _crop_square(image)
+    swept = _horizontal_sweep(tile)
+    edge = 16
+    observed = swept[edge:-edge, edge:-edge]
+    scores = {}
+    for symbol in SYMBOLS:
+        template = _symbol_mask(symbol, tile.shape[0])[edge:-edge, edge:-edge].astype(np.float32)
+        scores[symbol] = _score(observed, template)
+    return max(scores, key=scores.get)

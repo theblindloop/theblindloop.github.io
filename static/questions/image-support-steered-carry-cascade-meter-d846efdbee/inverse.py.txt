@@ -1,0 +1,171 @@
+"""Pixel-only oracle for the carry_cascade_meter world.
+
+It receives one RGB image and nothing else: no scene, no renderer, no gold.
+
+Pipeline: segment the four dark tile frames, classify each tile by the number
+of pale slot outlines it holds (three round sockets -> lamp bank, twelve square
+slots -> tick patch), assign the corner roles from the tile centres, count the
+amber lit sockets in each bank and the teal filled slots in the patch, find the
+single crimson ring, replay the increments through the base-three carry chain,
+and name how many lamps the ringed bank ends up showing.
+
+It abstains whenever the meter is not fully legible: a wrong number of tiles,
+a tile whose slot lattice does not resolve, a bank showing more than two lit
+lamps, an out-of-range tick count, a missing, duplicated or unplaced ring, or a
+corner layout that is not two rows by two columns with the patch bottom-right.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "carry_cascade_meter-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+_WORDS = ("zero", "one", "two")
+
+_MAX_TICKS = 10
+_MIN_FRAME_W = 90
+_MIN_FRAME_H = 100
+_MAX_FRAME = 230
+_MIN_BLOB = 45
+_MIN_FILL_BLOB = 120
+
+
+def _components(mask: np.ndarray, min_size: int) -> list[tuple[int, int, int, int, int]]:
+    """Four-connected components as (size, y0, x0, y1, x1) boxes."""
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    out = []
+    for point in np.argwhere(mask):
+        sy, sx = int(point[0]), int(point[1])
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        size = 0
+        y0 = y1 = sy
+        x0 = x1 = sx
+        while stack:
+            y, x = stack.pop()
+            size += 1
+            if y < y0:
+                y0 = y
+            if y > y1:
+                y1 = y
+            if x < x0:
+                x0 = x
+            if x > x1:
+                x1 = x
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if size >= min_size:
+            out.append((size, y0, x0, y1, x1))
+    return out
+
+
+def _masks(arr: np.ndarray) -> dict[str, np.ndarray]:
+    red = arr[:, :, 0]
+    green = arr[:, :, 1]
+    blue = arr[:, :, 2]
+    top = arr.max(axis=2)
+    spread = top - arr.min(axis=2)
+    return {
+        "frame": top < 100,
+        "outline": (top >= 100) & (top < 165) & (spread < 30),
+        "amber": (red > 200) & (green > 120) & (green < 210) & (blue < 110),
+        "teal": (red < 115) & (green > 100) & (green < 195) & (blue > 130) & (blue < 220),
+        "crimson": (red > 165) & (green < 95) & (blue < 105),
+    }
+
+
+def _centre(box: tuple[int, int, int, int, int]) -> tuple[float, float]:
+    _, y0, x0, y1, x1 = box
+    return ((y0 + y1) / 2.0, (x0 + x1) / 2.0)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if arr.ndim != 3 or arr.shape[0] < 200 or arr.shape[1] < 200:
+        return ABSTAIN
+    masks = _masks(arr)
+
+    frames = [
+        box
+        for box in _components(masks["frame"], 200)
+        if _MIN_FRAME_W <= box[4] - box[2] <= _MAX_FRAME
+        and _MIN_FRAME_H <= box[3] - box[1] <= _MAX_FRAME
+    ]
+    if len(frames) != 4:
+        return ABSTAIN
+
+    tiles = []
+    for box in frames:
+        _, y0, x0, y1, x1 = box
+        window = (slice(y0, y1 + 1), slice(x0, x1 + 1))
+        slots = len(_components(masks["outline"][window], _MIN_BLOB))
+        amber = len(_components(masks["amber"][window], _MIN_FILL_BLOB))
+        teal = len(_components(masks["teal"][window], _MIN_FILL_BLOB))
+        crimson = int(masks["crimson"][window].sum())
+        cy, cx = _centre(box)
+        tiles.append(
+            {
+                "cy": cy,
+                "cx": cx,
+                "slots": slots,
+                "amber": amber,
+                "teal": teal,
+                "crimson": crimson,
+                "box": box,
+            }
+        )
+
+    banks = [tile for tile in tiles if tile["slots"] == 3]
+    patches = [tile for tile in tiles if tile["slots"] == 12]
+    if len(banks) != 3 or len(patches) != 1:
+        return ABSTAIN
+    patch = patches[0]
+
+    ys = sorted(tile["cy"] for tile in tiles)
+    xs = sorted(tile["cx"] for tile in tiles)
+    if ys[1] - ys[0] > 40 or ys[3] - ys[2] > 40 or xs[1] - xs[0] > 40 or xs[3] - xs[2] > 40:
+        return ABSTAIN
+    if ys[2] - ys[1] < 90 or xs[2] - xs[1] < 90:
+        return ABSTAIN
+    y_split = (ys[1] + ys[2]) / 2.0
+    x_split = (xs[1] + xs[2]) / 2.0
+
+    corners: dict[tuple[int, int], dict] = {}
+    for tile in tiles:
+        key = (int(tile["cy"] > y_split), int(tile["cx"] > x_split))
+        if key in corners:
+            return ABSTAIN
+        corners[key] = tile
+    if len(corners) != 4:
+        return ABSTAIN
+    if corners[(1, 1)] is not patch:
+        return ABSTAIN
+
+    ordered = [corners[(0, 0)], corners[(0, 1)], corners[(1, 0)]]
+    counts = []
+    for tile in ordered:
+        if tile["teal"] or not 0 <= tile["amber"] <= 2:
+            return ABSTAIN
+        counts.append(tile["amber"])
+    if patch["amber"]:
+        return ABSTAIN
+    ticks = patch["teal"]
+    if not 1 <= ticks <= _MAX_TICKS:
+        return ABSTAIN
+
+    ringed = [index for index, tile in enumerate(ordered) if tile["crimson"] >= 120]
+    stray = patch["crimson"] >= 120
+    if len(ringed) != 1 or stray:
+        return ABSTAIN
+
+    total = (9 * counts[0] + 3 * counts[1] + counts[2] + ticks) % 27
+    digits = (total // 9, (total // 3) % 3, total % 3)
+    return _WORDS[digits[ringed[0]]]

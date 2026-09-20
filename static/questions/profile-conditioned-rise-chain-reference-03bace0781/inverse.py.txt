@@ -1,0 +1,149 @@
+"""Pixel-only inverse arm for ``rise_chain_reference``.
+
+Input is one rasterized PNG and the public question contract; nothing else.
+This module imports no renderer, prompt, generator, verifier or gold code, and
+it never receives latent scene data.  It rediscovers the drawing from ink:
+
+1. threshold the image to dark ink, dropping the pale decorative guide rows;
+2. find the baseline as the dark row spanning almost the whole page;
+3. build the per-column ink height above that baseline and cut it into
+   maximal blocks of consecutive inked columns;
+4. the narrow full-height block is the divider; the block left of it is the
+   reference bar and the blocks right of it are the chart bars;
+5. apply the declared rule: a neighbouring pair of chart bars is a rise when
+   the right height exceeds the left height by strictly more than the
+   reference height, and report the longest run of consecutive bars linked by
+   rises.
+
+Any structural surprise (missing baseline, missing divider, a bar count other
+than the declared nine, a degenerate reference) yields ``"abstain"`` rather
+than a guess, so materially corrupted rasters and erased evidence do not
+silently produce an answer.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "rise_chain_reference-oracle-1.0.0"
+
+DARK_MAX = 200            # decorative guides are far lighter than any bar
+EXPECTED_BARS = 9
+ABSTAIN = "abstain"
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int32)
+    luminance = (
+        299 * pixels[:, :, 0] + 587 * pixels[:, :, 1] + 114 * pixels[:, :, 2]
+    ) // 1000
+    return luminance <= DARK_MAX
+
+
+def _baseline_row(mask: np.ndarray) -> int | None:
+    height, width = mask.shape
+    counts = mask.sum(axis=1)
+    wide = [row for row in range(height) if counts[row] >= 0.8 * width]
+    if not wide:
+        return None
+    # The baseline rule is the lowest band of wide dark rows on the page.
+    return min(row for row in wide if row >= max(wide) - 6)
+
+
+def _blocks(profile: np.ndarray) -> list[tuple[int, int, int]]:
+    """``(x0, x1, height)`` for every maximal run of inked columns."""
+    out: list[tuple[int, int, int]] = []
+    start = None
+    for column, value in enumerate(profile):
+        if value > 0 and start is None:
+            start = column
+        elif value == 0 and start is not None:
+            out.append((start, column - 1, int(profile[start:column].max())))
+            start = None
+    if start is not None:
+        out.append((start, len(profile) - 1, int(profile[start:].max())))
+    return out
+
+
+def _chain_length(heights: list[int], reference: int) -> int:
+    best = 1
+    run = 1
+    for left, right in zip(heights, heights[1:]):
+        if right - left > reference:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 1
+    return best
+
+
+def measure(image: Image.Image) -> dict:
+    """Structural read-out used by :func:`decision_from_image`; pixels only."""
+    mask = _ink_mask(image)
+    baseline = _baseline_row(mask)
+    if baseline is None or baseline < 20:
+        return {"ok": False, "reason": "no baseline"}
+
+    above = mask[:baseline, :]
+    profile = np.zeros(above.shape[1], dtype=np.int64)
+    for column in range(above.shape[1]):
+        rows = np.nonzero(above[:, column])[0]
+        if rows.size:
+            # Bars rest on the baseline: their extent is baseline minus the top row.
+            if rows.max() == baseline - 1:
+                profile[column] = baseline - rows.min()
+    blocks = _blocks(profile)
+    if len(blocks) < 3:
+        return {"ok": False, "reason": "too few blocks"}
+
+    divider = None
+    for index, (x0, x1, height) in enumerate(blocks):
+        if x1 - x0 + 1 <= 6 and height >= 0.9 * max(b[2] for b in blocks):
+            divider = index
+            break
+    if divider is None:
+        # Fall back to the narrowest block; still no scene knowledge involved.
+        widths = [block[1] - block[0] + 1 for block in blocks]
+        divider = int(np.argmin(widths))
+        if widths[divider] > 6:
+            return {"ok": False, "reason": "no divider"}
+
+    left = blocks[:divider]
+    right = blocks[divider + 1 :]
+    if len(left) != 1 or len(right) != EXPECTED_BARS:
+        return {
+            "ok": False,
+            "reason": f"unexpected layout: {len(left)} reference, {len(right)} bars",
+        }
+    reference = left[0][2]
+    if reference <= 0:
+        return {"ok": False, "reason": "degenerate reference"}
+    widths = {block[1] - block[0] + 1 for block in right}
+    if len(widths) != 1:
+        return {"ok": False, "reason": "chart bars are not uniform in width"}
+    heights = [block[2] for block in right]
+    return {
+        "ok": True,
+        "reference": int(reference),
+        "heights": [int(h) for h in heights],
+        "baseline": int(baseline),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Longest chain length, as a decimal string, or ``"abstain"``."""
+    read = measure(image)
+    if not read["ok"]:
+        return ABSTAIN
+    return str(_chain_length(read["heights"], read["reference"]))
+
+
+def runner_up_margin(image: Image.Image) -> float:
+    """Smallest pixel distance between any step and the reference height."""
+    read = measure(image)
+    if not read["ok"]:
+        return 0.0
+    heights = read["heights"]
+    reference = read["reference"]
+    return float(min(abs((r - l) - reference) for l, r in zip(heights, heights[1:])))

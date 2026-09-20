@@ -1,0 +1,198 @@
+"""Independent pixel-only inverse arm for the pivot-tape mirror-break world.
+
+Input: the final PNG and the public question contract (the board/tape/frame
+furniture colours, the six answer colours, and the stated rules -- a tape with
+a black diamond at its exact middle, an arrow tip at one end, evenly spaced
+colour marks, and exactly one broken reflected pair). It never receives the
+latent scene and imports no renderer, prompt, generator, verifier or gold code.
+
+Method, in order:
+
+1.  locate the tape as the bounding box of the cream fill;
+2.  read the tape's long axis from that box and normalise it to "left to right";
+3.  decide which end carries the arrow by how far the frame ink reaches beyond
+    the cream box at each end, and flip so the arrow tip is on the right;
+4.  segment the marks inside the tape by 4-connected components of non-cream
+    ink and snap each one's mean colour to the answer palette;
+5.  check the ordered chain: an odd number of marks, the black diamond exactly
+    in the middle of the chain, and even spacing;
+6.  pair step d on the left with step d on the right, score each pair by the
+    RGB distance between the two measured mark colours, and require exactly one
+    pair whose snapped colours differ;
+7.  return that pair's right-hand (arrow-side) colour name.
+
+Any failure of 1-6 raises ``OracleAbstain`` instead of guessing.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "pivot_tape_mirror_break-oracle-0.1.0"
+
+# Public question-contract constants (page furniture + the six answer colours).
+BOARD = (240, 238, 232)
+TAPE_FILL = (252, 250, 244)
+FRAME = (32, 64, 128)
+PIVOT_INK = (0, 0, 0)
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (214, 42, 42),
+    "orange": (232, 124, 26),
+    "yellow": (236, 204, 40),
+    "green": (34, 150, 60),
+    "blue": (40, 84, 208),
+    "purple": (136, 52, 176),
+}
+
+_COLOUR_TOL = 42.0        # max RGB distance from a mark's mean to its palette entry
+_PIVOT_TOL = 60.0         # max RGB distance from the diamond's mean to black
+_MIN_MARK_PX = 36         # a colour mark is ~12x12; below this it is debris
+_MIN_TAPE_PX = 1400
+_WINDOW = 24              # frame search halo around the cream box (< decoration clearance)
+_SPACING_TOL = 0.34       # allowed relative spread of consecutive mark spacings
+
+
+class OracleAbstain(ValueError):
+    """The image does not present a readable tape; the arm refuses to answer."""
+
+
+def _near(arr: np.ndarray, colour: tuple[int, int, int], tol: float) -> np.ndarray:
+    diff = arr.astype(np.int32) - np.array(colour, dtype=np.int32)
+    return (diff * diff).sum(axis=-1) <= tol * tol
+
+
+def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        raise OracleAbstain("empty mask")
+    return int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max())
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """4-connected components of a small boolean mask, as (N, 2) index arrays."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), dtype=bool)
+    out: list[np.ndarray] = []
+    for sy, sx in zip(*np.nonzero(mask)):
+        if seen[sy, sx]:
+            continue
+        stack = [(int(sy), int(sx))]
+        seen[sy, sx] = True
+        pix: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        out.append(np.array(pix, dtype=np.int64))
+    return out
+
+
+def _snap(mean: np.ndarray) -> tuple[str, float]:
+    best, best_d = "", math.inf
+    for name, rgb in PALETTE.items():
+        d = float(np.linalg.norm(mean - np.array(rgb, dtype=np.float64)))
+        if d < best_d:
+            best, best_d = name, d
+    return best, best_d
+
+
+def _normalise(arr: np.ndarray) -> np.ndarray:
+    """Crop to the tape and rotate/flip so the tape runs left->right, arrow right."""
+    cream = _near(arr, TAPE_FILL, 18.0)
+    if int(cream.sum()) < _MIN_TAPE_PX:
+        raise OracleAbstain("no cream tape fill of usable size")
+    y0, x0, y1, x1 = _bbox(cream)
+    if (y1 - y0) < 8 or (x1 - x0) < 8:
+        raise OracleAbstain("degenerate tape box")
+
+    h, w = arr.shape[:2]
+    wy0, wx0 = max(0, y0 - _WINDOW), max(0, x0 - _WINDOW)
+    wy1, wx1 = min(h - 1, y1 + _WINDOW), min(w - 1, x1 + _WINDOW)
+    frame = _near(arr[wy0:wy1 + 1, wx0:wx1 + 1], FRAME, 40.0)
+    if not frame.any():
+        raise OracleAbstain("no frame ink around the tape")
+    fy0, fx0, fy1, fx1 = _bbox(frame)
+    fy0, fx0, fy1, fx1 = fy0 + wy0, fx0 + wx0, fy1 + wy0, fx1 + wx0
+
+    horizontal = (x1 - x0) >= (y1 - y0)
+    if horizontal:
+        over_pos, over_neg = fx1 - x1, x0 - fx0   # frame reach beyond the cream box
+    else:
+        over_pos, over_neg = fy1 - y1, y0 - fy0
+    if abs(over_pos - over_neg) < 6:
+        raise OracleAbstain("arrow end is not distinguishable")
+
+    crop = arr[y0:y1 + 1, x0:x1 + 1]
+    if not horizontal:
+        crop = np.transpose(crop, (1, 0, 2))
+    if over_pos < over_neg:                       # arrow is at the low end
+        crop = crop[:, ::-1]
+    return crop
+
+
+def _read(crop: np.ndarray) -> tuple[list[str], list[np.ndarray]]:
+    """Ordered mark colours and mean RGBs, left to right, with the pivot marked."""
+    inner = crop[2:-2, 2:-2]
+    if inner.shape[0] < 6 or inner.shape[1] < 6:
+        raise OracleAbstain("tape interior too small")
+    ink = ~_near(inner, TAPE_FILL, 30.0)
+    marks: list[tuple[float, str, np.ndarray]] = []
+    for pix in _components(ink):
+        if len(pix) < _MIN_MARK_PX:
+            continue
+        mean = inner[pix[:, 0], pix[:, 1]].astype(np.float64).mean(axis=0)
+        cx = float(pix[:, 1].mean())
+        if float(np.linalg.norm(mean - np.array(PIVOT_INK, dtype=np.float64))) <= _PIVOT_TOL:
+            marks.append((cx, "#pivot", mean))
+            continue
+        name, dist = _snap(mean)
+        if dist > _COLOUR_TOL:
+            raise OracleAbstain(f"mark colour {mean.round(1).tolist()} is off palette")
+        marks.append((cx, name, mean))
+    marks.sort(key=lambda m: m[0])
+    if len(marks) < 5 or len(marks) % 2 == 0:
+        raise OracleAbstain(f"expected an odd chain of at least five marks, saw {len(marks)}")
+    xs = [m[0] for m in marks]
+    gaps = np.diff(np.array(xs))
+    if gaps.min() <= 0 or (gaps.max() - gaps.min()) > _SPACING_TOL * gaps.mean():
+        raise OracleAbstain("marks are not evenly spaced along the tape")
+    mid = len(marks) // 2
+    if marks[mid][1] != "#pivot" or sum(m[1] == "#pivot" for m in marks) != 1:
+        raise OracleAbstain("the black diamond is not the single middle mark")
+    return [m[1] for m in marks], [m[2] for m in marks]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Pixel-only decision: the arrow-side colour of the one broken pair."""
+    arr = np.asarray(image.convert("RGB"))
+    names, means = _read(_normalise(arr))
+    mid = len(names) // 2
+    k = mid
+    scores: list[float] = []
+    broken: list[int] = []
+    for d in range(1, k + 1):
+        left, right = mid - d, mid + d
+        scores.append(float(np.linalg.norm(means[left] - means[right])))
+        if names[left] != names[right]:
+            broken.append(d)
+    if len(broken) != 1:
+        raise OracleAbstain(f"expected exactly one broken pair, saw {broken}")
+    return names[mid + broken[0]]
+
+
+def margin_from_image(image: Image.Image) -> float:
+    """Runner-up margin in RGB units: best pair score minus the next best."""
+    arr = np.asarray(image.convert("RGB"))
+    names, means = _read(_normalise(arr))
+    mid = len(names) // 2
+    scores = sorted(
+        (float(np.linalg.norm(means[mid - d] - means[mid + d])) for d in range(1, mid + 1)),
+        reverse=True,
+    )
+    return scores[0] - scores[1]

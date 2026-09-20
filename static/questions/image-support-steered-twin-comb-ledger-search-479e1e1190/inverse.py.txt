@@ -1,0 +1,192 @@
+"""Pixel-only oracle for the twin comb ledger search world.
+
+The module receives one RGB image and the public question contract. It never
+imports the renderer, prompts, generator or verifier and never receives latent
+scene data.
+
+Route: the modal colour is the background and every other pixel is ink. Ink runs
+are labelled into connected components and everything at or below speck size is
+discarded, which must leave exactly twenty-four tall teeth. Teeth are split into
+a left-margin group and a right-margin group by centroid, the two groups are
+required to sit against opposite side margins, and inside each group the teeth
+are clustered by the row of their common baseline. Each cluster of three teeth
+yields a signature of bounding-box heights read left to right. Every left
+signature is compared against every right signature under the largest
+per-tooth difference; the pair with the smallest difference wins provided that
+difference is negligible, that it is the only negligible pair, and that the
+runner-up pair is clearly worse. Anything else abstains.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "twin_comb_ledger_search-oracle-0.1.0"
+
+WORDS = ("first", "second", "third", "fourth")
+ABSTAIN = "abstain"
+
+MIN_COMPONENT = 120       # a tooth covers at least 14 x 34 pixels; a speck covers 9
+MATCH_TOLERANCE = 3       # a repeated signature lands on zero difference
+MIN_PIXEL_MARGIN = 5      # the runner-up pair must be clearly worse
+SIDE_SPAN = 0.35          # the two ledgers must hug opposite side margins
+ROW_TOLERANCE = 24        # baselines inside one comb agree far better than this
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray | None:
+    arr = np.asarray(image.convert("RGB")).astype(np.int32)
+    keys = (arr[:, :, 0] << 16) + (arr[:, :, 1] << 8) + arr[:, :, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    if len(values) < 2:
+        return None
+    background = values[int(np.argmax(counts))]
+    return keys != background
+
+
+def _components(mask: np.ndarray) -> list:
+    """Run-based 8-connected labelling; returns bounding boxes and areas."""
+
+    height, width = mask.shape
+    parent: list = []
+
+    def find(node: int) -> int:
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list = []          # (y, x0, x1, label)
+    previous: list = []
+    for y in range(height):
+        row = mask[y].astype(np.int8)
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], row, [0]))))
+        current = []
+        for index in range(0, len(edges), 2):
+            x0 = int(edges[index])
+            x1 = int(edges[index + 1]) - 1
+            label = len(parent)
+            parent.append(label)
+            for py0, py1, plabel in previous:
+                if x0 <= py1 + 1 and py0 <= x1 + 1:
+                    union(label, plabel)
+            current.append((x0, x1, label))
+            runs.append((y, x0, x1, label))
+        previous = current
+
+    boxes: dict = {}
+    for y, x0, x1, label in runs:
+        root = find(label)
+        box = boxes.get(root)
+        if box is None:
+            boxes[root] = [x0, y, x1, y, x1 - x0 + 1]
+        else:
+            box[0] = min(box[0], x0)
+            box[1] = min(box[1], y)
+            box[2] = max(box[2], x1)
+            box[3] = max(box[3], y)
+            box[4] += x1 - x0 + 1
+    out = []
+    for x0, y0, x1, y1, area in boxes.values():
+        out.append(
+            {
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+                "area": area,
+                "width": x1 - x0 + 1,
+                "height": y1 - y0 + 1,
+                "centre_x": 0.5 * (x0 + x1),
+            }
+        )
+    return out
+
+
+def _ledger(teeth: list) -> list | None:
+    """Cluster teeth of one ledger into four combs and read their signatures."""
+
+    if len(teeth) != 12:
+        return None
+    ordered = sorted(teeth, key=lambda t: t["y1"])
+    groups: list = [[ordered[0]]]
+    for tooth in ordered[1:]:
+        if tooth["y1"] - groups[-1][-1]["y1"] <= ROW_TOLERANCE:
+            groups[-1].append(tooth)
+        else:
+            groups.append([tooth])
+    if len(groups) != 4 or any(len(group) != 3 for group in groups):
+        return None
+    signatures = []
+    for group in groups:
+        group.sort(key=lambda t: t["centre_x"])
+        signatures.append([tooth["height"] for tooth in group])
+    return signatures
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Both ledgers' signatures, the best matching pair and the runner-up gap."""
+
+    mask = _ink_mask(image)
+    if mask is None:
+        return None
+    height, width = mask.shape
+    teeth = [blob for blob in _components(mask) if blob["area"] > MIN_COMPONENT]
+    if len(teeth) != 24:
+        return None
+    for tooth in teeth:
+        if tooth["height"] <= tooth["width"]:
+            return None
+
+    left = [tooth for tooth in teeth if tooth["centre_x"] < 0.5 * width]
+    right = [tooth for tooth in teeth if tooth["centre_x"] >= 0.5 * width]
+    if len(left) != 12 or len(right) != 12:
+        return None
+    if max(tooth["x1"] for tooth in left) > SIDE_SPAN * width:
+        return None
+    if min(tooth["x0"] for tooth in right) < (1.0 - SIDE_SPAN) * width:
+        return None
+
+    left_signatures = _ledger(left)
+    right_signatures = _ledger(right)
+    if left_signatures is None or right_signatures is None:
+        return None
+
+    scored = []
+    for i, first in enumerate(left_signatures):
+        for j, second in enumerate(right_signatures):
+            gap = max(abs(a - b) for a, b in zip(first, second))
+            scored.append((gap, i, j))
+    scored.sort()
+    best_gap, best_row, _ = scored[0]
+    runner_gap = scored[1][0]
+    return {
+        "left_signatures": left_signatures,
+        "right_signatures": right_signatures,
+        "best_gap": float(best_gap),
+        "runner_gap": float(runner_gap),
+        "winner": best_row,
+        "pixel_margin": float(runner_gap - best_gap),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Which left-ledger comb has its signature repeated in the right ledger."""
+
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    if report["best_gap"] > MATCH_TOLERANCE:
+        return ABSTAIN
+    if report["runner_gap"] <= MATCH_TOLERANCE:
+        return ABSTAIN
+    if report["pixel_margin"] < MIN_PIXEL_MARGIN:
+        return ABSTAIN
+    return WORDS[report["winner"]]

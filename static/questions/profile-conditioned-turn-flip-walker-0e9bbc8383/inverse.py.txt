@@ -1,0 +1,136 @@
+"""Independent image-only inverse arm for the Turn-and-Flip Walker."""
+
+from __future__ import annotations
+
+from collections import deque
+import numpy as np
+from PIL import Image
+
+
+class AmbiguousImage(ValueError):
+    pass
+
+
+COLORS = {
+    "light": np.array((242, 211, 105), dtype=np.int16),
+    "dark": np.array((57, 91, 128), dtype=np.int16),
+    "magenta": np.array((201, 43, 132), dtype=np.int16),
+    "cyan": np.array((35, 166, 190), dtype=np.int16),
+}
+HEADINGS = ("up", "right", "down", "left")
+
+
+def _mask(arr: np.ndarray, name: str, tolerance: int = 24) -> np.ndarray:
+    return np.max(np.abs(arr.astype(np.int16) - COLORS[name]), axis=2) < tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result = []
+    for y, x in zip(*np.nonzero(mask), strict=True):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            yy, xx = queue.popleft()
+            points.append((yy, xx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = yy + dy, xx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            result.append(np.asarray(points, dtype=np.int32))
+    return result
+
+
+def _parse_grid(arr: np.ndarray):
+    cells = []
+    for state, name in ((0, "light"), (1, "dark")):
+        for points in _components(_mask(arr, name), 3000):
+            ys, xs = points[:, 0], points[:, 1]
+            width, height = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+            if 75 <= width <= 100 and 75 <= height <= 100:
+                cells.append((float(ys.mean()), float(xs.mean()), state))
+    if len(cells) != 16:
+        raise AmbiguousImage(f"expected sixteen tile interiors, found {len(cells)}")
+    cells.sort()
+    rows = [sorted(cells[index:index + 4], key=lambda item: item[1]) for index in range(0, 16, 4)]
+    row_centers = [sum(item[0] for item in row) / 4 for row in rows]
+    if min(np.diff(row_centers)) < 70:
+        raise AmbiguousImage("tile rows are not separated")
+    for row in rows:
+        if max(item[0] for item in row) - min(item[0] for item in row) > 8:
+            raise AmbiguousImage("tile row alignment is ambiguous")
+        if min(np.diff([item[1] for item in row])) < 70:
+            raise AmbiguousImage("tile columns are not separated")
+    return rows, [[item[2] for item in row] for row in rows]
+
+
+def _parse_walker(arr: np.ndarray, rows):
+    parts = _components(_mask(arr, "magenta"), 350)
+    arrow_parts = []
+    for points in parts:
+        ys, xs = points[:, 0], points[:, 1]
+        if xs.max() - xs.min() > 25 and ys.max() - ys.min() > 25:
+            arrow_parts.append(points)
+    if len(arrow_parts) != 1:
+        raise AmbiguousImage(f"expected one magenta walker arrow, found {len(arrow_parts)}")
+    points = arrow_parts[0]
+    y, x = float(points[:, 0].mean()), float(points[:, 1].mean())
+    candidates = [(abs(y - cell[0]) + abs(x - cell[1]), row, col)
+                  for row, line in enumerate(rows) for col, cell in enumerate(line)]
+    candidates.sort()
+    if candidates[0][0] > 20 or candidates[1][0] - candidates[0][0] < 50:
+        raise AmbiguousImage("walker is not bound to exactly one tile")
+    ys, xs = points[:, 0], points[:, 1]
+    width, height = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+    if abs(width - height) < 8:
+        raise AmbiguousImage("walker orientation axis is ambiguous")
+    if width > height:
+        midpoint = (float(xs.min()) + float(xs.max())) / 2
+        left, right = np.count_nonzero(xs < midpoint), np.count_nonzero(xs > midpoint)
+        if abs(left - right) < len(xs) * 0.04:
+            raise AmbiguousImage("horizontal arrow direction is ambiguous")
+        heading = 1 if right > left else 3
+    else:
+        midpoint = (float(ys.min()) + float(ys.max())) / 2
+        up, down = np.count_nonzero(ys < midpoint), np.count_nonzero(ys > midpoint)
+        if abs(up - down) < len(ys) * 0.04:
+            raise AmbiguousImage("vertical arrow direction is ambiguous")
+        heading = 2 if down > up else 0
+    return candidates[0][1], candidates[0][2], heading
+
+
+def _step_count(arr: np.ndarray) -> int:
+    parts = _components(_mask(arr, "cyan"), 600)
+    disks = []
+    for points in parts:
+        ys, xs = points[:, 0], points[:, 1]
+        width, height = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+        if 30 <= width <= 45 and 30 <= height <= 45:
+            disks.append((float(xs.mean()), float(ys.mean())))
+    disks.sort()
+    if len(disks) != 7 or min(np.diff([item[0] for item in disks])) < 60:
+        raise AmbiguousImage(f"expected seven ordered step tokens, found {len(disks)}")
+    return len(disks)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or min(arr.shape[:2]) < 500:
+        raise AmbiguousImage("unsupported raster")
+    rows, board = _parse_grid(arr)
+    row, col, heading = _parse_walker(arr, rows)
+    steps = _step_count(arr)
+    vectors = ((-1, 0), (0, 1), (1, 0), (0, -1))
+    for _ in range(steps):
+        heading = (heading + (1 if board[row][col] == 0 else -1)) % 4
+        board[row][col] ^= 1
+        dr, dc = vectors[heading]
+        row = (row + dr) % 4
+        col = (col + dc) % 4
+    return HEADINGS[heading]

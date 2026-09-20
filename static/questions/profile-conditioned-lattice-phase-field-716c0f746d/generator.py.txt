@@ -1,0 +1,204 @@
+"""Deterministic raster renderer and analytic lattice scorer.
+
+The scene stores only visible dot fields.  The analytic arm fits a rectangular
+coordinate system to each field and chooses the largest whole-field lattice
+score.  The inverse arm in oracle.py repeats the pixel reconstruction without
+importing this module.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+CANVAS = (640, 440)
+BACKGROUND = (249, 248, 244)
+PALETTE = {
+    "red": (215, 58, 67),
+    "blue": (48, 103, 202),
+    "green": (42, 163, 103),
+}
+COLORS = ("red", "blue", "green")
+DOT_COUNT = 12
+GRID_OFFSETS = np.array(
+    [[x, y] for y in (-32.0, 0.0, 32.0) for x in (-57.0, -19.0, 19.0, 57.0)],
+    dtype=float,
+)
+_EPS = 1e-9
+
+
+def _as_points(points: Iterable[Iterable[float]]) -> np.ndarray:
+    values = np.asarray(list(points), dtype=float)
+    if values.shape != (DOT_COUNT, 2):
+        return np.empty((0, 2), dtype=float)
+    return values
+
+
+def _group_centers(values: np.ndarray, group_size: int) -> np.ndarray:
+    ordered = np.sort(values)
+    return np.asarray(
+        [float(np.mean(ordered[start : start + group_size])) for start in range(0, len(ordered), group_size)],
+        dtype=float,
+    )
+
+
+def lattice_score(points: Iterable[Iterable[float]]) -> float:
+    """Return a bounded score for complete rectangular 4-by-3 occupancy."""
+
+    values = _as_points(points)
+    if len(values) != DOT_COUNT:
+        return 0.0
+    centered = values - np.mean(values, axis=0, keepdims=True)
+    covariance = centered.T @ centered / float(len(values))
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    major = eigenvectors[:, int(np.argmax(eigenvalues))]
+    major = major / max(float(np.linalg.norm(major)), _EPS)
+    minor = np.array([-major[1], major[0]], dtype=float)
+    u = centered @ major
+    v = centered @ minor
+
+    x_centers = _group_centers(u, 3)
+    y_centers = _group_centers(v, 4)
+    x_gaps = np.diff(x_centers)
+    y_gaps = np.diff(y_centers)
+    if len(x_gaps) != 3 or len(y_gaps) != 2:
+        return 0.0
+    x_step = max(float(np.mean(np.abs(x_gaps))), 1.0)
+    y_step = max(float(np.mean(np.abs(y_gaps))), 1.0)
+    x_index = np.argmin(np.abs(u[:, None] - x_centers[None, :]), axis=1)
+    y_index = np.argmin(np.abs(v[:, None] - y_centers[None, :]), axis=1)
+    x_residual = float(np.sqrt(np.mean((u - x_centers[x_index]) ** 2)) / x_step)
+    y_residual = float(np.sqrt(np.mean((v - y_centers[y_index]) ** 2)) / y_step)
+    x_cv = float(np.std(np.abs(x_gaps)) / x_step)
+    y_cv = float(np.std(np.abs(y_gaps)) / y_step)
+
+    cells = {(int(ix), int(iy)) for ix, iy in zip(x_index, y_index)}
+    occupancy = len(cells) / 12.0
+
+    error = 2.8 * (x_residual + y_residual) + 1.8 * (x_cv + y_cv)
+    return float(occupancy * math.exp(-error))
+
+
+def _rotate(local: np.ndarray, angle: float) -> np.ndarray:
+    c = math.cos(angle)
+    s = math.sin(angle)
+    matrix = np.array([[c, -s], [s, c]], dtype=float)
+    return local @ matrix.T
+
+
+def _normalize_local(local: np.ndarray) -> np.ndarray:
+    centered = local - np.mean(local, axis=0, keepdims=True)
+    x_scale = max(float(np.max(np.abs(centered[:, 0]))), 1.0)
+    y_scale = max(float(np.max(np.abs(centered[:, 1]))), 1.0)
+    return centered / np.array([x_scale, y_scale]) * np.array([57.0, 32.0])
+
+
+def _make_local(mode: int, rng: np.random.Generator) -> np.ndarray:
+    if mode == 0:
+        local = GRID_OFFSETS + rng.normal(0.0, 0.42, size=(DOT_COUNT, 2))
+    elif mode == 1:
+        local = GRID_OFFSETS.copy()
+        row_shift = (-12.0, 12.0, -12.0)
+        for row in range(3):
+            local[row * 4 : row * 4 + 4, 0] += row_shift[row]
+        local += rng.normal(0.0, 1.3, size=(DOT_COUNT, 2))
+    else:
+        local = GRID_OFFSETS.copy()
+        column_shift = (-10.0, 10.0, -10.0, 10.0)
+        for column in range(4):
+            local[column::4, 1] += column_shift[column]
+        local += rng.normal(0.0, 1.3, size=(DOT_COUNT, 2))
+    return _normalize_local(local)
+
+
+def sample_scene(seed: int) -> dict:
+    rng = np.random.default_rng(int(seed))
+    true_color = COLORS[int(rng.integers(0, len(COLORS)))]
+    modes = [1, 2, 0]
+    rng.shuffle(modes)
+    true_index = COLORS.index(true_color)
+    modes[true_index] = 0
+    remaining = [1, 2]
+    for index in range(len(modes)):
+        if index == true_index:
+            continue
+        modes[index] = remaining.pop(0) if modes[index] == 0 else modes[index]
+    # The loop above can leave duplicate decoy modes after the true slot is set;
+    # deterministically repair that without making the answer depend on mode.
+    decoy_modes = [1, 2]
+    rng.shuffle(decoy_modes)
+    for index in range(len(modes)):
+        if index != true_index:
+            modes[index] = decoy_modes.pop()
+
+    slots = np.asarray([[132.0, 126.0], [318.0, 300.0], [508.0, 142.0]], dtype=float)
+    rng.shuffle(slots, axis=0)
+    fields = []
+    radius = float(rng.uniform(6.0, 8.0))
+    for index, color in enumerate(COLORS):
+        center = slots[index] + rng.normal(0.0, 6.0, size=2)
+        angle = float(rng.uniform(-math.pi * 0.43, math.pi * 0.43))
+        local = _rotate(_make_local(modes[index], rng), angle)
+        points = local + center
+        order = rng.permutation(DOT_COUNT)
+        fields.append(
+            {
+                "color": color,
+                "points": [[round(float(x), 4), round(float(y), 4)] for x, y in points[order]],
+            }
+        )
+    return {
+        "canvas": [CANVAS[0], CANVAS[1]],
+        "dot_radius": round(radius, 4),
+        "fields": fields,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    width, height = (int(value) for value in scene["canvas"])
+    image = Image.new("RGB", (width, height), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    radius = float(scene["dot_radius"])
+    for field in scene["fields"]:
+        color = PALETTE[field["color"]]
+        for x, y in field["points"]:
+            cx = float(x)
+            cy = float(y)
+            draw.ellipse(
+                [
+                    int(round(cx - radius)),
+                    int(round(cy - radius)),
+                    int(round(cx + radius)),
+                    int(round(cy + radius)),
+                ],
+                fill=color,
+            )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = [(lattice_score(field["points"]), field["color"]) for field in scene["fields"]]
+    scores.sort(key=lambda item: (-item[0], COLORS.index(item[1])))
+    return scores[0][1]
+
+
+def margin(scene: dict) -> float:
+    scores = sorted((lattice_score(field["points"]) for field in scene["fields"]), reverse=True)
+    if len(scores) < 2:
+        return 0.0
+    return round(float(scores[0] - scores[1]), 8)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 0.06
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    for field in twin["fields"]:
+        field["points"] = list(reversed(field["points"]))
+    return [("reverse_visible_point_order", twin)]

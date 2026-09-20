@@ -1,0 +1,148 @@
+"""Independent image-only parser and replay arm for the line-push grammar."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+INK_LIMIT = 70
+QUERY = (218, 35, 178)
+CRATE_COLORS = {
+    (220, 58, 48), (35, 116, 210), (32, 162, 92),
+    (235, 118, 32), (44, 138, 194), (103, 78, 191),
+    (202, 54, 126), (19, 151, 151), (102, 139, 35),
+}
+
+
+def _mask_for(arr: np.ndarray, colors: set[tuple[int, int, int]]) -> np.ndarray:
+    mask = np.zeros(arr.shape[:2], dtype=bool)
+    for color in colors:
+        mask |= np.all(arr == np.asarray(color, dtype=np.uint8), axis=2)
+    return mask
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            py, px = queue.popleft()
+            points.append((py, px))
+            for ny, nx in ((py - 1, px), (py + 1, px), (py, px - 1), (py, px + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            ys = [point[0] for point in points]
+            xs = [point[1] for point in points]
+            output.append({"area": len(points), "box": (min(xs), min(ys), max(xs), max(ys)), "cx": sum(xs) / len(xs), "cy": sum(ys) / len(ys)})
+    return output
+
+
+def _parse_boxes(black: np.ndarray) -> tuple[list[dict], list[dict]]:
+    large = _components(black, minimum=250)
+    bays, cards = [], []
+    for item in large:
+        x0, y0, x1, y1 = item["box"]
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if 120 <= width <= 150 and 130 <= height <= 155:
+            bays.append(item)
+        elif 95 <= width <= 120 and 185 <= height <= 210:
+            cards.append(item)
+    bays.sort(key=lambda item: item["cx"])
+    cards.sort(key=lambda item: item["cx"])
+    if len(bays) != 4 or len(cards) != 6:
+        raise ValueError(f"visual grammar damaged: found {len(bays)} bays and {len(cards)} cards")
+    return bays, cards
+
+
+def _nearest_bay(cx: float, bays: list[dict]) -> int:
+    distances = [abs(cx - bay["cx"]) for bay in bays]
+    order = sorted(range(4), key=lambda index: distances[index])
+    if distances[order[1]] - distances[order[0]] < 35:
+        raise ValueError("crate bay is ambiguous")
+    return order[0] + 1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 300 or arr.shape[1] < 600:
+        raise ValueError("image is too small")
+    black = np.all(arr < INK_LIMIT, axis=2)
+    bays, cards = _parse_boxes(black)
+
+    # Verify the public bay labels, not merely their x-order.
+    for expected, bay in enumerate(bays, start=1):
+        x0, _, x1, _ = bay["box"]
+        dots = [c for c in _components(black[82:101, x0 + 10:x1 - 9], minimum=30) if c["area"] < 110]
+        if len(dots) != expected:
+            raise ValueError(f"bay label damaged: expected {expected} dots, found {len(dots)}")
+
+    color_components: dict[tuple[int, int, int], list[dict]] = {}
+    for color in CRATE_COLORS:
+        comps = _components(_mask_for(arr, {color}), minimum=500)
+        if comps:
+            color_components[color] = comps
+    active = {color: comps for color, comps in color_components.items() if any(comp["cy"] < 225 for comp in comps)}
+    if len(active) != 3:
+        raise ValueError(f"expected three crate identities, found {len(active)}")
+
+    positions: dict[tuple[int, int, int], int] = {}
+    for color, comps in active.items():
+        top = [comp for comp in comps if comp["cy"] < 225]
+        if len(top) != 1:
+            raise ValueError("crate identity evidence is incomplete")
+        positions[color] = _nearest_bay(top[0]["cx"], bays)
+    if len(set(positions.values())) != 3:
+        raise ValueError("initial crate occupancy is ambiguous")
+
+    query_parts = [c for c in _components(_mask_for(arr, {QUERY}), minimum=300) if c["cy"] < 225]
+    if len(query_parts) != 1:
+        raise ValueError("query-ring evidence damaged")
+    qx = query_parts[0]["cx"]
+    query = min(active, key=lambda color: abs(next(c for c in active[color] if c["cy"] < 225)["cx"] - qx))
+    if abs(next(c for c in active[query] if c["cy"] < 225)["cx"] - qx) > 8:
+        raise ValueError("query identity is ambiguous")
+
+    commands = []
+    for card in cards:
+        x0, y0, x1, y1 = card["box"]
+        candidates = []
+        for color in active:
+            area = int(_mask_for(arr[y0 + 8:y1 - 7, x0 + 8:x1 - 7], {color}).sum())
+            if area > 2500:
+                candidates.append(color)
+        if len(candidates) != 1:
+            raise ValueError("card identity is ambiguous")
+        arrow = black[332:391, x0 + 12:x1 - 11]
+        ys, xs = np.nonzero(arrow)
+        if len(xs) < 500:
+            raise ValueError("arrow evidence damaged")
+        center = (arrow.shape[1] - 1) / 2
+        displacement = float(xs.mean() - center)
+        if abs(displacement) < 2.0:
+            raise ValueError("arrow direction is ambiguous")
+        commands.append((candidates[0], "right" if displacement > 0 else "left"))
+
+    pos = dict(positions)
+    for name, direction in commands:
+        step = 1 if direction == "right" else -1
+        occupied = {slot: crate for crate, slot in pos.items()}
+        cursor = pos[name] + step
+        chain = [name]
+        while 1 <= cursor <= 4 and cursor in occupied:
+            chain.append(occupied[cursor])
+            cursor += step
+        if not 1 <= cursor <= 4:
+            continue
+        for crate in reversed(chain):
+            pos[crate] += step
+    return str(pos[query])

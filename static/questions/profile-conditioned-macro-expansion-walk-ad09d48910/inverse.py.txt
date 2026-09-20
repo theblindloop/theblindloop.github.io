@@ -1,0 +1,180 @@
+"""Scene-free pixel inverse arm for macro_expansion_walk.
+
+Receives one RGB image and the public question contract only. It re-finds the
+track, the ringed start cell, the programme row and the legend rows, reads each
+legend row's triangle directions from ink asymmetry, dereferences every
+programme badge to its legend row by badge colour, replays the moves and names
+the cell the marker finishes on.
+
+It imports no renderer, prompt, generator, verifier or analytic-gold code and
+never sees latent scene data. Ambiguous or unreadable pictures abstain with
+"unresolved".
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "macro_expansion_walk-oracle-0.1.0"
+
+BG = (250, 247, 240)
+ARROW_RGB = (55, 60, 70)
+RING_RGB = (20, 20, 20)
+N_CELLS = 7
+ROW_SPLIT = 40
+
+PALETTE = (
+    ("red", (214, 45, 40)),
+    ("orange", (235, 130, 25)),
+    ("yellow", (240, 205, 40)),
+    ("green", (40, 150, 70)),
+    ("blue", (40, 95, 200)),
+    ("purple", (130, 60, 175)),
+    ("brown", (140, 85, 45)),
+    ("teal", (20, 150, 150)),
+)
+
+UNRESOLVED = "unresolved"
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """4-connected components of a boolean mask, as (N, 2) row/col arrays."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pix) >= 200:
+            out.append(np.array(pix, dtype=np.int32))
+    return out
+
+
+def _describe(arr: np.ndarray, pix: np.ndarray) -> dict:
+    ys, xs = pix[:, 0], pix[:, 1]
+    colors = arr[ys, xs]
+    counts = Counter(map(tuple, colors.tolist()))
+    dom, _ = counts.most_common(1)[0]
+    return {
+        "y0": int(ys.min()),
+        "y1": int(ys.max()),
+        "x0": int(xs.min()),
+        "x1": int(xs.max()),
+        "cy": float(ys.mean()),
+        "cx": float(xs.mean()),
+        "n": int(len(ys)),
+        "rgb": tuple(int(v) for v in dom),
+        "pix": pix,
+    }
+
+
+def _rows(comps: list[dict]) -> list[list[dict]]:
+    ordered = sorted(comps, key=lambda c: c["cy"])
+    rows: list[list[dict]] = [[ordered[0]]]
+    for comp in ordered[1:]:
+        if comp["cy"] - rows[-1][-1]["cy"] > ROW_SPLIT:
+            rows.append([comp])
+        else:
+            rows[-1].append(comp)
+    for row in rows:
+        row.sort(key=lambda c: c["cx"])
+    return rows
+
+
+def _arrow_direction(comp: dict) -> int:
+    """+1 when the triangle points right: its apex side carries less ink."""
+    mid = (comp["x0"] + comp["x1"]) / 2.0
+    left = int((comp["pix"][:, 1] < mid).sum())
+    right = int((comp["pix"][:, 1] > mid).sum())
+    if left == right:
+        return 0
+    return 1 if left > right else -1
+
+
+def _name(rgb) -> str:
+    def d(c):
+        return sum((int(a) - int(b)) ** 2 for a, b in zip(c, rgb)) ** 0.5
+
+    return min(PALETTE, key=lambda p: d(p[1]))[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    bg = np.array(BG, dtype=np.uint8)
+    mask = np.any(arr != bg, axis=2)
+    comps = [_describe(arr, pix) for pix in _components(mask)]
+    if len(comps) < N_CELLS + 2:
+        return UNRESOLVED
+
+    rows = _rows(comps)
+    if len(rows) < 3:
+        return UNRESOLVED
+
+    track = rows[-1]
+    if len(track) != N_CELLS:
+        return UNRESOLVED
+
+    upper = rows[:-1]
+    prog_rows = [r for r in upper if not any(c["rgb"] == ARROW_RGB for c in r)]
+    legend_rows = [r for r in upper if any(c["rgb"] == ARROW_RGB for c in r)]
+    if len(prog_rows) != 1 or not legend_rows:
+        return UNRESOLVED
+    programme = prog_rows[0]
+
+    cards: dict[tuple, list[int]] = {}
+    for row in legend_rows:
+        badges = [c for c in row if c["rgb"] != ARROW_RGB]
+        arrows = [c for c in row if c["rgb"] == ARROW_RGB]
+        if len(badges) != 1 or not arrows:
+            return UNRESOLVED
+        if badges[0]["cx"] > min(a["cx"] for a in arrows):
+            return UNRESOLVED  # the badge must lead its own row
+        steps = [_arrow_direction(a) for a in arrows]
+        if any(s == 0 for s in steps):
+            return UNRESOLVED
+        key = badges[0]["rgb"]
+        if key in cards:
+            return UNRESOLVED  # two legend rows share a badge colour
+        cards[key] = steps
+
+    # ringed start cell: the black ring sits inside exactly one track cell
+    ring = np.all(np.abs(arr.astype(np.int16) - np.array(RING_RGB, dtype=np.int16)) <= 6, axis=2)
+    ry, rx = np.nonzero(ring)
+    if len(ry) < 50:
+        return UNRESOLVED
+    cxr, cyr = float(rx.mean()), float(ry.mean())
+    start = None
+    for i, cell in enumerate(track):
+        if cell["x0"] <= cxr <= cell["x1"] and cell["y0"] <= cyr <= cell["y1"]:
+            start = i
+    if start is None:
+        return UNRESOLVED
+
+    pos = start
+    for badge in programme:
+        steps = cards.get(badge["rgb"])
+        if steps is None:
+            return UNRESOLVED
+        for step in steps:
+            pos += step
+            if pos < 0 or pos >= N_CELLS:
+                return UNRESOLVED
+    if pos == start:
+        return UNRESOLVED
+
+    direction = "right" if pos > start else "left"
+    return f"{_name(track[pos]['rgb'])}|{direction}"

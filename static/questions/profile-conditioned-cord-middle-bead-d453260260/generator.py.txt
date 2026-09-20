@@ -1,0 +1,285 @@
+"""Renderer and analytic gold for cord_middle_bead.
+
+One smooth cord is drawn as a single continuous stroke that never branches and
+never touches itself.  Three beads (red, blue, amber) sit on the cord.  The
+decision is which bead lies in the middle of the other two *when position is
+measured along the cord itself*.  The decision is invariant under reversing the
+direction of travel, so no start marker exists and no anchor is needed.
+
+Scene sampling actively decorrelates the answer from the cheap plane cue:
+the bead that lies between the other two in the picture plane is drawn from an
+independent balanced sequence, so the plane heuristic is at chance.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "cord_middle_bead-renderer-0.1.0"
+
+CANVAS = (880, 640)
+BACKGROUND = (255, 255, 255)
+CORD_COLOR = (70, 72, 78)
+STROKE = 9
+BEAD_RADIUS = 14
+
+BEAD_COLORS = {
+    "red": (214, 44, 44),
+    "blue": (36, 84, 206),
+    "amber": (240, 166, 20),
+}
+COLOR_NAMES = ("red", "blue", "amber")
+
+GRID_X0, GRID_Y0, GRID_STEP = 110, 95, 120
+GRID_COLS, GRID_ROWS = 6, 4
+JITTER = 16
+
+SAMPLE_MIN_GAP = 55.0        # sampling floor: near-boundary scenes stay in the pool
+MIN_ALONG_GAP = 110.0        # quarantine floor on the along-cord bead gap
+MIN_END_MARGIN = 70.0        # bead must not sit at the very tip of the cord
+MIN_BEAD_CLEARANCE = 30.0    # bead vs. non-local cord clearance floor
+MIN_SELF_CLEARANCE = 40.0    # cord vs. distant part of itself
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+def _self_avoiding_walk(rng: random.Random, length: int):
+    """Random self-avoiding walk on the lattice, returned as cell coordinates."""
+    for _ in range(400):
+        cur = (rng.randrange(GRID_COLS + 1), rng.randrange(GRID_ROWS + 1))
+        path = [cur]
+        seen = {cur}
+        ok = True
+        for _ in range(length - 1):
+            moves = []
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nxt = (cur[0] + dx, cur[1] + dy)
+                if 0 <= nxt[0] <= GRID_COLS and 0 <= nxt[1] <= GRID_ROWS and nxt not in seen:
+                    moves.append(nxt)
+            if not moves:
+                ok = False
+                break
+            cur = moves[rng.randrange(len(moves))]
+            path.append(cur)
+            seen.add(cur)
+        if ok:
+            return path
+    return None
+
+
+def _chaikin(pts, iterations=2):
+    out = [tuple(p) for p in pts]
+    for _ in range(iterations):
+        new = [out[0]]
+        for a, b in zip(out, out[1:]):
+            new.append((a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25))
+            new.append((a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75))
+        new.append(out[-1])
+        out = new
+    return out
+
+
+def _densify(poly, step=2.0):
+    """Resample a polyline at a fixed spacing; returns points and arc lengths."""
+    pts = [(float(poly[0][0]), float(poly[0][1]))]
+    lens = [0.0]
+    carry = 0.0
+    for (x0, y0), (x1, y1) in zip(poly, poly[1:]):
+        seg = math.hypot(x1 - x0, y1 - y0)
+        if seg <= 1e-9:
+            continue
+        t = step - carry
+        while t < seg:
+            f = t / seg
+            pts.append((x0 + (x1 - x0) * f, y0 + (y1 - y0) * f))
+            lens.append(lens[-1] + step)
+            t += step
+        carry = seg - (t - step)
+    pts.append((float(poly[-1][0]), float(poly[-1][1])))
+    lens.append(lens[-1] + carry)
+    return pts, lens
+
+
+def _point_at(pts, lens, s):
+    lo, hi = 0, len(lens) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if lens[mid] <= s:
+            lo = mid
+        else:
+            hi = mid
+    span = lens[hi] - lens[lo]
+    f = 0.0 if span <= 1e-9 else (s - lens[lo]) / span
+    return (pts[lo][0] + (pts[hi][0] - pts[lo][0]) * f,
+            pts[lo][1] + (pts[hi][1] - pts[lo][1]) * f)
+
+
+def _min_self_clearance(pts, lens, skip=90.0):
+    """Smallest distance between two cord points more than `skip` apart along it."""
+    idx = list(range(0, len(pts), 3))
+    best = 1e9
+    for ii in range(len(idx)):
+        i = idx[ii]
+        xi, yi = pts[i]
+        si = lens[i]
+        for jj in range(ii + 1, len(idx)):
+            j = idx[jj]
+            if lens[j] - si <= skip:
+                continue
+            d = math.hypot(pts[j][0] - xi, pts[j][1] - yi)
+            if d < best:
+                best = d
+    return best
+
+
+def _bead_clearance(pts, lens, s, xy, skip=60.0):
+    best = 1e9
+    for p, sl in zip(pts, lens):
+        if abs(sl - s) <= skip:
+            continue
+        d = math.hypot(p[0] - xy[0], p[1] - xy[1])
+        if d < best:
+            best = d
+    return best
+
+
+def _plane_middle(beads):
+    """Which bead lies between the other two in the picture plane (cheap cue)."""
+    best, who = None, None
+    for i in range(3):
+        j, k = [t for t in range(3) if t != i]
+        a, b, c = beads[i], beads[j], beads[k]
+        detour = (math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+                  + math.hypot(a["x"] - c["x"], a["y"] - c["y"])
+                  - math.hypot(b["x"] - c["x"], b["y"] - c["y"]))
+        if best is None or detour < best:
+            best, who = detour, beads[i]["color"]
+    return who
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _attempt(rng: random.Random):
+    walk = _self_avoiding_walk(rng, rng.randrange(12, 17))
+    if walk is None:
+        return None
+    nodes = [(GRID_X0 + cx * GRID_STEP + rng.uniform(-JITTER, JITTER),
+              GRID_Y0 + cy * GRID_STEP + rng.uniform(-JITTER, JITTER))
+             for cx, cy in walk]
+    poly = _chaikin(nodes, 2)
+    pts, lens = _densify(poly)
+    total = lens[-1]
+    if total < 900.0:
+        return None
+    if _min_self_clearance(pts, lens) < MIN_SELF_CLEARANCE:
+        return None
+
+    lo, hi = MIN_END_MARGIN, total - MIN_END_MARGIN
+    if hi - lo < 3 * MIN_ALONG_GAP:
+        return None
+    ss = sorted(rng.uniform(lo, hi) for _ in range(3))
+    gaps = [ss[1] - ss[0], ss[2] - ss[1]]
+    if min(gaps) < SAMPLE_MIN_GAP:
+        return None
+
+    names = list(COLOR_NAMES)
+    rng.shuffle(names)
+    beads = []
+    for name, s in zip(names, ss):
+        xy = _point_at(pts, lens, s)
+        beads.append({"color": name, "s": round(s, 4),
+                      "x": round(xy[0], 3), "y": round(xy[1], 3)})
+
+    clear = min(_bead_clearance(pts, lens, b["s"], (b["x"], b["y"])) for b in beads)
+    if clear < MIN_BEAD_CLEARANCE:
+        return None
+
+    scene = {
+        "canvas": list(CANVAS),
+        "background": list(BACKGROUND),
+        "cord_color": list(CORD_COLOR),
+        "stroke": STROKE,
+        "bead_radius": BEAD_RADIUS,
+        "nodes": [[round(x, 3), round(y, 3)] for x, y in nodes],
+        "beads": beads,
+        "cord_length": round(total, 3),
+        "min_along_gap": round(min(gaps), 4),
+        "bead_clearance": round(clear, 3),
+        "plane_middle": _plane_middle(beads),
+    }
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    """Balanced rejection sampling: the along-cord answer and the plane cue are
+    driven by two independent balanced sequences, so the plane cue carries no
+    information about the answer."""
+    ctrl = random.Random(f"cord_middle_bead|{seed}")
+    want_gold = COLOR_NAMES[ctrl.randrange(3)]
+    want_plane = COLOR_NAMES[ctrl.randrange(3)]
+    fallback = None
+    for attempt in range(4000):
+        rng = random.Random(f"cord_middle_bead|scene|{seed}|{attempt}")
+        scene = _attempt(rng)
+        if scene is None:
+            continue
+        if analytic_gold(scene) != want_gold:
+            continue
+        if fallback is None:
+            fallback = scene
+        if scene["plane_middle"] == want_plane:
+            return scene
+    if fallback is not None:
+        return fallback
+    raise RuntimeError(f"cord_middle_bead: sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    w, h = scene["canvas"]
+    img = Image.new("RGB", (w, h), tuple(scene["background"]))
+    dr = ImageDraw.Draw(img)
+    poly = _chaikin([tuple(p) for p in scene["nodes"]], 2)
+    dr.line([(round(x, 3), round(y, 3)) for x, y in poly],
+            fill=tuple(scene["cord_color"]), width=scene["stroke"], joint="curve")
+    r = scene["bead_radius"]
+    for bead in scene["beads"]:
+        x, y = bead["x"], bead["y"]
+        dr.ellipse([x - r, y - r, x + r, y + r], fill=BEAD_COLORS[bead["color"]])
+    return img
+
+
+# --------------------------------------------------------------------------
+# analytic gold / margin / quarantine
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    """Colour of the bead whose along-cord position is the median of the three."""
+    beads = sorted(scene["beads"], key=lambda b: b["s"])
+    return beads[1]["color"]
+
+
+def margin(scene: dict) -> float:
+    """Smaller of the two along-cord gaps between consecutive beads, in pixels.
+
+    The answer flips exactly when a neighbouring bead slides past the middle
+    bead along the cord, so this gap is the distance to the decision boundary.
+    """
+    ss = sorted(b["s"] for b in scene["beads"])
+    return round(min(ss[1] - ss[0], ss[2] - ss[1]), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < MIN_ALONG_GAP
+                or scene["bead_clearance"] < MIN_BEAD_CLEARANCE)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent aliases: every field that feeds the label is drawn."""
+    return []

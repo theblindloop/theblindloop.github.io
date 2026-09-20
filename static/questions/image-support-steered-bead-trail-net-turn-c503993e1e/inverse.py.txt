@@ -1,0 +1,152 @@
+"""Independent pixel-only inverse arm for the bead-trail net-turning world.
+
+It receives a PNG and nothing else.  Pipeline:
+
+1. darkness segmentation (clutter is pale, the trail is dark) -- hue free;
+2. connected components -> one node per dark mark, with area, bbox, centroid;
+3. marker typing by size and bbox fill ratio: the filled square is the start,
+   the large round blob is the stop;
+4. proximity-graph reconstruction of the chain: greedy nearest-neighbour walk
+   from the square, with explicit ambiguity guards;
+5. the declared global quantity: total signed turning along the recovered
+   chain, positive counter-clockwise as the page is viewed.
+
+Any structural failure (missing markers, unfollowable or incomplete chain)
+returns "abstain", which never matches a gold label.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "bead_trail_net_turn-oracle-0.1.0"
+
+DARK_LUMA = 110.0
+MIN_COMPONENT_PX = 14
+MARKER_AREA_RATIO = 1.7
+SQUARE_FILL = 0.90
+ROUND_FILL_MAX = 0.88
+STEP_SPREAD_MAX = 2.3
+NEXT_STEP_MAX = 1.9
+ABSTAIN = "abstain"
+
+
+def _dark_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    luma = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    return luma < DARK_LUMA
+
+
+def _components(mask: np.ndarray) -> list:
+    """8-connected components with area, centroid and bbox fill ratio."""
+    height, width = mask.shape
+    seen = np.zeros((height, width), dtype=bool)
+    marks = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pixels) < MIN_COMPONENT_PX:
+            continue
+        py = [pixel[0] for pixel in pixels]
+        px = [pixel[1] for pixel in pixels]
+        box = (max(py) - min(py) + 1) * (max(px) - min(px) + 1)
+        marks.append(
+            {
+                "area": len(pixels),
+                "cx": sum(px) / len(pixels) + 0.5,
+                "cy": sum(py) / len(pixels) + 0.5,
+                "fill": len(pixels) / box,
+            }
+        )
+    return marks
+
+
+def _endpoints(marks: list) -> tuple:
+    areas = sorted(mark["area"] for mark in marks)
+    median = areas[len(areas) // 2]
+    large = [mark for mark in marks if mark["area"] > MARKER_AREA_RATIO * median]
+    squares = [mark for mark in large if mark["fill"] >= SQUARE_FILL]
+    rounds = [mark for mark in large if mark["fill"] <= ROUND_FILL_MAX]
+    if len(large) != 2 or len(squares) != 1 or len(rounds) != 1:
+        return None, None
+    return squares[0], rounds[0]
+
+
+def _chain(marks: list, start: dict, stop: dict) -> list | None:
+    """Greedy nearest-neighbour walk from the square marker to the round one."""
+    nodes = [(mark["cx"], mark["cy"]) for mark in marks]
+    start_point = (start["cx"], start["cy"])
+    stop_point = (stop["cx"], stop["cy"])
+    remaining = [point for point in nodes if point not in (start_point, stop_point)]
+    order = [start_point]
+    steps = []
+    current = start_point
+    while remaining:
+        ranked = sorted(remaining + [stop_point], key=lambda point: math.dist(current, point))
+        nearest = ranked[0]
+        if nearest == stop_point:
+            return None  # the stop marker cut the walk short: chain is broken
+        if len(ranked) > 1 and math.dist(current, ranked[1]) < 1.0:
+            return None
+        if steps:
+            typical = sorted(steps)[len(steps) // 2]
+            if math.dist(current, nearest) > NEXT_STEP_MAX * typical:
+                return None
+        steps.append(math.dist(current, nearest))
+        order.append(nearest)
+        remaining.remove(nearest)
+        current = nearest
+    steps.append(math.dist(current, stop_point))
+    order.append(stop_point)
+    if min(steps) <= 0.0 or max(steps) / min(steps) > STEP_SPREAD_MAX:
+        return None
+    return order
+
+
+def _signed_turning(order: list) -> float:
+    total = 0.0
+    for index in range(1, len(order) - 1):
+        ux = order[index][0] - order[index - 1][0]
+        uy = order[index][1] - order[index - 1][1]
+        vx = order[index + 1][0] - order[index][0]
+        vy = order[index + 1][1] - order[index][1]
+        total += math.degrees(math.atan2(-(ux * vy - uy * vx), ux * vx + uy * vy))
+    return total
+
+
+def measure_net_turning(image: Image.Image) -> float | None:
+    """Net signed turning in degrees recovered from pixels, or None."""
+    marks = _components(_dark_mask(image))
+    if len(marks) < 8:
+        return None
+    start, stop = _endpoints(marks)
+    if start is None:
+        return None
+    order = _chain(marks, start, stop)
+    if order is None or len(order) < 8:
+        return None
+    return _signed_turning(order)
+
+
+def decision_from_image(image):
+    """Pixel-only decision: which way the bead trail nets its turning."""
+    net = measure_net_turning(image)
+    if net is None:
+        return ABSTAIN
+    return "counterclockwise" if net > 0.0 else "clockwise"

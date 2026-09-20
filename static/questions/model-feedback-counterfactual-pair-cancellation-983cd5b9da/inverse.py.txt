@@ -1,0 +1,185 @@
+"""Independent image-only inverse for the pair-cancellation visual grammar."""
+
+from __future__ import annotations
+
+from collections import Counter
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 760
+HEIGHT = 850
+SOURCE_CENTERS = {"S": (70, 86), "T": (276, 86), "U": (484, 86), "V": (690, 86)}
+GATE_CENTERS = {
+    "J": (145, 205), "K": (380, 205), "L": (615, 205),
+    "M": (260, 330), "N": (500, 330), "R": (380, 455),
+    "P": (380, 570),
+}
+EDGES = (
+    ("S", "J"), ("T", "J"), ("T", "K"), ("U", "K"),
+    ("U", "L"), ("V", "L"), ("J", "M"), ("K", "M"),
+    ("K", "N"), ("L", "N"), ("M", "R"), ("N", "R"),
+    ("M", "P"), ("R", "P"),
+)
+ELIGIBLE_NODES = ("J", "K", "L", "M", "N", "R")
+OPTIONS = ("A", "B", "C", "D")
+CARD_LEFTS = (12, 201, 390, 579)
+CARD_ROWS = (738, 805)
+REQUIRED_SIGNATURES = {(1, 1, 0), (0, 0, 1), (1, 1, 1), (0, 0, 0)}
+TARGET_SIGNATURE = (1, 1, 0)
+
+GATE_RGB = {"XOR": (36, 116, 216), "AND": (242, 169, 0), "OR": (135, 84, 200)}
+NODE_RGB = {
+    "J": (216, 74, 91), "K": (0, 163, 163), "L": (58, 157, 77),
+    "M": (209, 63, 165), "N": (229, 104, 30), "R": (74, 77, 179),
+}
+INK_RGB = (23, 33, 43)
+WHITE_RGB = (255, 255, 255)
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _near(arr: np.ndarray, rgb: tuple[int, int, int], radius: float) -> np.ndarray:
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int32) <= radius * radius
+
+
+def _recover_bit(arr: np.ndarray, center: tuple[int, int], name: str) -> int:
+    cx, cy = center
+    patch = arr[cy - 13:cy + 14, cx - 13:cx + 14]
+    dark = int(_near(patch, INK_RGB, 48.0).sum())
+    light = int(_near(patch, WHITE_RGB, 24.0).sum())
+    if dark >= 590 and light <= 60:
+        return 1
+    if light >= 590 and dark <= 60:
+        return 0
+    raise OracleError(f"{name} bit is missing or ambiguous")
+
+
+def _recover_gate(arr: np.ndarray, center: tuple[int, int], name: str) -> str:
+    cx, cy = center
+    radius = 29
+    patch = arr[cy - radius:cy + radius + 1, cx - radius:cx + radius + 1]
+    yy, xx = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+    annulus = ((xx * xx + yy * yy) >= 18 * 18) & ((xx * xx + yy * yy) <= 27 * 27)
+    scores = {kind: int((_near(patch, rgb, 55.0) & annulus).sum()) for kind, rgb in GATE_RGB.items()}
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if ranked[0][1] < 980 or ranked[1][1] > 130:
+        raise OracleError(f"gate {name} is missing or ambiguous: {scores}")
+    return ranked[0][0]
+
+
+def _validate_node_rims(arr: np.ndarray) -> None:
+    for name in ELIGIBLE_NODES:
+        cx, cy = GATE_CENTERS[name]
+        radius = 39
+        patch = arr[cy - radius:cy + radius + 1, cx - radius:cx + radius + 1]
+        yy, xx = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        ring = ((xx * xx + yy * yy) >= 32 * 32) & ((xx * xx + yy * yy) <= 37 * 37)
+        score = int((_near(patch, NODE_RGB[name], 52.0) & ring).sum())
+        if score < 720:
+            raise OracleError(f"colored intervention rim for {name} is missing")
+
+
+def _recover_card_node(arr: np.ndarray, left: int, cy: int, label: str) -> str:
+    patch = arr[cy - 29:cy + 30, left + 24:left + 166]
+    scores = {name: int(_near(patch, rgb, 52.0).sum()) for name, rgb in NODE_RGB.items()}
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if ranked[0][1] < 1500 or ranked[1][1] > 260:
+        raise OracleError(f"{label} node binding is missing or ambiguous: {scores}")
+    return ranked[0][0]
+
+
+def _validate_wires(arr: np.ndarray) -> None:
+    ink = _near(arr, INK_RGB, 68.0)
+    centers = {**SOURCE_CENTERS, **GATE_CENTERS}
+    for parent, child in EDGES:
+        x0, y0 = centers[parent]
+        x1, y1 = centers[child]
+        mx = int(round((x0 + x1) / 2))
+        my = int(round((y0 + y1) / 2))
+        if int(ink[my - 6:my + 7, mx - 6:mx + 7].sum()) < 22:
+            raise OracleError(f"wire {parent}->{child} is missing")
+
+
+def _gate(kind: str, left: int, right: int) -> int:
+    if kind == "XOR":
+        return int(left != right)
+    if kind == "AND":
+        return int(left == 1 and right == 1)
+    if kind == "OR":
+        return int(left == 1 or right == 1)
+    raise OracleError(f"invalid gate {kind!r}")
+
+
+def _evaluate(
+    source: dict[str, int], kinds: dict[str, str], overrides: dict[str, int] | None = None
+) -> dict[str, int]:
+    forced = {} if overrides is None else overrides
+    values = dict(source)
+    for node, left, right in (
+        ("J", "S", "T"), ("K", "T", "U"), ("L", "U", "V"),
+        ("M", "J", "K"), ("N", "K", "L"), ("R", "M", "N"),
+        ("P", "M", "R"),
+    ):
+        values[node] = _gate(kinds[node], values[left], values[right])
+        if node in forced:
+            values[node] = forced[node]
+    return values
+
+
+def _signature(
+    source: dict[str, int], kinds: dict[str, str], nodes: list[str], bits: list[int]
+) -> tuple[int, int, int]:
+    factual = _evaluate(source, kinds)["P"]
+    left = _evaluate(source, kinds, {nodes[0]: bits[0]})["P"] ^ factual
+    right = _evaluate(source, kinds, {nodes[1]: bits[1]})["P"] ^ factual
+    joint = _evaluate(source, kinds, {nodes[0]: bits[0], nodes[1]: bits[1]})["P"] ^ factual
+    return left, right, joint
+
+
+def decision_from_image(image: Image.Image) -> str:
+    if image.size != (WIDTH, HEIGHT):
+        raise OracleError(f"expected {(WIDTH, HEIGHT)} image, got {image.size}")
+    arr = np.asarray(image.convert("RGB"))
+    _validate_wires(arr)
+    _validate_node_rims(arr)
+    source = {name: _recover_bit(arr, center, name) for name, center in SOURCE_CENTERS.items()}
+    kinds = {name: _recover_gate(arr, center, name) for name, center in GATE_CENTERS.items()}
+
+    pairs: list[list[str]] = []
+    forced_bits: list[list[int]] = []
+    for option, left in zip(OPTIONS, CARD_LEFTS):
+        nodes = [
+            _recover_card_node(arr, left, cy, f"card {option} row {row_index}")
+            for row_index, cy in enumerate(CARD_ROWS, 1)
+        ]
+        if nodes[0] == nodes[1]:
+            raise OracleError(f"card {option} repeats one intervention node")
+        bits = [
+            _recover_bit(arr, (left + 135, cy), f"card {option} row {row_index}")
+            for row_index, cy in enumerate(CARD_ROWS, 1)
+        ]
+        pairs.append(nodes)
+        forced_bits.append(bits)
+
+    normalized = {tuple(sorted(pair)) for pair in pairs}
+    endpoint_counts = Counter(node for pair in pairs for node in pair)
+    if len(normalized) != 4 or set(endpoint_counts) != set(ELIGIBLE_NODES) or max(endpoint_counts.values()) > 2:
+        raise OracleError("cards do not show four varied pairs spanning all intervention nodes")
+    factual = _evaluate(source, kinds)
+    if any(bit != 1 - factual[node] for pair, bits in zip(pairs, forced_bits) for node, bit in zip(pair, bits)):
+        raise OracleError("a shown override does not change its named node's factual bit")
+
+    signatures = [
+        _signature(source, kinds, nodes, bits)
+        for nodes, bits in zip(pairs, forced_bits)
+    ]
+    if set(signatures) != REQUIRED_SIGNATURES:
+        raise OracleError("visible pairs do not realize the four required interaction signatures")
+    matches = [option for option, signature in zip(OPTIONS, signatures) if signature == TARGET_SIGNATURE]
+    if len(matches) != 1:
+        raise OracleError("visible interventions do not have a unique canceling pair")
+    return matches[0]

@@ -1,0 +1,134 @@
+"""Independent pixel-only inverse arm for the segment-betweenness world.
+
+Receives ONLY the final rasterized PNG and the public question contract (the
+visual spec). It never imports the renderer, prompt, generator, verifier, or
+analytic-gold code, and never reads scene data.
+
+Public visual spec (this file's own specification):
+
+  * the image contains four horizontal panels stacked top to bottom: the top
+    one is the ``reference`` panel; the next three are candidate panels A, B, C;
+  * every panel shows two dark-gray ``anchor`` disks and exactly one saturated
+    colored ``target`` disk; the two anchors define a segment, and the question
+    is whether the colored target lies *between* the two anchors (inside the
+    span, collinear) or clearly *beyond* one of them (past the end of the span);
+  * the task: decide which candidate panel (A, B, or C) reproduces the
+    reference's between/outside relationship (its target inside-vs-beyond its
+    own two anchors) - the candidate whose target extent relative to its own two
+    anchors matches the reference's.
+
+The oracle recovers, from pixels alone: every disk and its color, the two
+anchors and the colored target of each panel, the anchor-to-anchor line and its
+midpoint, the target's signed projection along that line, each panel's
+between/outside state, and finally which candidate matches the reference's state.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "segment_betweenness_correspondence-oracle-0.1.0"
+
+_BACKGROUND_DIST = 30.0
+_GRAY_MAX_CH = 150.0
+_GRAY_RANGE = 55.0
+_MIN_PX = 100
+_THRESH = 70.0
+_GROUP_TOL = 100.0
+
+
+def _is_background(rgb: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(rgb - np.array([255.0, 255.0, 255.0]), axis=-1) < _BACKGROUND_DIST
+
+
+def _is_gray(rgb: np.ndarray) -> bool:
+    r, g, b = (float(v) for v in rgb)
+    return max(r, g, b) < _GRAY_MAX_CH and max(r, g, b) - min(r, g, b) < _GRAY_RANGE
+
+
+def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    comps = []
+    for y in range(h):
+        for x in range(w):
+            if mask[y, x] and not visited[y, x]:
+                queue = deque([(x, y)])
+                visited[y, x] = True
+                cur = []
+                while queue:
+                    cx, cy = queue.popleft()
+                    cur.append((cx, cy))
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx_, ny_ = cx + dx, cy + dy
+                        if 0 <= nx_ < w and 0 <= ny_ < h and mask[ny_, nx_] and not visited[ny_, nx_]:
+                            visited[ny_, nx_] = True
+                            queue.append((nx_, ny_))
+                comps.append(np.array(cur, dtype=np.float32))
+    return comps
+
+
+def _panel_state(anchors: list[np.ndarray], target: np.ndarray) -> str:
+    a1, a2 = anchors
+    tx, ty = float(target[0]), float(target[1])
+    a1x, a1y = float(a1[0]), float(a1[1])
+    a2x, a2y = float(a2[0]), float(a2[1])
+    dx, dy = a2x - a1x, a2y - a1y
+    length = float(np.hypot(dx, dy))
+    if length == 0:
+        raise ValueError("degenerate anchor pair")
+    ux, uy = dx / length, dy / length
+    mx, my = (a1x + a2x) / 2.0, (a1y + a2y) / 2.0
+    offset = (tx - mx) * ux + (ty - my) * uy
+    return "between" if abs(offset) < _THRESH else "outside"
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.float32)
+    mask = ~_is_background(arr)
+    comps = [c for c in _connected_components(mask) if len(c) >= _MIN_PX]
+    if len(comps) != 12:
+        raise ValueError(f"expected 12 disks, got {len(comps)}")
+
+    disks = []
+    for comp in comps:
+        cx, cy = comp.mean(axis=0)
+        xs = comp[:, 0].astype(int)
+        ys = comp[:, 1].astype(int)
+        mean_color = arr[ys, xs].mean(axis=0)
+        disks.append({"y": float(cy), "x": float(cx), "color": mean_color})
+
+    disks.sort(key=lambda d: d["y"])
+    panels: list[list[dict]] = []
+    for disk in disks:
+        if panels and abs(disk["y"] - panels[-1][0]["y"]) < _GROUP_TOL:
+            panels[-1].append(disk)
+        else:
+            panels.append([disk])
+    if len(panels) != 4:
+        raise ValueError(f"expected 4 panels, got {len(panels)}")
+
+    states = []
+    for panel in panels:
+        if len(panel) != 3:
+            raise ValueError(f"expected 3 disks per panel, got {len(panel)}")
+        anchors = [np.array([d["x"], d["y"]]) for d in panel if _is_gray(d["color"])]
+        targets = [d for d in panel if not _is_gray(d["color"])]
+        if len(anchors) != 2 or len(targets) != 1:
+            raise ValueError("panel must contain exactly two anchors and one target")
+        states.append(_panel_state(anchors, np.array([targets[0]["x"], targets[0]["y"]])))
+
+    ref_state = states[0]
+    for i in range(1, 4):
+        if states[i] == ref_state:
+            return "ABC"[i - 1]
+    raise ValueError("no candidate reproduced the reference betweenness relationship")
+
+
+if __name__ == "__main__":
+    import sys
+    img = Image.open(sys.argv[1]).convert("RGB")
+    print(decision_from_image(img))

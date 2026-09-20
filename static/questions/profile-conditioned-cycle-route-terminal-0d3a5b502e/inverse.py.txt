@@ -1,0 +1,283 @@
+"""Independent pixel-only inverse for cycle-route terminal identity."""
+
+from __future__ import annotations
+
+import sys
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "cycle_route_terminal-oracle-0.1.0"
+
+
+def _marker_center(arr: np.ndarray, name: str) -> tuple[float, float] | None:
+    red, green, blue = [arr[:, :, index].astype(np.int16) for index in range(3)]
+    if name == "red":
+        mask = (red > 135) & (red > green + 55) & (red > blue + 55)
+    elif name == "blue":
+        mask = (blue > 120) & (blue > red + 30) & (blue > green + 12)
+    elif name == "green":
+        mask = (green > 105) & (green > red + 30) & (green > blue + 8)
+    else:
+        raise ValueError(name)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 250:
+        return None
+    return float(xs.mean()), float(ys.mean())
+
+
+def _thin(binary: np.ndarray) -> np.ndarray:
+    """Zhang-Suen thinning on a small binary network mask."""
+    image = binary.copy().astype(bool)
+    for _ in range(80):
+        changed = False
+        for phase in (0, 1):
+            padded = np.pad(image, 1, mode="constant")
+            north = padded[:-2, 1:-1]
+            ne = padded[:-2, 2:]
+            east = padded[1:-1, 2:]
+            se = padded[2:, 2:]
+            south = padded[2:, 1:-1]
+            sw = padded[2:, :-2]
+            west = padded[1:-1, :-2]
+            nw = padded[:-2, :-2]
+            neighbors = north.astype(np.uint8) + ne + east + se + south + sw + west + nw
+            transitions = (
+                ((~north) & ne).astype(np.uint8)
+                + ((~ne) & east).astype(np.uint8)
+                + ((~east) & se).astype(np.uint8)
+                + ((~se) & south).astype(np.uint8)
+                + ((~south) & sw).astype(np.uint8)
+                + ((~sw) & west).astype(np.uint8)
+                + ((~west) & nw).astype(np.uint8)
+                + ((~nw) & north).astype(np.uint8)
+            )
+            if phase == 0:
+                keep_condition = (~north | ~east | ~south) & (~east | ~south | ~west)
+            else:
+                keep_condition = (~north | ~east | ~west) & (~north | ~south | ~west)
+            remove = image & (neighbors >= 2) & (neighbors <= 6) & (transitions == 1) & keep_condition
+            if bool(remove.any()):
+                image[remove] = False
+                changed = True
+        if not changed:
+            break
+    return image
+
+
+def _nearest_pixel(skeleton: np.ndarray, center: tuple[float, float], scale: int) -> tuple[int, int] | None:
+    ys, xs = np.nonzero(skeleton)
+    if len(xs) == 0:
+        return None
+    cx, cy = center[0] / scale, center[1] / scale
+    distances = (xs.astype(np.float64) - cx) ** 2 + (ys.astype(np.float64) - cy) ** 2
+    index = int(np.argmin(distances))
+    if float(distances[index]) > 45.0**2:
+        return None
+    return int(ys[index]), int(xs[index])
+
+
+def _count_paths(skeleton: np.ndarray, start: tuple[int, int], target: tuple[int, int]) -> int:
+    height, width = skeleton.shape
+    sys.setrecursionlimit(max(10000, height * width // 2))
+    path: set[tuple[int, int]] = set()
+    directions = (
+        (-1, -1), (-1, 0), (-1, 1), (0, -1),
+        (0, 1), (1, -1), (1, 0), (1, 1),
+    )
+
+    def visit(node: tuple[int, int]) -> int:
+        if node == target:
+            return 1
+        path.add(node)
+        total = 0
+        y, x = node
+        for dy, dx in directions:
+            ny, nx = y + dy, x + dx
+            if not (0 <= ny < height and 0 <= nx < width) or not skeleton[ny, nx]:
+                continue
+            neighbor = (ny, nx)
+            if neighbor in path:
+                continue
+            total += visit(neighbor)
+            if total >= 2:
+                total = 2
+                break
+        path.remove(node)
+        return total
+
+    return visit(start)
+
+
+def _two_core(skeleton: np.ndarray) -> np.ndarray:
+    """Keep pixels that belong to a visible closed route, contracting leaf arms."""
+    core = skeleton.copy()
+    height, width = core.shape
+    directions = (
+        (-1, -1), (-1, 0), (-1, 1), (0, -1),
+        (0, 1), (1, -1), (1, 0), (1, 1),
+    )
+    changed = True
+    while changed:
+        padded = np.pad(core, 1, mode="constant")
+        degree = np.zeros_like(core, dtype=np.uint8)
+        for dy, dx in directions:
+            degree += padded[1 + dy : 1 + dy + height, 1 + dx : 1 + dx + width]
+        remove = core & (degree < 2)
+        changed = bool(remove.any())
+        core[remove] = False
+    return core
+
+
+def _cycle_core(skeleton: np.ndarray) -> np.ndarray:
+    """Find the largest edge-biconnected pixel component.
+
+    Eight-neighbour skeletons can make a tiny triangular pixel loop where a
+    thick T-junction turns.  Bridge detection separates that raster artifact
+    from the deliberately large rectangular loop.
+    """
+    height, width = skeleton.shape
+    directions = (
+        (-1, -1), (-1, 0), (-1, 1), (0, -1),
+        (0, 1), (1, -1), (1, 0), (1, 1),
+    )
+    nodes = [tuple(value) for value in np.argwhere(skeleton)]
+    node_set = set(nodes)
+    adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {node: [] for node in nodes}
+    for y, x in nodes:
+        for dy, dx in directions:
+            neighbor = (y + dy, x + dx)
+            if neighbor in node_set:
+                adjacency[(y, x)].append(neighbor)
+
+    discovered: dict[tuple[int, int], int] = {}
+    low: dict[tuple[int, int], int] = {}
+    bridges: set[frozenset[tuple[int, int]]] = set()
+    clock = 0
+
+    def edge(left: tuple[int, int], right: tuple[int, int]) -> frozenset[tuple[int, int]]:
+        return frozenset((left, right))
+
+    def visit(node: tuple[int, int], parent: tuple[int, int] | None) -> None:
+        nonlocal clock
+        clock += 1
+        discovered[node] = low[node] = clock
+        for neighbor in adjacency[node]:
+            if neighbor == parent:
+                continue
+            if neighbor not in discovered:
+                visit(neighbor, node)
+                low[node] = min(low[node], low[neighbor])
+                if low[neighbor] > discovered[node]:
+                    bridges.add(edge(node, neighbor))
+            else:
+                low[node] = min(low[node], discovered[neighbor])
+
+    for node in nodes:
+        if node not in discovered:
+            visit(node, None)
+
+    nonbridge_adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {
+        node: [] for node in nodes
+    }
+    for node in nodes:
+        for neighbor in adjacency[node]:
+            if edge(node, neighbor) not in bridges:
+                nonbridge_adjacency[node].append(neighbor)
+
+    components: list[set[tuple[int, int]]] = []
+    remaining = {node for node in nodes if nonbridge_adjacency[node]}
+    while remaining:
+        root = next(iter(remaining))
+        component = {root}
+        queue = [root]
+        remaining.remove(root)
+        for node in queue:
+            for neighbor in nonbridge_adjacency[node]:
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    component.add(neighbor)
+                    queue.append(neighbor)
+        components.append(component)
+    if not components:
+        return np.zeros_like(skeleton, dtype=bool)
+    chosen = max(components, key=len)
+    result = np.zeros_like(skeleton, dtype=bool)
+    for y, x in chosen:
+        result[y, x] = True
+    return result
+
+
+def _shortest_path_hits_core(
+    skeleton: np.ndarray,
+    core: np.ndarray,
+    start: tuple[int, int],
+    target: tuple[int, int],
+) -> bool:
+    """Test whether a shortest source-to-target trace crosses the cycle core."""
+    height, width = skeleton.shape
+    directions = (
+        (-1, -1), (-1, 0), (-1, 1), (0, -1),
+        (0, 1), (1, -1), (1, 0), (1, 1),
+    )
+    queue = [start]
+    previous: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+    for node in queue:
+        if node == target:
+            break
+        y, x = node
+        for dy, dx in directions:
+            ny, nx = y + dy, x + dx
+            neighbor = (ny, nx)
+            if not (0 <= ny < height and 0 <= nx < width):
+                continue
+            if not skeleton[ny, nx] or neighbor in previous:
+                continue
+            previous[neighbor] = node
+            queue.append(neighbor)
+    if target not in previous:
+        return False
+    node: tuple[int, int] | None = target
+    while node is not None:
+        if core[node]:
+            return True
+        node = previous[node]
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return red/blue only when the raster exposes an unambiguous topology."""
+    try:
+        arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        green_center = _marker_center(arr, "green")
+        red_center = _marker_center(arr, "red")
+        blue_center = _marker_center(arr, "blue")
+        if green_center is None or red_center is None or blue_center is None:
+            return "unknown"
+
+        # The route ink is substantially darker than the pale distractors and
+        # the three colored disks.  A 4x block reduction retains the 11--14 px
+        # route stroke while making thinning cheap and stable.
+        dark = arr.max(axis=2) < 120
+        scale = 4
+        small_height = dark.shape[0] // scale
+        small_width = dark.shape[1] // scale
+        reduced = dark[: small_height * scale, : small_width * scale].reshape(
+            small_height, scale, small_width, scale
+        ).any(axis=(1, 3))
+        skeleton = _thin(reduced)
+        start = _nearest_pixel(skeleton, green_center, scale)
+        red_target = _nearest_pixel(skeleton, red_center, scale)
+        blue_target = _nearest_pixel(skeleton, blue_center, scale)
+        if start is None or red_target is None or blue_target is None:
+            return "unknown"
+        core = _cycle_core(skeleton)
+        red_has_alternate = _shortest_path_hits_core(skeleton, core, start, red_target)
+        blue_has_alternate = _shortest_path_hits_core(skeleton, core, start, blue_target)
+        if red_has_alternate and not blue_has_alternate:
+            return "red"
+        if blue_has_alternate and not red_has_alternate:
+            return "blue"
+        return "unknown"
+    except (IndexError, KeyError, TypeError, ValueError, RecursionError):
+        return "unknown"

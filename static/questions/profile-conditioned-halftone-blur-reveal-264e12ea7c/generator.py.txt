@@ -1,0 +1,154 @@
+"""Deterministic high-frequency halftone scene sampler and renderer."""
+
+from __future__ import annotations
+
+import copy
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 480, 420
+GRID, CELL, MICRO = 17, 16, 4
+FIELD = GRID * CELL
+SYMBOLS = ("circle", "triangle", "plus", "x")
+QUARANTINE_MARGIN = 0.12
+FRAME_RGB = (20, 174, 196)
+
+PALETTES = (
+    {"bg": [247, 244, 236], "dark": [24, 28, 34], "light": [218, 224, 229], "shift": 30,
+     "clutter": [[210, 96, 73], [103, 88, 127]]},
+    {"bg": [240, 247, 249], "dark": [30, 25, 42], "light": [222, 228, 220], "shift": 28,
+     "clutter": [[211, 93, 112], [102, 103, 80]]},
+    {"bg": [248, 242, 248], "dark": [20, 35, 32], "light": [224, 218, 232], "shift": 32,
+     "clutter": [[203, 104, 53], [85, 105, 122]]},
+)
+
+
+def _distance_to_segment(xx: np.ndarray, yy: np.ndarray, a: tuple[float, float], b: tuple[float, float]) -> np.ndarray:
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    t = np.clip(((xx - ax) * vx + (yy - ay) * vy) / (vx * vx + vy * vy), 0.0, 1.0)
+    return np.hypot(xx - (ax + t * vx), yy - (ay + t * vy))
+
+
+def _templates() -> dict[str, np.ndarray]:
+    yy, xx = np.mgrid[:GRID, :GRID]
+    c = 8
+    rr = np.hypot(xx - c, yy - c)
+    circle = (rr >= 5.0) & (rr <= 6.5)
+    triangle = np.minimum.reduce([
+        _distance_to_segment(xx, yy, (8, 2), (2, 14)),
+        _distance_to_segment(xx, yy, (2, 14), (14, 14)),
+        _distance_to_segment(xx, yy, (14, 14), (8, 2)),
+    ]) <= 0.9
+    plus = (((np.abs(xx - c) <= 1) & (np.abs(yy - c) <= 6)) |
+            ((np.abs(yy - c) <= 1) & (np.abs(xx - c) <= 6)))
+    cross = (((np.abs((xx - c) - (yy - c)) <= 1) |
+              (np.abs((xx - c) + (yy - c)) <= 1)) &
+             (np.abs(xx - c) <= 6) & (np.abs(yy - c) <= 6))
+    plus[c, c] = False
+    cross[c, c] = False
+    masks = {"circle": circle, "triangle": triangle, "plus": plus, "x": cross}
+    assert {int(mask.sum()) for mask in masks.values()} == {68}
+    return masks
+
+
+TEMPLATES = _templates()
+
+
+def _encoded_mask(scene: dict) -> np.ndarray:
+    mask = TEMPLATES[scene["symbol"]].copy()
+    for off, on in scene["cell_noise"]:
+        oy, ox = off
+        ny, nx = on
+        mask[oy, ox] = False
+        mask[ny, nx] = True
+    return mask
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    symbol = SYMBOLS[int(seed) % len(SYMBOLS)]
+    base = TEMPLATES[symbol]
+    on_cells = list(zip(*np.nonzero(base), strict=True))
+    off_cells = list(zip(*np.nonzero(~base), strict=True))
+    rng.shuffle(on_cells)
+    rng.shuffle(off_cells)
+    flips = rng.randrange(4)
+    cell_noise = [
+        [[int(y), int(x)], [int(ny), int(nx)]]
+        for (y, x), (ny, nx) in zip(on_cells[:flips], off_cells[:flips], strict=True)
+    ]
+    phases = [[rng.randrange(2) for _ in range(GRID)] for _ in range(GRID)]
+    offset = [rng.randrange(72, 120), rng.randrange(55, 87)]
+    clutter = []
+    for index in range(7):
+        side = index % 2
+        cx = rng.uniform(20, 57) if side == 0 else rng.uniform(422, 463)
+        cy = rng.uniform(45, 380)
+        clutter.append({
+            "x": round(cx, 3), "y": round(cy, 3), "r": round(rng.uniform(6, 15), 3),
+            "kind": rng.randrange(2), "color": index % 2,
+        })
+    return {
+        "symbol": symbol,
+        "offset": offset,
+        "palette": copy.deepcopy(PALETTES[rng.randrange(len(PALETTES))]),
+        "phase": phases,
+        "cell_noise": cell_noise,
+        "clutter": clutter,
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["symbol"])
+
+
+def margin(scene: dict) -> float:
+    observed = _encoded_mask(scene)
+    scores = sorted((1.0 - float(np.mean(observed != mask)) for mask in TEMPLATES.values()), reverse=True)
+    return round(scores[0] - scores[1], 12)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []
+
+
+def render(scene: dict) -> Image.Image:
+    palette = scene["palette"]
+    image = Image.new("RGB", (WIDTH, HEIGHT), tuple(palette["bg"]))
+    draw = ImageDraw.Draw(image)
+    for item in scene["clutter"]:
+        x, y, r = item["x"], item["y"], item["r"]
+        color = tuple(palette["clutter"][item["color"]])
+        if item["kind"] == 0:
+            draw.ellipse((x-r, y-r, x+r, y+r), outline=color, width=3)
+        else:
+            draw.polygon([(x, y-r), (x-r, y+r), (x+r, y+r)], outline=color, width=3)
+
+    ox, oy = scene["offset"]
+    mask = _encoded_mask(scene)
+    dark = np.asarray(palette["dark"], dtype=int)
+    light = np.asarray(palette["light"], dtype=int)
+    shift = int(palette["shift"])
+    for row in range(GRID):
+        for col in range(GRID):
+            encoded = bool(mask[row, col])
+            phase = int(scene["phase"][row][col])
+            for my in range(MICRO):
+                for mx in range(MICRO):
+                    high = ((mx + my + phase) & 1) == 1
+                    rgb = light if high else dark
+                    if not encoded:
+                        rgb = np.minimum(255, rgb + shift)
+                    x0 = ox + col * CELL + mx * (CELL // MICRO)
+                    y0 = oy + row * CELL + my * (CELL // MICRO)
+                    draw.rectangle((x0, y0, x0 + CELL // MICRO - 1, y0 + CELL // MICRO - 1), fill=tuple(int(v) for v in rgb))
+    draw.rectangle((ox-5, oy-5, ox+FIELD+4, oy+FIELD+4), outline=FRAME_RGB, width=5)
+    return image

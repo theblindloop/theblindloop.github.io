@@ -1,0 +1,357 @@
+"""Renderer and analytic gold for the pipe-path connectivity search world.
+
+Every panel holds a lattice pipe network drawn with square-ended strokes plus
+two round terminal dots.  Some pipes carry a visible centred gap.  The analytic
+gold selects the unique panel whose two terminals are joined by an unbroken
+chain of pipe, and the margin is the runner-up panel's bottleneck gap: the
+narrowest gap that would still have to be bridged there.
+"""
+
+from __future__ import annotations
+
+import heapq
+import json
+import random
+
+from PIL import Image, ImageDraw, ImageFont
+
+# ---------------------------------------------------------------- geometry --
+NX = 4  # lattice columns per panel
+NY = 5  # lattice rows per panel
+SPACING = 44  # lattice pitch in pixels
+N_PANELS = 5
+EDGES_PER_PANEL = 14
+BROKEN_PER_PANEL = 3
+TOTAL_GAP_PX = 60  # identical in every panel
+MIN_GAP_PX = 14
+MAX_GAP_PX = 26
+PORT_LATTICE_DISTANCES = (4, 5)
+
+STROKE = 7
+HALF = STROKE // 2
+PORT_RADIUS = 8
+PANEL_PAD = 22
+PANEL_W = (NX - 1) * SPACING + 2 * PANEL_PAD
+PANEL_H = (NY - 1) * SPACING + 2 * PANEL_PAD
+PANEL_GAP = 18
+OUTER = 20
+LABEL_BAND = 30
+
+WIDTH = 2 * OUTER + N_PANELS * PANEL_W + (N_PANELS - 1) * PANEL_GAP
+HEIGHT = OUTER + PANEL_H + LABEL_BAND
+
+QUARANTINE_MARGIN_PX = 12.0
+ABSENT_EDGE_GAP_PX = float(SPACING)
+
+PALETTES = (
+    {
+        "bg": (255, 255, 255),
+        "frame": (150, 150, 150),
+        "pipe": (40, 42, 50),
+        "port": (232, 120, 28),
+        "label": (110, 110, 110),
+    },
+    {
+        "bg": (250, 248, 242),
+        "frame": (158, 152, 140),
+        "pipe": (34, 48, 40),
+        "port": (214, 58, 44),
+        "label": (110, 110, 110),
+    },
+)
+
+PANEL_LABELS = tuple(f"panel-{i + 1}" for i in range(N_PANELS))
+AMBIGUOUS = "ambiguous"
+
+
+def json_clone(value):
+    return json.loads(json.dumps(value))
+
+
+# ------------------------------------------------------------ lattice graph --
+def _node(row: int, col: int) -> int:
+    return row * NX + col
+
+
+def _rowcol(node: int) -> tuple:
+    return divmod(node, NX)
+
+
+def _all_edges() -> list:
+    edges = []
+    for row in range(NY):
+        for col in range(NX):
+            if col + 1 < NX:
+                edges.append((_node(row, col), _node(row, col + 1)))
+            if row + 1 < NY:
+                edges.append((_node(row, col), _node(row + 1, col)))
+    return edges
+
+
+ALL_EDGES = tuple(_all_edges())
+
+
+def _edge_key(a: int, b: int) -> tuple:
+    return (a, b) if a < b else (b, a)
+
+
+def _gap_table(edges: list) -> dict:
+    """Map every lattice edge to the pixel gap that interrupts it."""
+    table = {_edge_key(a, b): ABSENT_EDGE_GAP_PX for a, b in ALL_EDGES}
+    for a, b, gap in edges:
+        table[_edge_key(a, b)] = float(gap)
+    return table
+
+
+def _bottleneck(edges: list, ports: list) -> float:
+    """Minimax gap over all lattice routes between the two terminals.
+
+    Zero exactly when an unbroken chain of pipe joins the two terminals.
+    """
+    table = _gap_table(edges)
+    neighbours = {node: [] for node in range(NX * NY)}
+    for (a, b), gap in table.items():
+        neighbours[a].append((b, gap))
+        neighbours[b].append((a, gap))
+    start, goal = ports
+    best = {start: 0.0}
+    queue = [(0.0, start)]
+    while queue:
+        cost, node = heapq.heappop(queue)
+        if cost > best.get(node, float("inf")):
+            continue
+        if node == goal:
+            return cost
+        for nxt, gap in neighbours[node]:
+            step = cost if cost > gap else gap
+            if step < best.get(nxt, float("inf")):
+                best[nxt] = step
+                heapq.heappush(queue, (step, nxt))
+    return ABSENT_EDGE_GAP_PX
+
+
+def _solid_components(edges: list) -> dict:
+    """Connected components using unbroken pipes only."""
+    parent = list(range(NX * NY))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b, gap in edges:
+        if gap == 0:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+    return {node: find(node) for node in range(NX * NY)}
+
+
+def _component_edge_count(edges: list, node: int) -> int:
+    comp = _solid_components(edges)
+    root = comp[node]
+    return sum(1 for a, b, gap in edges if gap == 0 and comp[a] == root)
+
+
+# ------------------------------------------------------------- scene sample --
+def _sample_gaps(rng: random.Random) -> list:
+    while True:
+        g1 = rng.randrange(MIN_GAP_PX, MAX_GAP_PX + 1, 2)
+        g2 = rng.randrange(MIN_GAP_PX, MAX_GAP_PX + 1, 2)
+        g3 = TOTAL_GAP_PX - g1 - g2
+        if MIN_GAP_PX <= g3 <= MAX_GAP_PX and g3 % 2 == 0:
+            gaps = [g1, g2, g3]
+            rng.shuffle(gaps)
+            return gaps
+
+
+def _sample_panel(rng: random.Random, connected: bool, distance: int) -> dict:
+    for _ in range(4000):
+        chosen = rng.sample(list(ALL_EDGES), EDGES_PER_PANEL)
+        gaps = _sample_gaps(rng)
+        broken_slots = rng.sample(range(EDGES_PER_PANEL), BROKEN_PER_PANEL)
+        edges = []
+        for index, (a, b) in enumerate(chosen):
+            gap = 0
+            if index in broken_slots:
+                gap = gaps[broken_slots.index(index)]
+            edges.append([a, b, gap])
+
+        incident_solid = {}
+        incident_broken = set()
+        for a, b, gap in edges:
+            if gap == 0:
+                incident_solid.setdefault(a, 0)
+                incident_solid.setdefault(b, 0)
+                incident_solid[a] += 1
+                incident_solid[b] += 1
+            else:
+                incident_broken.add(a)
+                incident_broken.add(b)
+        # A terminal must sit on solid pipe and never on a gapped pipe.
+        seats = sorted(node for node in incident_solid if node not in incident_broken)
+        if len(seats) < 2:
+            continue
+        pairs = []
+        for i, u in enumerate(seats):
+            ru, cu = _rowcol(u)
+            for v in seats[i + 1:]:
+                rv, cv = _rowcol(v)
+                if abs(ru - rv) + abs(cu - cv) == distance:
+                    pairs.append((u, v))
+        if not pairs:
+            continue
+        rng.shuffle(pairs)
+        for u, v in pairs:
+            bottleneck = _bottleneck(edges, [u, v])
+            if connected:
+                if bottleneck != 0.0:
+                    continue
+            else:
+                if not (MIN_GAP_PX <= bottleneck <= MAX_GAP_PX):
+                    continue
+                if _component_edge_count(edges, u) < 3:
+                    continue
+                if _component_edge_count(edges, v) < 3:
+                    continue
+            return {"edges": edges, "ports": [u, v]}
+    raise RuntimeError("panel sampling failed to converge")
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    answer_index = seed % N_PANELS  # counterbalances the answer position
+    distance = PORT_LATTICE_DISTANCES[rng.randrange(len(PORT_LATTICE_DISTANCES))]
+    panels = [
+        _sample_panel(rng, index == answer_index, distance)
+        for index in range(N_PANELS)
+    ]
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "palette": rng.randrange(len(PALETTES)),
+        "panels": panels,
+    }
+
+
+# ------------------------------------------------------------ analytic gold --
+def _bottlenecks(scene: dict) -> list:
+    # The panel dict is unpacked here, in the caller, so that the only scene
+    # field the analytic gold reads is the one declared in latent_alias.
+    return [_bottleneck(panel["edges"], panel["ports"]) for panel in scene["panels"]]
+
+
+def analytic_gold(scene: dict) -> str:
+    values = _bottlenecks(scene)
+    order = sorted(range(len(values)), key=lambda i: (values[i], i))
+    winner = order[0]
+    if values[winner] != 0.0:
+        return AMBIGUOUS
+    if len(values) > 1 and values[order[1]] == values[winner]:
+        return AMBIGUOUS
+    return PANEL_LABELS[winner]
+
+
+def margin(scene: dict) -> float:
+    values = sorted(_bottlenecks(scene))
+    if len(values) < 2:
+        return 0.0
+    return float(values[1] - values[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    values = sorted(_bottlenecks(scene))
+    if values[0] != 0.0:
+        return True
+    return margin(scene) < QUARANTINE_MARGIN_PX
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Declared pixel-identical latent aliases that must preserve the answer."""
+    period = json_clone(scene)
+    period["palette"] = scene["palette"] + len(PALETTES)
+
+    reordered = json_clone(scene)
+    for panel in reordered["panels"]:
+        panel["edges"] = list(reversed(panel["edges"]))
+
+    swapped = json_clone(reordered)
+    for panel in swapped["panels"]:
+        panel["ports"] = [panel["ports"][1], panel["ports"][0]]
+
+    return [
+        ("palette_period", period),
+        ("edge_order_reversal", reordered),
+        ("terminal_order_swap", swapped),
+    ]
+
+
+# ----------------------------------------------------------------- drawing --
+def _panel_origin(index: int) -> tuple:
+    left = OUTER + index * (PANEL_W + PANEL_GAP)
+    return left, OUTER
+
+
+def _node_xy(index: int, node: int) -> tuple:
+    left, top = _panel_origin(index)
+    row, col = _rowcol(node)
+    return left + PANEL_PAD + col * SPACING, top + PANEL_PAD + row * SPACING
+
+
+def _draw_edge(draw, index, a, b, gap, colour) -> None:
+    ax, ay = _node_xy(index, a)
+    bx, by = _node_xy(index, b)
+    if ay == by:  # horizontal
+        x0, x1 = (ax, bx) if ax < bx else (bx, ax)
+        spans = [(x0, x1)]
+        if gap:
+            mid = (x0 + x1) // 2
+            spans = [(x0, mid - gap // 2), (mid + gap // 2, x1)]
+        for sx0, sx1 in spans:
+            draw.rectangle([sx0, ay - HALF, sx1, ay + HALF], fill=colour)
+    else:  # vertical
+        y0, y1 = (ay, by) if ay < by else (by, ay)
+        spans = [(y0, y1)]
+        if gap:
+            mid = (y0 + y1) // 2
+            spans = [(y0, mid - gap // 2), (mid + gap // 2, y1)]
+        for sy0, sy1 in spans:
+            draw.rectangle([ax - HALF, sy0, ax + HALF, sy1], fill=colour)
+
+
+def _draw_label(image, text, centre_x, top, colour, bg) -> None:
+    tile = Image.new("RGB", (14, 12), bg)
+    ImageDraw.Draw(tile).text((3, 0), text, fill=colour, font=ImageFont.load_default())
+    tile = tile.resize((28, 24), Image.NEAREST)
+    image.paste(tile, (int(centre_x - 14), int(top)))
+
+
+def render(scene: dict) -> Image.Image:
+    palette = PALETTES[scene["palette"] % len(PALETTES)]
+    image = Image.new("RGB", (scene["width"], scene["height"]), palette["bg"])
+    draw = ImageDraw.Draw(image)
+    for index, panel in enumerate(scene["panels"]):
+        left, top = _panel_origin(index)
+        draw.rectangle(
+            [left, top, left + PANEL_W - 1, top + PANEL_H - 1],
+            outline=palette["frame"],
+            width=2,
+        )
+        for a, b, gap in panel["edges"]:
+            _draw_edge(draw, index, a, b, gap, palette["pipe"])
+        for node in panel["ports"]:
+            cx, cy = _node_xy(index, node)
+            draw.ellipse(
+                [cx - PORT_RADIUS, cy - PORT_RADIUS, cx + PORT_RADIUS, cy + PORT_RADIUS],
+                fill=palette["port"],
+            )
+        _draw_label(
+            image,
+            str(index + 1),
+            left + PANEL_W / 2,
+            top + PANEL_H + 3,
+            palette["label"],
+            palette["bg"],
+        )
+    return image

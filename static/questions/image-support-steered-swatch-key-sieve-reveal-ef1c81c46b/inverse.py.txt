@@ -1,0 +1,228 @@
+"""Independent pixel-only inverse arm for the swatch-key sieve reveal world.
+
+Receives one rasterized PNG as a PIL image and nothing else. It locates the two
+black-bordered fiducial blocks, rectifies the panel's 5 by 5 cell lattice and
+the key's two swatches, executes the declared palette sieve on the recovered
+grays, and classifies the resulting mask against the public glyph alphabet with
+a runner-up margin. It imports no renderer, prompt, generator, verifier or gold
+code and never sees latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "swatch_key_sieve_reveal-oracle-0.1.0"
+
+GRID = 5
+UNDETERMINED = "undetermined"
+INK_MAX = 50
+INK_SPREAD = 14
+LEVEL_TOLERANCE = 4.0
+SWATCH_TOLERANCE = 5.0
+
+# Public glyph alphabet from the question contract, not from renderer code.
+GLYPHS: dict[str, tuple[tuple[int, int], ...]] = {
+    "arrow": ((0, 2), (1, 1), (1, 2), (1, 3), (2, 0), (2, 4), (3, 2), (4, 2)),
+    "cross": ((0, 0), (0, 4), (1, 1), (1, 3), (3, 1), (3, 3), (4, 0), (4, 4)),
+    "ring": ((1, 1), (1, 2), (1, 3), (2, 1), (2, 3), (3, 1), (3, 2), (3, 3)),
+    "stair": ((0, 0), (1, 0), (1, 1), (2, 1), (2, 2), (3, 2), (3, 3), (4, 3)),
+}
+
+
+def _templates() -> dict[str, np.ndarray]:
+    out = {}
+    for name, cells in GLYPHS.items():
+        mask = np.zeros((GRID, GRID), dtype=bool)
+        for row, column in cells:
+            mask[row, column] = True
+        out[name] = mask
+    return out
+
+
+def _ink_mask(array: np.ndarray) -> np.ndarray:
+    values = array.astype(np.int16)
+    spread = values.max(axis=2) - values.min(axis=2)
+    return (values.max(axis=2) <= INK_MAX) & (spread <= INK_SPREAD)
+
+
+def _components(mask: np.ndarray, limit: int = 64) -> list[tuple[int, int, int, int]]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    boxes: list[tuple[int, int, int, int]] = []
+    height, width = mask.shape
+    for sy, sx in np.argwhere(mask):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(int(sy), int(sx))])
+        seen[sy, sx] = True
+        y0 = y1 = int(sy)
+        x0 = x1 = int(sx)
+        size = 0
+        while queue:
+            cy, cx = queue.popleft()
+            size += 1
+            y0, y1 = min(y0, cy), max(y1, cy)
+            x0, x1 = min(x0, cx), max(x1, cx)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if size >= 40:
+            boxes.append((x0, y0, x1 + 1, y1 + 1))
+        if len(boxes) > limit:
+            return []
+    return boxes
+
+
+def _border_thickness(mask: np.ndarray) -> int:
+    height, width = mask.shape
+    thickness = 0
+    while thickness < min(height, width) // 3:
+        if not mask[thickness].all() or not mask[height - 1 - thickness].all():
+            break
+        if not mask[:, thickness].all() or not mask[:, width - 1 - thickness].all():
+            break
+        thickness += 1
+    return thickness
+
+
+def _patch_gray(gray: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float | None:
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    inset_y = max(1, (y1 - y0) // 4)
+    inset_x = max(1, (x1 - x0) // 4)
+    patch = gray[y0 + inset_y : y1 - inset_y, x0 + inset_x : x1 - inset_x]
+    if patch.size == 0:
+        return None
+    if float(patch.max() - patch.min()) > 6.0:
+        return None
+    return float(np.median(patch))
+
+
+def _read_panel(gray: np.ndarray, box: tuple[int, int, int, int], ink: np.ndarray):
+    x0, y0, x1, y1 = box
+    thickness = _border_thickness(ink[y0:y1, x0:x1])
+    if thickness < 1:
+        return None
+    ix0, iy0 = x0 + thickness, y0 + thickness
+    ix1, iy1 = x1 - thickness, y1 - thickness
+    if ix1 - ix0 < GRID * 4 or iy1 - iy0 < GRID * 4:
+        return None
+    values = np.zeros((GRID, GRID), dtype=np.float64)
+    for row in range(GRID):
+        cy0 = iy0 + (iy1 - iy0) * row // GRID
+        cy1 = iy0 + (iy1 - iy0) * (row + 1) // GRID
+        for column in range(GRID):
+            cx0 = ix0 + (ix1 - ix0) * column // GRID
+            cx1 = ix0 + (ix1 - ix0) * (column + 1) // GRID
+            value = _patch_gray(gray, cx0, cy0, cx1, cy1)
+            if value is None:
+                return None
+            values[row, column] = value
+    return values
+
+
+def _read_key(gray: np.ndarray, box: tuple[int, int, int, int], ink: np.ndarray):
+    x0, y0, x1, y1 = box
+    thickness = _border_thickness(ink[y0:y1, x0:x1])
+    if thickness < 1:
+        return None
+    ix0, iy0 = x0 + thickness, y0 + thickness
+    ix1, iy1 = x1 - thickness, y1 - thickness
+    width, height = ix1 - ix0, iy1 - iy0
+    if width <= 0 or height <= 0:
+        return None
+    readings = []
+    if width >= height:
+        for index in range(2):
+            cx0 = ix0 + width * index // 2
+            cx1 = ix0 + width * (index + 1) // 2
+            readings.append(_patch_gray(gray, cx0, iy0, cx1, iy1))
+    else:
+        for index in range(2):
+            cy0 = iy0 + height * index // 2
+            cy1 = iy0 + height * (index + 1) // 2
+            readings.append(_patch_gray(gray, ix0, cy0, ix1, cy1))
+    if any(value is None for value in readings):
+        return None
+    return (float(readings[0]), float(readings[1]))
+
+
+def _levels(values: np.ndarray) -> list[float] | None:
+    flat = sorted(float(value) for value in values.ravel())
+    clusters: list[list[float]] = [[flat[0]]]
+    for value in flat[1:]:
+        if value - clusters[-1][-1] <= LEVEL_TOLERANCE:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+    if len(clusters) != 4:
+        return None
+    return [float(np.median(cluster)) for cluster in clusters]
+
+
+def decide(image: Image.Image) -> tuple[str, float]:
+    """Return the pixel-only symbol decision and its runner-up margin."""
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    gray = array.astype(np.float64).mean(axis=2)
+    ink = _ink_mask(array)
+    boxes = _components(ink)
+    if not boxes:
+        return UNDETERMINED, 0.0
+
+    panels = []
+    keys = []
+    for box in boxes:
+        x0, y0, x1, y1 = box
+        width, height = x1 - x0, y1 - y0
+        if min(width, height) < 14:
+            continue
+        ratio = max(width, height) / float(min(width, height))
+        if ratio <= 1.15 and min(width, height) >= 30:
+            panels.append(box)
+        elif 1.5 <= ratio <= 2.6:
+            keys.append(box)
+    if len(panels) != 1 or len(keys) != 1:
+        return UNDETERMINED, 0.0
+
+    values = _read_panel(gray, panels[0], ink)
+    swatches = _read_key(gray, keys[0], ink)
+    if values is None or swatches is None:
+        return UNDETERMINED, 0.0
+    levels = _levels(values)
+    if levels is None:
+        return UNDETERMINED, 0.0
+
+    keyed = set()
+    for swatch in swatches:
+        distances = [abs(swatch - level) for level in levels]
+        best = int(np.argmin(distances))
+        if distances[best] > SWATCH_TOLERANCE:
+            return UNDETERMINED, 0.0
+        keyed.add(best)
+    if len(keyed) != 2:
+        return UNDETERMINED, 0.0
+
+    mask = np.zeros((GRID, GRID), dtype=bool)
+    for row in range(GRID):
+        for column in range(GRID):
+            index = int(np.argmin([abs(values[row, column] - level) for level in levels]))
+            mask[row, column] = index in keyed
+
+    templates = _templates()
+    scored = sorted(
+        (int(np.count_nonzero(mask ^ template)), name) for name, template in templates.items()
+    )
+    best_distance, best_name = scored[0]
+    if best_distance != 0:
+        return UNDETERMINED, 0.0
+    runner_up = scored[1][0]
+    return best_name, float(runner_up - best_distance)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Pixel-only decision; abstains with 'undetermined' when unreadable."""
+    return decide(image)[0]

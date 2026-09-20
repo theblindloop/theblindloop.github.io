@@ -1,0 +1,176 @@
+"""Independent image-only inverse for convex-boundary dot search."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
+import numpy as np
+from PIL import Image
+
+_DOT = np.array([24, 48, 82], dtype=np.int16)
+_FRAME = np.array([35, 137, 151], dtype=np.int16)
+
+
+@dataclass(frozen=True)
+class Component:
+    area: int
+    cx: float
+    cy: float
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+
+
+def _near(arr: np.ndarray, color: np.ndarray, radius: float) -> np.ndarray:
+    delta = arr.astype(np.int32) - color.astype(np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int32) <= radius * radius
+
+
+def _components(mask: np.ndarray) -> list[Component]:
+    """Extract 8-connected raster components without renderer geometry."""
+    ys, xs = np.nonzero(mask)
+    remaining = set(zip(ys.tolist(), xs.tolist(), strict=True))
+    found: list[Component] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        pixels = [start]
+        while stack:
+            y, x = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    neighbor = (y + dy, x + dx)
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+                        pixels.append(neighbor)
+        py = np.fromiter((item[0] for item in pixels), dtype=np.float64)
+        px = np.fromiter((item[1] for item in pixels), dtype=np.float64)
+        found.append(
+            Component(
+                area=len(pixels),
+                cx=float(px.mean()),
+                cy=float(py.mean()),
+                x0=int(px.min()),
+                y0=int(py.min()),
+                x1=int(px.max()),
+                y1=int(py.max()),
+            )
+        )
+    return found
+
+
+def _hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    ordered = sorted(set(points))
+    if len(ordered) < 3:
+        raise ValueError("a panel needs at least three distinct dot centers")
+
+    def turn(o: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    low: list[tuple[float, float]] = []
+    for point in ordered:
+        while len(low) >= 2 and turn(low[-2], low[-1], point) <= 1e-7:
+            low.pop()
+        low.append(point)
+    high: list[tuple[float, float]] = []
+    for point in reversed(ordered):
+        while len(high) >= 2 and turn(high[-2], high[-1], point) <= 1e-7:
+            high.pop()
+        high.append(point)
+    polygon = low[:-1] + high[:-1]
+    if len(polygon) < 3:
+        raise ValueError("dot centers do not span a two-dimensional hull")
+    return polygon
+
+
+def _segment_gap(point: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    wx, wy = point[0] - a[0], point[1] - a[1]
+    scale = vx * vx + vy * vy
+    if scale <= 0:
+        return math.hypot(wx, wy)
+    u = max(0.0, min(1.0, (wx * vx + wy * vy) / scale))
+    return math.hypot(point[0] - (a[0] + u * vx), point[1] - (a[1] + u * vy))
+
+
+def _panel_score(points: list[tuple[float, float]]) -> float:
+    polygon = _hull(points)
+    return max(
+        min(_segment_gap(point, polygon[i], polygon[(i + 1) % len(polygon)]) for i in range(len(polygon)))
+        for point in points
+    )
+
+
+def _measure(image: Image.Image) -> tuple[str, tuple[float, ...], float, tuple[tuple[tuple[float, float], ...], ...]]:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3 or arr.shape[0] < 300 or arr.shape[1] < 500:
+        raise ValueError("image is too small for the four-panel contract")
+
+    frames = [
+        item
+        for item in _components(_near(arr, _FRAME, 48.0))
+        if 1000 <= item.area <= 5000 and item.x1 - item.x0 >= 230 and item.y1 - item.y0 >= 155
+    ]
+    if len(frames) != 4:
+        raise ValueError(f"expected four visible panel frames, found {len(frames)}")
+    frames.sort(key=lambda item: (item.cy, item.cx))
+    upper = sorted(frames[:2], key=lambda item: item.cx)
+    lower = sorted(frames[2:], key=lambda item: item.cx)
+    frames = [*upper, *lower]
+    if max(item.cy for item in upper) >= min(item.cy for item in lower):
+        raise ValueError("panel rows are not separable")
+
+    dots = [
+        item
+        for item in _components(_near(arr, _DOT, 48.0))
+        if 120 <= item.area <= 310 and 12 <= item.x1 - item.x0 <= 20 and 12 <= item.y1 - item.y0 <= 20
+    ]
+    if len(dots) != 48:
+        raise ValueError(f"expected 48 equal-size navy dots, found {len(dots)}")
+
+    point_sets: list[tuple[tuple[float, float], ...]] = []
+    assigned = 0
+    for frame in frames:
+        points = tuple(
+            (dot.cx, dot.cy)
+            for dot in dots
+            if frame.x0 < dot.cx < frame.x1 and frame.y0 < dot.cy < frame.y1
+        )
+        if len(points) != 12:
+            raise ValueError(f"expected 12 dots inside each frame, found {len(points)}")
+        point_sets.append(points)
+        assigned += len(points)
+    if assigned != len(dots):
+        raise ValueError("at least one dot is outside all detected frames")
+
+    scores = tuple(_panel_score(list(points)) for points in point_sets)
+    boundary_panels = [index for index, score in enumerate(scores) if score <= 2.0]
+    if len(boundary_panels) != 1:
+        raise ValueError(f"expected one all-boundary panel, found {len(boundary_panels)}")
+    if any(score < 8.0 for index, score in enumerate(scores) if index != boundary_panels[0]):
+        raise ValueError("a distractor is too close to the raster boundary tolerance")
+    ordered_scores = sorted(scores)
+    measured_margin = float(ordered_scores[1] - ordered_scores[0])
+    if measured_margin < 7.0:
+        raise ValueError("winner has inadequate raster runner-up margin")
+    return "ABCD"[boundary_panels[0]], scores, measured_margin, tuple(point_sets)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the winning label solely from segmented dot-center geometry."""
+    decision, _, _, _ = _measure(image)
+    return decision
+
+
+def diagnostics_from_image(image: Image.Image) -> dict:
+    decision, scores, measured_margin, _ = _measure(image)
+    return {
+        "decision": decision,
+        "scores": [round(value, 3) for value in scores],
+        "margin": round(measured_margin, 3),
+    }

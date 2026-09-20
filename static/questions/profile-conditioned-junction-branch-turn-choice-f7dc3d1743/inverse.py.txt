@@ -1,0 +1,253 @@
+"""Independent pixel-only inverse for the traced-fork turn-choice world.
+
+This file deliberately repeats only public raster facts: the fixed palette, the
+two glyph bitmaps, and generic image operations.  It detects the source, marked
+fork, and terminals from the PNG, reconstructs the source-connected route with
+a flood fill, fits each local arm centerline, and compares the two turn angles.
+It does not import the renderer or read a latent scene.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+SOURCE_COLOR = np.array((44, 137, 91), dtype=np.float32)
+JUNCTION_COLOR = np.array((126, 89, 181), dtype=np.float32)
+ROUTE_COLOR = np.array((39, 54, 73), dtype=np.float32)
+GLYPH_COLOR = np.array((236, 171, 45), dtype=np.float32)
+TERMINAL_PALETTE = np.asarray(
+    ((218, 75, 83), (36, 150, 163), (224, 143, 45), (78, 119, 190)),
+    dtype=np.float32,
+)
+SOURCE_TOL = 38.0
+JUNCTION_TOL = 38.0
+ROUTE_TOL = 88.0
+TERMINAL_TOL = 28.0
+GLYPHS = {
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+}
+
+
+class OracleFitError(ValueError):
+    pass
+
+
+def _color_mask(array: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    return np.linalg.norm(array - color, axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        found: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            found.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(found) >= minimum:
+            result.append(np.asarray(found, dtype=np.int32))
+    return result
+
+
+def _center_of_largest(mask: np.ndarray, minimum: int, name: str) -> tuple[float, float]:
+    components = _components(mask, minimum=minimum)
+    if not components:
+        raise OracleFitError(f"{name} marker is missing")
+    component = max(components, key=len)
+    return (float(component[:, 1].mean()), float(component[:, 0].mean()))
+
+
+def _terminal_centers(array: np.ndarray) -> list[tuple[float, float]]:
+    centers: list[tuple[float, float]] = []
+    for color in TERMINAL_PALETTE:
+        mask = _color_mask(array, color, TERMINAL_TOL)
+        components = _components(mask, minimum=100)
+        if components:
+            component = max(components, key=len)
+            center = (float(component[:, 1].mean()), float(component[:, 0].mean()))
+            if all(math.hypot(center[0] - old[0], center[1] - old[1]) > 25.0 for old in centers):
+                centers.append(center)
+    if len(centers) != 2:
+        raise OracleFitError(f"expected two terminal rings, found {len(centers)}")
+    return centers
+
+
+def _gold_mask(array: np.ndarray) -> np.ndarray:
+    gold_distance = np.linalg.norm(array - GLYPH_COLOR, axis=2)
+    terminal_distance = np.min(
+        np.stack([np.linalg.norm(array - color, axis=2) for color in TERMINAL_PALETTE], axis=2),
+        axis=2,
+    )
+    return (gold_distance <= 105.0) & (gold_distance + 7.0 < terminal_distance)
+
+
+def _glyph_score(gold: np.ndarray, center: tuple[float, float], label: str) -> float:
+    pattern = GLYPHS[label]
+    best = -1e9
+    center_x, center_y = center
+    for offset_x in np.arange(-2.0, 2.01, 1.0):
+        for offset_y in np.arange(-2.0, 2.01, 1.0):
+            score = 0.0
+            x0 = center_x + offset_x - 7.5
+            y0 = center_y + offset_y - 10.5
+            for row, line in enumerate(pattern):
+                for col, bit in enumerate(line):
+                    cx = int(round(x0 + col * 3.0 + 1.0))
+                    cy = int(round(y0 + row * 3.0 + 1.0))
+                    xlo, xhi = max(0, cx - 1), min(gold.shape[1], cx + 2)
+                    ylo, yhi = max(0, cy - 1), min(gold.shape[0], cy + 2)
+                    occupied = float(gold[ylo:yhi, xlo:xhi].mean()) if xhi > xlo and yhi > ylo else 0.0
+                    score += occupied if bit == "1" else -0.55 * occupied
+            best = max(best, score)
+    return best
+
+
+def _labels(array: np.ndarray, centers: list[tuple[float, float]]) -> dict[str, tuple[float, float]]:
+    gold = _gold_mask(array)
+    found: dict[str, tuple[float, float]] = {}
+    for center in centers:
+        scores = {label: _glyph_score(gold, center, label) for label in GLYPHS}
+        label = max(scores, key=scores.get)
+        if scores[label] < 2.0 or scores[label] - scores["B" if label == "A" else "A"] < 0.5:
+            raise OracleFitError("terminal glyph is not legible")
+        if label in found:
+            raise OracleFitError("terminal labels are not unique")
+        found[label] = center
+    if set(found) != {"A", "B"}:
+        raise OracleFitError(f"expected A/B terminals, found {sorted(found)}")
+    return found
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Small eight-neighbour dilation without relying on renderer geometry."""
+    result = mask.copy()
+    for _ in range(int(radius)):
+        expanded = result.copy()
+        expanded[:-1, :] |= result[1:, :]
+        expanded[1:, :] |= result[:-1, :]
+        expanded[:, :-1] |= result[:, 1:]
+        expanded[:, 1:] |= result[:, :-1]
+        expanded[:-1, :-1] |= result[1:, 1:]
+        expanded[1:, 1:] |= result[:-1, :-1]
+        expanded[:-1, 1:] |= result[1:, :-1]
+        expanded[1:, :-1] |= result[:-1, 1:]
+        result = expanded
+    return result
+
+
+def _nearest_point(mask: np.ndarray, target: tuple[float, float]) -> tuple[int, int]:
+    points = np.argwhere(mask)
+    if len(points) == 0:
+        raise OracleFitError("route mask is empty")
+    dx = points[:, 1].astype(np.float64) - target[0]
+    dy = points[:, 0].astype(np.float64) - target[1]
+    index = int(np.argmin(dx * dx + dy * dy))
+    return int(points[index, 0]), int(points[index, 1])
+
+
+def _flood(route: np.ndarray, source: tuple[float, float]) -> np.ndarray:
+    walkable = _dilate(route, 22)
+    start = _nearest_point(walkable, source)
+    height, width = walkable.shape
+    distances = np.full((height, width), -1, dtype=np.int32)
+    distances[start] = 0
+    queue: deque[tuple[int, int]] = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distances[y, x]) + 1
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dx or dy):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and walkable[ny, nx] and distances[ny, nx] < 0:
+                    distances[ny, nx] = next_distance
+                    queue.append((ny, nx))
+    return distances
+
+
+def _reachable_near(distances: np.ndarray, center: tuple[float, float], radius: int = 24) -> bool:
+    cx, cy = int(round(center[0])), int(round(center[1]))
+    y0, y1 = max(0, cy - radius), min(distances.shape[0], cy + radius + 1)
+    x0, x1 = max(0, cx - radius), min(distances.shape[1], cx + radius + 1)
+    return bool(np.any(distances[y0:y1, x0:x1] >= 0))
+
+
+def _angle_difference(a: float, b: float) -> float:
+    return (float(a) - float(b) + 180.0) % 360.0 - 180.0
+
+
+def _fit_arm_angle(
+    route: np.ndarray,
+    origin: tuple[float, float],
+    target: tuple[float, float],
+) -> float:
+    """PCA-fit one straight arm selected by its visible target direction."""
+    points = np.argwhere(route)
+    dx, dy = target[0] - origin[0], target[1] - origin[1]
+    distance = math.hypot(dx, dy)
+    if distance < 70.0:
+        raise OracleFitError("arm target is too close to the fork")
+    ux, uy = dx / distance, dy / distance
+    x = points[:, 1].astype(np.float64) - origin[0]
+    y = points[:, 0].astype(np.float64) - origin[1]
+    radial = np.hypot(x, y)
+    projection = (x * ux + y * uy) / np.maximum(radial, 1e-6)
+    selected = (radial >= 25.0) & (radial <= min(108.0, distance - 24.0)) & (projection >= 0.965)
+    candidates = np.column_stack((x[selected] + origin[0], y[selected] + origin[1]))
+    if len(candidates) < 30:
+        raise OracleFitError("not enough pixels for an arm line fit")
+    mean = candidates.mean(axis=0)
+    covariance = np.cov(candidates - mean, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    vector = eigenvectors[:, int(np.argmax(eigenvalues))]
+    if vector[0] * ux + vector[1] * uy < 0.0:
+        vector = -vector
+    return math.degrees(math.atan2(float(vector[1]), float(vector[0]))) % 360.0
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return A or B from the final PNG alone."""
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    source = _center_of_largest(_color_mask(array, SOURCE_COLOR, SOURCE_TOL), 100, "green source")
+    junction = _center_of_largest(_color_mask(array, JUNCTION_COLOR, JUNCTION_TOL), 100, "purple fork")
+    terminals = _terminal_centers(array)
+    labeled = _labels(array, terminals)
+    route = _color_mask(array, ROUTE_COLOR, ROUTE_TOL)
+    if int(route.sum()) < 500:
+        raise OracleFitError("dark route mask is too small")
+    distances = _flood(route, source)
+    if not _reachable_near(distances, junction, radius=28):
+        raise OracleFitError("ringed fork is not source-connected")
+    for label, center in labeled.items():
+        if not _reachable_near(distances, center, radius=28):
+            raise OracleFitError(f"terminal {label} is not connected to the source route")
+
+    source_arm = _fit_arm_angle(route, junction, source)
+    incoming_heading = (source_arm + 180.0) % 360.0
+    turns: dict[str, float] = {}
+    for label, center in labeled.items():
+        branch_heading = _fit_arm_angle(route, junction, center)
+        turns[label] = abs(_angle_difference(branch_heading, incoming_heading))
+    if abs(turns["A"] - turns["B"]) < 0.8:
+        raise OracleFitError("turn comparison is below pixel resolution")
+    return "A" if turns["A"] < turns["B"] else "B"

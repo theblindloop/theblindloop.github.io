@@ -1,0 +1,236 @@
+"""Pixel-only inverse arm for the stripe-phase wedge world.
+
+Input is the final PNG and nothing else.  The arm reconstructs the declared
+global evidence -- the local phase field of the periodic bar carrier -- and
+classifies only the silhouette that the phase discontinuity forms:
+
+1. threshold the dark ink and take its bounding box (the bar carrier);
+2. decide which way the bars run from the two ink profiles;
+3. recover the bar pitch by autocorrelation of the profile along the bar normal;
+4. compute a one-pitch quadrature response at every pixel, giving a local phase;
+5. take the anti-phase minority region relative to the pooled reference phase,
+   keep its largest connected component;
+6. read the direction of that component's width gradient, which is the tip of an
+   isoceles triangle, and abstain when the component spans too few pitches.
+
+No renderer, prompt, generator, verifier or gold code is imported, and no latent
+scene data is accepted.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "stripe_phase_wedge-oracle-0.1.0"
+
+INK_LEVEL = 128
+MIN_PITCH = 6
+MAX_PITCH = 30
+READABLE_PITCHES = 4.0
+ORACLE_SPAN_SLACK = 34.0
+MIN_TREND = 0.55
+ABSTAIN = "unclear"
+
+
+def _profile_oscillation(profile: np.ndarray) -> float:
+    if profile.size < 4:
+        return 0.0
+    centered = profile - profile.mean()
+    scale = profile.mean() + 1.0
+    return float(np.sqrt((centered**2).mean()) / scale)
+
+
+def _estimate_pitch(profile: np.ndarray) -> int | None:
+    centered = profile - profile.mean()
+    denom = float((centered**2).sum())
+    if denom <= 0.0:
+        return None
+    scores: dict[int, float] = {}
+    for lag in range(MIN_PITCH, MAX_PITCH + 1):
+        if centered.size <= lag + 4:
+            break
+        head = centered[:-lag]
+        tail = centered[lag:]
+        norm = math.sqrt(float((head**2).sum()) * float((tail**2).sum()))
+        if norm <= 0.0:
+            continue
+        scores[lag] = float((head * tail).sum()) / norm
+    if not scores:
+        return None
+    best = max(scores.values())
+    if best <= 0.2:
+        return None
+    for lag in sorted(scores):
+        if scores[lag] >= 0.85 * best:
+            return lag
+    return None
+
+
+def _erode(mask: np.ndarray, half_i: int, half_j: int) -> np.ndarray:
+    out = mask
+    for axis, half in ((0, half_i), (1, half_j)):
+        for _ in range(half):
+            shifted_up = np.zeros_like(out)
+            shifted_down = np.zeros_like(out)
+            if axis == 0:
+                shifted_up[:-1] = out[1:]
+                shifted_down[1:] = out[:-1]
+            else:
+                shifted_up[:, :-1] = out[:, 1:]
+                shifted_down[:, 1:] = out[:, :-1]
+            out = out & shifted_up & shifted_down
+    return out
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    current = 0
+    best_size = 0
+    best_label = 0
+    coords = np.argwhere(mask)
+    for start in coords:
+        si, sj = int(start[0]), int(start[1])
+        if labels[si, sj]:
+            continue
+        current += 1
+        stack = [(si, sj)]
+        labels[si, sj] = current
+        size = 0
+        while stack:
+            i, j = stack.pop()
+            size += 1
+            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < mask.shape[0] and 0 <= nj < mask.shape[1]:
+                    if mask[ni, nj] and not labels[ni, nj]:
+                        labels[ni, nj] = current
+                        stack.append((ni, nj))
+        if size > best_size:
+            best_size = size
+            best_label = current
+    if best_label == 0:
+        return np.zeros_like(mask)
+    return labels == best_label
+
+
+def _trend(index: np.ndarray, counts: np.ndarray) -> float:
+    if index.size < 4:
+        return 0.0
+    a = index.astype(np.float64) - index.mean()
+    b = counts.astype(np.float64) - counts.mean()
+    denom = math.sqrt(float((a**2).sum()) * float((b**2).sum()))
+    if denom <= 0.0:
+        return 0.0
+    return float((a * b).sum() / denom)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    grey = np.asarray(image.convert("L")).astype(np.int16)
+    ink = grey < INK_LEVEL
+    if int(ink.sum()) < 400:
+        return ABSTAIN
+
+    rows_any = np.flatnonzero(ink.any(axis=1))
+    cols_any = np.flatnonzero(ink.any(axis=0))
+    box = ink[rows_any[0] : rows_any[-1] + 1, cols_any[0] : cols_any[-1] + 1]
+    if min(box.shape) < 4 * MIN_PITCH:
+        return ABSTAIN
+
+    row_profile = box.sum(axis=1).astype(np.float64)
+    col_profile = box.sum(axis=0).astype(np.float64)
+
+    # Bars running horizontally make the row profile oscillate; bars running
+    # vertically make the column profile oscillate.  Orient the analysis so that
+    # axis 0 is always the bar normal.
+    if _profile_oscillation(row_profile) >= _profile_oscillation(col_profile):
+        oriented = box
+        normal_is_y = True
+        profile = row_profile
+    else:
+        oriented = box.T
+        normal_is_y = False
+        profile = col_profile
+
+    pitch = _estimate_pitch(profile)
+    if pitch is None:
+        return ABSTAIN
+
+    n = oriented.shape[0]
+    windows = n - pitch + 1
+    if windows < 3 * pitch:
+        return ABSTAIN
+    angles = 2.0 * math.pi * np.arange(pitch) / float(pitch)
+    cos_part = np.zeros((windows, oriented.shape[1]), dtype=np.float64)
+    sin_part = np.zeros((windows, oriented.shape[1]), dtype=np.float64)
+    ink_f = oriented.astype(np.float64)
+    for k in range(pitch):
+        slab = ink_f[k : k + windows]
+        cos_part += slab * math.cos(angles[k])
+        sin_part += slab * math.sin(angles[k])
+
+    amplitude = np.hypot(cos_part, sin_part)
+    valid = amplitude > 0.22 * pitch
+    valid = _erode(valid, 2, 2)
+    if int(valid.sum()) < 40 * pitch:
+        return ABSTAIN
+
+    # The quadrature phase is measured relative to each sliding window's own
+    # start, so an absolute carrier phase needs the window ramp added back.
+    ramp = 2.0 * math.pi * np.arange(windows, dtype=np.float64)[:, None] / float(pitch)
+    phase = np.arctan2(sin_part, cos_part) + ramp
+    weight = np.where(valid, amplitude, 0.0)
+    mean_vector = complex(
+        float((weight * np.cos(phase)).sum()), float((weight * np.sin(phase)).sum())
+    )
+    if abs(mean_vector) <= 0.0:
+        return ABSTAIN
+    reference = math.atan2(mean_vector.imag, mean_vector.real)
+
+    delta = np.abs(np.angle(np.exp(1j * (phase - reference))))
+    anti = valid & (delta > 1.9)
+    if int(anti.sum()) < 6 * pitch:
+        return ABSTAIN
+
+    opened = _erode(anti, 1, 1)
+    if not opened.any():
+        return ABSTAIN
+    component = _largest_component(opened)
+    if int(component.sum()) < 4 * pitch:
+        return ABSTAIN
+    if int(component.sum()) < 0.02 * int(valid.sum()):
+        return ABSTAIN
+
+    idx_i = np.flatnonzero(component.any(axis=1))
+    idx_j = np.flatnonzero(component.any(axis=0))
+    counts_i = component.sum(axis=1)[idx_i[0] : idx_i[-1] + 1]
+    counts_j = component.sum(axis=0)[idx_j[0] : idx_j[-1] + 1]
+
+    # The one-pitch analysis window shortens the recovered patch along the bar
+    # normal by about one pitch; the erosion trims one further pixel each way.
+    span_i = float(idx_i[-1] - idx_i[0] + 1) + pitch + 2.0
+    span_j = float(idx_j[-1] - idx_j[0] + 1) + 2.0
+    if min(span_i, span_j) < READABLE_PITCHES * pitch + ORACLE_SPAN_SLACK:
+        return ABSTAIN
+
+    trend_i = _trend(np.arange(counts_i.size), counts_i)
+    trend_j = _trend(np.arange(counts_j.size), counts_j)
+
+    if abs(trend_i) >= abs(trend_j):
+        axis_is_normal, trend = True, trend_i
+    else:
+        axis_is_normal, trend = False, trend_j
+    if abs(trend) < MIN_TREND:
+        return ABSTAIN
+
+    # Widths grow away from the tip, so a positive trend puts the tip at the low
+    # end of that page axis.
+    gradient_is_vertical = axis_is_normal == normal_is_y
+    if gradient_is_vertical:
+        return "up" if trend > 0 else "down"
+    return "left" if trend > 0 else "right"
+
+
+__all__ = ["ORACLE_VERSION", "decision_from_image"]

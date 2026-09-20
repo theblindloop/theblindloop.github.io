@@ -1,0 +1,359 @@
+"""Scene sampling, rendering, analytic gold and margin for hatch_conjunction_panel.
+
+A single key figure stands alone above a row of five panels. Every figure in the
+image is an outlined silhouette filled with straight parallel stripes running in
+one of four directions. Each panel holds exactly four figures, of which exactly
+two repeat the key's outline and exactly two repeat the key's stripe direction,
+so neither feature alone ever separates the panels. In exactly one panel a
+single figure carries both key features at once, and that conjunction is the
+decision. The margin is the gap between the winning panel's best figure score
+and the best score reached in any other panel, where a figure scores half for
+outline agreement and half for stripe-direction agreement.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# ------------------------------------------------------------------ layout --
+PANELS = 5
+FIGURES_PER_PANEL = 4
+BOX = 76
+OUTER = 14
+COL_GAP = 14
+ROW_GAP = 12
+SIDE_PAD = 12
+TOP_PAD = 20
+BOT_PAD = 12
+PANEL_W = 2 * SIDE_PAD + 2 * BOX + COL_GAP
+PANEL_H = TOP_PAD + BOT_PAD + 2 * BOX + ROW_GAP
+PANEL_GAP = 16
+KEY_PAD = 12
+KEY_W = BOX + 2 * KEY_PAD + 26
+KEY_H = BOX + 2 * KEY_PAD
+JITTER = 4
+CANVAS_W = 2 * OUTER + PANELS * PANEL_W + (PANELS - 1) * PANEL_GAP
+CANVAS_H = 2 * OUTER + KEY_H + 14 + PANEL_H
+
+BACKGROUND = (255, 255, 255)
+FRAME = (150, 150, 150)
+LABEL = (120, 120, 120)
+
+# Saturated inks only; the pixel arm separates ink from furniture by saturation.
+PALETTES = [
+    [(198, 40, 40), (21, 101, 192), (46, 125, 50), (146, 64, 14), (109, 40, 165)],
+    [(191, 54, 12), (2, 119, 189), (56, 118, 29), (136, 14, 79), (69, 39, 160)],
+    [(183, 28, 28), (13, 71, 161), (27, 94, 32), (129, 78, 6), (74, 20, 140)],
+]
+
+# Unit-square outlines, never rotated and never mirrored by the renderer.
+OUTLINES = {
+    "square": [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+    "diamond": [(0.5, 0.0), (1.0, 0.5), (0.5, 1.0), (0.0, 0.5)],
+    "wedge": [(0.0, 1.0), (0.5, 0.0), (1.0, 1.0)],
+    "cross": [
+        (0.32, 0.0), (0.68, 0.0), (0.68, 0.32), (1.0, 0.32), (1.0, 0.68),
+        (0.68, 0.68), (0.68, 1.0), (0.32, 1.0), (0.32, 0.68), (0.0, 0.68),
+        (0.0, 0.32), (0.32, 0.32),
+    ],
+    "house": [(0.0, 1.0), (0.0, 0.42), (0.5, 0.0), (1.0, 0.42), (1.0, 1.0)],
+    "vee": [
+        (0.0, 0.0), (0.3, 0.0), (0.5, 0.52), (0.7, 0.0), (1.0, 0.0),
+        (0.62, 1.0), (0.38, 1.0),
+    ],
+}
+OUTLINE_IDS = sorted(OUTLINES)
+DIRECTIONS = (0, 45, 90, 135)
+TARGET_AREA = 2600.0
+STRIPE_PERIOD = 9
+STRIPE_INK = 4
+RING = 3
+
+OUTLINE_IOU_MAX = 0.72
+SHIFT = 6
+PAD = SHIFT + 2
+QUARANTINE_MARGIN = 0.07
+
+
+def json_clone(value):
+    return json.loads(json.dumps(value))
+
+
+# --------------------------------------------------------------- geometry --
+def _polygon_points(outline_id: str) -> list:
+    raw = OUTLINES[outline_id]
+    area = abs(
+        sum(
+            raw[i][0] * raw[(i + 1) % len(raw)][1] - raw[(i + 1) % len(raw)][0] * raw[i][1]
+            for i in range(len(raw))
+        )
+    ) / 2.0
+    scale = math.sqrt(TARGET_AREA / area)
+    scaled = [(x * scale, y * scale) for x, y in raw]
+    min_x = min(p[0] for p in scaled)
+    min_y = min(p[1] for p in scaled)
+    max_x = max(p[0] for p in scaled)
+    max_y = max(p[1] for p in scaled)
+    off_x = (BOX - (max_x - min_x)) / 2.0 - min_x
+    off_y = (BOX - (max_y - min_y)) / 2.0 - min_y
+    return [(round(x + off_x, 3), round(y + off_y, 3)) for x, y in scaled]
+
+
+_CACHE: dict = {}
+
+
+def silhouette(outline_id: str) -> np.ndarray:
+    """Filled outline silhouette on the BOX-sized figure tile."""
+    key = ("sil", outline_id)
+    if key not in _CACHE:
+        image = Image.new("L", (BOX, BOX), 0)
+        ImageDraw.Draw(image).polygon(_polygon_points(outline_id), fill=255)
+        _CACHE[key] = np.asarray(image) > 0
+    return _CACHE[key]
+
+
+def _stripe_field(direction: int) -> np.ndarray:
+    ys, xs = np.mgrid[0:BOX, 0:BOX]
+    if direction == 0:
+        coord = ys
+    elif direction == 90:
+        coord = xs
+    elif direction == 45:
+        coord = xs + ys
+    else:
+        coord = xs - ys + BOX
+    return (coord % STRIPE_PERIOD) < STRIPE_INK
+
+
+def figure_mask(outline_id: str, direction: int) -> np.ndarray:
+    """Ink of one figure: closed outline ring plus interior stripes."""
+    key = ("fig", outline_id, direction)
+    if key not in _CACHE:
+        body = silhouette(outline_id)
+        ring = Image.new("L", (BOX, BOX), 0)
+        ImageDraw.Draw(ring).polygon(
+            _polygon_points(outline_id), outline=255, fill=0, width=RING
+        )
+        ring_mask = np.asarray(ring) > 0
+        _CACHE[key] = (body & _stripe_field(direction)) | (ring_mask & body)
+    return _CACHE[key]
+
+
+def _padded(mask: np.ndarray, dy: int = 0, dx: int = 0) -> np.ndarray:
+    out = np.zeros((BOX + 2 * PAD, BOX + 2 * PAD), dtype=bool)
+    out[PAD + dy : PAD + dy + BOX, PAD + dx : PAD + dx + BOX] = mask
+    return out
+
+
+def outline_iou(first: str, second: str) -> float:
+    """Best translation-aligned silhouette overlap of two outline families."""
+    if first == second:
+        return 1.0
+    key = ("iou", first, second)
+    if key in _CACHE:
+        return _CACHE[key]
+    fixed = _padded(silhouette(first))
+    other = silhouette(second)
+    best = 0.0
+    for dy in range(-SHIFT, SHIFT + 1):
+        for dx in range(-SHIFT, SHIFT + 1):
+            moved = _padded(other, dy, dx)
+            union = np.count_nonzero(fixed | moved)
+            if union:
+                best = max(best, np.count_nonzero(fixed & moved) / union)
+    value = round(float(best), 6)
+    _CACHE[key] = value
+    _CACHE[("iou", second, first)] = value
+    return value
+
+
+def direction_agreement(first: int, second: int) -> float:
+    """1 for the same stripe direction, 0.5 at 45 degrees, 0 at 90 degrees."""
+    delta = abs(int(first) - int(second)) % 180
+    delta = min(delta, 180 - delta)
+    return round(1.0 - delta / 90.0, 6)
+
+
+def score_of(outline_id: str, direction: int, key_outline: str, key_direction: int) -> float:
+    """Half outline agreement plus half stripe-direction agreement with the key."""
+    return round(
+        0.5 * outline_iou(outline_id, key_outline)
+        + 0.5 * direction_agreement(direction, key_direction),
+        6,
+    )
+
+
+def figure_score(figure: dict, key_outline: str, key_direction: int) -> float:
+    return score_of(figure["outline"], figure["direction"], key_outline, key_direction)
+
+
+def _compatible(outline_id: str, key_outline: str) -> bool:
+    return outline_id != key_outline and outline_iou(outline_id, key_outline) <= OUTLINE_IOU_MAX
+
+
+# ---------------------------------------------------------------- sampling --
+def _panel_figures(rng: random.Random, key_outline: str, key_direction: int, target: bool) -> list:
+    """Two figures repeat the key outline, two repeat the key stripe direction."""
+    others = [o for o in OUTLINE_IDS if _compatible(o, key_outline)]
+    off_dirs = [d for d in DIRECTIONS if d != key_direction]
+    figures = []
+    if target:
+        figures.append({"outline": key_outline, "direction": key_direction})
+        figures.append({"outline": key_outline, "direction": rng.choice(off_dirs)})
+        figures.append({"outline": rng.choice(others), "direction": key_direction})
+        figures.append({"outline": rng.choice(others), "direction": rng.choice(off_dirs)})
+    else:
+        d1, d2 = rng.sample(off_dirs, 2)
+        figures.append({"outline": key_outline, "direction": d1})
+        figures.append({"outline": key_outline, "direction": d2})
+        o1, o2 = rng.sample(others, 2)
+        figures.append({"outline": o1, "direction": key_direction})
+        figures.append({"outline": o2, "direction": key_direction})
+    return figures
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 31)
+    target = seed % PANELS
+    key_outline = rng.choice(OUTLINE_IDS)
+    key_direction = rng.choice(DIRECTIONS)
+    palette = rng.randrange(len(PALETTES))
+    panels = []
+    for index in range(PANELS):
+        figures = _panel_figures(rng, key_outline, key_direction, index == target)
+        slots = [0, 1, 2, 3]
+        rng.shuffle(slots)
+        colours = list(range(len(PALETTES[0])))
+        rng.shuffle(colours)
+        records = []
+        for figure, slot, colour in zip(figures, slots, colours):
+            records.append(
+                {
+                    "outline": figure["outline"],
+                    "direction": figure["direction"],
+                    "slot": slot,
+                    "colour": colour,
+                    "dx": rng.randint(-JITTER, JITTER),
+                    "dy": rng.randint(-JITTER, JITTER),
+                }
+            )
+        panels.append({"figures": records})
+    return {
+        "canvas": [CANVAS_W, CANVAS_H],
+        "palette": palette,
+        "key": {
+            "outline": key_outline,
+            "direction": key_direction,
+            "colour": rng.randrange(len(PALETTES[0])),
+            "dx": rng.randint(-JITTER, JITTER),
+        },
+        "panels": panels,
+    }
+
+
+# ------------------------------------------------------- analytic decision --
+def _ranked(scene: dict) -> list:
+    key_outline = scene["key"]["outline"]
+    key_direction = int(scene["key"]["direction"])
+    ranked = []
+    for index, panel in enumerate(scene["panels"]):
+        best = max(
+            score_of(f["outline"], f["direction"], key_outline, key_direction)
+            for f in panel["figures"]
+        )
+        ranked.append((best, index))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return ranked
+
+
+def analytic_gold(scene: dict) -> str:
+    return f"panel-{_ranked(scene)[0][1] + 1}"
+
+
+def margin(scene: dict) -> float:
+    ranked = _ranked(scene)
+    return round(ranked[0][0] - ranked[1][0], 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Declared pixel-identical latent aliases that must preserve the answer."""
+    period = json_clone(scene)
+    period["palette"] = int(scene["palette"]) + len(PALETTES)
+
+    reordered = json_clone(scene)
+    for panel in reordered["panels"]:
+        panel["figures"] = list(reversed(panel["figures"]))
+
+    swapped = json_clone(reordered)
+    for panel in swapped["panels"]:
+        panel["figures"][0], panel["figures"][2] = panel["figures"][2], panel["figures"][0]
+
+    return [
+        ("palette_period", period),
+        ("figure_record_reversal", reordered),
+        ("figure_record_swap", swapped),
+    ]
+
+
+# ----------------------------------------------------------------- drawing --
+def _key_origin(scene: dict) -> tuple:
+    left = (CANVAS_W - KEY_W) // 2
+    return left, OUTER
+
+
+def _panel_origin(index: int) -> tuple:
+    return (
+        OUTER + index * (PANEL_W + PANEL_GAP),
+        OUTER + KEY_H + 14,
+    )
+
+
+def _figure_origin(panel_index: int, figure: dict) -> tuple:
+    left, top = _panel_origin(panel_index)
+    slot = int(figure["slot"])
+    x = left + SIDE_PAD + (slot % 2) * (BOX + COL_GAP)
+    y = top + TOP_PAD + (slot // 2) * (BOX + ROW_GAP)
+    return x + int(figure["dx"]), y + int(figure["dy"])
+
+
+def render(scene: dict) -> Image.Image:
+    width, height = scene["canvas"]
+    palette = PALETTES[int(scene["palette"]) % len(PALETTES)]
+    pixels = np.full((height, width, 3), BACKGROUND, dtype=np.uint8)
+
+    key = scene["key"]
+    kx, ky = _key_origin(scene)
+    ink_x = kx + KEY_PAD + 26 + int(key["dx"])
+    ink_y = ky + KEY_PAD
+    mask = figure_mask(key["outline"], int(key["direction"]))
+    region = pixels[ink_y : ink_y + BOX, ink_x : ink_x + BOX]
+    region[mask] = palette[int(key["colour"]) % len(palette)]
+
+    for index, panel in enumerate(scene["panels"]):
+        for figure in panel["figures"]:
+            mask = figure_mask(figure["outline"], int(figure["direction"]))
+            ox, oy = _figure_origin(index, figure)
+            region = pixels[oy : oy + BOX, ox : ox + BOX]
+            region[mask] = palette[int(figure["colour"]) % len(palette)]
+
+    image = Image.fromarray(pixels)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    draw.rectangle([kx, ky, kx + KEY_W - 1, ky + KEY_H - 1], outline=FRAME, width=2)
+    draw.text((kx + 8, ky + KEY_H // 2 - 4), "KEY", fill=LABEL, font=font)
+    for index in range(PANELS):
+        left, top = _panel_origin(index)
+        draw.rectangle(
+            [left, top, left + PANEL_W - 1, top + PANEL_H - 1], outline=FRAME, width=2
+        )
+        draw.text((left + 8, top + 6), str(index + 1), fill=LABEL, font=font)
+    return image

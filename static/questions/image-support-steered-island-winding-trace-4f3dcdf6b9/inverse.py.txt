@@ -1,0 +1,202 @@
+"""Independent pixel-only inverse for compact directed island winding.
+
+This module intentionally imports no candidate renderer or manifest code.  It
+segments semantic colors, locates the island and endpoint rings, reconstructs
+angular route occupancy, checks that the dark centerline is a single continuous
+long trace, and only then reports traversal direction.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_COLOR_BANK = {
+    "background": ((248, 246, 239), (246, 244, 238)),
+    "route": ((28, 48, 70), (38, 51, 73)),
+    "start": ((38, 112, 216), (33, 105, 205)),
+    "finish": ((231, 105, 56), (222, 96, 48)),
+    "island": ((244, 193, 66), (239, 184, 55)),
+}
+
+
+def _nearest_masks(array: np.ndarray) -> dict[str, np.ndarray]:
+    names = list(_COLOR_BANK)
+    representatives = []
+    owner = []
+    for name in names:
+        for color in _COLOR_BANK[name]:
+            representatives.append(color)
+            owner.append(name)
+    colors = np.asarray(representatives, dtype=np.float32)
+    pixels = array.astype(np.float32)
+    distances = np.sum((pixels[:, :, None, :] - colors[None, None, :, :]) ** 2, axis=3)
+    labels = distances.argmin(axis=2)
+    minimum = np.sqrt(distances.min(axis=2))
+    masks = {}
+    for name in names:
+        indices = [index for index, value in enumerate(owner) if value == name]
+        masks[name] = np.isin(labels, indices) & (minimum < 72.0)
+    return masks
+
+
+def _component_sizes(mask: np.ndarray) -> list[int]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    sizes = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        queue = [(y, x)]
+        seen[y, x] = True
+        size = 0
+        while queue:
+            cy, cx = queue.pop()
+            size += 1
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        sizes.append(size)
+    return sorted(sizes, reverse=True)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for y, x in np.argwhere(mask):
+        origin = (int(y), int(x))
+        if seen[origin]:
+            continue
+        stack = [origin]
+        seen[origin] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            component.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    output = np.zeros_like(mask, dtype=bool)
+    if best:
+        yy, xx = zip(*best)
+        output[np.asarray(yy), np.asarray(xx)] = True
+    return output
+
+
+def _centroid(mask: np.ndarray, label: str, minimum: int) -> tuple[float, float]:
+    points = np.argwhere(mask)
+    if len(points) < minimum:
+        raise ValueError(f"missing or damaged {label}")
+    y, x = points.mean(axis=0)
+    spread = np.ptp(points, axis=0)
+    if float(max(spread)) > 38.0:
+        raise ValueError(f"implausibly diffuse {label}")
+    return float(x), float(y)
+
+
+def _angle(center: tuple[float, float], point: tuple[float, float]) -> float:
+    return math.degrees(math.atan2(point[1] - center[1], point[0] - center[0])) % 360.0
+
+
+def _angular_coverage(
+    route: np.ndarray,
+    center: tuple[float, float],
+    radius: float,
+    start: float,
+    delta: float,
+    samples: int,
+) -> float:
+    height, width = route.shape
+    hits = 0
+    # Sample the middle 94% so the endpoint rings cannot masquerade as route ink.
+    for index in range(samples):
+        fraction = 0.03 + 0.94 * index / max(1, samples - 1)
+        theta = math.radians(start + delta * fraction)
+        found = False
+        for radial_offset in (-4.0, -2.0, 0.0, 2.0, 4.0):
+            x = int(round(center[0] + (radius + radial_offset) * math.cos(theta)))
+            y = int(round(center[1] + (radius + radial_offset) * math.sin(theta)))
+            if 0 <= x < width and 0 <= y < height and route[y, x]:
+                found = True
+                break
+        hits += int(found)
+    return hits / samples
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 64 or array.shape[1] < 64:
+        raise ValueError("image is too small")
+    masks = _nearest_masks(array)
+
+    island_mask = _largest_component(masks["island"])
+    start_mask = _largest_component(masks["start"])
+    finish_mask = _largest_component(masks["finish"])
+    center = _centroid(island_mask, "yellow island", 420)
+    start_point = _centroid(start_mask, "blue start ring", 70)
+    finish_point = _centroid(finish_mask, "orange finish ring", 70)
+
+    island_points = np.argwhere(island_mask)
+    island_radii = np.hypot(island_points[:, 1] - center[0], island_points[:, 0] - center[1])
+    if not (11.0 <= np.percentile(island_radii, 95) <= 18.5):
+        raise ValueError("yellow island geometry is damaged")
+
+    start_radius = math.hypot(start_point[0] - center[0], start_point[1] - center[1])
+    finish_radius = math.hypot(finish_point[0] - center[0], finish_point[1] - center[1])
+    if not (27.0 <= start_radius <= 38.5 and 27.0 <= finish_radius <= 38.5):
+        raise ValueError("an endpoint is not attached to the island route")
+    if abs(start_radius - finish_radius) > 4.0:
+        raise ValueError("endpoint attachment radii disagree")
+    route_radius = (start_radius + finish_radius) / 2.0
+
+    route = masks["route"]
+    route_points = np.argwhere(route)
+    if len(route_points) < 1350:
+        raise ValueError("dark route has too little intact ink")
+    radial = np.hypot(route_points[:, 1] - center[0], route_points[:, 0] - center[1])
+    annular = (radial >= route_radius - 7.5) & (radial <= route_radius + 7.5)
+    if int(annular.sum()) < 1325:
+        raise ValueError("dark route is not a broad continuous annulus trace")
+
+    # A clean route is one dominant connected component. Endpoint overpainting
+    # affects only caps and cannot split it; destructive ablation usually does.
+    sizes = _component_sizes(route)
+    if not sizes or sizes[0] < 1325 or (len(sizes) > 1 and sizes[1] > 45):
+        raise ValueError("dark route centerline is broken")
+
+    start_angle = _angle(center, start_point)
+    finish_angle = _angle(center, finish_point)
+    clockwise_delta = (finish_angle - start_angle) % 360.0
+    counter_delta = clockwise_delta - 360.0
+    if clockwise_delta > 180.0:
+        chosen_delta = clockwise_delta
+        decision = "clockwise"
+    else:
+        chosen_delta = counter_delta
+        decision = "counterclockwise"
+    if abs(chosen_delta) < 250.0:
+        raise ValueError("route does not show a decisive long winding")
+
+    long_coverage = _angular_coverage(
+        route, center, route_radius, start_angle, chosen_delta, samples=220
+    )
+    short_delta = chosen_delta - math.copysign(360.0, chosen_delta)
+    gap_coverage = _angular_coverage(
+        route, center, route_radius, start_angle, short_delta, samples=70
+    )
+    if long_coverage < 0.91:
+        raise ValueError("route trace is incomplete")
+    if gap_coverage > 0.43:
+        raise ValueError("route endpoints do not delimit one unambiguous trace")
+    return decision

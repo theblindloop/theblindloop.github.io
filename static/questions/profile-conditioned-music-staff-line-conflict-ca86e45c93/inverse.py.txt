@@ -1,0 +1,111 @@
+"""Independent PNG-only inverse for long horizontal staff-line structure.
+
+This module deliberately imports no scene, renderer, prompt, generation,
+verification, or analytic-gold code. Its public decision receives only pixels.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+class PixelEvidenceError(ValueError):
+    """The raster does not expose a supported staff-line measurement."""
+
+
+@dataclass(frozen=True)
+class Measurement:
+    line_count: int
+    runner_up_margin_px: float
+    min_vertical_gap_px: float
+    support_rows: int
+    ink_pixels: int
+    foreground_bbox: tuple[int, int, int, int]
+
+
+def _longest_run(row: np.ndarray) -> int:
+    padded = np.pad(row.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1)
+    return int(max((end - start for start, end in zip(starts, ends)), default=0))
+
+
+def _groups(flags: np.ndarray) -> list[tuple[int, int]]:
+    padded = np.pad(flags.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1)
+    return [(int(start), int(end)) for start, end in zip(starts, ends)]
+
+
+def measure(image: Image.Image) -> Measurement:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if arr.ndim != 3 or min(arr.shape[:2]) < 96:
+        raise PixelEvidenceError("image is too small")
+    height, width = arr.shape[:2]
+    patch = max(5, min(height, width) // 32)
+    corners = np.concatenate(
+        [
+            arr[:patch, :patch].reshape(-1, 3),
+            arr[:patch, -patch:].reshape(-1, 3),
+            arr[-patch:, :patch].reshape(-1, 3),
+            arr[-patch:, -patch:].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    background = np.median(corners, axis=0)
+    distance = np.linalg.norm(arr - background, axis=2)
+    mask = distance > 42.0
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 1000:
+        raise PixelEvidenceError("insufficient foreground ink")
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    bbox_width = x1 - x0
+    if bbox_width < int(width * 0.52) or y1 - y0 < 70:
+        raise PixelEvidenceError("foreground does not contain a wide staff-like scaffold")
+
+    crop = mask[y0:y1, x0:x1]
+    longest = np.asarray([_longest_run(row) for row in crop], dtype=np.int32)
+    cutoff = max(80, int(round(bbox_width * 0.62)))
+    bands = _groups(longest >= cutoff)
+    if len(bands) not in (4, 5, 6):
+        raise PixelEvidenceError(f"unsupported long-line count: {len(bands)}")
+    thicknesses = [end - start for start, end in bands]
+    if min(thicknesses) < 2 or max(thicknesses) > 14:
+        raise PixelEvidenceError("staff-line thickness is unstable")
+    centers = [(start + end - 1) / 2.0 for start, end in bands]
+    gaps = [centers[index + 1] - centers[index] for index in range(len(centers) - 1)]
+    if not gaps or min(gaps) < 12.0:
+        raise PixelEvidenceError("staff lines are merged or under-resolved")
+
+    accepted_rows = np.zeros(len(longest), dtype=bool)
+    strengths = []
+    for start, end in bands:
+        accepted_rows[start:end] = True
+        strengths.append(int(longest[start:end].max()))
+    rejected_strength = int(longest[~accepted_rows].max()) if np.any(~accepted_rows) else 0
+    horizontal_margin = min(min(strengths) - cutoff, cutoff - rejected_strength)
+    vertical_margin = min(
+        centers[index + 1] - centers[index] - max(thicknesses[index], thicknesses[index + 1])
+        for index in range(len(centers) - 1)
+    )
+    runner_up_margin = float(min(horizontal_margin, vertical_margin))
+    if runner_up_margin < 4.0:
+        raise PixelEvidenceError("runner-up separation is ambiguous")
+    return Measurement(
+        line_count=len(bands),
+        runner_up_margin_px=runner_up_margin,
+        min_vertical_gap_px=float(vertical_margin),
+        support_rows=int(sum(thicknesses)),
+        ink_pixels=int(mask.sum()),
+        foreground_bbox=(x0, y0, x1, y1),
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return "yes" if measure(image).line_count == 5 else "no"

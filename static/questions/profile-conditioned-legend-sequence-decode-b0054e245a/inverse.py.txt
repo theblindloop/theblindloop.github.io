@@ -1,0 +1,142 @@
+"""Independent inverse arm. Receives only the final raster."""
+
+from __future__ import annotations
+
+from collections import deque
+import numpy as np
+from PIL import Image
+
+SHAPE_INK = (28, 31, 36)
+LEGEND_BG = (255, 244, 218)
+MESSAGE_BG = (224, 244, 255)
+OPTION_BG = (242, 242, 242)
+PAYLOAD_RGB = {
+    "cyan": (25, 166, 190),
+    "orange": (232, 126, 35),
+    "purple": (133, 76, 180),
+    "green": (51, 153, 85),
+}
+TAG_RGB = {
+    "red": (210, 54, 62),
+    "blue": (48, 100, 205),
+    "gold": (218, 166, 32),
+}
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    return np.all(arr == np.asarray(rgb, dtype=np.uint8), axis=2)
+
+
+def _single_panel(arr: np.ndarray, rgb: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(_mask(arr, rgb))
+    if len(xs) < 1000:
+        raise ValueError("role panel is absent")
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _option_panels(arr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    mask = _mask(arr, OPTION_BG)
+    active = np.count_nonzero(mask, axis=0) > 20
+    spans = []
+    start = None
+    for x, value in enumerate(active.tolist() + [False]):
+        if value and start is None:
+            start = x
+        elif not value and start is not None:
+            if x - start > 50:
+                sub = mask[:, start:x]
+                ys, xs = np.nonzero(sub)
+                spans.append((start + int(xs.min()), int(ys.min()), start + int(xs.max()), int(ys.max())))
+            start = None
+    if len(spans) != 3:
+        raise ValueError(f"expected three option panels, found {len(spans)}")
+    return spans
+
+
+def _components(mask: np.ndarray, box: tuple[int, int, int, int], minimum: int = 100) -> list[dict]:
+    x0, y0, x1, y1 = box
+    crop = mask[y0 : y1 + 1, x0 : x1 + 1].copy()
+    seen = np.zeros(crop.shape, dtype=bool)
+    found = []
+    h, w = crop.shape
+    for sy, sx in zip(*np.nonzero(crop & ~seen), strict=True):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(int(sy), int(sx))])
+        seen[sy, sx] = True
+        points = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and crop[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            py = np.asarray([p[0] for p in points])
+            px = np.asarray([p[1] for p in points])
+            found.append(
+                {
+                    "area": len(points),
+                    "cx": float(px.mean() + x0),
+                    "cy": float(py.mean() + y0),
+                    "bbox": (int(px.min() + x0), int(py.min() + y0), int(px.max() + x0), int(py.max() + y0)),
+                }
+            )
+    return found
+
+
+def _shape_name(comp: dict) -> str:
+    x0, y0, x1, y1 = comp["bbox"]
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    fill = comp["area"] / float(width * height)
+    if fill > 0.94:
+        return "square"
+    if fill > 0.68:
+        return "circle"
+    mid_y = (y0 + y1) / 2.0
+    return "triangle" if comp["cy"] > mid_y + 2.0 else "diamond"
+
+
+def _colored_components(arr: np.ndarray, palette: dict[str, tuple[int, int, int]], box: tuple[int, int, int, int]) -> list[dict]:
+    result = []
+    for name, rgb in palette.items():
+        for comp in _components(_mask(arr, rgb), box, minimum=120):
+            comp["name"] = name
+            result.append(comp)
+    return result
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    legend_box = _single_panel(arr, LEGEND_BG)
+    message_box = _single_panel(arr, MESSAGE_BG)
+    option_boxes = _option_panels(arr)
+
+    legend_shapes = sorted(_components(_mask(arr, SHAPE_INK), legend_box, minimum=300), key=lambda c: c["cy"])
+    legend_colors = sorted(_colored_components(arr, PAYLOAD_RGB, legend_box), key=lambda c: c["cy"])
+    if len(legend_shapes) != 4 or len(legend_colors) != 4:
+        raise ValueError("legend cannot be recovered")
+    legend = {_shape_name(shape): color["name"] for shape, color in zip(legend_shapes, legend_colors, strict=True)}
+    if len(legend) != 4:
+        raise ValueError("legend shape identities are not unique")
+
+    message_shapes = sorted(_components(_mask(arr, SHAPE_INK), message_box, minimum=250), key=lambda c: c["cx"])
+    if len(message_shapes) != 5:
+        raise ValueError("five message shapes were not recovered")
+    decoded = tuple(legend[_shape_name(comp)] for comp in message_shapes)
+
+    matches = []
+    tags = []
+    for index, box in enumerate(option_boxes):
+        sequence_comps = sorted(_colored_components(arr, PAYLOAD_RGB, box), key=lambda c: c["cx"])
+        tag_comps = _colored_components(arr, TAG_RGB, box)
+        if len(sequence_comps) != 5 or len(tag_comps) != 1:
+            raise ValueError("option contents cannot be recovered")
+        sequence = tuple(comp["name"] for comp in sequence_comps)
+        tags.append(tag_comps[0]["name"])
+        if sequence == decoded:
+            matches.append(index)
+    if len(matches) != 1:
+        raise ValueError(f"expected one decoded match, found {len(matches)}")
+    return tags[matches[0]]

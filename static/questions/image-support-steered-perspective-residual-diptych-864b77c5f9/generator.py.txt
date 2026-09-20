@@ -1,0 +1,202 @@
+"""Deterministic scene sampler and renderer for a projective residual diptych."""
+
+from __future__ import annotations
+
+import copy
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+W, H = 640, 420
+N = 7
+AA = 4
+
+FIDUCIALS = (
+    (232, 62, 70),    # top-left red
+    (45, 168, 92),    # top-right green
+    (52, 101, 210),   # bottom-right blue
+    (240, 184, 48),   # bottom-left amber
+)
+FRAME = (103, 74, 160)
+BACKGROUND = (247, 244, 237)
+
+PALETTES = (
+    ((34, 42, 58), (226, 232, 235)),
+    ((59, 36, 66), (235, 222, 231)),
+    ((30, 55, 54), (219, 234, 226)),
+)
+
+
+def _template(name: str) -> list[list[int]]:
+    g = [[0] * N for _ in range(N)]
+    if name == "X":
+        for i in range(N):
+            g[i][i] = g[i][N - 1 - i] = 1
+    elif name == "plus":
+        for i in range(N):
+            g[3][i] = g[i][3] = 1
+    elif name == "diamond":
+        for y in range(N):
+            for x in range(N):
+                if abs(x - 3) + abs(y - 3) == 3:
+                    g[y][x] = 1
+        g[3][3] = 1
+    elif name == "U":
+        for y in range(1, 6):
+            g[y][1] = g[y][5] = 1
+        for x in range(2, 5):
+            g[5][x] = 1
+    else:
+        raise KeyError(name)
+    assert sum(map(sum, g)) == 13
+    return g
+
+
+TEMPLATES = {name: _template(name) for name in ("X", "plus", "diamond", "U")}
+
+
+def _flat(grid: list[list[int]]) -> list[int]:
+    return [value for row in grid for value in row]
+
+
+def _reshape(values: list[int]) -> list[list[int]]:
+    return [values[i * N:(i + 1) * N] for i in range(N)]
+
+
+def _perturbed_mask(rng: random.Random, name: str, swaps: int) -> list[int]:
+    mask = _flat(TEMPLATES[name])
+    for _ in range(swaps):
+        on = [i for i, v in enumerate(mask) if v]
+        off = [i for i, v in enumerate(mask) if not v]
+        mask[rng.choice(on)] = 0
+        mask[rng.choice(off)] = 1
+    return mask
+
+
+def _quad(rng: random.Random, side: int) -> list[list[float]]:
+    x0 = 178 if side == 0 else 342
+    x1 = 298 if side == 0 else 462
+    top = 125 + rng.randint(-7, 7)
+    bottom = 295 + rng.randint(-7, 7)
+    skew = rng.randint(-13, 13)
+    inset_top = rng.randint(7, 21)
+    inset_bottom = rng.randint(3, 17)
+    return [
+        [x0 + inset_top + skew, top],
+        [x1 - inset_top + skew, top + rng.randint(-5, 5)],
+        [x1 - inset_bottom - skew, bottom],
+        [x0 + inset_bottom - skew, bottom + rng.randint(-5, 5)],
+    ]
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    names = tuple(TEMPLATES)
+    name = names[int(seed) % len(names)]
+    swaps = int(seed) % 3
+    residual = _perturbed_mask(rng, name, swaps)
+
+    # Each first panel has 24 dark cells. Its overlap with the 13-cell residual
+    # is exactly 6, so the second always has 25: answer identity cannot leak via ink.
+    on = [i for i, v in enumerate(residual) if v]
+    off = [i for i, v in enumerate(residual) if not v]
+    base_on = set(rng.sample(on, 6) + rng.sample(off, 18))
+    left = [1 if i in base_on else 0 for i in range(N * N)]
+    right = [a ^ b for a, b in zip(left, residual)]
+    assert sum(left) == 24 and sum(right) == 25
+    return {
+        "left_grid": _reshape(left),
+        "right_grid": _reshape(right),
+        "quads": [_quad(rng, 0), _quad(rng, 1)],
+        "panel_order": rng.randrange(2),
+        "palette": rng.randrange(len(PALETTES)),
+        "width": W,
+        "height": H,
+    }
+
+
+def _homography(quad: list[list[float]]) -> np.ndarray:
+    src = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+    a, b = [], []
+    for (u, v), (x, y) in zip(src, quad):
+        a.extend(([u, v, 1, 0, 0, 0, -u * x, -v * x],
+                  [0, 0, 0, u, v, 1, -u * y, -v * y]))
+        b.extend((x, y))
+    h = np.linalg.solve(np.asarray(a, float), np.asarray(b, float))
+    return np.append(h, 1.0).reshape(3, 3)
+
+
+def _project(h: np.ndarray, u: float, v: float) -> tuple[float, float]:
+    p = h @ np.array([u, v, 1.0])
+    return float(p[0] / p[2]), float(p[1] / p[2])
+
+
+def render(scene: dict) -> Image.Image:
+    width, height = int(scene.get("width", W)), int(scene.get("height", H))
+    image = Image.new("RGB", (width * AA, height * AA), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    quads = scene["quads"]
+    grids = [scene["left_grid"], scene["right_grid"]]
+    if int(scene["panel_order"]):
+        grids = grids[::-1]
+    dark, light = PALETTES[int(scene["palette"])]
+
+    def pts(points):
+        return [(round(x * AA), round(y * AA)) for x, y in points]
+
+    for quad, grid in zip(quads, grids):
+        h = _homography(quad)
+        draw.polygon(pts(quad), fill=(252, 250, 245), outline=FRAME, width=7 * AA)
+        lo, span = 0.105, 0.79
+        for y in range(N):
+            for x in range(N):
+                u0, u1 = lo + span * x / N, lo + span * (x + 1) / N
+                v0, v1 = lo + span * y / N, lo + span * (y + 1) / N
+                poly = [_project(h, u0, v0), _project(h, u1, v0),
+                        _project(h, u1, v1), _project(h, u0, v1)]
+                color = dark if grid[y][x] else light
+                draw.polygon(pts(poly), fill=color, outline=(154, 151, 153), width=1 * AA)
+        for color, (x, y) in zip(FIDUCIALS, quad):
+            r = 8.5 * AA
+            cx, cy = x * AA, y * AA
+            draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=color,
+                         outline=(255, 255, 255), width=2 * AA)
+
+    # A neutral divider makes panel pairing explicit without connecting evidence.
+    draw.rounded_rectangle((309 * AA, 194 * AA, 331 * AA, 216 * AA),
+                           radius=5 * AA, fill=(126, 119, 132))
+    draw.line((314 * AA, 205 * AA, 326 * AA, 205 * AA), fill=(247, 244, 237), width=3 * AA)
+    image = image.resize((width, height), Image.Resampling.LANCZOS)
+    return image
+
+
+def _residual(scene: dict) -> list[int]:
+    left = _flat(scene["left_grid"])
+    right = _flat(scene["right_grid"])
+    return [a ^ b for a, b in zip(left, right)]
+
+
+def _scores(values: list[int]) -> list[tuple[int, str]]:
+    return sorted((sum(a != b for a, b in zip(values, _flat(t))), name)
+                  for name, t in TEMPLATES.items())
+
+
+def analytic_gold(scene: dict) -> str:
+    return _scores([a ^ b for a, b in zip(_flat(scene["left_grid"]), _flat(scene["right_grid"]))])[0][1]
+
+
+def margin(scene: dict) -> float:
+    scores = _scores(_residual(scene))
+    return float(scores[1][0] - scores[0][0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 1.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["left_grid"], twin["right_grid"] = twin["right_grid"], twin["left_grid"]
+    twin["panel_order"] = 1 - int(twin["panel_order"])
+    return [("swap_payload_names_and_order", twin)]

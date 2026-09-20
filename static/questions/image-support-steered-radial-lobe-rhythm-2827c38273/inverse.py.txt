@@ -1,0 +1,119 @@
+"""Independent pixel-only inverse for global radial lobe rhythm."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        queue = [(sy, sx)]
+        seen[sy, sx] = True
+        points = []
+        while queue:
+            y, x = queue.pop()
+            points.append((y, x))
+            for dy, dx in ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1),
+                           (1, -1), (1, 0), (1, 1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        groups.append(np.asarray(points, dtype=np.int32))
+    return groups
+
+
+def _has_large_hole(mask: np.ndarray) -> bool:
+    """Return whether the ink separates a sizeable interior from the border."""
+    free = ~mask
+    height, width = free.shape
+    outside = np.zeros_like(free, dtype=bool)
+    queue: deque[tuple[int, int]] = deque()
+    for x in range(width):
+        for y in (0, height - 1):
+            if free[y, x] and not outside[y, x]:
+                outside[y, x] = True
+                queue.append((y, x))
+    for y in range(height):
+        for x in (0, width - 1):
+            if free[y, x] and not outside[y, x]:
+                outside[y, x] = True
+                queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and free[ny, nx] and not outside[ny, nx]:
+                outside[ny, nx] = True
+                queue.append((ny, nx))
+    return int(np.count_nonzero(free & ~outside)) >= 2500
+
+
+def _circular_fill(values: np.ndarray) -> np.ndarray:
+    good = np.flatnonzero(np.isfinite(values))
+    if len(good) < int(0.82 * len(values)):
+        raise OracleAbstention("contour has inadequate angular coverage")
+    if len(good) == len(values):
+        return values
+    extended_x = np.concatenate((good - len(values), good, good + len(values)))
+    extended_y = np.tile(values[good], 3)
+    return np.interp(np.arange(len(values)), extended_x, extended_y)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    border = np.concatenate((array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3),
+                             array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)))
+    background = np.median(border, axis=0)
+    mask = np.linalg.norm(array - background, axis=2) > 55.0
+    if not 1800 <= int(mask.sum()) <= 9000:
+        raise OracleAbstention("foreground area is not a single thin contour")
+    groups = sorted(_components(mask), key=len, reverse=True)
+    if not groups or len(groups[0]) < 0.985 * int(mask.sum()):
+        raise OracleAbstention("foreground is fragmented")
+    if not _has_large_hole(mask):
+        raise OracleAbstention("the contour is not visibly closed")
+
+    # PCA-normalize the long oval before measuring radial periodicity. This is
+    # independent of the renderer's axes, rotation, scale, and latent center.
+    points_yx = groups[0].astype(np.float64)
+    points = points_yx[:, ::-1]
+    center = points.mean(axis=0)
+    centered = points - center
+    covariance = centered.T @ centered / len(centered)
+    values, vectors = np.linalg.eigh(covariance)
+    if values[0] <= 1.0 or values[1] / values[0] < 2.5:
+        raise OracleAbstention("contour is not a measurable elongated loop")
+    normalized = (centered @ vectors) / np.sqrt(values)
+    angles = np.mod(np.arctan2(normalized[:, 1], normalized[:, 0]), 2.0 * np.pi)
+    radii = np.hypot(normalized[:, 0], normalized[:, 1])
+    bins = 360
+    indices = np.floor(angles * bins / (2.0 * np.pi)).astype(int) % bins
+    profile = np.full(bins, np.nan)
+    for index in range(bins):
+        sample = radii[indices == index]
+        if len(sample):
+            profile[index] = float(np.percentile(sample, 85))
+    profile = _circular_fill(profile)
+    # Mild circular smoothing suppresses raster teeth but leaves 4/5 cycles.
+    profile = sum(np.roll(profile, shift) for shift in range(-2, 3)) / 5.0
+    profile -= profile.mean()
+    spectrum = np.abs(np.fft.rfft(profile)) / bins
+    amp4, amp5 = float(spectrum[4]), float(spectrum[5])
+    label, winner, runner = ("four", amp4, amp5) if amp4 > amp5 else ("five", amp5, amp4)
+    if winner < 0.035 or winner - runner < 0.012:
+        raise OracleAbstention("four/five spectral margin is ambiguous")
+    return label

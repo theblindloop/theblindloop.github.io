@@ -1,0 +1,167 @@
+"""Independent pixel-only inverse for colored radial endpoint counts.
+
+This module deliberately repeats only the public raster palette and panel layout.
+It does not import the renderer or inspect a latent scene. It segments each color,
+finds its connected component, estimates the component centroid, and counts the
+rotationally invariant terminal-arm peaks in the outer annulus.
+"""
+
+from __future__ import annotations
+
+import math
+import hashlib
+
+import numpy as np
+from PIL import Image
+
+
+_PANELS = {
+    "reference": (24, 72, 376, 596),
+    "A": (424, 72, 776, 596),
+    "B": (824, 72, 1176, 596),
+}
+_PALETTE = {
+    "red": (220, 45, 50),
+    "blue": (35, 90, 190),
+    "green": (30, 150, 80),
+    "gold": (235, 155, 25),
+    "purple": (135, 60, 175),
+}
+_COLORS = tuple(_PALETTE)
+_LABEL_PALETTE = np.asarray(
+    [*_PALETTE.values(), (255, 255, 255), (74, 78, 88), (25, 28, 35)],
+    dtype=np.float32,
+)
+_COUNTS = (2, 3, 4, 5, 6)
+_DECISION_CACHE: dict[tuple[tuple[int, int], bytes], str] = {}
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 8-connected components as (x, y) pixel-center arrays."""
+    height, width = mask.shape
+    remaining = mask.copy()
+    components: list[np.ndarray] = []
+    for y, x in zip(*np.where(remaining)):
+        if not remaining[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        remaining[y, x] = False
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cx, cy))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and remaining[ny, nx]:
+                        remaining[ny, nx] = False
+                        stack.append((ny, nx))
+        components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _labels(crop: np.ndarray) -> np.ndarray:
+    distances = np.linalg.norm(
+        crop.astype(np.float32)[:, :, None, :] - _LABEL_PALETTE[None, None, :, :],
+        axis=3,
+    )
+    return distances.argmin(axis=2)
+
+
+def _colored_component(
+    image_array: np.ndarray, box: tuple[int, int, int, int], color_index: int
+) -> np.ndarray:
+    left, top, right, bottom = box
+    # The crop excludes the border and the black panel heading, which are not
+    # part of the public glyph contract.
+    crop = image_array[top + 48 : bottom - 5, left + 5 : right - 5]
+    labels = _labels(crop)
+    parts = [part for part in _components(labels == color_index) if len(part) >= 50]
+    if len(parts) != 1:
+        raise ValueError("expected one connected glyph for each panel color")
+    part = parts[0]
+    part[:, 0] += left + 5
+    part[:, 1] += top + 48
+    return part
+
+
+def _angular_lattice_distance(angles: np.ndarray, phase: float, count: int) -> np.ndarray:
+    period = 2.0 * math.pi / count
+    centered = (angles - phase + period / 2.0) % period - period / 2.0
+    return np.abs(centered)
+
+
+def _circular_distance(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Pairwise circular distance for two angle arrays."""
+    return np.abs((left[:, None] - right[None, :] + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def _endpoint_count(points: np.ndarray) -> int:
+    center = points.mean(axis=0)
+    delta = points - center
+    radii = np.hypot(delta[:, 0], delta[:, 1])
+    max_radius = float(radii.max())
+    if max_radius < 15.0:
+        raise ValueError("glyph is too small to count terminal tips")
+    outer = radii >= max(0.72 * max_radius, float(np.percentile(radii, 70)))
+    if int(outer.sum()) < 18:
+        raise ValueError("glyph has too few outer pixels")
+    angles = np.arctan2(delta[outer, 1], delta[outer, 0])
+    scores: dict[int, float] = {}
+    for count in _COUNTS:
+        period = 2.0 * math.pi / count
+        phases = np.linspace(0.0, period, 121, endpoint=False)
+        phase_scores = []
+        for phase in phases:
+            pixel_coverage = float(
+                np.mean(_angular_lattice_distance(angles, phase, count) < 0.28)
+            )
+            expected = phase + np.arange(count, dtype=np.float64) * period
+            expected_coverage = float(
+                np.mean(np.min(_circular_distance(expected, angles), axis=1) < 0.28)
+            )
+            # Pixel coverage alone cannot distinguish a two-arm glyph from a
+            # four- or six-ray lattice: the larger lattice merely adds empty
+            # expected rays. Requiring both occupied pixels and occupied rays
+            # selects the fundamental terminal-tip count.
+            phase_scores.append(pixel_coverage * expected_coverage)
+        scores[count] = max(phase_scores)
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    best_count, best_score = ordered[0]
+    runner_score = ordered[1][1]
+    if best_score < 0.55 or best_score - runner_score < 0.09:
+        raise ValueError(f"ambiguous endpoint count: {scores}")
+    return int(best_count)
+
+
+def _panel_signature(array: np.ndarray, box: tuple[int, int, int, int]) -> dict[str, int]:
+    result = {}
+    for index, color in enumerate(_COLORS):
+        result[color] = _endpoint_count(_colored_component(array, box, index))
+    if set(result.values()) != set(_COUNTS):
+        raise ValueError("panel endpoint inventory is incomplete or duplicated")
+    return result
+
+
+def _score(reference: dict[str, int], candidate: dict[str, int]) -> int:
+    return sum(reference[color] == candidate.get(color) for color in _COLORS)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the selected candidate using only the final RGB image."""
+    raw = image.convert("RGB").tobytes()
+    cache_key = (image.size, hashlib.sha256(raw).digest())
+    if cache_key in _DECISION_CACHE:
+        return _DECISION_CACHE[cache_key]
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    reference = _panel_signature(array, _PANELS["reference"])
+    candidate_a = _panel_signature(array, _PANELS["A"])
+    candidate_b = _panel_signature(array, _PANELS["B"])
+    scores = (_score(reference, candidate_a), _score(reference, candidate_b))
+    if max(scores) != len(_COLORS) or scores[0] == scores[1]:
+        raise ValueError("image has no unique endpoint-count correspondence")
+    decision = "A" if scores[0] > scores[1] else "B"
+    _DECISION_CACHE[cache_key] = decision
+    return decision

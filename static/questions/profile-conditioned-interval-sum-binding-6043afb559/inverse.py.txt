@@ -1,0 +1,112 @@
+"""Image-only inverse arm for interval_sum_binding.
+
+Receives a rendered PNG and nothing else: no scene, no renderer constants, no
+gold. It re-discovers the marks from ink alone —
+
+1. saturated pixels are classified into the three chart hues by nearest hue
+   direction in normalized RGB (only pairwise hue separation is assumed, no
+   renderer palette constants and no coordinates);
+2. each hue mask is split into connected components;
+3. components too short to be chart intervals (the small key squares) are
+   dropped, and each survivor contributes its vertical extent;
+4. the per-hue extents are summed and the largest total wins.
+
+Any structural surprise — a hue with the wrong number of intervals, no ink at
+all, or a top-two total gap too small to resolve — returns "abstain" instead of
+a guess.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "interval_sum_binding-oracle-1.0.0"
+
+SAT_SPREAD = 60          # max-min channel spread before a pixel counts as colored
+SAT_MAX_MIN = 90         # ... and the mark must not be near-black
+MIN_INTERVAL_PX = 18     # shorter colored blobs are key squares, not data
+MIN_INTERVAL_W = 4
+EXPECTED_PER_HUE = 3
+MIN_TOTAL_GAP_PX = 1     # rectangles are crisp, so only an exact tie is unresolvable
+ABSTAIN = "abstain"
+
+# Hue directions only: which channel dominates. Used for classification, not geometry.
+HUES = (
+    ("red", (1.0, 0.0, 0.0)),
+    ("green", (0.0, 1.0, 0.0)),
+    ("blue", (0.0, 0.0, 1.0)),
+)
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Bounding boxes (y0, y1, x0, x1) of 4-connected True components."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    boxes: list[tuple[int, int, int, int]] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        y0 = y1 = start_y
+        x0 = x1 = start_x
+        while stack:
+            y, x = stack.pop()
+            if y < y0:
+                y0 = y
+            elif y > y1:
+                y1 = y
+            if x < x0:
+                x0 = x
+            elif x > x1:
+                x1 = x
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        boxes.append((y0, y1, x0, x1))
+    return boxes
+
+
+def _hue_masks(array: np.ndarray) -> dict[str, np.ndarray]:
+    values = array.astype(np.int16)
+    high = values.max(axis=2)
+    low = values.min(axis=2)
+    colored = ((high - low) >= SAT_SPREAD) & (high >= SAT_MAX_MIN)
+    norm = values.astype(np.float32)
+    scale = np.maximum(np.sqrt((norm * norm).sum(axis=2)), 1.0)
+    unit = norm / scale[:, :, None]
+    scores = []
+    for _, anchor in HUES:
+        vector = np.array(anchor, dtype=np.float32)
+        vector = vector / np.sqrt((vector * vector).sum())
+        scores.append((unit * vector[None, None, :]).sum(axis=2))
+    best = np.stack(scores, axis=2).argmax(axis=2)
+    return {name: colored & (best == index) for index, (name, _) in enumerate(HUES)}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+    if array.size == 0:
+        return ABSTAIN
+    masks = _hue_masks(array)
+
+    totals: dict[str, int] = {}
+    for name, mask in masks.items():
+        if not mask.any():
+            return ABSTAIN
+        extents = [
+            (y1 - y0 + 1)
+            for y0, y1, x0, x1 in _components(mask)
+            if (y1 - y0 + 1) >= MIN_INTERVAL_PX and (x1 - x0 + 1) >= MIN_INTERVAL_W
+        ]
+        if len(extents) != EXPECTED_PER_HUE:
+            return ABSTAIN
+        totals[name] = sum(extents)
+
+    ranked = sorted(totals.items(), key=lambda item: item[1], reverse=True)
+    if ranked[0][1] - ranked[1][1] < MIN_TOTAL_GAP_PX:
+        return ABSTAIN
+    return ranked[0][0]

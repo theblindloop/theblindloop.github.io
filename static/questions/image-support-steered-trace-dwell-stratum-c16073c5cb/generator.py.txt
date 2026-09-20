@@ -1,0 +1,344 @@
+"""Dwell-band world: which shaded stratum holds one thin trace for the most columns.
+
+Latent scene z describes a four-band chart panel and one thin near-black trace
+given as exactly one centre row per panel column. The decision is the 1-based
+index (from the top) of the band whose total column dwell is largest, i.e. an
+argmax over a histogram accumulated along the whole trace.
+
+Analytic gold reads only ``band_edges`` and ``ys``; both are drawn by ``render``.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "trace_dwell_stratum-0.1.0"
+
+CANVAS = (640, 460)
+PANEL = (70, 40, 570, 420)  # x0, y0, x1, y1 (exclusive right/bottom)
+NBANDS = 4
+NCOL = PANEL[2] - PANEL[0]
+HALF = NCOL // 2
+TRACE_VALUE = 38
+BAND_SHADE_POOL = (192, 208, 222, 234, 246)
+MAX_SLOPE = 12
+EDGE_KEEP = 9  # keep run plateaus this far from a band edge
+NEAR_EDGE_TOL = 4
+QUARANTINE_MARGIN = 8.0
+
+MARGIN_CLASSES = {
+    "wide": (60.0, 200.0),
+    "medium": (26.0, 59.0),
+    "narrow": (9.0, 25.0),
+    "boundary": (1.0, 7.0),
+}
+CLASS_BY_SLOT = ("wide", "wide", "medium", "narrow", "wide", "wide", "medium", "boundary")
+
+DISTRACTOR_COLORS = (
+    (206, 74, 62),
+    (58, 106, 186),
+    (196, 142, 44),
+    (96, 156, 84),
+    (150, 88, 174),
+    (54, 158, 160),
+)
+
+
+# --------------------------------------------------------------------------- #
+# shared column/band accounting (scene arithmetic only)
+# --------------------------------------------------------------------------- #
+def _column_spans(scene: dict) -> list[tuple[int, int]]:
+    """Vertical dark span (top row, bottom row) drawn for every panel column.
+
+    ``render`` fills exactly these rows, so the span midpoint is both the drawn
+    trace centre and the quantity the pixel oracle measures.
+    """
+    ys = scene["ys"]
+    spans: list[tuple[int, int]] = []
+    n = len(ys)
+    for i, y in enumerate(ys):
+        left = (ys[i - 1] + y) // 2 if i > 0 else y
+        right = (ys[i + 1] + y) // 2 if i + 1 < n else y
+        spans.append((min(y, left, right) - 1, max(y, left, right) + 1))
+    return spans
+
+
+def _column_bands(scene: dict) -> list[int]:
+    """Band index of each column, from the drawn span midpoint."""
+    edges = scene["band_edges"]
+    bands = []
+    for top, bottom in _column_spans(scene):
+        mid = (top + bottom) / 2.0
+        index = 0
+        for k in range(1, NBANDS):
+            if edges[k] <= mid:
+                index = k
+        bands.append(index)
+    return bands
+
+
+def _tally(scene: dict) -> list[int]:
+    counts = [0] * NBANDS
+    for band in _column_bands(scene):
+        counts[band] += 1
+    return counts
+
+
+def _ranked(scene: dict) -> tuple[int, float]:
+    counts = _tally(scene)
+    order = sorted(range(NBANDS), key=lambda k: (-counts[k], k))
+    best = order[0]
+    return best, float(counts[best] - counts[order[1]])
+
+
+def analytic_gold(scene: dict) -> str:
+    """1-based index from the top of the band with the largest column dwell."""
+    best, _ = _ranked(scene)
+    return str(best + 1)
+
+
+def margin(scene: dict) -> float:
+    """Column-count lead of the winning band over the runner-up band."""
+    _, gap = _ranked(scene)
+    return gap
+
+
+def is_quarantined(scene: dict) -> bool:
+    _, gap = _ranked(scene)
+    return gap < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent alias: every sampled field is drawn and gold reads drawn fields."""
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def _sample_edges(rng: random.Random, winner: int) -> list[int]:
+    y0, y1 = PANEL[1], PANEL[3]
+    total = y1 - y0
+    for _ in range(400):
+        heights = [rng.randint(74, 118) for _ in range(NBANDS - 1)]
+        last = total - sum(heights)
+        if not 74 <= last <= 118:
+            continue
+        heights.append(last)
+        if heights[winner] == max(heights):
+            continue  # counterbalance: the answer band is never the tallest
+        edges = [y0]
+        for height in heights:
+            edges.append(edges[-1] + height)
+        return edges
+    raise RuntimeError("band heights not sampled")
+
+
+def _plan_runs(rng: random.Random, winner: int, target: float) -> list[tuple[int, int]] | None:
+    others = [k for k in range(NBANDS) if k != winner]
+    rng.shuffle(others)
+    leader_left, leader_right, filler = others
+    small_a = rng.randint(9, 18)
+    small_b = rng.randint(9, 18)
+    gap = (250 - 3 * small_a - small_b - 2 * target) / 3.0
+    lead = int(round(gap))
+    if lead < 12:
+        return None
+    quota = (250 - small_a - small_b - lead) // 2
+    plateau = quota
+    strong = 250 - small_a - small_b - plateau
+    if plateau < 40 or strong < plateau + 12:
+        return None
+    runs: list[tuple[int, int]] = []
+    for leader in (leader_left, leader_right):
+        first = strong // 2
+        runs.append((leader, first))
+        runs.append((winner, plateau // 2))
+        runs.append((filler, small_a))
+        runs.append((leader, strong - first))
+        runs.append((winner, plateau - plateau // 2))
+        runs.append((filler if rng.random() < 0.5 else leader_right, small_b))
+        leader_left, leader_right = leader_right, leader_left
+    return runs
+
+
+def _walk(rng: random.Random, edges: list[int], runs: list[tuple[int, int]]) -> list[int]:
+    ys: list[int] = []
+    current = None
+    for band, length in runs:
+        lo = edges[band] + EDGE_KEEP
+        hi = edges[band + 1] - 1 - EDGE_KEEP
+        target = rng.randint(lo, hi)
+        remaining = length
+        if current is not None and remaining > 0:
+            jump = target - current
+            steps = max(1, min(remaining, (abs(jump) + MAX_SLOPE - 1) // MAX_SLOPE))
+            for step in range(1, steps + 1):
+                ys.append(int(round(current + jump * step / steps)))
+            remaining -= steps
+        while remaining > 0:
+            if current is None:
+                current = target
+                ys.append(current)
+            else:
+                nxt = ys[-1] + rng.choice((-2, -1, 0, 0, 1, 2))
+                ys.append(max(lo, min(hi, nxt)))
+            remaining -= 1
+        current = ys[-1] if ys else target
+    del ys[NCOL:]
+    while len(ys) < NCOL:
+        ys.append(ys[-1] if ys else (edges[0] + edges[1]) // 2)
+    return ys
+
+
+def _near_edge_count(scene: dict) -> int:
+    edges = scene["band_edges"]
+    total = 0
+    for top, bottom in _column_spans(scene):
+        mid = (top + bottom) / 2.0
+        if any(abs(mid - edges[k]) < NEAR_EDGE_TOL for k in range(1, NBANDS)):
+            total += 1
+    return total
+
+
+def _acceptable(scene: dict, winner: int, lo: float, hi: float, strict: bool) -> bool:
+    """Accept only scenes whose answer is globally decided and locally reversed."""
+    bands = _column_bands(scene)
+    counts = [0] * NBANDS
+    left = [0] * NBANDS
+    right = [0] * NBANDS
+    for index, band in enumerate(bands):
+        counts[band] += 1
+        (left if index < HALF else right)[band] += 1
+    order = sorted(range(NBANDS), key=lambda k: (-counts[k], k))
+    best = order[0]
+    if strict and best != winner:
+        return False
+    gap = counts[best] - counts[order[1]]
+    if not lo <= gap <= hi:
+        return False
+    edges = scene["band_edges"]
+    heights = [edges[k + 1] - edges[k] for k in range(NBANDS)]
+    if heights[best] == max(heights):
+        return False  # counterbalance: the answer band is never the tallest
+    for half in (left, right):
+        rank = sorted(range(NBANDS), key=lambda k: (-half[k], k))
+        if rank[0] == best or half[rank[0]] - half[rank[1]] < 8:
+            return False  # each half alone must point at a different band
+    if bands[0] == best or bands[-1] == best:
+        return False  # counterbalance: endpoints never mark the answer
+    if _near_edge_count(scene) > 18:
+        return False
+    return True
+
+
+def _decorations(rng: random.Random, edges: list[int]) -> dict:
+    colors = list(DISTRACTOR_COLORS)
+    rng.shuffle(colors)
+    rules = []
+    for _ in range(rng.randint(1, 2)):
+        band = rng.randrange(NBANDS)
+        row = rng.randint(edges[band] + 12, edges[band + 1] - 13)
+        start = rng.randint(PANEL[0] + 10, PANEL[0] + 110)
+        stop = rng.randint(PANEL[2] - 110, PANEL[2] - 11)
+        rules.append([row, start, stop, list(colors[rng.randrange(len(colors))])])
+    guides = []
+    for _ in range(rng.randint(1, 3)):
+        column = rng.randint(PANEL[0] + 40, PANEL[2] - 41)
+        guides.append([column, list(colors[rng.randrange(len(colors))])])
+    chips = []
+    for _ in range(rng.randint(4, 7)):
+        side = rng.choice(("top", "bottom", "left", "right"))
+        if side == "top":
+            cx, cy = rng.randint(80, 560), rng.randint(12, 30)
+        elif side == "bottom":
+            cx, cy = rng.randint(80, 560), rng.randint(430, 448)
+        elif side == "left":
+            cx, cy = rng.randint(14, 56), rng.randint(50, 410)
+        else:
+            cx, cy = rng.randint(584, 626), rng.randint(50, 410)
+        chips.append([cx, cy, rng.randint(4, 8), list(colors[rng.randrange(len(colors))])])
+    return {"rules": rules, "guides": guides, "chips": chips}
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    winner = seed % NBANDS
+    lo, hi = MARGIN_CLASSES[CLASS_BY_SLOT[seed % len(CLASS_BY_SLOT)]]
+    shades = list(BAND_SHADE_POOL)
+    for stage in range(3):
+        try:
+            return _search(rng, seed, winner, lo, hi, shades, stage)
+        except RuntimeError:
+            lo, hi = 9.0, 200.0  # widen the requested margin class, keep every gate constraint
+    raise RuntimeError(f"could not sample dwell scene for seed {seed}")
+
+
+def _search(
+    rng: random.Random,
+    seed: int,
+    winner: int,
+    lo: float,
+    hi: float,
+    shades: list[int],
+    stage: int,
+) -> dict:
+    band_shades = shades[:NBANDS]
+    edges = _sample_edges(rng, winner)
+    for attempt in range(2500):
+        if attempt % 25 == 0:
+            edges = _sample_edges(rng, winner)
+            rng.shuffle(shades)
+            band_shades = shades[:NBANDS]
+            if any(
+                abs(band_shades[k] - band_shades[k + 1]) < 12 for k in range(NBANDS - 1)
+            ):
+                continue
+        target = rng.uniform(lo, min(hi, 96.0))
+        runs = _plan_runs(rng, winner, target)
+        if runs is None:
+            continue
+        ys = _walk(rng, edges, runs)
+        scene = {
+            "canvas": list(CANVAS),
+            "panel": list(PANEL),
+            "band_edges": list(edges),
+            "band_shades": list(band_shades),
+            "trace_value": TRACE_VALUE,
+            "ys": ys,
+            "decoration": _decorations(rng, edges),
+        }
+        if _acceptable(scene, winner, lo, hi, stage == 0 and lo >= 26.0):
+            return scene
+    raise RuntimeError(f"stage {stage} exhausted for seed {seed}")
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def render(scene: dict) -> Image.Image:
+    width, height = scene["canvas"]
+    x0, y0, x1, y1 = scene["panel"]
+    edges = scene["band_edges"]
+    shades = scene["band_shades"]
+    image = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    for k in range(NBANDS):
+        value = int(shades[k])
+        draw.rectangle([x0, edges[k], x1 - 1, edges[k + 1] - 1], fill=(value, value, value))
+    decoration = scene["decoration"]
+    for row, start, stop, color in decoration["rules"]:
+        draw.rectangle([start, row, stop, row + 1], fill=tuple(color))
+    for column, color in decoration["guides"]:
+        for top in range(y0 + 4, y1 - 4, 14):
+            draw.rectangle([column, top, column + 1, min(top + 7, y1 - 1)], fill=tuple(color))
+    for cx, cy, radius, color in decoration["chips"]:
+        draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=tuple(color))
+    value = int(scene["trace_value"])
+    ink = (value, value, value)
+    for index, (top, bottom) in enumerate(_column_spans(scene)):
+        column = x0 + index
+        draw.rectangle([column, top, column, bottom], fill=ink)
+    return image

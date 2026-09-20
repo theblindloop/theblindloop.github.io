@@ -1,0 +1,123 @@
+"""Independent inverse arm: parse and replay the visual grammar from RGB pixels."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+INK_LIMIT = 70
+COURIER_COLORS = {(25, 110, 205), (20, 150, 145), (95, 75, 190)}
+PARCEL_COLORS = {(200, 40, 135), (185, 55, 175), (220, 65, 75)}
+MOVE_COLORS = {(40, 155, 95), (215, 105, 35), (25, 140, 190)}
+
+
+def _mask_for(arr: np.ndarray, colors: set[tuple[int, int, int]]) -> np.ndarray:
+    mask = np.zeros(arr.shape[:2], dtype=bool)
+    for color in colors:
+        mask |= np.all(arr == np.asarray(color, dtype=np.uint8), axis=2)
+    return mask
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            py, px = queue.popleft()
+            points.append((py, px))
+            for ny, nx in ((py - 1, px), (py + 1, px), (py, px - 1), (py, px + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            ys = [point[0] for point in points]
+            xs = [point[1] for point in points]
+            output.append({"area": len(points), "box": (min(xs), min(ys), max(xs), max(ys)), "cx": sum(xs) / len(xs), "cy": sum(ys) / len(ys)})
+    return output
+
+
+def _parse_rooms_and_cards(black: np.ndarray) -> tuple[list[dict], list[dict]]:
+    large = _components(black, minimum=250)
+    rooms, cards = [], []
+    for item in large:
+        x0, y0, x1, y1 = item["box"]
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if 115 <= width <= 155 and 120 <= height <= 155:
+            rooms.append(item)
+        elif 90 <= width <= 125 and 170 <= height <= 210:
+            cards.append(item)
+    rooms.sort(key=lambda item: item["cx"])
+    cards.sort(key=lambda item: item["cx"])
+    if len(rooms) != 4 or len(cards) != 6:
+        raise ValueError(f"visual grammar damaged: found {len(rooms)} rooms and {len(cards)} cards")
+    return rooms, cards
+
+
+def _nearest_room(component: dict, rooms: list[dict], name: str) -> int:
+    distances = [abs(component["cx"] - room["cx"]) for room in rooms]
+    order = sorted(range(4), key=lambda index: distances[index])
+    if distances[order[1]] - distances[order[0]] < 30:
+        raise ValueError(f"{name} room is ambiguous")
+    return order[0] + 1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 300 or arr.shape[1] < 600:
+        raise ValueError("image is too small")
+    black = np.all(arr < INK_LIMIT, axis=2)
+    rooms, cards = _parse_rooms_and_cards(black)
+
+    courier_parts = [item for item in _components(_mask_for(arr, COURIER_COLORS), minimum=100) if item["cy"] < 230]
+    parcel_parts = [item for item in _components(_mask_for(arr, PARCEL_COLORS), minimum=100) if item["cy"] < 230]
+    if len(courier_parts) not in (1, 2) or len(parcel_parts) != 2:
+        raise ValueError(f"start evidence damaged: {len(courier_parts)} courier parts, {len(parcel_parts)} parcel parts")
+    courier = _nearest_room(max(courier_parts, key=lambda item: item["area"]), rooms, "courier")
+    parcel_component = max(parcel_parts, key=lambda item: item["area"])
+    parcel = _nearest_room(parcel_component, rooms, "parcel")
+    carried = False
+
+    parcel_mask = _mask_for(arr, PARCEL_COLORS)
+    move_mask = _mask_for(arr, MOVE_COLORS)
+    commands = []
+    for card in cards:
+        x0, y0, x1, y1 = card["box"]
+        inner_parcel = int(parcel_mask[y0 + 8:y1 - 7, x0 + 8:x1 - 7].sum())
+        inner_move = move_mask[y0 + 8:y1 - 7, x0 + 8:x1 - 7]
+        move_area = int(inner_move.sum())
+        if move_area > 300 and inner_parcel < 50:
+            _ys, xs = np.nonzero(inner_move)
+            center = (inner_move.shape[1] - 1) / 2
+            displacement = float(xs.mean() - center)
+            if abs(displacement) < 3:
+                raise ValueError("arrow direction is ambiguous")
+            commands.append(("move", "right" if displacement > 0 else "left"))
+        elif inner_parcel > 1500 and move_area < 50:
+            commands.append(("pick", None))
+        elif 500 < inner_parcel < 1300 and move_area < 50:
+            commands.append(("drop", None))
+        else:
+            raise ValueError(f"card type evidence is ambiguous: parcel={inner_parcel}, move={move_area}")
+
+    for op, value in commands:
+        if op == "move":
+            destination = courier + (1 if value == "right" else -1)
+            if 1 <= destination <= 4:
+                courier = destination
+                if carried:
+                    parcel = courier
+        elif op == "pick":
+            if not carried and courier == parcel:
+                carried = True
+        elif carried:
+            parcel = courier
+            carried = False
+    return str(parcel)

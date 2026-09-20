@@ -1,0 +1,204 @@
+"""Pixel-only inverse arm for the notch-keyed tile de-rotation world.
+
+Input is one rasterised PNG plus the public question contract; nothing else.
+The arm segments the saturated marks, takes the four large ones as the sheet
+fiducials and the sixteen small ones as tile notches, rebuilds the 4x4 tile
+grid the fiducials delimit, reads each tile's printed block corner and its own
+notch edge, executes the declared per-tile turn on that raster evidence (turn
+the tile until its notch is at the top, i.e. subtract the notch edge index from
+the block corner index), and matches the sixteen recovered corners against the
+five arrangements named in the question.
+
+It abstains when the fiducials or notches are not exactly as described, when a
+tile does not show exactly one dark corner cell, when the sheet has no legible
+ink-to-paper separation, or when two arrangements tie.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ABSTAIN = "abstain"
+TILES = 4
+
+# The five arrangements named in the question, transcribed independently from
+# their verbal descriptions.  Corners are written as compass-free letters:
+# a = top left, b = top right, c = bottom right, d = bottom left, numbered
+# clockwise from the top left so that a clockwise quarter turn adds one.
+LETTERS = {"a": 0, "b": 1, "c": 2, "d": 3}
+ART: dict[str, tuple[str, ...]] = {
+    # nearest the sheet centre
+    "quads": ("ccdd", "ccdd", "bbaa", "bbaa"),
+    # furthest from the sheet centre
+    "window": ("aabb", "aabb", "ddcc", "ddcc"),
+    # all at the top left of their own tile
+    "grid": ("aaaa", "aaaa", "aaaa", "aaaa"),
+    # vertical pairs, every block against the left edge of its tile
+    "bars": ("dddd", "aaaa", "dddd", "aaaa"),
+    # horizontal pairs, every block against the top edge of its tile
+    "dashes": ("baba", "baba", "baba", "baba"),
+}
+TEMPLATES: dict[str, tuple[int, ...]] = {
+    name: tuple(LETTERS[ch] for row in rows for ch in row) for name, rows in ART.items()
+}
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, float, float]]:
+    """Areas and centroids of the 4-connected true regions of a small mask."""
+
+    seen = np.zeros(mask.shape, dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1]:
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        cy = sum(p[0] for p in pixels) / len(pixels)
+        cx = sum(p[1] for p in pixels) / len(pixels)
+        out.append((len(pixels), cx, cy))
+    return out
+
+
+def _marks(arr: np.ndarray):
+    high = arr.max(axis=2).astype(np.int16)
+    low = arr.min(axis=2).astype(np.int16)
+    comps = _components((high - low) > 60)
+    if not comps:
+        return None
+    big = [c for c in comps if c[0] >= 150]
+    small = [c for c in comps if c[0] < 150]
+    if len(big) != 4 or len(small) != TILES * TILES:
+        return None
+    xs = [c[1] for c in big]
+    ys = [c[2] for c in big]
+    mid_x = 0.5 * (min(xs) + max(xs))
+    mid_y = 0.5 * (min(ys) + max(ys))
+    corners = {}
+    for key, want in (("tl", (0, 0)), ("tr", (1, 0)), ("bl", (0, 1)), ("br", (1, 1))):
+        picked = [
+            c
+            for c in big
+            if (c[1] >= mid_x) == bool(want[0]) and (c[2] >= mid_y) == bool(want[1])
+        ]
+        if len(picked) != 1:
+            return None
+        corners[key] = (picked[0][1], picked[0][2])
+    return corners, small
+
+
+def _grid(corners) -> tuple[float, float, float] | None:
+    x0 = 0.5 * (corners["tl"][0] + corners["bl"][0])
+    x1 = 0.5 * (corners["tr"][0] + corners["br"][0])
+    y0 = 0.5 * (corners["tl"][1] + corners["tr"][1])
+    y1 = 0.5 * (corners["bl"][1] + corners["br"][1])
+    pitch_x = (x1 - x0) / TILES
+    pitch_y = (y1 - y0) / TILES
+    if pitch_x < 24.0 or pitch_y < 24.0 or abs(pitch_x - pitch_y) > 2.0:
+        return None
+    return x0, y0, 0.5 * (pitch_x + pitch_y)
+
+
+def _notch_edges(small, x0: float, y0: float, pitch: float):
+    """Edge index (0 top, 1 right, 2 bottom, 3 left) of each tile's notch."""
+
+    edges: dict[int, int] = {}
+    for _area, cx, cy in small:
+        col = int(np.floor((cx - x0) / pitch))
+        row = int(np.floor((cy - y0) / pitch))
+        if not (0 <= col < TILES and 0 <= row < TILES):
+            return None
+        tile = row * TILES + col
+        if tile in edges:
+            return None
+        dx = cx - (x0 + (col + 0.5) * pitch)
+        dy = cy - (y0 + (row + 0.5) * pitch)
+        if abs(dx) > abs(dy):
+            edges[tile] = 1 if dx > 0 else 3
+        else:
+            edges[tile] = 2 if dy > 0 else 0
+    if len(edges) != TILES * TILES:
+        return None
+    return edges
+
+
+def _block_corners(luma: np.ndarray, x0: float, y0: float, pitch: float):
+    """Printed block corner of each tile, read from its four corner cells."""
+
+    threshold = 0.5 * (float(luma.min()) + float(luma.max()))
+    if float(luma.max()) - float(luma.min()) < 60.0:
+        return None
+    inset = 0.24 * pitch
+    radius = max(2.0, 0.05 * pitch)
+    rows, cols = luma.shape
+    printed: list[int] = []
+    for r in range(TILES):
+        for c in range(TILES):
+            bx = x0 + c * pitch
+            by = y0 + r * pitch
+            dark = []
+            probes = (
+                (bx + inset, by + inset),
+                (bx + pitch - inset, by + inset),
+                (bx + pitch - inset, by + pitch - inset),
+                (bx + inset, by + pitch - inset),
+            )
+            for index, (px, py) in enumerate(probes):
+                xa, xb = int(round(px - radius)), int(round(px + radius)) + 1
+                ya, yb = int(round(py - radius)), int(round(py + radius)) + 1
+                if xa < 0 or ya < 0 or xb > cols or yb > rows:
+                    return None
+                if float(luma[ya:yb, xa:xb].mean()) < threshold:
+                    dark.append(index)
+            if len(dark) != 1:
+                return None
+            printed.append(dark[0])
+    return printed
+
+
+def decide(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    found = _marks(arr)
+    if found is None:
+        return ABSTAIN, 0.0
+    corners, small = found
+    grid = _grid(corners)
+    if grid is None:
+        return ABSTAIN, 0.0
+    x0, y0, pitch = grid
+    edges = _notch_edges(small, x0, y0, pitch)
+    if edges is None:
+        return ABSTAIN, 0.0
+    luma = arr[:, :, 0] * 0.299 + arr[:, :, 1] * 0.587 + arr[:, :, 2] * 0.114
+    printed = _block_corners(luma, x0, y0, pitch)
+    if printed is None:
+        return ABSTAIN, 0.0
+    # The declared turn: bringing the notch back to the top subtracts the notch
+    # edge index from the block corner index.
+    turned = tuple((printed[t] - edges[t]) % 4 for t in range(TILES * TILES))
+    ranked = sorted(
+        (sum(1 for x, y in zip(turned, cells) if x != y), name)
+        for name, cells in TEMPLATES.items()
+    )
+    gap = float(ranked[1][0] - ranked[0][0])
+    if gap < 1.0:
+        return ABSTAIN, gap
+    return ranked[0][1], gap
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return decide(image)[0]
+
+
+def margin_from_image(image: Image.Image) -> float:
+    return decide(image)[1]

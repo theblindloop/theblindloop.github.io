@@ -1,0 +1,168 @@
+"""Independent pixel-only inverse for the folded-route reassembly world."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+PANEL_COUNT = 4
+STRIP_WIDTH = 320
+STRIP_HEIGHT = 120
+PANEL_WIDTH = 80
+INK_WIDTH = 8
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if visited[y, x]:
+            continue
+        stack = [(y, x)]
+        visited[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(points) > len(best):
+            best = points
+    if len(best) < 1000:
+        raise ValueError("connected route is missing")
+    result = np.zeros_like(mask, dtype=bool)
+    points = np.asarray(best, dtype=int)
+    result[points[:, 0], points[:, 1]] = True
+    return result
+
+
+def _route_frame(component: np.ndarray) -> tuple[float, float, float, float, float]:
+    ys, xs = np.nonzero(component)
+    if len(xs) < 1000:
+        raise ValueError("route component is too small")
+    x0 = float(xs.min())
+    x1 = float(xs.max())
+    y0 = float(ys.min())
+    y1 = float(ys.max())
+    column_counts = component.sum(axis=0).astype(float)
+    positive = column_counts[column_counts > 0]
+    if len(positive) == 0:
+        raise ValueError("route has no measurable width")
+    # The dark mask loses the bright embedded stroke.  Restoring its fixed
+    # width gives the centerline offset used for the inverse reassembly.
+    thin_band = positive[positive < max(positive) * 0.72]
+    estimate = float(np.percentile(thin_band if len(thin_band) else positive, 30.0))
+    thickness = max(24.0, estimate + float(INK_WIDTH))
+    half = thickness / 2.0
+    left = x0 + half
+    right = x1 - half
+    top = y0 + half
+    bottom = y1 - half
+    step = (right - left) / PANEL_COUNT
+    if step < 45.0 or bottom - top < 22.0:
+        raise ValueError("route frame is ambiguous")
+    return left, right, top, bottom, step
+
+
+def _check_panels(component: np.ndarray, left: float, top: float, bottom: float, step: float) -> None:
+    for panel in range(PANEL_COUNT):
+        base = top if panel % 2 == 0 else bottom
+        start = left + panel * step + 0.18 * step
+        end = left + (panel + 1) * step - 0.18 * step
+        for x in np.linspace(start, end, 18):
+            xi = int(round(float(x)))
+            yi = int(round(base))
+            crop = component[max(0, yi - 8): yi + 9, max(0, xi - 5): xi + 6]
+            if crop.size == 0 or not np.any(crop):
+                raise ValueError("one route panel is incomplete")
+
+
+def _sample_strip(array: np.ndarray, left: float, top: float, bottom: float, step: float, thickness: float) -> np.ndarray:
+    height, width = array.shape[:2]
+    gray = array.astype(np.float32).mean(axis=2)
+    result = np.zeros((STRIP_HEIGHT, STRIP_WIDTH), dtype=bool)
+    scale_y = thickness * 0.72 / 60.0
+    for y in range(22, 99):
+        for x in range(STRIP_WIDTH):
+            panel = min(PANEL_COUNT - 1, x // PANEL_WIDTH)
+            local_x = (x - panel * PANEL_WIDTH) / float(PANEL_WIDTH - 1)
+            image_x = left + (panel + local_x) * step
+            base = top if panel % 2 == 0 else bottom
+            image_y = base + (y - 60.0) * scale_y
+            xi = int(round(image_x))
+            yi = int(round(image_y))
+            if 0 <= xi < width and 0 <= yi < height:
+                # Avoid the bright join ticks at panel boundaries and sample
+                # only inside the route's thick band.
+                if 9 < x % PANEL_WIDTH < PANEL_WIDTH - 9:
+                    result[y, x] = gray[yi, xi] > 152.0
+    return result
+
+
+def _paths(symbol: str) -> list[list[tuple[float, float]]]:
+    if symbol == "wave":
+        return [[(float(x), 60.0 + 16.0 * math.sin((float(x) - 16.0) * 2.0 * math.pi / 142.0)) for x in range(16, 305, 2)]]
+    if symbol == "fork":
+        return [
+            [(176.0, 101.0), (176.0, 60.0)],
+            [(18.0, 29.0), (176.0, 60.0), (302.0, 29.0)],
+            [(18.0, 91.0), (66.0, 68.0)],
+            [(254.0, 68.0), (302.0, 91.0)],
+        ]
+    raise ValueError(symbol)
+
+
+def _template(symbol: str) -> np.ndarray:
+    image = Image.new("L", (STRIP_WIDTH, STRIP_HEIGHT), 0)
+    draw = ImageDraw.Draw(image)
+    for path in _paths(symbol):
+        draw.line([(int(round(x)), int(round(y))) for x, y in path], fill=255, width=12, joint="curve")
+    result = np.asarray(image, dtype=np.uint8) > 0
+    for panel in range(PANEL_COUNT):
+        result[:, panel * PANEL_WIDTH: panel * PANEL_WIDTH + 10] = False
+        result[:, (panel + 1) * PANEL_WIDTH - 9: (panel + 1) * PANEL_WIDTH] = False
+    result[:22] = False
+    result[99:] = False
+    return result
+
+
+def _score(observed: np.ndarray, expected: np.ndarray) -> float:
+    observed_count = int(np.count_nonzero(observed))
+    expected_count = int(np.count_nonzero(expected))
+    overlap = int(np.count_nonzero(observed & expected))
+    if observed_count == 0 or expected_count == 0:
+        return 0.0
+    return 2.0 * overlap / float(observed_count + expected_count)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover ``wave`` or ``fork`` using only the final RGB pixels."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 64:
+        raise ValueError("invalid raster")
+    gray = array.astype(np.float32).mean(axis=2)
+    route = gray < 110.0
+    component = _largest_component(route)
+    left, right, top, bottom, step = _route_frame(component)
+    _check_panels(component, left, top, bottom, step)
+    thickness = max(24.0, float(np.percentile(component.sum(axis=0)[component.sum(axis=0) > 0], 30.0)) + INK_WIDTH)
+    observed = _sample_strip(array, left, top, bottom, step, thickness)
+    scores = {symbol: _score(observed, _template(symbol)) for symbol in ("wave", "fork")}
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if ranked[0][1] < 0.12 or ranked[0][1] - ranked[1][1] < 0.045:
+        raise ValueError("reassembled strip is ambiguous")
+    for panel in range(PANEL_COUNT):
+        section = observed[22:99, panel * PANEL_WIDTH + 12: (panel + 1) * PANEL_WIDTH - 12]
+        if int(np.count_nonzero(section)) < 8:
+            raise ValueError("one strip panel lacks visible ink")
+    return ranked[0][0]

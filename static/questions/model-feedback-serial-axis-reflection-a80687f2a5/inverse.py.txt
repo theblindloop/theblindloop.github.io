@@ -1,0 +1,138 @@
+"""Independent image-only inverse for the serial-axis reflection world.
+
+The inverse repeats only raster constants and measurement primitives.  It
+segments the two guide colors, estimates their infinite supporting lines,
+reflects source-mask pixels in the visible order, and compares the predicted
+mask with each target fill.  It receives no scene data and imports no
+renderer-side code.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 1020
+HEIGHT = 740
+PANEL_W = 480
+PANEL_H = 340
+MARGIN_X = 20
+MARGIN_Y = 20
+GAP_X = 20
+GAP_Y = 20
+
+SOURCE = (30, 66, 105)
+TARGET_FILL = (255, 244, 216)
+VIOLET_AXIS = (105, 78, 151)
+GOLD_AXIS = (183, 125, 36)
+
+
+def _origin(slot: int) -> tuple[int, int]:
+    return (
+        MARGIN_X + (slot % 2) * (PANEL_W + GAP_X),
+        MARGIN_Y + (slot // 2) * (PANEL_H + GAP_Y),
+    )
+
+
+def _exact(arr: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    return np.all(arr == np.asarray(color, dtype=np.uint8), axis=2)
+
+
+def _points(mask: np.ndarray) -> np.ndarray:
+    y, x = np.nonzero(mask)
+    if len(x) == 0:
+        raise ValueError("empty raster component")
+    return np.column_stack((x.astype(np.float64), y.astype(np.float64)))
+
+
+def _fit_axis(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    points = _points(mask)
+    center = points.mean(axis=0)
+    centered = points - center
+    covariance = centered.T @ centered
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    norm = np.linalg.norm(direction)
+    return center, direction / (norm or 1.0)
+
+
+def _reflect(points: np.ndarray, axis_center: np.ndarray, axis_direction: np.ndarray) -> np.ndarray:
+    direction = axis_direction / (np.linalg.norm(axis_direction) or 1.0)
+    relative = points - axis_center
+    return 2.0 * (relative @ direction)[:, None] * direction[None, :] - relative + axis_center
+
+
+def _transformed_mask(
+    source: np.ndarray,
+    first_center: np.ndarray,
+    first_direction: np.ndarray,
+    second_center: np.ndarray,
+    second_direction: np.ndarray,
+) -> set[tuple[int, int]]:
+    points = _points(source)
+    first = _reflect(points, first_center, first_direction)
+    second = _reflect(first, second_center, second_direction)
+    rounded = np.rint(second).astype(np.int32)
+    height, width = source.shape
+    inside = (
+        (rounded[:, 0] >= 0)
+        & (rounded[:, 0] < width)
+        & (rounded[:, 1] >= 0)
+        & (rounded[:, 1] < height)
+    )
+    return {(int(x), int(y)) for x, y in rounded[inside]}
+
+
+def _mask_set(mask: np.ndarray) -> set[tuple[int, int]]:
+    y, x = np.nonzero(mask)
+    return {(int(px), int(py)) for px, py in zip(x, y)}
+
+
+def _overlap_score(predicted: set[tuple[int, int]], target: np.ndarray) -> float:
+    actual = _mask_set(target)
+    union = len(predicted | actual)
+    if not union:
+        return -1.0
+    return len(predicted & actual) / union
+
+
+def _panel_score(arr: np.ndarray, slot: int) -> float:
+    x0, y0 = _origin(slot)
+    crop = arr[y0 : y0 + PANEL_H + 1, x0 : x0 + PANEL_W + 1]
+    source = _exact(crop, SOURCE)
+    target = _exact(crop, TARGET_FILL)
+    first_axis = _exact(crop, VIOLET_AXIS)
+    second_axis = _exact(crop, GOLD_AXIS)
+    if (
+        source.sum() < 500
+        or target.sum() < 500
+        or first_axis.sum() < 80
+        or second_axis.sum() < 80
+    ):
+        raise ValueError("missing panel component")
+    first_center, first_direction = _fit_axis(first_axis)
+    second_center, second_direction = _fit_axis(second_axis)
+    predicted = _transformed_mask(
+        source,
+        first_center,
+        first_direction,
+        second_center,
+        second_direction,
+    )
+    target_points = _points(target)
+    predicted_points = np.asarray(list(predicted), dtype=np.float64)
+    if len(predicted_points) == 0:
+        return -1.0
+    center_error = float(np.linalg.norm(predicted_points.mean(axis=0) - target_points.mean(axis=0)))
+    return _overlap_score(predicted, target) - 0.0015 * center_error
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the selected tile using only the supplied raster."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape[:2] != (HEIGHT, WIDTH):
+        raise ValueError(f"unexpected image size {arr.shape[:2]}")
+    scores = [_panel_score(arr, slot) for slot in range(4)]
+    winner = max(range(4), key=lambda index: scores[index])
+    return f"tile-{chr(65 + winner)}"

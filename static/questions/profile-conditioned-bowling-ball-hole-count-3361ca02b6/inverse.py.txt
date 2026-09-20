@@ -1,0 +1,121 @@
+"""Independent pixel-only inverse for enclosed-hole counting.
+
+This module deliberately knows nothing about the renderer's scene dictionary,
+analytic labels, prompts, or generator. It estimates the background from image
+border pixels, segments the dark ball by color distance, flood-fills the
+background from the image border, and counts the remaining sufficiently large
+background components. Those components are the enclosed light openings.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "bowling_ball_hole_count-oracle-0.1.0"
+FOREGROUND_THRESHOLD = 22.0
+MIN_COMPONENT_AREA = 180
+
+
+def _background_estimate(array: np.ndarray) -> np.ndarray:
+    height, width = array.shape[:2]
+    strips = np.concatenate(
+        (
+            array[:8, :8].reshape(-1, 3),
+            array[:8, max(0, width - 8) : width].reshape(-1, 3),
+            array[max(0, height - 8) : height, :8].reshape(-1, 3),
+            array[max(0, height - 8) : height, max(0, width - 8) : width].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    return np.median(strips.astype(np.float32), axis=0)
+
+
+def _background_components(mask: np.ndarray) -> list[int]:
+    """Return enclosed component areas using a scanline union-find.
+
+    The same four-connected pixel topology as a flood fill is computed over
+    horizontal runs. A ball-sized image then contributes only a few thousand
+    runs instead of hundreds of thousands of Python-level queue operations,
+    which keeps the protected repeated probe bounded.
+    """
+
+    height, width = mask.shape
+    parent: list[int] = []
+    area: list[int] = []
+    touches_edge: list[bool] = []
+
+    def make_run(start: int, end: int, row: int) -> int:
+        label = len(parent)
+        parent.append(label)
+        area.append(end - start)
+        touches_edge.append(row == 0 or row == height - 1 or start == 0 or end == width)
+        return label
+
+    def find(label: int) -> int:
+        root = label
+        while parent[root] != root:
+            root = parent[root]
+        while parent[label] != label:
+            next_label = parent[label]
+            parent[label] = root
+            label = next_label
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        parent[right_root] = left_root
+        area[left_root] += area[right_root]
+        touches_edge[left_root] = touches_edge[left_root] or touches_edge[right_root]
+
+    previous: list[tuple[int, int, int]] = []
+    for row in range(height):
+        row_mask = mask[row]
+        starts = np.flatnonzero(row_mask & ~np.r_[False, row_mask[:-1]])
+        ends = np.flatnonzero(row_mask & ~np.r_[row_mask[1:], False]) + 1
+        current: list[tuple[int, int, int]] = []
+        previous_index = 0
+        for start_value, end_value in zip(starts.tolist(), ends.tolist()):
+            start, end = int(start_value), int(end_value)
+            label = make_run(start, end, row)
+            while previous_index < len(previous) and previous[previous_index][1] <= start:
+                previous_index += 1
+            scan_index = previous_index
+            while scan_index < len(previous) and previous[scan_index][0] < end:
+                old_start, old_end, old_label = previous[scan_index]
+                if old_end > start:
+                    union(label, old_label)
+                scan_index += 1
+            current.append((start, end, label))
+        previous = current
+
+    totals: dict[int, int] = {}
+    edge_flags: dict[int, bool] = {}
+    for label in range(len(parent)):
+        root = find(label)
+        totals[root] = area[root]
+        edge_flags[root] = touches_edge[root]
+    return [value for root, value in totals.items() if not edge_flags[root]]
+
+
+def measure_hole_count(image: Image.Image) -> tuple[int, float]:
+    """Count enclosed light components and return count plus runner-up clearance."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    background = _background_estimate(array)
+    distance = np.linalg.norm(array - background[None, None, :], axis=2)
+    # Pixels close to the estimated background include both the exterior and
+    # the hole interiors. Antialiasing leaves a dark ring around every opening.
+    light = distance <= FOREGROUND_THRESHOLD
+    areas = [area for area in _background_components(light) if area >= MIN_COMPONENT_AREA]
+    areas.sort(reverse=True)
+    return len(areas), float(min(areas) ** 0.5 if areas else 0.0)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the count recovered from the raster alone."""
+
+    count, _margin = measure_hole_count(image)
+    return str(count)

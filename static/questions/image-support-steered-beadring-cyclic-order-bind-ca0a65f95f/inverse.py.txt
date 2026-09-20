@@ -1,0 +1,202 @@
+"""Pixel-only inverse arm for the bead-ring cyclic-order world.
+
+Input: one rasterised PNG plus the public question contract. No latent scene, no
+renderer, no analytic gold. The arm locates the cream card, segments the beads
+and bars inside it, groups the beads into three rings, reads each ring's
+clockwise cyclic colour order, solves the key/dial correspondence up to rotation,
+and only then reports the bar colour bound to the rotated dial.
+
+Every structural expectation stated in the question is checked, and any
+violation raises `ValueError` (abstention) rather than guessing.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "beadring_cyclic_order_bind-oracle-0.1.0"
+
+CREAM = (240, 232, 208)
+PALETTE = {
+    "red": (196, 52, 52),
+    "blue": (44, 92, 196),
+    "green": (36, 140, 80),
+    "purple": (132, 60, 168),
+}
+
+BEADS_PER_RING = 6
+RINGS = 3
+BEAD_SIDE = 7
+BAND_SIDE = (24, 7)
+CLUSTER_THRESHOLD = 21.0
+RING_RADIUS_TOLERANCE = 3.5
+ANGLE_STEP = 360.0 / BEADS_PER_RING
+ANGLE_TOLERANCE = 18.0
+
+
+def _components(mask: np.ndarray):
+    """4-connected components of a small boolean mask."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out = []
+    for y0 in range(height):
+        for x0 in range(width):
+            if not mask[y0, x0] or seen[y0, x0]:
+                continue
+            stack = [(y0, x0)]
+            seen[y0, x0] = True
+            cells = []
+            while stack:
+                y, x = stack.pop()
+                cells.append((y, x))
+                for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+            out.append(cells)
+    return out
+
+
+def _card_crop(array: np.ndarray) -> np.ndarray:
+    cream = np.all(array == np.asarray(CREAM, dtype=np.uint8), axis=-1)
+    if int(cream.sum()) < 3000:
+        raise ValueError("no cream card of usable area was found")
+    ys, xs = np.nonzero(cream)
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    height, width = y1 - y0 + 1, x1 - x0 + 1
+    if not (70 <= width <= 190 and 70 <= height <= 240):
+        raise ValueError(f"cream card extent {width}x{height} is outside the contract")
+    filled = float(cream[y0 : y1 + 1, x0 : x1 + 1].sum()) / float(height * width)
+    if filled < 0.45:
+        raise ValueError("the cream card is too broken to read")
+    return array[y0 : y1 + 1, x0 : x1 + 1]
+
+
+def _parts(crop: np.ndarray):
+    beads = []
+    bands = []
+    for name, rgb in sorted(PALETTE.items()):
+        mask = np.all(crop == np.asarray(rgb, dtype=np.uint8), axis=-1)
+        if not mask.any():
+            continue
+        for cells in _components(mask):
+            ys = [c[0] for c in cells]
+            xs = [c[1] for c in cells]
+            height = max(ys) - min(ys) + 1
+            width = max(xs) - min(xs) + 1
+            area = len(cells)
+            if (width, height) == (BEAD_SIDE, BEAD_SIDE) and area == BEAD_SIDE * BEAD_SIDE:
+                beads.append({"color": name, "x": min(xs) + width / 2.0, "y": min(ys) + height / 2.0})
+            elif (width, height) == BAND_SIDE and area == BAND_SIDE[0] * BAND_SIDE[1]:
+                bands.append({"color": name, "x": min(xs) + width / 2.0, "y": min(ys) + height / 2.0})
+            else:
+                raise ValueError(f"unreadable {name} part of extent {width}x{height} area {area}")
+    if len(beads) != RINGS * BEADS_PER_RING:
+        raise ValueError(f"expected {RINGS * BEADS_PER_RING} beads, found {len(beads)}")
+    if len(bands) != 2:
+        raise ValueError(f"expected two bars, found {len(bands)}")
+    if bands[0]["color"] == bands[1]["color"]:
+        raise ValueError("the two bars share a colour")
+    return beads, bands
+
+
+def _cluster(beads):
+    """Single-linkage grouping of bead centres into rings."""
+    groups = [[index] for index in range(len(beads))]
+    merged = True
+    while merged:
+        merged = False
+        for a in range(len(groups)):
+            for b in range(a + 1, len(groups)):
+                close = any(
+                    math.hypot(beads[i]["x"] - beads[j]["x"], beads[i]["y"] - beads[j]["y"])
+                    <= CLUSTER_THRESHOLD
+                    for i in groups[a]
+                    for j in groups[b]
+                )
+                if close:
+                    groups[a] = groups[a] + groups[b]
+                    del groups[b]
+                    merged = True
+                    break
+            if merged:
+                break
+    if len(groups) != RINGS or any(len(g) != BEADS_PER_RING for g in groups):
+        raise ValueError(f"bead grouping is not three rings of six: {[len(g) for g in groups]}")
+    rings = []
+    for group in groups:
+        members = [beads[i] for i in group]
+        cx = sum(m["x"] for m in members) / len(members)
+        cy = sum(m["y"] for m in members) / len(members)
+        rings.append({"cx": cx, "cy": cy, "beads": members})
+    return rings
+
+
+def _cyclic_order(ring) -> tuple[str, ...]:
+    """Clockwise bead colours of one ring, starting at an arbitrary bead."""
+    radii = [math.hypot(b["x"] - ring["cx"], b["y"] - ring["cy"]) for b in ring["beads"]]
+    if max(radii) - min(radii) > 2 * RING_RADIUS_TOLERANCE:
+        raise ValueError("ring beads are not equidistant from their centre")
+    # image coordinates run y-down, so increasing atan2 is clockwise on screen
+    angles = sorted(
+        (math.degrees(math.atan2(b["y"] - ring["cy"], b["x"] - ring["cx"])) % 360.0, b["color"])
+        for b in ring["beads"]
+    )
+    gaps = [
+        (angles[(i + 1) % BEADS_PER_RING][0] - angles[i][0]) % 360.0
+        for i in range(BEADS_PER_RING)
+    ]
+    if any(abs(gap - ANGLE_STEP) > ANGLE_TOLERANCE for gap in gaps):
+        raise ValueError(f"ring beads are not evenly spaced: {gaps}")
+    return tuple(color for _, color in angles)
+
+
+def _rotations(seq):
+    n = len(seq)
+    return [tuple(seq[(i + k) % n] for i in range(n)) for k in range(n)]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    crop = _card_crop(array)
+    beads, bands = _parts(crop)
+    rings = _cluster(beads)
+
+    rings = sorted(rings, key=lambda r: r["cy"])
+    key, dials = rings[0], rings[1:]
+    if min(d["cy"] for d in dials) - key["cy"] < 20.0:
+        raise ValueError("no single ring sits above the other two")
+    dials = sorted(dials, key=lambda r: r["cx"])
+    if dials[1]["cx"] - dials[0]["cx"] < 30.0:
+        raise ValueError("the two lower rings are not side by side")
+
+    key_order = _cyclic_order(key)
+    dial_orders = [_cyclic_order(dial) for dial in dials]
+    for order in dial_orders:
+        if sorted(order) != sorted(key_order):
+            raise ValueError("a dial ring does not carry the key ring's bead colours")
+
+    matching = [index for index, order in enumerate(dial_orders) if key_order in _rotations(order)]
+    if len(matching) != 1:
+        raise ValueError(f"the rotated dial is not unique: {len(matching)} candidates")
+    assignment: dict[int, str] = {}
+    for band in bands:
+        distances = [
+            (math.hypot(band["x"] - dial["cx"], band["y"] - dial["cy"]), index)
+            for index, dial in enumerate(dials)
+        ]
+        distances.sort()
+        if math.hypot(band["x"] - key["cx"], band["y"] - key["cy"]) <= distances[0][0]:
+            raise ValueError("a bar is not bound to a dial ring")
+        if distances[1][0] - distances[0][0] < 10.0:
+            raise ValueError("a bar cannot be bound to a single dial ring")
+        index = distances[0][1]
+        if index in assignment:
+            raise ValueError("both bars bind to the same dial ring")
+        assignment[index] = band["color"]
+    if len(assignment) != 2:
+        raise ValueError("the two bars do not cover both dial rings")
+    return assignment[matching[0]]

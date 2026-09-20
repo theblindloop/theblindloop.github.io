@@ -1,0 +1,258 @@
+"""Deterministic scene sampler and renderer for paired mask intersection."""
+
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+CANVAS_SIZE = 512
+GRID_SIZE = 7
+CELL_SIZE = 4
+FRAME_SIZE = 32
+FRAME_WIDTH = 2
+ATTESTATION_CELL = 64
+PANEL_INK = 28
+SYMBOLS = ("diamond", "plus", "X")
+
+PALETTES = (
+    {
+        "background": (250, 248, 242),
+        "frame": (32, 126, 170),
+        "marker": (224, 78, 62),
+        "ink": (28, 31, 38),
+    },
+    {
+        "background": (246, 250, 247),
+        "frame": (116, 79, 160),
+        "marker": (231, 147, 38),
+        "ink": (24, 38, 33),
+    },
+    {
+        "background": (249, 247, 252),
+        "frame": (30, 145, 109),
+        "marker": (197, 59, 118),
+        "ink": (38, 30, 46),
+    },
+    {
+        "background": (250, 249, 244),
+        "frame": (190, 91, 35),
+        "marker": (45, 115, 184),
+        "ink": (33, 32, 27),
+    },
+)
+
+
+def _templates() -> dict[str, np.ndarray]:
+    plus = np.zeros((GRID_SIZE, GRID_SIZE), dtype=bool)
+    plus[3, :] = True
+    plus[:, 3] = True
+
+    cross = np.eye(GRID_SIZE, dtype=bool) | np.fliplr(np.eye(GRID_SIZE, dtype=bool))
+
+    diamond = np.zeros((GRID_SIZE, GRID_SIZE), dtype=bool)
+    for row, col in (
+        (0, 3),
+        (1, 2),
+        (1, 4),
+        (2, 1),
+        (2, 5),
+        (3, 0),
+        (3, 3),
+        (3, 6),
+        (4, 1),
+        (4, 5),
+        (5, 2),
+        (5, 4),
+        (6, 3),
+    ):
+        diamond[row, col] = True
+    return {"diamond": diamond, "plus": plus, "X": cross}
+
+
+TEMPLATES = _templates()
+
+
+def _classification(bits: np.ndarray) -> tuple[str, float, dict[str, int]]:
+    distances = {
+        name: int(np.count_nonzero(bits != template))
+        for name, template in TEMPLATES.items()
+    }
+    ranked = sorted(distances.items(), key=lambda item: (item[1], SYMBOLS.index(item[0])))
+    return ranked[0][0], float(ranked[1][1] - ranked[0][1]), distances
+
+
+def _perturbed_symbol(symbol: str, level: int, rng: random.Random) -> np.ndarray:
+    """Return a unique nearest-template raster with a controlled runner-up gap."""
+
+    base = TEMPLATES[symbol].copy()
+    if level == 0:
+        return base
+
+    candidates: list[tuple[float, np.ndarray]] = []
+    for runner_name in SYMBOLS:
+        if runner_name == symbol:
+            continue
+        runner = TEMPLATES[runner_name]
+        removals = [tuple(v) for v in np.argwhere(base & ~runner)]
+        additions = [tuple(v) for v in np.argwhere(~base & runner)]
+        difference = len(removals) + len(additions)
+        for changed in range(1, difference // 2):
+            remove_count = min(len(removals), changed // 2)
+            add_count = changed - remove_count
+            if add_count > len(additions):
+                add_count = len(additions)
+                remove_count = changed - add_count
+            if remove_count > len(removals):
+                continue
+            for _ in range(16):
+                proposal = base.copy()
+                for row, col in rng.sample(removals, remove_count):
+                    proposal[row, col] = False
+                for row, col in rng.sample(additions, add_count):
+                    proposal[row, col] = True
+                decision, gap, _ = _classification(proposal)
+                count = int(proposal.sum())
+                if decision == symbol and gap > 0 and 8 <= count <= 20:
+                    candidates.append((gap, proposal))
+
+    if not candidates:
+        raise RuntimeError("could not construct a unique perturbed glyph")
+    if level == 1:
+        eligible = [item for item in candidates if item[0] > 2]
+        return min(eligible or candidates, key=lambda item: (abs(item[0] - 8), item[0]))[1]
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def _split_masks(revealed: np.ndarray, rng: random.Random) -> tuple[np.ndarray, np.ndarray]:
+    shared = int(revealed.sum())
+    private_count = PANEL_INK - shared
+    available = [tuple(v) for v in np.argwhere(~revealed)]
+    if private_count < 0 or 2 * private_count > len(available):
+        raise RuntimeError("revealed raster cannot be split into equal-ink masks")
+    rng.shuffle(available)
+    mask_a = revealed.copy()
+    mask_b = revealed.copy()
+    for row, col in available[:private_count]:
+        mask_a[row, col] = True
+    for row, col in available[private_count : 2 * private_count]:
+        mask_b[row, col] = True
+    if np.any(mask_a & mask_b != revealed):
+        raise AssertionError("private mask noise overlapped")
+    return mask_a, mask_b
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced, randomized, JSON-serializable latent scene."""
+
+    symbol = SYMBOLS[int(seed) % len(SYMBOLS)]
+    level = (int(seed) // 9) % 3
+    rng = random.Random((int(seed) + 0x9E3779B9) & 0xFFFFFFFF)
+    revealed = _perturbed_symbol(symbol, level, rng)
+    mask_a, mask_b = _split_masks(revealed, rng)
+    scene = {
+        "mask_a": mask_a.astype(int).tolist(),
+        "mask_b": mask_b.astype(int).tolist(),
+        "rotation_a": rng.randrange(4),
+        "rotation_b": rng.randrange(4),
+        "anchor_col": rng.randrange(1, 6),
+        "anchor_row": rng.randrange(1, 7),
+        "palette": (int(seed) // 3) % len(PALETTES),
+    }
+    # Sampling is allowed to use a target, but the stored scene and gold are not.
+    decision, gap, _ = _classification(mask_a & mask_b)
+    if decision != symbol or gap <= 0:
+        raise AssertionError("sampled raster lost its intended unique class")
+    return scene
+
+
+def _panel_corner(rotation: int, left: int, top: int) -> tuple[int, int]:
+    offsets = ((0, 0), (0, FRAME_SIZE - 2), (FRAME_SIZE - 2, FRAME_SIZE - 2), (FRAME_SIZE - 2, 0))
+    dx, dy = offsets[int(rotation) % 4]
+    return left + dx, top + dy
+
+
+def _draw_panel(
+    draw: ImageDraw.ImageDraw,
+    mask: np.ndarray,
+    rotation: int,
+    center_x: int,
+    center_y: int,
+    palette: dict[str, tuple[int, int, int]],
+) -> None:
+    left = center_x - FRAME_SIZE // 2
+    top = center_y - FRAME_SIZE // 2
+    right = left + FRAME_SIZE - 1
+    bottom = top + FRAME_SIZE - 1
+    draw.rectangle(
+        (left, top, right, bottom),
+        outline=palette["frame"],
+        width=FRAME_WIDTH,
+    )
+    shown = np.rot90(mask, int(rotation) % 4)
+    for row in range(GRID_SIZE):
+        for col in range(GRID_SIZE):
+            if bool(shown[row, col]):
+                x0 = left + FRAME_WIDTH + col * CELL_SIZE
+                y0 = top + FRAME_WIDTH + row * CELL_SIZE
+                draw.rectangle(
+                    (x0, y0, x0 + CELL_SIZE - 1, y0 + CELL_SIZE - 1),
+                    fill=palette["ink"],
+                )
+    marker_x, marker_y = _panel_corner(rotation, left, top)
+    draw.rectangle(
+        (marker_x, marker_y, marker_x + 1, marker_y + 1),
+        fill=palette["marker"],
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    """Render two small masks exactly on separated attestation-grid cells."""
+
+    mask_a = np.asarray(scene["mask_a"], dtype=bool)
+    mask_b = np.asarray(scene["mask_b"], dtype=bool)
+    rotation_a = int(scene["rotation_a"])
+    rotation_b = int(scene["rotation_b"])
+    anchor_col = int(scene["anchor_col"])
+    anchor_row = int(scene["anchor_row"])
+    palette_index = int(scene["palette"])
+    if mask_a.shape != (GRID_SIZE, GRID_SIZE) or mask_b.shape != (GRID_SIZE, GRID_SIZE):
+        raise ValueError("masks must be seven by seven")
+    if not (1 <= anchor_col <= 5 and 1 <= anchor_row <= 6):
+        raise ValueError("anchor is outside the safe canvas interior")
+    palette = PALETTES[palette_index % len(PALETTES)]
+    image = Image.new("RGB", (CANVAS_SIZE, CANVAS_SIZE), palette["background"])
+    draw = ImageDraw.Draw(image)
+    center_y = anchor_row * ATTESTATION_CELL + ATTESTATION_CELL // 2
+    center_a = anchor_col * ATTESTATION_CELL + ATTESTATION_CELL // 2
+    center_b = center_a + 2 * ATTESTATION_CELL
+    _draw_panel(draw, mask_a, rotation_a, center_a, center_y, palette)
+    _draw_panel(draw, mask_b, rotation_b, center_b, center_y, palette)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    mask_a = np.asarray(scene["mask_a"], dtype=bool)
+    mask_b = np.asarray(scene["mask_b"], dtype=bool)
+    return _classification(mask_a & mask_b)[0]
+
+
+def margin(scene: dict) -> float:
+    mask_a = np.asarray(scene["mask_a"], dtype=bool)
+    mask_b = np.asarray(scene["mask_b"], dtype=bool)
+    return _classification(mask_a & mask_b)[1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    mask_a = np.asarray(scene["mask_a"], dtype=bool)
+    mask_b = np.asarray(scene["mask_b"], dtype=bool)
+    return _classification(mask_a & mask_b)[1] <= 2.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No pixel-identical latent aliases are declared for this minimal scene."""
+
+    return []
+

@@ -1,0 +1,173 @@
+"""Independent final-PNG inverse arm for landmark similarity correspondence.
+
+The oracle knows no renderer palette or coordinates.  It segments chromatic
+components, discovers four repeated color identities, groups the upper reference
+and the three lower cards from component order, and independently fits the best
+orientation-preserving complex similarity for each card.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+@dataclass(frozen=True)
+class _Component:
+    cx: float
+    cy: float
+    area: int
+    rgb: tuple[int, int, int]
+
+
+def _components(arr: np.ndarray) -> list[_Component]:
+    high = arr.max(axis=2).astype(np.int16)
+    low = arr.min(axis=2).astype(np.int16)
+    mask = (high - low >= 48) & (high >= 105) & (low <= 205)
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[_Component] = []
+    for start_y, start_x in zip(*np.nonzero(mask), strict=True):
+        y, x = int(start_y), int(start_x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            py, px = queue.popleft()
+            points.append((py, px))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = py + dy, px + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) < 170:
+            continue
+        ys = np.fromiter((point[0] for point in points), dtype=np.int32)
+        xs = np.fromiter((point[1] for point in points), dtype=np.int32)
+        pixels = arr[ys, xs]
+        median = np.median(pixels, axis=0)
+        result.append(
+            _Component(
+                float(xs.mean()),
+                float(ys.mean()),
+                len(points),
+                tuple(int(round(value)) for value in median),
+            )
+        )
+    return result
+
+
+def _color_classes(components: list[_Component]) -> list[list[_Component]]:
+    classes: list[list[_Component]] = []
+    centers: list[np.ndarray] = []
+    for component in sorted(components, key=lambda item: item.rgb):
+        rgb = np.array(component.rgb, dtype=np.float64)
+        distances = [float(np.linalg.norm(rgb - center)) for center in centers]
+        if distances and min(distances) < 38.0:
+            index = distances.index(min(distances))
+            classes[index].append(component)
+            centers[index] = np.mean(
+                np.array([item.rgb for item in classes[index]], dtype=np.float64), axis=0
+            )
+        else:
+            classes.append([component])
+            centers.append(rgb)
+    if len(classes) != 4 or sorted(len(group) for group in classes) != [4, 4, 4, 4]:
+        raise ValueError(
+            f"expected four repeated landmark colors, found class sizes "
+            f"{sorted(len(group) for group in classes)}"
+        )
+    return classes
+
+
+def _mapping(
+    group: list[_Component], color_lookup: dict[int, int]
+) -> dict[int, complex]:
+    result: dict[int, complex] = {}
+    for component in group:
+        identity = color_lookup[id(component)]
+        if identity in result:
+            raise ValueError("a card repeats a landmark color")
+        result[identity] = complex(component.cx, component.cy)
+    if set(result) != {0, 1, 2, 3}:
+        raise ValueError("a card does not contain exactly one of each landmark color")
+    return result
+
+
+def _residual(reference: dict[int, complex], test: dict[int, complex]) -> float:
+    source = [reference[index] for index in range(4)]
+    target = [test[index] for index in range(4)]
+    source_mean = sum(source) / 4.0
+    target_mean = sum(target) / 4.0
+    x = [value - source_mean for value in source]
+    y = [value - target_mean for value in target]
+    denominator = sum(abs(value) ** 2 for value in x)
+    if denominator <= 1e-9:
+        raise ValueError("reference constellation has no spatial extent")
+    coefficient = sum(
+        left.conjugate() * right for left, right in zip(x, y, strict=True)
+    ) / denominator
+    predicted = [target_mean + coefficient * value for value in x]
+    rms = math.sqrt(
+        sum(abs(pred - actual) ** 2 for pred, actual in zip(predicted, target, strict=True))
+        / 4.0
+    )
+    radius = math.sqrt(sum(abs(value) ** 2 for value in y) / 4.0)
+    return rms / radius
+
+
+def _analyse(image: Image.Image) -> tuple[str, float, list[float]]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    components = _components(arr)
+    if len(components) != 16:
+        raise ValueError(f"expected sixteen visible colored landmarks, found {len(components)}")
+
+    classes = _color_classes(components)
+    color_lookup = {
+        id(component): identity
+        for identity, group in enumerate(classes)
+        for component in group
+    }
+    by_y = sorted(components, key=lambda item: item.cy)
+    reference_group = by_y[:4]
+    lower = by_y[4:]
+    if max(item.cy for item in reference_group) >= min(item.cy for item in lower):
+        raise ValueError("reference and test-card landmarks are not visibly separated")
+    lower_by_x = sorted(lower, key=lambda item: item.cx)
+    test_groups = [lower_by_x[index : index + 4] for index in range(0, 12, 4)]
+    if len(test_groups) != 3:
+        raise ValueError("could not recover three test cards")
+    if not (
+        max(item.cx for item in test_groups[0]) < min(item.cx for item in test_groups[1])
+        and max(item.cx for item in test_groups[1]) < min(item.cx for item in test_groups[2])
+    ):
+        raise ValueError("test-card landmark groups overlap horizontally")
+
+    reference = _mapping(reference_group, color_lookup)
+    tests = [_mapping(group, color_lookup) for group in test_groups]
+    scores = [_residual(reference, test) for test in tests]
+    order = sorted(range(3), key=scores.__getitem__)
+    gap = scores[order[1]] - scores[order[0]]
+    if scores[order[0]] > 0.055:
+        raise ValueError(f"no exact-enough similarity match; best residual {scores[order[0]]:.4f}")
+    if gap < 0.10:
+        raise ValueError(f"ambiguous similarity match; runner-up gap {gap:.4f}")
+    return ("A", "B", "C")[order[0]], float(gap), scores
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _analyse(image)[0]

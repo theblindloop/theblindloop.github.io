@@ -1,0 +1,155 @@
+"""Independent pixel-only inverse arm for `unpaired_window_plate`.
+
+Receives one rasterised RGB image and nothing else: no scene, no renderer
+constant, no grid pitch, no plate table, no analytic gold. It separates
+saturated ink from unsaturated decoration, sorts saturated ink into the five
+colour names announced by the public question, labels the connected slab of
+each colour, counts how many background regions each slab traps entirely
+inside itself (its punched windows), and then reports which colour carries a
+window count shared with no other colour, together with that count.
+
+Returns "<colour>_<windows>", or "abstain" when the picture does not present
+five single-slab colours whose window counts form two pairs and one singleton.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ABSTAIN = "abstain"
+
+# chromaticities of the five colour names used by the public question text
+PROTOTYPES = {
+    "red": (1.000, 0.000, 0.000),
+    "orange": (0.640, 0.360, 0.000),
+    "green": (0.000, 0.690, 0.310),
+    "blue": (0.085, 0.220, 0.695),
+    "purple": (0.372, 0.116, 0.512),
+}
+CHROMA_TOLERANCE = 0.20
+MIN_SLAB_PIXELS = 150
+MIN_WINDOW_PIXELS = 3
+
+
+def _label(mask: np.ndarray, min_area: int) -> list[np.ndarray]:
+    """Four-connected components of a small boolean mask, largest first."""
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    out = []
+    for start in np.argwhere(mask):
+        sy, sx = int(start[0]), int(start[1])
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= min_area:
+            out.append(np.asarray(pixels, dtype=np.int64))
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _border_reachable(free: np.ndarray) -> np.ndarray:
+    height, width = free.shape
+    reached = np.zeros(free.shape, dtype=bool)
+    stack = []
+    for y in range(height):
+        for x in (0, width - 1):
+            if free[y, x] and not reached[y, x]:
+                reached[y, x] = True
+                stack.append((y, x))
+    for x in range(width):
+        for y in (0, height - 1):
+            if free[y, x] and not reached[y, x]:
+                reached[y, x] = True
+                stack.append((y, x))
+    while stack:
+        y, x = stack.pop()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and free[ny, nx] and not reached[ny, nx]:
+                reached[ny, nx] = True
+                stack.append((ny, nx))
+    return reached
+
+
+def _colour_masks(array: np.ndarray) -> dict:
+    channels = array.astype(np.int16)
+    high = channels.max(axis=2)
+    low = channels.min(axis=2)
+    saturated = ((high - low) >= 50) & (high >= 60)
+    total = channels.sum(axis=2).astype(np.float64)
+    total[total == 0] = 1.0
+    chroma = channels.astype(np.float64) / total[:, :, None]
+    masks = {}
+    best = np.full(array.shape[:2], 9.0)
+    labels = {}
+    for name, proto in PROTOTYPES.items():
+        delta = chroma - np.asarray(proto, dtype=np.float64)
+        distance = np.sqrt((delta ** 2).sum(axis=2))
+        labels[name] = distance
+        best = np.minimum(best, distance)
+    for name, distance in labels.items():
+        masks[name] = saturated & (distance <= CHROMA_TOLERANCE) & (distance <= best)
+    return masks
+
+
+def _windows_of_slab(mask: np.ndarray) -> int | None:
+    """Number of background regions trapped inside the single slab in `mask`."""
+    if int(mask.sum()) < MIN_SLAB_PIXELS:
+        return None
+    ys, xs = np.nonzero(mask)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    crop = mask[y0:y1 + 1, x0:x1 + 1]
+    padded = np.zeros((crop.shape[0] + 2, crop.shape[1] + 2), dtype=bool)
+    padded[1:-1, 1:-1] = crop
+    parts = _label(padded, MIN_SLAB_PIXELS)
+    if len(parts) != 1:
+        return None
+    solid = np.zeros_like(padded)
+    solid[parts[0][:, 0], parts[0][:, 1]] = True
+    free = ~solid
+    enclosed = free & ~_border_reachable(free)
+    if not enclosed.any():
+        return 0
+    return len(_label(enclosed, MIN_WINDOW_PIXELS))
+
+
+def _decide(counts: dict) -> str:
+    if len(counts) != 5:
+        return ABSTAIN
+    tally: dict[int, int] = {}
+    for value in counts.values():
+        tally[value] = tally.get(value, 0) + 1
+    singles = sorted(value for value, hits in tally.items() if hits == 1)
+    pairs = sorted(value for value, hits in tally.items() if hits == 2)
+    if len(singles) != 1 or len(pairs) != 2:
+        return ABSTAIN
+    orphan = singles[0]
+    for name in sorted(counts):
+        if counts[name] == orphan:
+            return f"{name}_{orphan}"
+    return ABSTAIN
+
+
+def decision_from_image(image: Image.Image) -> str:
+    try:
+        array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        masks = _colour_masks(array)
+        counts = {}
+        for name in sorted(masks):
+            windows = _windows_of_slab(masks[name])
+            if windows is None:
+                return ABSTAIN
+            counts[name] = windows
+        return _decide(counts)
+    except Exception:
+        return ABSTAIN

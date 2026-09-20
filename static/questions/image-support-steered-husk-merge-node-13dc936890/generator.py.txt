@@ -1,0 +1,430 @@
+"""Renderer for the husk-merge world.
+
+One opaque square chip carries a caterpillar network of thick dark corridors.
+Three coloured node squares sit on the three places where three corridors meet;
+two green caps and one yellow cap sit on the chip border. Travelling along the
+corridors from each green cap to the yellow cap gives two forced trips, and the
+answer is the colour of the first node both trips pass through. Gray bars
+outside the chip are decoration.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 640
+HEIGHT = 512
+L = 14
+STEP = 7
+CHIP = L * STEP + 1  # 99 px inclusive square
+
+BG = (255, 255, 255)
+PLATE = (216, 216, 220)
+DARK = (40, 40, 48)
+DECOY = (152, 152, 158)
+
+BAND_HALF = 3  # 7 px corridors
+NODE_HALF = 6  # 13 px node squares
+CAP_HALF = 6
+CAP_DEPTH = 12
+
+COLORS = {
+    "green": (30, 150, 70),
+    "yellow": (240, 205, 40),
+    "orange": (235, 130, 25),
+    "purple": (140, 60, 190),
+    "blue": (35, 95, 215),
+}
+ANSWER_COLORS = ("orange", "purple", "blue")
+QUARANTINE_MARGIN = 7.0
+CHIP_CLEARANCE = 12
+
+
+# --------------------------------------------------------------------------- lattice
+def _transform(point, rot: int, mirror: int):
+    c, r = point
+    if mirror:
+        c = L - c
+    for _ in range(rot):
+        c, r = L - r, c
+    return (c, r)
+
+
+def _pixel(scene_xy, point, rot: int, mirror: int):
+    c, r = _transform(point, rot, mirror)
+    return (scene_xy[0] + c * STEP, scene_xy[1] + r * STEP)
+
+
+def _chip_rect(x: int, y: int):
+    return (x, y, x + CHIP - 1, y + CHIP - 1)
+
+
+# --------------------------------------------------------------------------- topology
+def _stub_route(spec: dict, cols, spine_row: int):
+    """Lattice polyline from the host junction out to the chip border."""
+
+    col = cols[spec["host"]]
+    jog = spec["jog_row"]
+    port = spec["port_col"]
+    end_row = 0 if spec["dir"] == "up" else L
+    return [(col, spine_row), (col, jog), (port, jog), (port, end_row)]
+
+
+def _edges(scene_like) -> list[dict]:
+    """Corridor edges of the hub network with their incident marker names."""
+
+    cols = list(scene_like["cols"])
+    spine_row = int(scene_like["spine_row"])
+    specs = list(scene_like["stub_specs"])
+    caps = list(scene_like["caps"])
+
+    out = [
+        {
+            "route": [(cols[0], spine_row), (cols[1], spine_row)],
+            "nodes": {"d0", "d1"},
+        },
+        {
+            "route": [(cols[1], spine_row), (cols[2], spine_row)],
+            "nodes": {"d1", "d2"},
+        },
+        {
+            "route": [(cols[2], spine_row), (L, spine_row)],
+            "nodes": {"d2", "exit"},
+        },
+    ]
+    for index, spec in enumerate(specs):
+        nodes = {f"d{spec['host']}"}
+        if index in caps:
+            nodes.add(f"cap{index}")
+        out.append({"route": _stub_route(spec, cols, spine_row), "nodes": nodes})
+    return out
+
+
+def _markers(scene_like) -> dict:
+    """Marker name -> (lattice point, colour name, half-size)."""
+
+    cols = list(scene_like["cols"])
+    spine_row = int(scene_like["spine_row"])
+    specs = list(scene_like["stub_specs"])
+    caps = list(scene_like["caps"])
+    colors = list(scene_like["node_colors"])
+
+    out = {}
+    for j in range(3):
+        out[f"d{j}"] = ((cols[j], spine_row), colors[j], NODE_HALF)
+    out["exit"] = ((L, spine_row), "yellow", CAP_HALF)
+    for index in caps:
+        spec = specs[index]
+        end_row = 0 if spec["dir"] == "up" else L
+        out[f"cap{index}"] = ((spec["port_col"], end_row), "green", CAP_HALF)
+    return out
+
+
+# --------------------------------------------------------------------------- sampling
+def _stub_pair(rng: random.Random, direction: str, host_left: int, host_right: int,
+               cols, spine_row: int):
+    """Two non-crossing stubs in one half plane: the left one jogs nearer the spine."""
+
+    c_left, c_right = cols[host_left], cols[host_right]
+    sign = -1 if direction == "up" else 1
+    gap_near = rng.choice((3, 4))
+    gap_far = gap_near + rng.choice((2, 3))
+    row_near = spine_row + sign * gap_near
+    row_far = spine_row + sign * gap_far
+    if not (1 <= row_far <= L - 1) or not (1 <= row_near <= L - 1):
+        return None
+
+    def allowed(center: int, lo: int, hi: int):
+        return [x for x in range(lo, hi + 1) if x == center or abs(x - center) >= 2]
+
+    left_options = allowed(c_left, 1, c_right - 2)
+    if not left_options:
+        return None
+    port_left = rng.choice(left_options)
+    right_options = [
+        x for x in allowed(c_right, c_left + 2, L - 1) if x >= port_left + 3
+    ]
+    if not right_options:
+        return None
+    port_right = rng.choice(right_options)
+    return (
+        {"host": host_left, "dir": direction, "jog_row": row_near, "port_col": port_left},
+        {"host": host_right, "dir": direction, "jog_row": row_far, "port_col": port_right},
+    )
+
+
+def _sample_hub(rng: random.Random) -> dict | None:
+    spine_row = 7
+    cols = [rng.choice((1, 2)), rng.choice((5, 6)), rng.choice((10, 11))]
+
+    # junction 0 anchors one stub in each half plane; junctions 1 and 2 take the
+    # remaining slot in one half plane each, in a randomised order
+    upper_partner, lower_partner = rng.choice(((1, 2), (2, 1)))
+    upper = _stub_pair(rng, "up", 0, upper_partner, cols, spine_row)
+    lower = _stub_pair(rng, "down", 0, lower_partner, cols, spine_row)
+    if upper is None or lower is None:
+        return None
+
+    specs = [upper[0], upper[1], lower[0], lower[1]]
+    order = list(range(4))
+    rng.shuffle(order)
+    specs = [specs[i] for i in order]
+
+    by_host = {0: [], 1: [], 2: []}
+    for index, spec in enumerate(specs):
+        by_host[spec["host"]].append(index)
+
+    # the merge junction is drawn uniformly, then a cap pair consistent with it
+    merge = rng.randrange(3)
+    if merge == 0:
+        caps = list(by_host[0])
+    elif merge == 1:
+        caps = [rng.choice(by_host[0]), by_host[1][0]]
+    else:
+        upstream = by_host[0] + by_host[1]
+        caps = [by_host[2][0], rng.choice(upstream)]
+    caps = sorted(caps)
+
+    # the answer colour is drawn before placement, so it is independent of the
+    # merge junction's position along the spine
+    answer = rng.choice(ANSWER_COLORS)
+    rest = [name for name in ANSWER_COLORS if name != answer]
+    rng.shuffle(rest)
+    node_colors = [None, None, None]
+    node_colors[merge] = answer
+    for j, name in zip([j for j in range(3) if j != merge], rest):
+        node_colors[j] = name
+
+    return {
+        "spine_row": spine_row,
+        "cols": cols,
+        "stub_specs": specs,
+        "caps": caps,
+        "node_colors": node_colors,
+        "rot": rng.randrange(4),
+        "mirror": rng.randrange(2),
+    }
+
+
+def _rect_gap(a, b) -> float:
+    dx = max(a[0] - b[2], b[0] - a[2])
+    dy = max(a[1] - b[3], b[1] - a[3])
+    if dx >= 0 and dy >= 0:
+        return math.hypot(dx, dy)
+    return float(max(dx, dy))
+
+
+def _sample_bars(rng: random.Random, chip_rect) -> list[dict]:
+    bars = []
+    attempts = 0
+    target = rng.randint(6, 13)
+    while len(bars) < target and attempts < 400:
+        attempts += 1
+        horizontal = rng.randrange(2)
+        length = rng.randint(14, 44)
+        thick = 7
+        w, h = (length, thick) if horizontal else (thick, length)
+        x = rng.randint(4, WIDTH - w - 5)
+        y = rng.randint(4, HEIGHT - h - 5)
+        rect = (x, y, x + w - 1, y + h - 1)
+        if _rect_gap(rect, chip_rect) < CHIP_CLEARANCE:
+            continue
+        bars.append({"x": rect[0], "y": rect[1], "w": w, "h": h})
+    return bars
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed) * 2_654_435_761 + 97)
+    hub = None
+    for _ in range(64):
+        hub = _sample_hub(rng)
+        if hub is not None:
+            break
+    if hub is None:  # pragma: no cover - the sampler always succeeds
+        raise RuntimeError("hub sampling failed")
+
+    x = rng.randint(14, WIDTH - CHIP - 15)
+    y = rng.randint(14, HEIGHT - CHIP - 15)
+    bars = _sample_bars(rng, _chip_rect(x, y))
+
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "chip_side": CHIP,
+        "hub_x": int(x),
+        "hub_y": int(y),
+        "hub_rot": int(hub["rot"]),
+        "hub_mirror": int(hub["mirror"]),
+        "hub_spine_row": int(hub["spine_row"]),
+        "hub_cols": list(hub["cols"]),
+        "hub_stub_specs": list(hub["stub_specs"]),
+        "hub_caps": list(hub["caps"]),
+        "hub_node_colors": list(hub["node_colors"]),
+        "decoys": bars,
+    }
+
+
+def hub_of(scene: dict) -> dict:
+    return {
+        "spine_row": scene["hub_spine_row"],
+        "cols": scene["hub_cols"],
+        "stub_specs": scene["hub_stub_specs"],
+        "caps": scene["hub_caps"],
+        "node_colors": scene["hub_node_colors"],
+        "rot": scene["hub_rot"],
+        "mirror": scene["hub_mirror"],
+    }
+
+
+# --------------------------------------------------------------------------- gold
+def analytic_gold(scene: dict) -> str:
+    """Colour of the junction where the two forced trips first run together.
+
+    Along the spine, junction index 2 is nearest the yellow exit, so the merge
+    junction of two capped stubs is the downstream one of their two hosts.
+    """
+
+    specs = scene["hub_stub_specs"]
+    caps = scene["hub_caps"]
+    hosts = [specs[index]["host"] for index in caps]
+    return scene["hub_node_colors"][max(hosts)]
+
+
+# --------------------------------------------------------------------------- margin
+def _polyline_points(scene: dict, route) -> np.ndarray:
+    origin = (scene["hub_x"], scene["hub_y"])
+    rot, mirror = scene["hub_rot"], scene["hub_mirror"]
+    points = []
+    for start, end in zip(route, route[1:]):
+        x0, y0 = _pixel(origin, start, rot, mirror)
+        x1, y1 = _pixel(origin, end, rot, mirror)
+        steps = max(abs(x1 - x0), abs(y1 - y0))
+        for i in range(steps + 1):
+            t = i / steps if steps else 0.0
+            points.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+    return np.asarray(points, dtype=np.float64)
+
+
+def margin(scene: dict) -> float:
+    hub = hub_of(scene)
+    edges = _edges(hub)
+    markers = _markers(hub)
+    origin = (scene["hub_x"], scene["hub_y"])
+    rot, mirror = scene["hub_rot"], scene["hub_mirror"]
+
+    samples = [_polyline_points(scene, edge["route"]) for edge in edges]
+    values = []
+    for i in range(len(edges)):
+        for j in range(i + 1, len(edges)):
+            if edges[i]["nodes"] & edges[j]["nodes"]:
+                continue
+            dist = np.linalg.norm(samples[i][:, None, :] - samples[j][None, :, :], axis=2)
+            values.append(float(dist.min()) - 2 * BAND_HALF - 1)
+
+    for name, (point, _color, half) in markers.items():
+        px, py = _pixel(origin, point, rot, mirror)
+        target = np.asarray([[px, py]], dtype=np.float64)
+        for index, edge in enumerate(edges):
+            if name in edge["nodes"]:
+                continue
+            gap = float(np.linalg.norm(samples[index] - target, axis=1).min())
+            values.append(gap - BAND_HALF - half)
+
+    names = sorted(markers)
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            (pa, _ca, ha) = markers[names[i]]
+            (pb, _cb, hb) = markers[names[j]]
+            ax, ay = _pixel(origin, pa, rot, mirror)
+            bx, by = _pixel(origin, pb, rot, mirror)
+            values.append(math.hypot(ax - bx, ay - by) - ha - hb)
+
+    chip = _chip_rect(scene["hub_x"], scene["hub_y"])
+    for bar in scene["decoys"]:
+        rect = (bar["x"], bar["y"], bar["x"] + bar["w"] - 1, bar["y"] + bar["h"] - 1)
+        values.append(_rect_gap(rect, chip))
+
+    return round(float(min(values)), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Reordering the gray decoy bars is a pixel-identical latent rewrite.
+
+    Every bar carries the same gray, so their paint order cannot be seen even
+    where two bars overlap.
+    """
+
+    bars = list(scene["decoys"])
+    if len(bars) >= 2:
+        orders = (
+            ("reverse_decoy_order", list(reversed(bars))),
+            ("rotate_decoy_order", bars[1:] + bars[:1]),
+        )
+    else:  # pragma: no cover - the sampler always places several bars
+        orders = (("identity_decoy_order", bars),)
+    out = []
+    for name, order in orders:
+        other = dict(scene)
+        other["decoys"] = order
+        out.append((name, other))
+    return out
+
+
+# --------------------------------------------------------------------------- render
+def _band_rects(scene: dict, route):
+    left, top, right, bottom = _chip_rect(scene["hub_x"], scene["hub_y"])
+    origin = (scene["hub_x"], scene["hub_y"])
+    rot, mirror = scene["hub_rot"], scene["hub_mirror"]
+    rects = []
+    for start, end in zip(route, route[1:]):
+        x0, y0 = _pixel(origin, start, rot, mirror)
+        x1, y1 = _pixel(origin, end, rot, mirror)
+        rects.append(
+            (
+                max(left, min(x0, x1) - BAND_HALF),
+                max(top, min(y0, y1) - BAND_HALF),
+                min(right, max(x0, x1) + BAND_HALF),
+                min(bottom, max(y0, y1) + BAND_HALF),
+            )
+        )
+    return rects
+
+
+def _marker_rect(scene: dict, point, half: int):
+    left, top, right, bottom = _chip_rect(scene["hub_x"], scene["hub_y"])
+    px, py = _pixel((scene["hub_x"], scene["hub_y"]), point, scene["hub_rot"],
+                    scene["hub_mirror"])
+    return (
+        max(left, px - half),
+        max(top, py - half),
+        min(right, px + half),
+        min(bottom, py + half),
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BG)
+    draw = ImageDraw.Draw(image)
+
+    for bar in scene["decoys"]:
+        draw.rectangle(
+            (bar["x"], bar["y"], bar["x"] + bar["w"] - 1, bar["y"] + bar["h"] - 1),
+            fill=DECOY,
+        )
+
+    draw.rectangle(_chip_rect(scene["hub_x"], scene["hub_y"]), fill=PLATE)
+    hub = hub_of(scene)
+    for edge in _edges(hub):
+        for rect in _band_rects(scene, edge["route"]):
+            draw.rectangle(rect, fill=DARK)
+    for _name, (point, color, half) in sorted(_markers(hub).items()):
+        draw.rectangle(_marker_rect(scene, point, half), fill=COLORS[color])
+    return image

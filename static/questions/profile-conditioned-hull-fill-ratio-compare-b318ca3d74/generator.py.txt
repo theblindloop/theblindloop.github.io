@@ -1,0 +1,286 @@
+"""Deterministic paired-silhouette renderer and analytic hull-fill oracle."""
+
+from __future__ import annotations
+
+import math
+import random
+from functools import lru_cache
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+
+RENDERER_VERSION = "hull_fill_ratio_compare-0.1.0"
+CANVAS_SIZE = (1000, 640)
+SUPERSAMPLE = 4
+PANEL_RECTS = {"a": (60, 120, 480, 550), "b": (520, 120, 940, 550)}
+TARGET_TEMPLATE_AREA = 3.2
+QUARANTINE_MARGIN = 0.035
+
+SHAPE_KINDS = (
+    "hexagon",
+    "shallow_gear",
+    "soft_notch",
+    "deep_notch",
+    "gear",
+    "star",
+    "sharp_star",
+)
+
+# Every pair has a comfortably measurable difference. Shape order is randomized
+# independently below, so the answer is not tied to a family or a panel.
+PAIR_POOL = (
+    ("hexagon", "soft_notch"),
+    ("hexagon", "deep_notch"),
+    ("soft_notch", "gear"),
+    ("deep_notch", "gear"),
+    ("shallow_gear", "gear"),
+    ("gear", "star"),
+    ("star", "sharp_star"),
+    ("shallow_gear", "star"),
+)
+
+SHAPE_COLORS = (
+    (24, 102, 205),
+    (206, 54, 67),
+    (21, 141, 98),
+    (132, 62, 183),
+    (220, 105, 24),
+    (20, 143, 157),
+)
+BACKGROUND = (245, 247, 250)
+PANEL_FILL = (255, 255, 255)
+PANEL_OUTLINE = (181, 190, 204)
+TITLE_COLOR = (29, 40, 58)
+SUBTITLE_COLOR = (75, 89, 108)
+LABEL_COLOR = (42, 55, 74)
+
+
+def _regular_polygon(sides: int, phase: float = -math.pi / 2.0) -> tuple[tuple[float, float], ...]:
+    return tuple(
+        (
+            math.cos(phase + 2.0 * math.pi * index / sides),
+            math.sin(phase + 2.0 * math.pi * index / sides),
+        )
+        for index in range(sides)
+    )
+
+
+def _radial_polygon(outer: float, inner: float, spokes: int) -> tuple[tuple[float, float], ...]:
+    points: list[tuple[float, float]] = []
+    for index in range(2 * spokes):
+        radius = outer if index % 2 == 0 else inner
+        angle = -math.pi / 2.0 + index * math.pi / spokes
+        points.append((radius * math.cos(angle), radius * math.sin(angle)))
+    return tuple(points)
+
+
+def _notched_polygon(depth: float) -> tuple[tuple[float, float], ...]:
+    # A single broad inward V is deliberately not a copy of a regular star.
+    return (
+        (-1.0, -0.75),
+        (-0.55, -1.0),
+        (0.0, -0.80),
+        (0.55, -1.0),
+        (1.0, -0.75),
+        (1.0, 1.0),
+        (0.42, 1.0),
+        (0.0, 1.0 - depth),
+        (-0.42, 1.0),
+        (-1.0, 1.0),
+    )
+
+
+def _raw_vertices(kind: str) -> tuple[tuple[float, float], ...]:
+    if kind == "hexagon":
+        return _regular_polygon(6)
+    if kind == "shallow_gear":
+        return _radial_polygon(1.0, 0.88, 8)
+    if kind == "soft_notch":
+        return _notched_polygon(0.35)
+    if kind == "deep_notch":
+        return _notched_polygon(0.55)
+    if kind == "gear":
+        return _radial_polygon(1.0, 0.75, 8)
+    if kind == "star":
+        return _radial_polygon(1.0, 0.58, 6)
+    if kind == "sharp_star":
+        return _radial_polygon(1.0, 0.45, 5)
+    raise KeyError(f"unknown silhouette kind {kind!r}")
+
+
+def _polygon_area(vertices: tuple[tuple[float, float], ...] | list[tuple[float, float]]) -> float:
+    return 0.5 * abs(
+        sum(
+            vertices[index][0] * vertices[(index + 1) % len(vertices)][1]
+            - vertices[(index + 1) % len(vertices)][0] * vertices[index][1]
+            for index in range(len(vertices))
+        )
+    )
+
+
+def _cross(
+    origin: tuple[float, float],
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> float:
+    return (first[0] - origin[0]) * (second[1] - origin[1]) - (
+        first[1] - origin[1]
+    ) * (second[0] - origin[0])
+
+
+def _convex_hull(points: tuple[tuple[float, float], ...] | list[tuple[float, float]]) -> list[tuple[float, float]]:
+    ordered = sorted(set(points))
+    if len(ordered) <= 2:
+        return ordered
+    lower: list[tuple[float, float]] = []
+    for point in ordered:
+        while len(lower) >= 2 and _cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[float, float]] = []
+    for point in reversed(ordered):
+        while len(upper) >= 2 and _cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _hull_deficit(vertices: tuple[tuple[float, float], ...]) -> float:
+    hull = _convex_hull(vertices)
+    return 1.0 - _polygon_area(vertices) / _polygon_area(hull)
+
+
+@lru_cache(maxsize=None)
+def _template_vertices(kind: str) -> tuple[tuple[float, float], ...]:
+    raw = _raw_vertices(kind)
+    factor = math.sqrt(TARGET_TEMPLATE_AREA / _polygon_area(raw))
+    return tuple((x * factor, y * factor) for x, y in raw)
+
+
+@lru_cache(maxsize=None)
+def _deficit_for_kind(kind: str) -> float:
+    return _hull_deficit(_template_vertices(kind))
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Sample a pair with independent visual nuisance fields."""
+
+    seed = int(seed)
+    pair_rng = random.Random(seed * 1009 + 17)
+    style_rng = random.Random(seed * 7919 + 53)
+    first, second = PAIR_POOL[(seed * 5 + 7) % len(PAIR_POOL)]
+    if pair_rng.randrange(2):
+        kind_a, kind_b = second, first
+    else:
+        kind_a, kind_b = first, second
+
+    def center(x_mid: float) -> list[float]:
+        return [
+            round(x_mid + style_rng.uniform(-22.0, 22.0), 4),
+            round(335.0 + style_rng.uniform(-18.0, 18.0), 4),
+        ]
+
+    def color() -> list[int]:
+        return list(SHAPE_COLORS[style_rng.randrange(len(SHAPE_COLORS))])
+
+    return {
+        "shape_type_a": kind_a,
+        "shape_type_b": kind_b,
+        "center_a": center(270.0),
+        "center_b": center(730.0),
+        "scale_a": round(style_rng.uniform(84.0, 104.0), 4),
+        "scale_b": round(style_rng.uniform(84.0, 104.0), 4),
+        "rotation_a": round(style_rng.uniform(-math.pi, math.pi), 6),
+        "rotation_b": round(style_rng.uniform(-math.pi, math.pi), 6),
+        "color_a": color(),
+        "color_b": color(),
+    }
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    """Select the panel with the larger exact convex-hull deficit."""
+
+    score_a = _deficit_for_kind(scene["shape_type_a"])
+    score_b = _deficit_for_kind(scene["shape_type_b"])
+    if abs(score_a - score_b) < 1e-12:
+        raise ValueError("exactly tied silhouette families are not answerable")
+    return "A" if score_a > score_b else "B"
+
+
+def margin(scene: dict[str, Any]) -> float:
+    """Signed score gap: positive means A has the larger deficit."""
+
+    return _deficit_for_kind(scene["shape_type_a"]) - _deficit_for_kind(scene["shape_type_b"])
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    return abs(margin(scene)) < QUARANTINE_MARGIN
+
+
+def _shape_points(scene: dict[str, Any], side: str, kind: str) -> list[tuple[float, float]]:
+    center = scene[f"center_{side}"]
+    scale = float(scene[f"scale_{side}"])
+    rotation = float(scene[f"rotation_{side}"])
+    cosine = math.cos(rotation)
+    sine = math.sin(rotation)
+    points: list[tuple[float, float]] = []
+    for x, y in _template_vertices(kind):
+        xr = cosine * x - sine * y
+        yr = sine * x + cosine * y
+        points.append((float(center[0]) + scale * xr, float(center[1]) + scale * yr))
+    return points
+
+
+def _scaled_box(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SUPERSAMPLE)) for value in box)
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    """Render only visible labels and shapes; no answer is drawn."""
+
+    high = Image.new(
+        "RGB",
+        (CANVAS_SIZE[0] * SUPERSAMPLE, CANVAS_SIZE[1] * SUPERSAMPLE),
+        BACKGROUND,
+    )
+    draw = ImageDraw.Draw(high)
+    points_by_side = {
+        "a": _shape_points(scene, "a", scene["shape_type_a"]),
+        "b": _shape_points(scene, "b", scene["shape_type_b"]),
+    }
+    for side in ("a", "b"):
+        draw.rounded_rectangle(
+            _scaled_box(PANEL_RECTS[side]),
+            radius=14 * SUPERSAMPLE,
+            fill=PANEL_FILL,
+            outline=PANEL_OUTLINE,
+            width=2 * SUPERSAMPLE,
+        )
+        points = [
+            (round(x * SUPERSAMPLE), round(y * SUPERSAMPLE))
+            for x, y in points_by_side[side]
+        ]
+        draw.polygon(points, fill=tuple(int(value) for value in scene[f"color_{side}"]))
+
+    image = high.resize(CANVAS_SIZE, Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    draw.text((48, 28), "Convex-hull fill ratio", fill=TITLE_COLOR, font=font)
+    draw.text(
+        (48, 50),
+        "Compare the fraction of each visible shape occupied by its convex hull",
+        fill=SUBTITLE_COLOR,
+        font=font,
+    )
+    draw.text((78, 138), "A", fill=LABEL_COLOR, font=font)
+    draw.text((538, 138), "B", fill=LABEL_COLOR, font=font)
+    draw.text((70, 574), "one filled silhouette", fill=SUBTITLE_COLOR, font=font)
+    draw.text((530, 574), "one filled silhouette", fill=SUBTITLE_COLOR, font=font)
+    return image
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """No latent field is interchangeable without changing the labeled raster."""
+
+    return []

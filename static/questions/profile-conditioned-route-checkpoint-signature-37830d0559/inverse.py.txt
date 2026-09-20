@@ -1,0 +1,153 @@
+"""Independent pixel-only inverse for ordered checkpoint cables."""
+
+from __future__ import annotations
+
+from collections import Counter, deque
+
+import numpy as np
+from PIL import Image
+
+TARGET_ORDER = ("orange", "blue", "purple")
+PALETTE = {
+    "gray": (135, 143, 151),
+    "orange": (238, 126, 34),
+    "blue": (38, 112, 214),
+    "purple": (143, 73, 188),
+    "red": (214, 55, 62),
+    "green": (42, 155, 88),
+    "yellow": (232, 184, 36),
+}
+
+
+def _color_mask(array: np.ndarray, rgb: tuple[int, int, int], radius: float = 48.0) -> np.ndarray:
+    delta = array.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int64) <= radius * radius
+
+
+def _components(mask: np.ndarray, minimum: int = 80) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    found: list[list[tuple[int, int]]] = []
+    for y, x in zip(*np.nonzero(mask & ~seen)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            found.append(pixels)
+    return found
+
+
+def _centroids(mask: np.ndarray, expected: int) -> list[tuple[float, float]]:
+    components = _components(mask)
+    if len(components) != expected:
+        raise ValueError(f"expected {expected} visible components, found {len(components)}")
+    return [
+        (sum(x for y, x in component) / len(component), sum(y for y, x in component) / len(component))
+        for component in components
+    ]
+
+
+def _objects(mask: np.ndarray, expected: int) -> list[dict]:
+    components = _components(mask)
+    if len(components) != expected:
+        raise ValueError(f"expected {expected} visible components, found {len(components)}")
+    return [
+        {
+            "pixels": component,
+            "x": sum(x for y, x in component) / len(component),
+            "y": sum(y for y, x in component) / len(component),
+        }
+        for component in components
+    ]
+
+
+def _foreground_labels(array: np.ndarray) -> np.ndarray:
+    background = np.asarray((250, 249, 246), dtype=np.int32)
+    delta = array.astype(np.int32) - background
+    foreground = np.sum(delta * delta, axis=2, dtype=np.int64) > 32 * 32
+    labels = np.zeros(foreground.shape, dtype=np.int16)
+    next_label = 0
+    height, width = foreground.shape
+    for y, x in zip(*np.nonzero(foreground & (labels == 0))):
+        if labels[y, x]:
+            continue
+        next_label += 1
+        queue = deque([(int(y), int(x))])
+        labels[y, x] = next_label
+        while queue:
+            cy, cx = queue.popleft()
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and foreground[ny, nx] and labels[ny, nx] == 0:
+                    labels[ny, nx] = next_label
+                    queue.append((ny, nx))
+    return labels
+
+
+def _owner_label(obj: dict, labels: np.ndarray) -> int:
+    counts = Counter(int(labels[y, x]) for y, x in obj["pixels"] if labels[y, x] > 0)
+    if not counts:
+        raise ValueError("visible marker is not attached to foreground")
+    owner, count = counts.most_common(1)[0]
+    if count < 0.9 * len(obj["pixels"]):
+        raise ValueError("visible marker has ambiguous cable ownership")
+    return owner
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+    if array.ndim != 3 or array.shape[0] < 100 or array.shape[1] < 100:
+        raise ValueError("image is too small")
+
+    labels = _foreground_labels(array)
+    rings = _objects(_color_mask(array, PALETTE["gray"]), 3)
+    route_labels = [_owner_label(obj, labels) for obj in rings]
+    if len(set(route_labels)) != 3:
+        raise ValueError("gray rings do not lead to three disconnected cables")
+    route_index = {label: index for index, label in enumerate(route_labels)}
+
+    checkpoint_points: list[list[tuple[str, float, float]]] = [[], [], []]
+    for name in TARGET_ORDER:
+        for obj in _objects(_color_mask(array, PALETTE[name]), 3):
+            owner = _owner_label(obj, labels)
+            if owner not in route_index:
+                raise ValueError("checkpoint is not attached to a ringed cable")
+            checkpoint_points[route_index[owner]].append((name, obj["x"], obj["y"]))
+
+    terminal_by_band: dict[int, str] = {}
+    terminal_positions: dict[int, tuple[float, float]] = {}
+    for name in ("red", "green", "yellow"):
+        obj = _objects(_color_mask(array, PALETTE[name]), 1)[0]
+        owner = _owner_label(obj, labels)
+        if owner not in route_index:
+            raise ValueError("terminal is not attached to a ringed cable")
+        band = route_index[owner]
+        if band in terminal_by_band:
+            raise ValueError("two terminals assigned to one cable")
+        terminal_by_band[band] = name
+        terminal_positions[band] = (obj["x"], obj["y"])
+
+    matches: list[int] = []
+    for band in range(3):
+        markers = checkpoint_points[band]
+        if len(markers) != 3 or band not in terminal_by_band:
+            raise ValueError("incomplete route signature")
+        ring_x = rings[band]["x"]
+        terminal_x = terminal_positions[band][0]
+        if abs(ring_x - terminal_x) < 200.0:
+            raise ValueError("route direction is ambiguous")
+        markers.sort(key=lambda item: item[1], reverse=ring_x > terminal_x)
+        order = tuple(item[0] for item in markers)
+        if order == TARGET_ORDER:
+            matches.append(band)
+    if len(matches) != 1:
+        raise ValueError("image does not show exactly one matching route")
+    return terminal_by_band[matches[0]]

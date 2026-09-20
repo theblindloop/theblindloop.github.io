@@ -1,0 +1,133 @@
+"""Independent inverse arm using only raster pixels.
+
+It segments marker colors, reconstructs a node-link graph from dark pixel runs,
+traverses from the magenta start, and measures every recovered link.  It has no
+access to latent scenes or renderer/generator/prompt modules.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+COLOR_RGB = {
+    "orange": (230, 126, 34),
+    "blue": (40, 105, 210),
+    "green": (35, 158, 88),
+    "start": (194, 48, 171),
+}
+
+
+def _components(mask: np.ndarray, minimum: int = 12) -> list[tuple[float, float, int]]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        xs, ys = [], []
+        while stack:
+            cy, cx = stack.pop()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(xs) >= minimum:
+            found.append((float(np.mean(xs)), float(np.mean(ys)), len(xs)))
+    return found
+
+
+def _near(arr: np.ndarray, rgb: tuple[int, int, int], tolerance: float = 62.0) -> np.ndarray:
+    target = np.asarray(rgb, dtype=np.float32)
+    return np.linalg.norm(arr.astype(np.float32) - target, axis=2) < tolerance
+
+
+def _dark_fraction(mask: np.ndarray, a: tuple[float, float], b: tuple[float, float]) -> float:
+    x1, y1 = a
+    x2, y2 = b
+    if abs(y1 - y2) <= 3.0:
+        lo, hi = sorted((int(round(x1)), int(round(x2))))
+        if hi - lo < 25:
+            return 0.0
+        y = int(round((y1 + y2) / 2))
+        strip = mask[max(0, y - 2) : y + 3, lo + 11 : hi - 10]
+    elif abs(x1 - x2) <= 3.0:
+        lo, hi = sorted((int(round(y1)), int(round(y2))))
+        if hi - lo < 25:
+            return 0.0
+        x = int(round((x1 + x2) / 2))
+        strip = mask[lo + 11 : hi - 10, max(0, x - 2) : x + 3]
+    else:
+        return 0.0
+    if strip.size == 0:
+        return 0.0
+    # Require most longitudinal positions to contain some dark centerline ink.
+    occupied = strip.any(axis=0) if strip.shape[1] >= strip.shape[0] else strip.any(axis=1)
+    return float(occupied.mean())
+
+
+def _measure(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"))
+    nodes: list[dict] = []
+    for name, rgb in COLOR_RGB.items():
+        comps = _components(_near(arr, rgb), minimum=20)
+        if name == "start":
+            if len(comps) != 1:
+                raise ValueError("start marker missing or ambiguous")
+        elif len(comps) != 2:
+            raise ValueError(f"expected two {name} checkpoint rings, found {len(comps)}")
+        for x, y, _ in comps:
+            nodes.append({"x": x, "y": y, "color": name})
+
+    dark = (arr[:, :, 0] < 95) & (arr[:, :, 1] < 95) & (arr[:, :, 2] < 95)
+    adjacency: dict[int, list[int]] = {i: [] for i in range(len(nodes))}
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            a = (nodes[i]["x"], nodes[i]["y"])
+            b = (nodes[j]["x"], nodes[j]["y"])
+            if _dark_fraction(dark, a, b) > 0.96:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+
+    starts = [i for i, node in enumerate(nodes) if node["color"] == "start"]
+    if len(starts) != 1 or len(adjacency[starts[0]]) != 1:
+        raise ValueError("recovered graph has no unique degree-one start")
+    if sorted(len(v) for v in adjacency.values()) != [1, 1, 2, 2, 2, 2, 2]:
+        raise ValueError("recovered graph is not one seven-node cable")
+
+    order = [starts[0]]
+    previous = None
+    current = starts[0]
+    while len(order) < len(nodes):
+        options = [n for n in adjacency[current] if n != previous]
+        if len(options) != 1:
+            raise ValueError("cable traversal is ambiguous")
+        previous, current = current, options[0]
+        if current in order:
+            raise ValueError("cable unexpectedly loops")
+        order.append(current)
+
+    measured = []
+    for left, right in zip(order, order[1:]):
+        dx = abs(nodes[right]["x"] - nodes[left]["x"])
+        dy = abs(nodes[right]["y"] - nodes[left]["y"])
+        measured.append((dx + dy, right))
+    ranked = sorted(measured, reverse=True)
+    pixel_margin = ranked[0][0] - ranked[1][0]
+    if pixel_margin < 20.0:
+        raise ValueError("longest-section evidence is ambiguous")
+    return str(nodes[ranked[0][1]]["color"]), float(pixel_margin)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _measure(image)[0]
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    return _measure(image)

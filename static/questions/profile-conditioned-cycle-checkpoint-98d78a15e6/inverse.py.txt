@@ -1,0 +1,116 @@
+"""Independent image-only inverse arm for cycle_checkpoint.
+
+The oracle knows only the public visual vocabulary. It segments circular node
+fills, tests dark-pixel support between recovered node centroids, reconstructs
+the graph, and leaf-prunes it to its 2-core. It imports no candidate modules.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_COLORS = {
+    "orange": np.array((232, 112, 35), dtype=np.int16),
+    "purple": np.array((139, 92, 246), dtype=np.int16),
+    "blue": np.array((37, 99, 235), dtype=np.int16),
+    "neutral": np.array((203, 213, 225), dtype=np.int16),
+}
+_INK = np.array((39, 49, 66), dtype=np.int16)
+
+
+def _components(mask: np.ndarray, minimum: int = 60) -> list[tuple[float, float, int]]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        pts = []
+        while stack:
+            yy, xx = stack.pop()
+            pts.append((yy, xx))
+            for ny, nx in ((yy - 1, xx), (yy + 1, xx), (yy, xx - 1), (yy, xx + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pts) >= minimum:
+            ys = np.fromiter((p[0] for p in pts), dtype=float)
+            xs = np.fromiter((p[1] for p in pts), dtype=float)
+            out.append((float(xs.mean()), float(ys.mean()), len(pts)))
+    return out
+
+
+def _near(arr: np.ndarray, color: np.ndarray, radius: float) -> np.ndarray:
+    delta = arr.astype(np.int32) - color.astype(np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int32) < radius * radius
+
+
+def _line_support(ink: np.ndarray, p: tuple[float, float], q: tuple[float, float]) -> float:
+    x0, y0 = p
+    x1, y1 = q
+    distance = float(np.hypot(x1 - x0, y1 - y0))
+    count = max(24, int(distance * 0.7))
+    hits = 0
+    total = 0
+    h, w = ink.shape
+    # Begin beyond the 14px node disk plus outline/antialiasing. Expressing the
+    # exclusion in pixels (not a fixed fraction) keeps short links measurable.
+    start = min(0.42, 19.0 / distance)
+    for t in np.linspace(start, 1.0 - start, count):
+        x = int(round(x0 + t * (x1 - x0)))
+        y = int(round(y0 + t * (y1 - y0)))
+        y0s, y1s = max(0, y - 2), min(h, y + 3)
+        x0s, x1s = max(0, x - 2), min(w, x + 3)
+        total += 1
+        hits += bool(ink[y0s:y1s, x0s:x1s].any())
+    return hits / max(total, 1)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    nodes: list[tuple[float, float]] = []
+    colored: dict[int, str] = {}
+    for name in ("orange", "purple", "blue", "neutral"):
+        # A tight radius keeps antialiased blue-to-white rims from masquerading
+        # as the light neutral fill; each marker has a broad exact-color core.
+        comps = _components(_near(arr, _COLORS[name], 18.0))
+        expected = 1 if name != "neutral" else 5
+        if len(comps) != expected:
+            raise ValueError(f"expected {expected} {name} node fills, found {len(comps)}")
+        for cx, cy, _ in comps:
+            index = len(nodes)
+            nodes.append((cx, cy))
+            if name != "neutral":
+                colored[index] = name
+
+    ink = _near(arr, _INK, 52.0)
+    adjacency = [set() for _ in nodes]
+    for a in range(len(nodes)):
+        for b in range(a + 1, len(nodes)):
+            distance = float(np.hypot(nodes[a][0] - nodes[b][0], nodes[a][1] - nodes[b][1]))
+            if 42.0 <= distance <= 190.0 and _line_support(ink, nodes[a], nodes[b]) >= 0.90:
+                adjacency[a].add(b)
+                adjacency[b].add(a)
+
+    if sum(map(len, adjacency)) // 2 != 8:
+        raise ValueError(f"expected 8 visible links, found {sum(map(len, adjacency)) // 2}")
+    alive = set(range(len(nodes)))
+    queue = deque(i for i in alive if len(adjacency[i]) < 2)
+    while queue:
+        u = queue.popleft()
+        if u not in alive:
+            continue
+        alive.remove(u)
+        for v in list(adjacency[u]):
+            adjacency[v].discard(u)
+            if v in alive and len(adjacency[v]) < 2:
+                queue.append(v)
+    winners = [name for node, name in colored.items() if node in alive]
+    if len(alive) != 4 or len(winners) != 1:
+        raise ValueError(f"ambiguous recovered loop: core={len(alive)}, colors={winners}")
+    return winners[0]

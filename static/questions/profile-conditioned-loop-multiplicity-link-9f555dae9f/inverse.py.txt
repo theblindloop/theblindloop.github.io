@@ -1,0 +1,153 @@
+"""Independent image-only graph parser and loop-multiplicity oracle.
+
+The parser sees only the final RGB raster.  Nodes and links are disconnected by
+small visible gaps, so exact-color components provide a stable, renderer-free
+inverse representation before simple alternate paths are enumerated.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+NODE_COLOR = np.array((32, 36, 44), dtype=np.int16)
+GRAY_COLOR = np.array((117, 123, 135), dtype=np.int16)
+COLORS = {
+    "red": np.array((218, 60, 65), dtype=np.int16),
+    "green": np.array((43, 155, 91), dtype=np.int16),
+    "blue": np.array((59, 103, 199), dtype=np.int16),
+}
+_CACHE: dict[tuple[tuple[int, ...], bytes], str] = {}
+
+
+def _color_mask(pixels: np.ndarray, color: np.ndarray) -> np.ndarray:
+    return np.max(np.abs(pixels.astype(np.int16) - color[None, None, :]), axis=2) <= 3
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    """Return 4-connected pixel coordinate arrays without external geometry."""
+
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask & ~visited)):
+        if visited[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        visited[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            result.append(np.asarray(points, dtype=np.int32))
+    return result
+
+
+def _node_centers(pixels: np.ndarray) -> list[np.ndarray]:
+    components = _components(_color_mask(pixels, NODE_COLOR), 120)
+    if len(components) != 27:
+        raise ValueError(f"expected 27 isolated nodes, found {len(components)}")
+    centers = [component[:, [1, 0]].mean(axis=0) for component in components]
+    return centers
+
+
+def _line_endpoints(component: np.ndarray, centers: list[np.ndarray]) -> tuple[int, int]:
+    points = component[:, [1, 0]].astype(np.float64)
+    center = points.mean(axis=0)
+    covariance = np.cov(points, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    direction = direction / np.linalg.norm(direction)
+    projection = (points - center) @ direction
+    first_point = center + direction * float(projection.min())
+    second_point = center + direction * float(projection.max())
+    first = min(range(len(centers)), key=lambda index: float(np.linalg.norm(centers[index] - first_point)))
+    second = min(range(len(centers)), key=lambda index: float(np.linalg.norm(centers[index] - second_point)))
+    if first == second:
+        raise ValueError("a link has one detected endpoint")
+    if min(
+        float(np.linalg.norm(centers[first] - first_point)),
+        float(np.linalg.norm(centers[second] - second_point)),
+    ) > 35.0:
+        raise ValueError("link endpoint is too far from a node")
+    if float(np.linalg.norm(centers[first] - first_point)) > 35.0 or float(
+        np.linalg.norm(centers[second] - second_point)
+    ) > 35.0:
+        raise ValueError("link endpoint fit is ambiguous")
+    return tuple(sorted((first, second)))
+
+
+def _recover_edges(pixels: np.ndarray, centers: list[np.ndarray]) -> list[tuple[int, int, str]]:
+    edges: list[tuple[int, int, str]] = []
+    for color_name, color in (("gray", GRAY_COLOR), *COLORS.items()):
+        components = _components(_color_mask(pixels, color), 35)
+        for component in components:
+            first, second = _line_endpoints(component, centers)
+            edges.append((first, second, color_name))
+    if len(edges) != 30:
+        raise ValueError(f"expected 30 isolated links, found {len(edges)}")
+    if len({(first, second) for first, second, _ in edges}) != 30:
+        raise ValueError("two raster links recovered the same node pair")
+    if {color for _, _, color in edges} != {"gray", "red", "green", "blue"}:
+        raise ValueError("highlight palette is incomplete")
+    if any(sum(color == name for _, _, color in edges) != 1 for name in COLORS):
+        raise ValueError("each highlight color must identify one link")
+    return edges
+
+
+def _path_count(
+    node_count: int,
+    edges: list[tuple[int, int, str]],
+    marked: tuple[int, int],
+) -> int:
+    adjacency = [[] for _ in range(node_count)]
+    for first, second, _ in edges:
+        if {first, second} == set(marked):
+            continue
+        adjacency[first].append(second)
+        adjacency[second].append(first)
+    start, target = marked
+    visited = {start}
+    count = 0
+
+    def visit(current: int) -> None:
+        nonlocal count
+        if current == target:
+            count += 1
+            return
+        for neighbor in adjacency[current]:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                visit(neighbor)
+                visited.remove(neighbor)
+
+    visit(start)
+    return count
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the highlighted color with exactly two simple-loop memberships."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    key = (tuple(rgb.shape), rgb.tobytes())
+    if key in _CACHE:
+        return _CACHE[key]
+    centers = _node_centers(rgb)
+    edges = _recover_edges(rgb, centers)
+    counts: dict[str, int] = {}
+    for first, second, color in edges:
+        if color != "gray":
+            counts[color] = _path_count(len(centers), edges, (first, second))
+    if set(counts) != set(COLORS) or sorted(counts.values()) != [0, 1, 2]:
+        raise ValueError(f"unexpected highlighted loop counts: {counts}")
+    winner = next(color for color, count in counts.items() if count == 2)
+    _CACHE[key] = winner
+    return winner

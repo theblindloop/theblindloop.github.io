@@ -1,0 +1,144 @@
+"""Independent pixel-only inverse arm for the speckle-majority reveal world.
+
+Input is the final PNG and the public question contract only: a bordered square
+panel divided into a 7x7 grid of equal cells, each cell packed with a two-ink
+speckle, and the declared transform "shade every cell whose warm ink covers
+more than half of the cell; read the glyph formed by the shaded cells".
+
+Pipeline: (1) locate the visible dark frame fiducial and recover its thickness,
+(2) rectify to the inner panel and split it into 7x7 equal cells, (3) execute
+the declared transform by comparing warm and cool ink area inside each cell,
+(4) classify the resulting 7x7 shading against the six glyph templates and
+report the runner-up Hamming margin, abstaining when evidence is missing or
+the decision is not clearly separated.
+
+No renderer, prompt, generator, verifier or analytic-gold code is imported, and
+no latent scene data is accepted: the only argument is a PIL image.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "speckle_majority_reveal-oracle-0.1.0"
+
+GRID = 7
+GLYPH_NAMES = ("plus", "ex", "tee_up", "tee_right", "tee_down", "tee_left")
+
+# Ink classification thresholds. The two inks are separated by a large
+# red-minus-blue signed difference; the frame fiducial is the only near-black
+# structure; background and distractors are achromatic.
+DARK_MAX_LEVEL = 80
+INK_CHANNEL_GAP = 40
+
+MIN_FRAME_PIXELS = 400
+MAX_FRAME_THICKNESS = 40
+MIN_PANEL_SIDE = 70
+# A cell must be essentially fully inked before its majority is trusted.
+MIN_CELL_INK_FRACTION = 0.75
+# Classification acceptance: template mismatch budget and runner-up gap.
+MAX_TEMPLATE_DISTANCE = 3
+MIN_TEMPLATE_GAP = 4
+
+ABSTAIN = "abstain"
+
+
+def _templates() -> dict:
+    last = GRID - 1
+    mid = GRID // 2
+    shapes = {
+        "plus": {(mid, c) for c in range(GRID)} | {(r, mid) for r in range(GRID)},
+        "ex": {(i, i) for i in range(GRID)} | {(i, last - i) for i in range(GRID)},
+        "tee_up": {(0, c) for c in range(GRID)} | {(r, mid) for r in range(1, GRID)},
+        "tee_down": {(last, c) for c in range(GRID)} | {(r, mid) for r in range(0, last)},
+        "tee_left": {(r, 0) for r in range(GRID)} | {(mid, c) for c in range(1, GRID)},
+        "tee_right": {(r, last) for r in range(GRID)} | {(mid, c) for c in range(0, last)},
+    }
+    grids = {}
+    for name, cells in shapes.items():
+        grids[name] = np.array(
+            [[1 if (r, c) in cells else 0 for c in range(GRID)] for r in range(GRID)],
+            dtype=np.int16,
+        )
+    return grids
+
+
+TEMPLATES = _templates()
+
+
+def _ink_masks(image: Image.Image):
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red = arr[:, :, 0]
+    blue = arr[:, :, 2]
+    dark = arr.max(axis=2) < DARK_MAX_LEVEL
+    lit = ~dark
+    warm = lit & ((red - blue) > INK_CHANNEL_GAP)
+    cool = lit & ((blue - red) > INK_CHANNEL_GAP)
+    return dark, warm, cool
+
+
+def _panel_box(dark: np.ndarray):
+    """Locate the inner panel from the visible dark frame fiducial."""
+    rows = np.flatnonzero(dark.any(axis=1))
+    cols = np.flatnonzero(dark.any(axis=0))
+    if rows.size == 0 or cols.size == 0 or int(dark.sum()) < MIN_FRAME_PIXELS:
+        return None
+    y0, y1 = int(rows[0]), int(rows[-1])
+    x0, x1 = int(cols[0]), int(cols[-1])
+    mid = (y0 + y1) // 2
+    thickness = 0
+    while thickness < MAX_FRAME_THICKNESS and x0 + thickness <= x1 and dark[mid, x0 + thickness]:
+        thickness += 1
+    if thickness < 1 or thickness >= MAX_FRAME_THICKNESS:
+        return None
+    inner = (y0 + thickness, x0 + thickness, y1 - thickness, x1 - thickness)
+    height = inner[2] - inner[0] + 1
+    width = inner[3] - inner[1] + 1
+    if height != width or width < MIN_PANEL_SIDE or width % GRID != 0:
+        return None
+    return inner
+
+
+def _shading(warm: np.ndarray, cool: np.ndarray, box) -> np.ndarray | None:
+    top, left, bottom, _ = box
+    side = bottom - top + 1
+    step = side // GRID
+    area = step * step
+    grid = np.zeros((GRID, GRID), dtype=np.int16)
+    for row in range(GRID):
+        for col in range(GRID):
+            ys = slice(top + row * step, top + (row + 1) * step)
+            xs = slice(left + col * step, left + (col + 1) * step)
+            warm_area = int(warm[ys, xs].sum())
+            cool_area = int(cool[ys, xs].sum())
+            inked = warm_area + cool_area
+            if inked < MIN_CELL_INK_FRACTION * area:
+                return None
+            grid[row, col] = 1 if 2 * warm_area > inked else 0
+    return grid
+
+
+def classify(image: Image.Image) -> dict:
+    """Full pixel-only report: decision plus the runner-up Hamming margin."""
+    dark, warm, cool = _ink_masks(image)
+    box = _panel_box(dark)
+    if box is None:
+        return {"decision": ABSTAIN, "reason": "frame fiducial not recoverable", "margin": 0.0}
+    grid = _shading(warm, cool, box)
+    if grid is None:
+        return {"decision": ABSTAIN, "reason": "a cell is not fully inked", "margin": 0.0}
+    scored = sorted(
+        (int(np.abs(grid - TEMPLATES[name]).sum()), name) for name in GLYPH_NAMES
+    )
+    best, name = scored[0]
+    gap = scored[1][0] - best
+    if best > MAX_TEMPLATE_DISTANCE or gap < MIN_TEMPLATE_GAP:
+        return {"decision": ABSTAIN, "reason": "glyph classification ambiguous", "margin": float(gap)}
+    return {"decision": name, "reason": "ok", "margin": float(gap), "distance": float(best)}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Pixel-only decision: the glyph revealed by the declared per-cell two-ink
+    area majority, or ``abstain`` when the image does not support a decision."""
+    return classify(image)["decision"]

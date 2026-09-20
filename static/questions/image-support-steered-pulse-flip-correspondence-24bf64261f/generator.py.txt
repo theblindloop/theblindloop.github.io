@@ -1,0 +1,241 @@
+"""Renderer and analytic arm for a focal connected-trace correspondence world."""
+
+from __future__ import annotations
+
+import copy
+import itertools
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "pulse-flip-correspondence-0.1.0"
+WIDTH = 512
+HEIGHT = 512
+SCALE = 4
+BACKGROUND = (248, 247, 243)
+NAVY = (27, 84, 140)
+FRAME = (202, 211, 217)
+LABEL = (89, 103, 115)
+LANE_WIDTH = 34.0
+LANE_STEP = 39.0
+PULSE_OFFSETS = (7.0, 14.0, 21.0, 28.0)
+PULSE_HALF_WIDTH = 3.0
+PULSE_AMPLITUDE = 10.0
+STROKE_WIDTH = 5
+QUARANTINE_MARGIN = 0.25
+
+_SIGNATURES = tuple(
+    tuple(int(value) for value in bits)
+    for bits in itertools.product((0, 1), repeat=4)
+    if sum(bits) == 2
+)
+
+
+def _font(size: int):
+    for name in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ):
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size=size * SCALE)
+    return ImageFont.load_default()
+
+
+def _panel_map(scene: dict) -> dict[str, tuple[int, ...]]:
+    panels = {}
+    for record in scene["candidate_panels"]:
+        slot = str(record["slot"])
+        if slot in panels:
+            raise ValueError("candidate slots must be unique")
+        signature = tuple(int(value) for value in record["signature"])
+        panels[slot] = signature
+    if set(panels) != {"A", "B"}:
+        raise ValueError("candidate slots must be A and B")
+    return panels
+
+
+def _complement(signature: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(1 - int(value) for value in signature)
+
+
+def _score(reference: tuple[int, ...], candidate: tuple[int, ...]) -> int:
+    if len(reference) != 4 or len(candidate) != 4:
+        raise ValueError("each lane must have four pulses")
+    transformed = _complement(candidate)
+    return sum(int(left == right) for left, right in zip(reference, transformed, strict=True))
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample equalized signatures and a translated focal workbench."""
+
+    rng = random.Random(int(seed))
+    reference = tuple(rng.choice(_SIGNATURES))
+    matching = _complement(reference)
+    wrong_pool = [
+        signature
+        for signature in _SIGNATURES
+        if signature != matching
+        and sum(int(left != right) for left, right in zip(signature, matching, strict=True)) >= 2
+    ]
+    wrong = tuple(rng.choice(wrong_pool))
+    matching_slot = "A" if rng.randrange(2) == 0 else "B"
+    records = [
+        {
+            "slot": "A",
+            "signature": list(matching if matching_slot == "A" else wrong),
+        },
+        {
+            "slot": "B",
+            "signature": list(matching if matching_slot == "B" else wrong),
+        },
+    ]
+    rng.shuffle(records)
+    # This translation keeps the entire navy trace inside a two-cell central
+    # neighborhood while making its absolute location nonconstant.
+    anchor = [182 + rng.randrange(8), 220 + rng.randrange(5)]
+    return {
+        "reference_signature": list(reference),
+        "candidate_panels": records,
+        "anchor": anchor,
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    """Select the slot with the larger exact transformed sequence score."""
+
+    reference = tuple(int(value) for value in scene["reference_signature"])
+    panels = _panel_map(scene)
+    scores = {slot: _score(reference, panels[slot]) for slot in ("A", "B")}
+    if scores["A"] == scores["B"]:
+        raise ValueError("candidate pulse sequences are tied")
+    return "A" if scores["A"] > scores["B"] else "B"
+
+
+def margin(scene: dict) -> float:
+    """Return the runner-up score gap normalized by the four-pulse length."""
+
+    reference = tuple(int(value) for value in scene["reference_signature"])
+    panels = _panel_map(scene)
+    scores = [_score(reference, panels[slot]) for slot in ("A", "B")]
+    return float(abs(scores[0] - scores[1])) / 4.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        reference = tuple(int(value) for value in scene["reference_signature"])
+        panels = _panel_map(scene)
+        signatures = [reference, panels["A"], panels["B"]]
+        if any(len(signature) != 4 or any(value not in (0, 1) for value in signature) for signature in signatures):
+            return True
+        if any(sum(signature) != 2 for signature in signatures):
+            return True
+        return margin(scene) < QUARANTINE_MARGIN
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _scaled_point(point: tuple[float, float]) -> tuple[int, int]:
+    return (int(round(point[0] * SCALE)), int(round(point[1] * SCALE)))
+
+
+def _lane_points(x: float, base_y: float, signature: tuple[int, ...]) -> list[tuple[int, int]]:
+    points: list[tuple[float, float]] = [(x, base_y)]
+    for offset, direction in zip(PULSE_OFFSETS, signature, strict=True):
+        peak_y = base_y - PULSE_AMPLITUDE if int(direction) == 1 else base_y + PULSE_AMPLITUDE
+        points.extend(
+            [
+                (x + offset - PULSE_HALF_WIDTH, base_y),
+                (x + offset, peak_y),
+                (x + offset + PULSE_HALF_WIDTH, base_y),
+            ]
+        )
+    points.append((x + LANE_WIDTH, base_y))
+    return [_scaled_point(point) for point in points]
+
+
+def _draw_centered_text(draw: ImageDraw.ImageDraw, center_x: float, y: float, text: str, font) -> None:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    width = (bbox[2] - bbox[0]) / SCALE
+    draw.text(_scaled_point((center_x - width / 2.0, y)), text, font=font, fill=LABEL)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one antialiased RGB image containing one connected navy trace."""
+
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    title_font = _font(13)
+    label_font = _font(12)
+    note_font = _font(10)
+
+    anchor = scene["anchor"]
+    x0, base_y = float(anchor[0]), float(anchor[1])
+    panels = _panel_map(scene)
+    reference = tuple(int(value) for value in scene["reference_signature"])
+
+    frame = (
+        x0 - 10.0,
+        base_y - 29.0,
+        x0 + 2.0 * LANE_STEP + LANE_WIDTH + 10.0,
+        base_y + 16.0,
+    )
+    draw.rounded_rectangle(
+        tuple(int(round(value * SCALE)) for value in frame),
+        radius=6 * SCALE,
+        outline=FRAME,
+        width=1 * SCALE,
+    )
+    draw.text(_scaled_point((32.0, 30.0)), "CONNECTED PULSE TRACE", font=title_font, fill=LABEL)
+    draw.text(
+        _scaled_point((32.0, 48.0)),
+        "Flip A and B vertically; compare all four interior pulses with R.",
+        font=note_font,
+        fill=LABEL,
+    )
+    draw.text(
+        _scaled_point((32.0, 474.0)),
+        "The navy line is one connected trace; gray marks are nondiagnostic.",
+        font=note_font,
+        fill=LABEL,
+    )
+
+    for index, label in enumerate(("R", "A", "B")):
+        lane_x = x0 + index * LANE_STEP
+        _draw_centered_text(draw, lane_x + LANE_WIDTH / 2.0, base_y - 24.0, label, label_font)
+        if index < 2:
+            divider_x = lane_x + LANE_WIDTH + 2.5
+            draw.line(
+                [_scaled_point((divider_x, base_y - 13.0)), _scaled_point((divider_x, base_y + 13.0))],
+                fill=FRAME,
+                width=1 * SCALE,
+            )
+
+    lane_signatures = (reference, panels["A"], panels["B"])
+    for index, signature in enumerate(lane_signatures):
+        lane_x = x0 + index * LANE_STEP
+        draw.line(
+            _lane_points(lane_x, base_y, signature),
+            fill=NAVY,
+            width=STROKE_WIDTH * SCALE,
+            joint="curve",
+        )
+        if index < 2:
+            draw.line(
+                [
+                    _scaled_point((lane_x + LANE_WIDTH, base_y)),
+                    _scaled_point((lane_x + LANE_STEP, base_y)),
+                ],
+                fill=NAVY,
+                width=STROKE_WIDTH * SCALE,
+            )
+
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Return a render-invariant permutation of slot-addressed records."""
+
+    twin = copy.deepcopy(scene)
+    twin["candidate_panels"] = list(reversed(twin["candidate_panels"]))
+    return [("candidate_record_order", twin)]

@@ -1,0 +1,163 @@
+"""Constellation-trace-letter world.
+
+A set of small dark dots is drawn on a white canvas. The dots are placed along
+the stroke skeleton of one capital letter (T, L, V, or X), so together the
+whole constellation traces that letter's global outline. The global-structure
+decision is which capital letter the dots trace.
+
+The renderer owns scene sampling + rasterization + the structural analytic
+gold (which recovers the letter purely from the rendered dot coordinates). The
+independent pixel-only inverse arm (``oracle.py``) reconstructs the dot
+constellation from the final PNG alone and recovers the same letter from the
+recovered dot centroids.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+CENTER_X = WIDTH // 2
+CENTER_Y = HEIGHT // 2
+DOT_R = 6
+INK = (30, 30, 30)
+BACKGROUND = (255, 255, 255)
+
+LETTERS = ("T", "L", "V", "X")
+
+SEGMENTS = {
+    "T": [((0.10, 0.18), (0.90, 0.18)), ((0.50, 0.18), (0.50, 0.88))],
+    "L": [((0.12, 0.15), (0.12, 0.88)), ((0.12, 0.88), (0.88, 0.88))],
+    "V": [((0.14, 0.18), (0.50, 0.88)), ((0.86, 0.18), (0.50, 0.88))],
+    "X": [((0.10, 0.10), (0.90, 0.90)), ((0.90, 0.10), (0.10, 0.90))],
+}
+
+QUARANTINE_MARGIN = 0.015
+_SKEL_STEPS = 90
+VALID_MARGINS: dict[str, float] = {}
+
+
+def _skeleton(letter: str) -> np.ndarray:
+    """Dense, evenly sampled point set along a letter's canonical stroke skeleton."""
+    points = []
+    for (a, b) in SEGMENTS[letter]:
+        for i in range(_SKEL_STEPS + 1):
+            t = i / _SKEL_STEPS
+            points.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+    return np.asarray(points, dtype=float)
+
+
+_SKEL = {letter: _skeleton(letter) for letter in LETTERS}
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene whose recovered letter matches its trace."""
+    for attempt in range(4000):
+        scene = _build(seed + attempt * 1000003)
+        letter = analytic_gold(scene)
+        if scene["target_letter"] == letter:
+            return scene
+    return _build(seed)
+
+
+def _build(seed: int) -> dict:
+    rng = np.random.default_rng(seed)
+    target = LETTERS[int(rng.integers(0, 4))]
+    scale = float(rng.uniform(0.60, 0.92))
+    rot = float(rng.uniform(-0.10, 0.10))
+    shift_x = float(rng.uniform(-0.08, 0.08))
+    shift_y = float(rng.uniform(-0.08, 0.08))
+    dots = []
+    for (a, b) in SEGMENTS[target]:
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        seg_len = (dx * dx + dy * dy) ** 0.5
+        n_dot = max(5, int(round(seg_len * 22)))
+        for i in range(n_dot):
+            t = (i + 0.5) / n_dot
+            x = a[0] + dx * t
+            y = a[1] + dy * t
+            norm = (dx * dx + dy * dy) ** 0.5 + 1e-9
+            jp = float(rng.normal(0.0, 0.007))
+            jq = float(rng.normal(0.0, 0.005))
+            x += (-dy / norm) * jp + jq
+            y += (dx / norm) * jp
+            dots.append((x, y))
+    pts = np.asarray(dots, dtype=float)
+    center = np.array([0.5, 0.5])
+    ca = np.cos(rot)
+    sa = np.sin(rot)
+    rot_mat = np.array([[ca, -sa], [sa, ca]])
+    pts = (pts - center) @ rot_mat.T
+    pts = pts * scale + np.array([0.5 + shift_x, 0.5 + shift_y])
+    pts = np.clip(pts, 0.02, 0.98)
+    pixels = np.round(pts * np.array([WIDTH, HEIGHT])).astype(int)
+    return {
+        "dots": [[int(x), int(y)] for (x, y) in pixels],
+        "target_letter": target,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the latent scene (a deterministic PNG)."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    d = ImageDraw.Draw(img)
+    for (x, y) in scene["dots"]:
+        d.ellipse([x - DOT_R, y - DOT_R, x + DOT_R, y + DOT_R], fill=INK)
+    return img
+
+
+def _shape_energy(pts: np.ndarray, letter: str) -> float:
+    """Mean distance from a normalized dot cloud to a letter skeleton."""
+    if pts.shape[0] == 0:
+        return 1e9
+    sk = _SKEL[letter]
+    best = np.empty(pts.shape[0], dtype=float)
+    for i, p in enumerate(pts):
+        best[i] = float(np.min(np.sum((sk - p) ** 2, axis=1)) ** 0.5)
+    return float(np.mean(best))
+
+
+def _normalize(pts: np.ndarray) -> np.ndarray:
+    x0, x1 = pts[:, 0].min(), pts[:, 0].max()
+    y0, y1 = pts[:, 1].min(), pts[:, 1].max()
+    w = x1 - x0
+    h = y1 - y0
+    if w < 1e-6 or h < 1e-6:
+        return pts * 0.0
+    return (pts - np.array([x0, y0])) / np.array([w, h])
+
+
+def _recover_letter(dots: list) -> tuple[str, float]:
+    """Return (best-letter, margin) where margin = second-best - best energy."""
+    pts = np.asarray(dots, dtype=float)
+    pts = _normalize(pts)
+    energies = {letter: _shape_energy(pts, letter) for letter in LETTERS}
+    ordered = sorted(energies.items(), key=lambda kv: kv[1])
+    best = ordered[0][0]
+    margin = float(ordered[1][1] - ordered[0][1])
+    return best, margin
+
+
+def analytic_gold(scene: dict) -> str:
+    """Structural gold: the capital letter traced by the dots."""
+    best, _ = _recover_letter(scene["dots"])
+    return best
+
+
+def margin(scene: dict) -> float:
+    """Decision commitment: distance between the best and next-best letter fit."""
+    _, m = _recover_letter(scene["dots"])
+    return m
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine constellations whose letter read is structurally ambiguous."""
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """The scene is injectively rendered; no latent aliases are declared."""
+    return []

@@ -1,0 +1,133 @@
+"""Independent image-only inverse arm for Orthogonal Bloom Replay.
+
+This module deliberately duplicates the public visual contract.  It imports no
+renderer, generator, prompt, verifier, scene, or analytic-gold implementation.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_SIZE = 7
+_GRID = np.array((42, 47, 55), dtype=np.int16)
+_OFF = np.array((251, 249, 241), dtype=np.float64)
+_MARKER = np.array((238, 147, 42), dtype=np.int16)
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for start_y, start_x in np.argwhere(mask):
+        if seen[start_y, start_x]:
+            continue
+        queue = deque([(int(start_y), int(start_x))])
+        seen[start_y, start_x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and mask[yy, xx] and not seen[yy, xx]:
+                    seen[yy, xx] = True
+                    queue.append((yy, xx))
+        groups.append(np.asarray(points, dtype=np.int32))
+    return groups
+
+
+def _step(grid: list[list[bool]]) -> list[list[bool]]:
+    n = len(grid)
+    output = [[False] * n for _ in range(n)]
+    for row in range(n):
+        for col in range(n):
+            count = 0
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                yy, xx = row + dy, col + dx
+                if 0 <= yy < n and 0 <= xx < n and grid[yy][xx]:
+                    count += 1
+            output[row][col] = count == 1
+    return output
+
+
+def _parse(image: Image.Image) -> tuple[list[list[bool]], int]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 300:
+        raise PixelParseError("unsupported raster dimensions")
+    values = array.astype(np.int32)
+    dark = np.sqrt(np.sum((values - _GRID) ** 2, axis=2)) < 12.0
+    components = _components(dark)
+    if not components:
+        raise PixelParseError("connected operation patch is missing")
+    patch = max(components, key=len)
+    if len(patch) < 12000:
+        raise PixelParseError("connected operation patch is incomplete")
+    y_min, x_min = patch.min(axis=0)
+    y_max, x_max = patch.max(axis=0)
+    width = int(x_max - x_min + 1)
+    total_height = int(y_max - y_min + 1)
+
+    viable: list[tuple[int, int, int]] = []
+    for cell in range(24, 33):
+        board_px = _SIZE * cell
+        header = total_height - board_px
+        if width == board_px and 20 <= header <= 32:
+            viable.append((cell, board_px, header))
+    if len(viable) != 1:
+        raise PixelParseError("operation patch geometry is not a 7-by-7 field")
+    cell, board_px, header = viable[0]
+    board_y = int(y_min + header)
+    board_x = int(x_min)
+
+    # Every gutter in the connected field must remain visibly intact.  This is
+    # both a parse guard and an abstention policy for destructive/ambiguous PNGs.
+    yy, xx = np.indices((board_px, board_px))
+    expected_grid = (xx % cell < 4) | (xx % cell >= cell - 4) | (yy % cell < 4) | (yy % cell >= cell - 4)
+    observed_grid = dark[board_y : board_y + board_px, board_x : board_x + board_px]
+    if observed_grid.shape != expected_grid.shape or float(observed_grid[expected_grid].mean()) < 0.985:
+        raise PixelParseError("grid gutters are damaged or occluded")
+
+    marker_mask = np.sqrt(np.sum((values - _MARKER) ** 2, axis=2)) < 14.0
+    marker_groups = _components(marker_mask)
+    small = [group for group in marker_groups if 35 <= len(group) <= 100]
+    large = [group for group in marker_groups if len(group) >= 120]
+    if len(small) != 6 or len(large) != 1:
+        raise PixelParseError("six round beads and one tracked-cell frame are required")
+    rounds = len(small)
+    marker_center = large[0].mean(axis=0)
+    expected_center = np.array((board_y + board_px / 2.0, board_x + board_px / 2.0))
+    if float(np.linalg.norm(marker_center - expected_center)) > cell * 0.35:
+        raise PixelParseError("tracked-cell frame is not centered")
+
+    grid: list[list[bool]] = []
+    for row in range(_SIZE):
+        states: list[bool] = []
+        for col in range(_SIZE):
+            cy = board_y + row * cell + cell // 2
+            cx = board_x + col * cell + cell // 2
+            half = max(3, cell // 7)
+            sample = array[cy - half : cy + half + 1, cx - half : cx + half + 1].astype(np.float64)
+            mean = sample.reshape(-1, 3).mean(axis=0)
+            spread = sample.reshape(-1, 3).std(axis=0).max()
+            if spread > 8.0:
+                raise PixelParseError("cell interior is visually ambiguous")
+            distance = float(np.linalg.norm(mean - _OFF))
+            states.append(distance > 70.0)
+        grid.append(states)
+    if sum(sum(row) for row in grid) != 24:
+        raise PixelParseError("initial field must contain exactly 24 colored cells")
+    return grid, rounds
+
+
+def decision_from_image(image: Image.Image) -> str:
+    grid, rounds = _parse(image)
+    for _ in range(rounds):
+        grid = _step(grid)
+    center = _SIZE // 2
+    return "on" if grid[center][center] else "off"

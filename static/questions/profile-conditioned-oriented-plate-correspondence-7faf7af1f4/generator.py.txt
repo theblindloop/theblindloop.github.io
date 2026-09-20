@@ -1,0 +1,265 @@
+"""Renderer and analytic arm for oriented-part plate correspondence.
+
+Four uniquely colored triangular pointers occupy the north, east, south, and
+west sockets of a plate.  A valid test plate applies one common quarter-turn to
+both each color's socket and its local pointer direction.  One distractor has
+the correct transported sockets but wrong directions; the other has the
+correct transported directions but wrong sockets.  Thus neither cue suffices.
+"""
+
+from __future__ import annotations
+
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 720
+HEIGHT = 560
+SUPERSAMPLE = 3
+LABELS = ("A", "B", "C")
+
+PALETTES = (
+    ((214, 62, 70), (48, 114, 211), (35, 160, 96), (230, 145, 32)),
+    ((190, 55, 132), (27, 151, 181), (106, 78, 198), (221, 119, 35)),
+    ((205, 72, 48), (40, 130, 194), (48, 157, 77), (181, 88, 179)),
+)
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    path = Path("/usr/share/fonts/truetype/dejavu") / name
+    try:
+        return ImageFont.truetype(str(path), size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _turn_part(part: dict, turns: int, *, slot_turns: int | None = None,
+               direction_turns: int | None = None) -> dict:
+    slot_delta = turns if slot_turns is None else slot_turns
+    direction_delta = turns if direction_turns is None else direction_turns
+    return {
+        "color": int(part["color"]),
+        "slot": (int(part["slot"]) + slot_delta) % 4,
+        "direction": (int(part["direction"]) + direction_delta) % 4,
+    }
+
+
+def _transform_parts(parts: list[dict], turns: int, *, slot_turns: int | None = None,
+                     direction_turns: int | None = None) -> list[dict]:
+    return [
+        _turn_part(
+            part,
+            turns,
+            slot_turns=slot_turns,
+            direction_turns=direction_turns,
+        )
+        for part in parts
+    ]
+
+
+def _part_map(parts: list[dict]) -> dict[int, tuple[int, int]]:
+    result: dict[int, tuple[int, int]] = {}
+    for part in parts:
+        color = int(part["color"])
+        if color in result:
+            raise ValueError("a plate repeats a color")
+        result[color] = (int(part["slot"]), int(part["direction"]))
+    if set(result) != {0, 1, 2, 3}:
+        raise ValueError("a plate must contain colors 0 through 3")
+    return result
+
+
+def _plate_score(reference: list[dict], test: list[dict]) -> int:
+    ref = _part_map(reference)
+    candidate = _part_map(test)
+    scores = []
+    for turns in range(4):
+        mismatches = 0
+        for color in range(4):
+            ref_slot, ref_direction = ref[color]
+            test_slot, test_direction = candidate[color]
+            mismatches += test_slot != (ref_slot + turns) % 4
+            mismatches += test_direction != (ref_direction + turns) % 4
+        scores.append(mismatches)
+    return min(scores)
+
+
+def _card_scores(scene: dict) -> list[int]:
+    return [_plate_score(scene["reference"], test) for test in scene["tests"]]
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    slots = list(range(4))
+    rng.shuffle(slots)
+    reference = [
+        {"color": color, "slot": slots[color], "direction": rng.randrange(4)}
+        for color in range(4)
+    ]
+    turns = rng.randrange(1, 4)
+    correct = _transform_parts(reference, turns)
+    # Shares every transported socket with the correct card, but no transported
+    # direction.  A position-only solver therefore cannot choose between them.
+    position_twin = _transform_parts(
+        reference, turns, slot_turns=turns, direction_turns=(turns + 1) % 4
+    )
+    # Shares every transported direction with the correct card, but no socket.
+    orientation_twin = _transform_parts(
+        reference, turns, slot_turns=(turns + 1) % 4, direction_turns=turns
+    )
+
+    correct_index = int(seed) % 3
+    remaining = [index for index in range(3) if index != correct_index]
+    if rng.random() < 0.5:
+        position_index, orientation_index = remaining
+    else:
+        orientation_index, position_index = remaining
+    tests: list[list[dict]] = [[], [], []]
+    tests[correct_index] = correct
+    tests[position_index] = position_twin
+    tests[orientation_index] = orientation_twin
+    rng.shuffle(reference)
+    for parts in tests:
+        rng.shuffle(parts)
+
+    palette = [list(color) for color in rng.choice(PALETTES)]
+    rng.shuffle(palette)
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "reference": reference,
+        "tests": tests,
+        "card_labels": list(LABELS),
+        "palette": palette,
+        "part_radius": rng.randint(16, 18),
+    }
+    if is_quarantined(scene):
+        raise RuntimeError("internal sampler produced a quarantined scene")
+    return scene
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _card_scores(scene)
+    winner = min(range(3), key=scores.__getitem__)
+    return str(scene["card_labels"][winner])
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_card_scores(scene))
+    return float(scores[1] - scores[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = sorted(_card_scores(scene))
+    return scores[0] != 0 or scores[1] == scores[0]
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Reverse parallel part-record order; drawing and color maps are unchanged."""
+
+    twin = dict(scene)
+    twin["reference"] = list(reversed(scene["reference"]))
+    twin["tests"] = [list(reversed(parts)) for parts in scene["tests"]]
+    return [("reverse_parallel_part_records", twin)]
+
+
+def _triangle(center: tuple[float, float], radius: float, direction: int) -> list[tuple[float, float]]:
+    # Direction 0 points up.  Rotating screen coordinates clockwise increments
+    # both socket and local-direction indices: N, E, S, W.
+    base = ((0.0, -radius), (-0.82 * radius, 0.72 * radius),
+            (0.82 * radius, 0.72 * radius))
+    result = []
+    for x, y in base:
+        for _ in range(int(direction) % 4):
+            x, y = -y, x
+        result.append((center[0] + x, center[1] + y))
+    return result
+
+
+def _socket_center(center: tuple[float, float], slot: int, spread: float) -> tuple[float, float]:
+    offsets = ((0.0, -spread), (spread, 0.0), (0.0, spread), (-spread, 0.0))
+    dx, dy = offsets[int(slot) % 4]
+    return center[0] + dx, center[1] + dy
+
+
+def _draw_plate(
+    draw: ImageDraw.ImageDraw,
+    parts: list[dict],
+    center: tuple[float, float],
+    spread: float,
+    palette: list[tuple[int, int, int]],
+    radius: float,
+    scale: int,
+) -> None:
+    cx, cy = center
+    def box(values: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+        return tuple(int(round(value * scale)) for value in values)
+
+    plate_half = spread + 35.0
+    draw.rounded_rectangle(
+        box((cx - plate_half, cy - plate_half, cx + plate_half, cy + plate_half)),
+        radius=18 * scale,
+        fill=(231, 234, 236),
+        outline=(151, 158, 164),
+        width=2 * scale,
+    )
+    for slot in range(4):
+        sx, sy = _socket_center(center, slot, spread)
+        draw.ellipse(
+            box((sx - radius - 7, sy - radius - 7, sx + radius + 7, sy + radius + 7)),
+            fill=(252, 252, 250),
+            outline=(126, 133, 140),
+            width=2 * scale,
+        )
+    for part in parts:
+        socket = _socket_center(center, int(part["slot"]), spread)
+        outer = _triangle(socket, radius + 3.0, int(part["direction"]))
+        inner = _triangle(socket, radius, int(part["direction"]))
+        draw.polygon([(int(x * scale), int(y * scale)) for x, y in outer], fill=(45, 49, 54))
+        draw.polygon(
+            [(int(x * scale), int(y * scale)) for x, y in inner],
+            fill=palette[int(part["color"])],
+        )
+
+
+def render(scene: dict) -> Image.Image:
+    scale = SUPERSAMPLE
+    width, height = int(scene["width"]), int(scene["height"])
+    image = Image.new("RGB", (width * scale, height * scale), (246, 245, 242))
+    draw = ImageDraw.Draw(image)
+
+    def box(values: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+        return tuple(int(round(value * scale)) for value in values)
+
+    draw.rounded_rectangle(
+        box((196, 28, 524, 266)), radius=15 * scale, fill=(255, 255, 255),
+        outline=(192, 197, 202), width=2 * scale,
+    )
+    for left in (10, 250, 490):
+        draw.rounded_rectangle(
+            box((left, 302, left + 220, 550)), radius=14 * scale,
+            fill=(255, 255, 255), outline=(192, 197, 202), width=2 * scale,
+        )
+
+    heading = _font(14 * scale, bold=True)
+    body = _font(12 * scale)
+    label_font = _font(22 * scale, bold=True)
+    draw.text((212 * scale, 39 * scale), "REFERENCE PLATE", fill=(55, 60, 66), font=heading)
+    draw.text(
+        (350 * scale, 40 * scale), "one turn moves sockets + pointers",
+        fill=(86, 92, 98), font=body,
+    )
+    draw.text((18 * scale, 278 * scale), "TEST PLATES", fill=(55, 60, 66), font=heading)
+    for index, label in enumerate(scene["card_labels"]):
+        draw.text(((25 + 240 * index) * scale, 313 * scale), str(label),
+                  fill=(50, 55, 61), font=label_font)
+
+    palette = [tuple(int(channel) for channel in color) for color in scene["palette"]]
+    radius = float(scene["part_radius"])
+    _draw_plate(draw, scene["reference"], (360.0, 154.0), 62.0, palette, radius, scale)
+    for index, parts in enumerate(scene["tests"]):
+        _draw_plate(draw, parts, (120.0 + 240.0 * index, 430.0), 52.0,
+                    palette, radius, scale)
+    return image.resize((width, height), Image.Resampling.LANCZOS)

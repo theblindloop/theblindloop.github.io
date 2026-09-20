@@ -1,0 +1,130 @@
+"""Independent pixel-only inverse for the negative-space corridor.
+
+This module deliberately knows neither the renderer nor latent scenes.  It
+segments saturated foreground relative to the border background, requires two
+large disconnected components, rotates their masks to a canonical top/bottom
+arrangement, and reconstructs the pale gap column by column.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """The final pixels do not contain two complete, decisive banks."""
+
+
+def _foreground(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    border = np.concatenate(
+        (array[:3].reshape(-1, 3), array[-3:].reshape(-1, 3),
+         array[:, :3].reshape(-1, 3), array[:, -3:].reshape(-1, 3)),
+        axis=0,
+    )
+    background = np.median(border, axis=0)
+    delta = np.sqrt(np.sum((array - background) ** 2, axis=2))
+    return delta > 70.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    work = mask.copy()
+    found: list[np.ndarray] = []
+    height, width = work.shape
+    for start_y, start_x in np.argwhere(work):
+        sy, sx = int(start_y), int(start_x)
+        if not work[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        work[sy, sx] = False
+        points = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and work[ny, nx]:
+                    work[ny, nx] = False
+                    queue.append((ny, nx))
+        if len(points) >= 180:
+            found.append(np.asarray(points, dtype=np.int32))
+    return found
+
+
+def _canonical_mask(image: Image.Image) -> tuple[np.ndarray, list[np.ndarray]]:
+    mask = _foreground(image)
+    components = _components(mask)
+    if len(components) != 2:
+        raise OracleAbstention(f"expected two complete banks, found {len(components)}")
+    centroids = [component.mean(axis=0) for component in components]
+    dy = abs(float(centroids[0][0] - centroids[1][0]))
+    dx = abs(float(centroids[0][1] - centroids[1][1]))
+    if max(dx, dy) < 70.0 or min(dx, dy) > 45.0:
+        raise OracleAbstention("the two banks do not form one clear corridor")
+    if dx > dy:
+        mask = mask.T
+        components = _components(mask)
+        if len(components) != 2:
+            raise OracleAbstention("quarter-turn normalization lost a bank")
+    components.sort(key=lambda points: float(points[:, 0].mean()))
+    return mask, components
+
+
+def _width_evidence(image: Image.Image) -> tuple[float, float, float]:
+    mask, components = _canonical_mask(image)
+    top_points, bottom_points = components
+    top_mask = np.zeros_like(mask)
+    bottom_mask = np.zeros_like(mask)
+    top_mask[top_points[:, 0], top_points[:, 1]] = True
+    bottom_mask[bottom_points[:, 0], bottom_points[:, 1]] = True
+    top_x0, top_x1 = int(top_points[:, 1].min()), int(top_points[:, 1].max())
+    bot_x0, bot_x1 = int(bottom_points[:, 1].min()), int(bottom_points[:, 1].max())
+    x0, x1 = max(top_x0, bot_x0), min(top_x1, bot_x1)
+    if x1 - x0 < 70:
+        raise OracleAbstention("facing contour overlap is too short")
+
+    xs = []
+    widths = []
+    for x in range(x0, x1 + 1):
+        top_ys = np.flatnonzero(top_mask[:, x])
+        bottom_ys = np.flatnonzero(bottom_mask[:, x])
+        if len(top_ys) and len(bottom_ys):
+            gap = int(bottom_ys.min()) - int(top_ys.max()) - 1
+            if gap <= 20:
+                raise OracleAbstention("banks overlap or leave no clear corridor")
+            xs.append(x)
+            widths.append(gap)
+    if len(widths) < 70:
+        raise OracleAbstention("too few jointly bounded corridor columns")
+    xs_array = np.asarray(xs, dtype=np.float64)
+    widths_array = np.asarray(widths, dtype=np.float64)
+    midpoint = (float(xs_array.min()) + float(xs_array.max())) / 2.0
+    halfspan = (float(xs_array.max()) - float(xs_array.min())) / 2.0
+    u = np.abs((xs_array - midpoint) / max(halfspan, 1.0))
+    center = widths_array[u <= 0.18]
+    shoulders = widths_array[(u >= 0.62) & (u <= 0.82)]
+    if len(center) < 8 or len(shoulders) < 12:
+        raise OracleAbstention("corridor center or shoulders are incomplete")
+    center_width = float(np.median(center))
+    shoulder_width = float(np.median(shoulders))
+    return abs(center_width - shoulder_width), center_width, shoulder_width
+
+
+def measure_from_image(image: Image.Image) -> dict[str, float]:
+    difference, center, shoulder = _width_evidence(image)
+    return {
+        "center_width": center,
+        "shoulder_width": shoulder,
+        "absolute_width_change": difference,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    difference, _center, _shoulder = _width_evidence(image)
+    if difference <= 3.5:
+        return "even"
+    if difference >= 8.0:
+        return "changing"
+    raise OracleAbstention(f"intermediate width evidence: {difference:.2f}px")

@@ -1,0 +1,120 @@
+"""Independent pixel-only inverse for cyclic landmark correspondence.
+
+The inverse duplicates only the public panel palette and framing. It labels exact
+color cores in each panel, extracts four-connected components, takes their
+centroids, sorts by screen-space angle, and compares directed color cycles. It
+does not import or inspect renderer state, scene data, or analytic gold.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+_PANEL_BOXES = {
+    "reference": (24, 58, 344, 502),
+    "A": (400, 58, 720, 502),
+    "B": (776, 58, 1096, 502),
+}
+_PALETTE = {
+    "red": (220, 50, 47),
+    "blue": (38, 91, 185),
+    "green": (40, 151, 77),
+    "gold": (235, 157, 24),
+    "purple": (135, 70, 170),
+}
+_EXPECTED_MARKERS = 5
+_MIN_COMPONENT_PIXELS = 120
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    """Return four-connected components without sharing renderer geometry."""
+
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    output: list[list[tuple[int, int]]] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist(), strict=True):
+        if visited[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        visited[start_y, start_x] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            component.append((y, x))
+            for next_y, next_x in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= next_y < height and 0 <= next_x < width and mask[next_y, next_x] and not visited[next_y, next_x]:
+                    visited[next_y, next_x] = True
+                    stack.append((next_y, next_x))
+        output.append(component)
+    return output
+
+
+def _panel_centers(image: Image.Image, box: tuple[int, int, int, int]) -> dict[str, tuple[float, float]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    left, top, right, bottom = box
+    crop = array[top + 4 : bottom - 4, left + 4 : right - 4]
+    centers: dict[str, tuple[float, float]] = {}
+    for color, rgb in _PALETTE.items():
+        mask = np.all(crop == np.asarray(rgb, dtype=np.uint8), axis=2)
+        components = [component for component in _components(mask) if len(component) >= _MIN_COMPONENT_PIXELS]
+        if len(components) != 1:
+            raise ValueError(f"{color}: expected one visible landmark component, got {len(components)}")
+        component = components[0]
+        ys = np.asarray([point[0] for point in component], dtype=np.float64)
+        xs = np.asarray([point[1] for point in component], dtype=np.float64)
+        centers[color] = (float(xs.mean() + left + 4), float(ys.mean() + top + 4))
+    if len(centers) != _EXPECTED_MARKERS:
+        raise ValueError("panel does not expose five colored landmarks")
+    return centers
+
+
+def _sequence(centers: dict[str, tuple[float, float]]) -> tuple[str, ...]:
+    cx = sum(point[0] for point in centers.values()) / len(centers)
+    cy = sum(point[1] for point in centers.values()) / len(centers)
+    return tuple(
+        color
+        for color, _ in sorted(
+            centers.items(),
+            key=lambda item: math.atan2(item[1][1] - cy, item[1][0] - cx),
+        )
+    )
+
+
+def _canonical(sequence: tuple[str, ...]) -> tuple[str, ...]:
+    return min(sequence[index:] + sequence[:index] for index in range(len(sequence)))
+
+
+def _cycle_edges(sequence: tuple[str, ...]) -> frozenset[tuple[str, str]]:
+    return frozenset(
+        (sequence[index], sequence[(index + 1) % len(sequence)])
+        for index in range(len(sequence))
+    )
+
+
+def _score(reference: tuple[str, ...], candidate: tuple[str, ...]) -> int:
+    return len(_cycle_edges(reference) & _cycle_edges(candidate))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return A or B using only the final raster."""
+
+    reference = _sequence(_panel_centers(image, _PANEL_BOXES["reference"]))
+    candidate_a = _sequence(_panel_centers(image, _PANEL_BOXES["A"]))
+    candidate_b = _sequence(_panel_centers(image, _PANEL_BOXES["B"]))
+    reference_canonical = _canonical(reference)
+    a_canonical = _canonical(candidate_a)
+    b_canonical = _canonical(candidate_b)
+    matches = (a_canonical == reference_canonical, b_canonical == reference_canonical)
+    if sum(matches) != 1:
+        # The score check makes evidence erasure and ambiguous images abstain
+        # rather than silently choosing a panel.
+        scores = (_score(reference, candidate_a), _score(reference, candidate_b))
+        if scores[0] == scores[1]:
+            raise ValueError("cyclic-order decision is tied or the raster is ambiguous")
+        raise ValueError("raster contains zero or two exact cyclic correspondences")
+    return "A" if matches[0] else "B"

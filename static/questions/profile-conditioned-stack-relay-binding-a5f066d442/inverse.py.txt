@@ -1,0 +1,137 @@
+"""Pixel-only inverse arm for stack_relay_binding.
+
+Receives one rasterized picture and nothing else: no latent parameters, no
+analytic gold, no renderer, prompt, generator or verifier code.  It locates the
+coloured tag disks to recover the column positions and the left-to-right tag
+order, counts the grey tokens stacked over each column from vertical run
+structure, finds the black pointer as the topmost black component, resolves the
+column it selects together with its runner-up margin, and then reads the tag of
+the column whose place equals the selected column's token count.  It abstains
+whenever the evidence is not clean.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+TAG_RGB = {
+    "red": (208, 30, 38),
+    "orange": (232, 120, 20),
+    "green": (16, 138, 60),
+    "blue": (30, 66, 208),
+    "purple": (128, 36, 160),
+    "brown": (124, 74, 32),
+}
+TOKEN_RGB = (150, 150, 150)
+CHANNEL_TOLERANCE = 30
+INK_LEVEL = 60
+
+MIN_DISK_PIXELS = 300
+MIN_COLUMN_SPACING = 60
+STRIP_HALF = 10
+MIN_STRIP_HITS = 15
+MIN_TOKEN_ROWS = 15
+MAX_TOKEN_ROWS = 40
+MIN_ARROW_PIXELS = 150
+MAX_ARROW_PIXELS = 3000
+MIN_ARROW_ROWS = 20
+MAX_ARROW_ROWS = 80
+MIN_POINTER_MARGIN = 8.0
+COLUMNS = 6
+ABSTAIN = "abstain"
+
+
+def _mask(pixels: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    target = np.array(rgb, dtype=np.int16)
+    return (np.abs(pixels.astype(np.int16) - target) <= CHANNEL_TOLERANCE).all(axis=2)
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """Inclusive index ranges of contiguous True runs."""
+
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            spans.append((start, index - 1))
+            start = None
+    if start is not None:
+        spans.append((start, len(flags) - 1))
+    return spans
+
+
+def _tag_columns(pixels: np.ndarray) -> list[tuple[float, str]] | None:
+    found: list[tuple[float, str]] = []
+    for name, rgb in TAG_RGB.items():
+        mask = _mask(pixels, rgb)
+        if int(mask.sum()) < MIN_DISK_PIXELS:
+            return None
+        columns = np.flatnonzero(mask.any(axis=0))
+        found.append((float((columns[0] + columns[-1]) / 2.0), name))
+    found.sort()
+    for left, right in zip(found, found[1:]):
+        if right[0] - left[0] < MIN_COLUMN_SPACING:
+            return None
+    return found
+
+
+def _token_count(token_mask: np.ndarray, centre: float) -> int | None:
+    left = max(0, int(round(centre)) - STRIP_HALF)
+    right = min(token_mask.shape[1], int(round(centre)) + STRIP_HALF + 1)
+    strip = token_mask[:, left:right]
+    hits = strip.sum(axis=1) >= MIN_STRIP_HITS
+    spans = _runs(hits)
+    if not spans:
+        return None
+    for low, high in spans:
+        height = high - low + 1
+        if not MIN_TOKEN_ROWS <= height <= MAX_TOKEN_ROWS:
+            return None
+    return len(spans)
+
+
+def _pointer_centre(pixels: np.ndarray) -> float | None:
+    ink = (pixels.astype(np.int16) <= INK_LEVEL).all(axis=2)
+    groups = _runs(ink.any(axis=1))
+    if len(groups) < 2:
+        return None
+    low, high = groups[0]
+    if not MIN_ARROW_ROWS <= high - low + 1 <= MAX_ARROW_ROWS:
+        return None
+    band = ink[low : high + 1]
+    if not MIN_ARROW_PIXELS <= int(band.sum()) <= MAX_ARROW_PIXELS:
+        return None
+    columns = np.flatnonzero(band.any(axis=0))
+    return float((columns[0] + columns[-1]) / 2.0)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the tag colour selected by the relay, or ``abstain``."""
+
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tags = _tag_columns(pixels)
+    if tags is None or len(tags) != COLUMNS:
+        return ABSTAIN
+
+    token_mask = _mask(pixels, TOKEN_RGB)
+    counts: list[int] = []
+    for centre, _name in tags:
+        count = _token_count(token_mask, centre)
+        if count is None or not 1 <= count <= COLUMNS:
+            return ABSTAIN
+        counts.append(count)
+
+    tip = _pointer_centre(pixels)
+    if tip is None:
+        return ABSTAIN
+    distances = sorted((abs(tip - centre), index) for index, (centre, _n) in enumerate(tags))
+    if (distances[1][0] - distances[0][0]) / 2.0 < MIN_POINTER_MARGIN:
+        return ABSTAIN
+
+    place = counts[distances[0][1]]
+    if not 1 <= place <= COLUMNS:
+        return ABSTAIN
+    return tags[place - 1][1]

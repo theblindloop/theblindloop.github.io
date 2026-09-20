@@ -1,0 +1,214 @@
+"""Independent pixel-only inverse arm for the pipchain_hop_ribbon world.
+
+Input is one rendered RGB image and nothing else: no latent scene, no
+renderer geometry, no analytic gold, no filenames.  The arm
+
+1. separates saturated cell bodies, dark ink and inert grey by colour alone;
+2. recovers the cells as connected saturated blobs;
+3. links two cells only when a continuous ink bridge spans the gap between
+   them, which reconstructs the ribbon as a simple path;
+4. orients the ribbon from its left-hand end;
+5. finds the solid tab welded above one cell and reads off the marked start
+   cell;
+6. counts the pips inside every cell body; and
+7. replays three data-dependent hops and reports the pip count of the cell
+   where the walk stops.
+
+Any structural failure returns ``unknown`` rather than a guess.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "pipchain_hop_ribbon-oracle-0.1.0"
+
+UNKNOWN = "unknown"
+HOPS = 3
+
+_INK_MAX = 90
+_SAT_MIN = 40
+_MIN_BODY_AREA = 400
+_MIN_PIP_AREA = 8
+_MIN_TAB_AREA = 24
+
+
+def _label(mask: np.ndarray, min_area: int) -> list[np.ndarray]:
+    """4-connected components of a boolean mask as arrays of (y, x) pixels."""
+    height, width = mask.shape
+    seen = np.zeros((height, width), dtype=bool)
+    out: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys, xs):
+        if seen[sy, sx]:
+            continue
+        stack = [(int(sy), int(sx))]
+        seen[sy, sx] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= min_area:
+            out.append(np.array(pixels, dtype=np.int32))
+    return out
+
+
+def _boxes(components: list[np.ndarray]) -> list[dict]:
+    cells = []
+    for pixels in components:
+        y0, x0 = int(pixels[:, 0].min()), int(pixels[:, 1].min())
+        y1, x1 = int(pixels[:, 0].max()), int(pixels[:, 1].max())
+        cells.append(
+            {
+                "x0": x0,
+                "x1": x1,
+                "y0": y0,
+                "y1": y1,
+                "cx": (x0 + x1) / 2.0,
+                "cy": (y0 + y1) / 2.0,
+                "w": x1 - x0 + 1,
+                "h": y1 - y0 + 1,
+            }
+        )
+    return cells
+
+
+def _bridged(ink: np.ndarray, a: dict, b: dict, axis: str) -> bool:
+    """True when a continuous ink bridge crosses the background gap a->b."""
+    if axis == "x":
+        lo, hi = (a, b) if a["cx"] < b["cx"] else (b, a)
+        span = hi["x0"] - lo["x1"] - 1
+        if span < 3:
+            return False
+        pad = max(1, int(round(span * 0.3)))
+        xs = slice(lo["x1"] + 1 + pad, hi["x0"] - pad)
+        y_lo = max(a["y0"], b["y0"])
+        y_hi = min(a["y1"], b["y1"])
+        if y_hi <= y_lo or xs.stop <= xs.start:
+            return False
+        sub = ink[y_lo : y_hi + 1, xs]
+        return bool(sub.size and sub.all(axis=1).any())
+    lo, hi = (a, b) if a["cy"] < b["cy"] else (b, a)
+    span = hi["y0"] - lo["y1"] - 1
+    if span < 3:
+        return False
+    pad = max(1, int(round(span * 0.3)))
+    ys = slice(lo["y1"] + 1 + pad, hi["y0"] - pad)
+    x_lo = max(a["x0"], b["x0"])
+    x_hi = min(a["x1"], b["x1"])
+    if x_hi <= x_lo or ys.stop <= ys.start:
+        return False
+    sub = ink[ys, x_lo : x_hi + 1]
+    return bool(sub.size and sub.all(axis=0).any())
+
+
+def _adjacency(cells: list[dict], ink: np.ndarray) -> dict[int, list[int]]:
+    widths = sorted(c["w"] for c in cells)
+    heights = sorted(c["h"] for c in cells)
+    w = widths[len(widths) // 2]
+    h = heights[len(heights) // 2]
+    links: dict[int, list[int]] = {i: [] for i in range(len(cells))}
+    for i in range(len(cells)):
+        for j in range(i + 1, len(cells)):
+            a, b = cells[i], cells[j]
+            overlap_y = min(a["y1"], b["y1"]) - max(a["y0"], b["y0"])
+            overlap_x = min(a["x1"], b["x1"]) - max(a["x0"], b["x0"])
+            gap_x = max(a["x0"], b["x0"]) - min(a["x1"], b["x1"]) - 1
+            gap_y = max(a["y0"], b["y0"]) - min(a["y1"], b["y1"]) - 1
+            axis = None
+            if overlap_y > 0.5 * h and 0 < gap_x <= 1.0 * w:
+                axis = "x"
+            elif overlap_x > 0.5 * w and 0 < gap_y <= 1.6 * h:
+                axis = "y"
+            if axis and _bridged(ink, a, b, axis):
+                links[i].append(j)
+                links[j].append(i)
+    return links
+
+
+def _path_order(cells: list[dict], links: dict[int, list[int]]) -> list[int] | None:
+    """Linearise a simple path and orient it from its left-hand end."""
+    ends = [i for i, nb in links.items() if len(nb) == 1]
+    if len(ends) != 2 or any(len(nb) > 2 or not nb for nb in links.values()):
+        return None
+    start = min(ends, key=lambda i: cells[i]["cx"])
+    order = [start]
+    previous = -1
+    current = start
+    while True:
+        nxt = [n for n in links[current] if n != previous]
+        if not nxt:
+            break
+        previous, current = current, nxt[0]
+        order.append(current)
+        if len(order) > len(cells):
+            return None
+    if len(order) != len(cells):
+        return None
+    return order
+
+
+def _pip_count(ink: np.ndarray, cell: dict) -> int | None:
+    sub = ink[cell["y0"] : cell["y1"] + 1, cell["x0"] : cell["x1"] + 1]
+    blobs = _label(sub, _MIN_PIP_AREA)
+    return len(blobs) if 1 <= len(blobs) <= 4 else None
+
+
+def _start_cell(ink: np.ndarray, cells: list[dict]) -> int | None:
+    """The start marker is the solid tab welded just above one cell's top edge."""
+    height, width = ink.shape
+    best = None
+    best_score = 0
+    for index, cell in enumerate(cells):
+        y1 = cell["y0"] - 3
+        y0 = max(0, cell["y0"] - 17)
+        x0 = max(0, int(round(cell["cx"])) - 7)
+        x1 = min(width, int(round(cell["cx"])) + 8)
+        if y1 <= y0:
+            continue
+        score = int(ink[y0:y1, x0:x1].sum())
+        if score > best_score:
+            best, best_score = index, score
+    return best if best_score >= _MIN_TAB_AREA else None
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    hi = arr.max(axis=2)
+    lo = arr.min(axis=2)
+    ink = hi < _INK_MAX
+    body = (hi - lo > _SAT_MIN) & ~ink
+
+    components = _label(body, _MIN_BODY_AREA)
+    if not 6 <= len(components) <= 40:
+        return UNKNOWN
+    cells = _boxes(components)
+
+    links = _adjacency(cells, ink)
+    order = _path_order(cells, links)
+    if order is None:
+        return UNKNOWN
+
+    marked = _start_cell(ink, cells)
+    if marked is None or marked not in order:
+        return UNKNOWN
+    start = order.index(marked)
+
+    pips: list[int] = []
+    for index in order:
+        count = _pip_count(ink, cells[index])
+        if count is None:
+            return UNKNOWN
+        pips.append(count)
+
+    position = start
+    for _ in range(HOPS):
+        position += pips[position]
+        if position >= len(pips):
+            return UNKNOWN
+    return str(pips[position])

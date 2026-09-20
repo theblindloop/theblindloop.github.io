@@ -1,0 +1,147 @@
+"""Pixel-only oracle for the pressed-jaw sealed-chamber world.
+
+Receives the final RGB raster and nothing else.  It segments dark ink, splits it
+at the empty column band between the two jaws, keeps only the largest connected
+ink body on each side (so a detached splinter is not treated as part of a jaw),
+measures the white channel width in every row, presses the jaws together
+numerically by subtracting the narrowest width, counts the walls formed by the
+finger pairs that then touch, and reports the chambers enclosed between
+consecutive walls.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+INK_MAX = 100
+TOUCH_TOL = 6
+MIN_WALL_ROWS = 8
+MIN_SIDE_PIXELS = 400
+MIN_CHANNEL_COLS = 12
+
+
+def _runs_bool(flags) -> list[tuple[int, int]]:
+    out = []
+    i = 0
+    n = len(flags)
+    while i < n:
+        if not flags[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and flags[j]:
+            j += 1
+        out.append((i, j))
+        i = j
+    return out
+
+
+def _largest_component_extents(mask: np.ndarray):
+    """Row-run connected components; return per-row (min_x, max_x) of the largest."""
+    height = mask.shape[0]
+    parent: list[int] = []
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    all_runs: list[tuple[int, int, int, int]] = []
+    prev: list[tuple[int, int, int]] = []
+    pad = np.zeros(mask.shape[1] + 2, dtype=np.int8)
+    for y in range(height):
+        pad[1:-1] = mask[y]
+        edges = np.flatnonzero(np.diff(pad) != 0)
+        cur: list[tuple[int, int, int]] = []
+        for k in range(0, len(edges), 2):
+            s = int(edges[k])
+            e = int(edges[k + 1])
+            label = len(parent)
+            parent.append(label)
+            for (ps, pe, pl) in prev:
+                if ps < e and s < pe:
+                    union(label, pl)
+            cur.append((s, e, label))
+            all_runs.append((y, s, e, label))
+        prev = cur
+
+    if not all_runs:
+        return None
+    sizes: dict[int, int] = {}
+    resolved: list[tuple[int, int, int, int]] = []
+    for (y, s, e, label) in all_runs:
+        root = find(label)
+        sizes[root] = sizes.get(root, 0) + (e - s)
+        resolved.append((y, s, e, root))
+    best = max(sizes, key=lambda k: sizes[k])
+    low = np.full(height, -1, dtype=np.int64)
+    high = np.full(height, -1, dtype=np.int64)
+    for (y, s, e, root) in resolved:
+        if root != best:
+            continue
+        if low[y] < 0 or s < low[y]:
+            low[y] = s
+        if high[y] < 0 or e - 1 > high[y]:
+            high[y] = e - 1
+    return low, high, sizes[best]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    ink = arr.max(axis=2) < INK_MAX
+    if int(ink.sum()) < 2 * MIN_SIDE_PIXELS:
+        return "abstain"
+
+    cols = np.nonzero(ink.any(axis=0))[0]
+    if cols.size == 0:
+        return "abstain"
+    c0, c1 = int(cols[0]), int(cols[-1])
+    occupied = ink[:, c0 : c1 + 1].any(axis=0)
+    empty = [not bool(v) for v in occupied]
+    bands = [(s, e) for (s, e) in _runs_bool(empty) if s > 0 and e < len(empty)]
+    if not bands:
+        return "abstain"
+    s, e = max(bands, key=lambda r: r[1] - r[0])
+    if e - s < MIN_CHANNEL_COLS:
+        return "abstain"
+    split = c0 + (s + e) // 2
+
+    left_mask = ink.copy()
+    left_mask[:, split:] = False
+    right_mask = ink.copy()
+    right_mask[:, :split] = False
+    left = _largest_component_extents(left_mask)
+    right = _largest_component_extents(right_mask)
+    if left is None or right is None:
+        return "abstain"
+    if left[2] < MIN_SIDE_PIXELS or right[2] < MIN_SIDE_PIXELS:
+        return "abstain"
+    left_edge = left[1]
+    right_edge = right[0]
+
+    valid = (left_edge >= 0) & (right_edge >= 0)
+    rows = np.nonzero(valid)[0]
+    if rows.size < 4 * MIN_WALL_ROWS:
+        return "abstain"
+    r0, r1 = int(rows[0]), int(rows[-1])
+    if not bool(valid[r0 : r1 + 1].all()):
+        return "abstain"
+
+    clearance = (right_edge[r0 : r1 + 1] - left_edge[r0 : r1 + 1] - 1).astype(np.int64)
+    if int(clearance.min()) < 4:
+        return "abstain"
+    width = clearance - int(clearance.min())
+    touching = [bool(w <= TOUCH_TOL) for w in width]
+
+    walls = sum(1 for (a, b) in _runs_bool(touching) if b - a >= MIN_WALL_ROWS)
+    pockets = max(0, walls - 1)
+    if pockets > 3 or pockets < 1:
+        return "abstain"
+    return str(pockets)

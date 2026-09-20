@@ -1,0 +1,221 @@
+"""Deterministic latent sampler and renderer for turn_toggle_terminal."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+BACKGROUND = (250, 250, 248)
+INK = (28, 31, 36)
+PALETTE = {
+    "green": (35, 170, 85),
+    "purple": (135, 82, 200),
+    "red": (220, 55, 55),
+    "blue": (45, 105, 220),
+    "orange": (240, 145, 35),
+    "cyan": (20, 175, 190),
+}
+TERMINAL_COLORS = ("red", "blue", "orange", "cyan")
+QUARANTINE_DEGREES = 15.0
+
+
+def _rotate_point(x: int, y: int, quarters: int) -> tuple[int, int]:
+    """Rotate clockwise about the exact canvas center in screen coordinates."""
+    for _ in range(quarters % 4):
+        x, y = WIDTH - y, x
+    return int(x), int(y)
+
+
+def _base_points(variant: int) -> dict[str, tuple[int, int]]:
+    if variant == 0:  # wide branch gaps
+        return {
+            "start": (54, 256),
+            "j0": (170, 256),
+            "j1": (300, 145),
+            "j2": (300, 367),
+            "t0": (448, 75),
+            "t1": (448, 215),
+            "t2": (448, 297),
+            "t3": (448, 437),
+        }
+    # A deliberately harder, but still well-separated, branch-order instance.
+    return {
+        "start": (54, 256),
+        "j0": (170, 256),
+        "j1": (300, 190),
+        "j2": (300, 322),
+        "t0": (448, 155),
+        "t1": (448, 225),
+        "t2": (448, 287),
+        "t3": (448, 357),
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample balanced answer color, rotation, layout difficulty, and line width."""
+    variant = (seed // 4) % 2
+    quarters = (seed // 8) % 4
+    points = {
+        key: _rotate_point(x, y, quarters)
+        for key, (x, y) in _base_points(variant).items()
+    }
+
+    # The alternating public rule selects abstract leaf t1. Assign its color by
+    # seed modulo four, then independently permute every distractor color.
+    answer_color = TERMINAL_COLORS[seed % len(TERMINAL_COLORS)]
+    remaining = [color for color in TERMINAL_COLORS if color != answer_color]
+    random.Random(seed ^ 0x5EEDC0DE).shuffle(remaining)
+    terminal_assignment = {
+        "t0": remaining[0],
+        "t1": answer_color,
+        "t2": remaining[1],
+        "t3": remaining[2],
+    }
+
+    nodes = []
+    for node_id in ("start", "j0", "j1", "j2", "t0", "t1", "t2", "t3"):
+        if node_id == "start":
+            kind, color = "start", "green"
+        elif node_id.startswith("j"):
+            kind, color = "junction", "purple"
+        else:
+            kind, color = "terminal", terminal_assignment[node_id]
+        x, y = points[node_id]
+        nodes.append({"id": node_id, "x": x, "y": y, "kind": kind, "color": color})
+
+    edges = [
+        ["start", "j0"],
+        ["j0", "j1"],
+        ["j0", "j2"],
+        ["j1", "t0"],
+        ["j1", "t1"],
+        ["j2", "t2"],
+        ["j2", "t3"],
+    ]
+    random.Random(seed ^ 0xA11CE).shuffle(edges)
+    return {"nodes": nodes, "edges": edges, "stroke_width": 7 + ((seed // 16) % 3)}
+
+
+def _node_map(scene: dict) -> dict[str, dict]:
+    return {node["id"]: node for node in scene["nodes"]}
+
+
+def _adjacency(scene: dict) -> dict[str, list[str]]:
+    graph = {node["id"]: [] for node in scene["nodes"]}
+    for left, right in scene["edges"]:
+        graph[left].append(right)
+        graph[right].append(left)
+    return graph
+
+
+def _signed_turn_degrees(
+    px: float,
+    py: float,
+    cx: float,
+    cy: float,
+    nx: float,
+    ny: float,
+) -> float:
+    # Convert screen y-down coordinates to Cartesian y-up before taking atan2.
+    incoming = (cx - px, py - cy)
+    outgoing = (nx - cx, cy - ny)
+    cross = incoming[0] * outgoing[1] - incoming[1] * outgoing[0]
+    dot = incoming[0] * outgoing[0] + incoming[1] * outgoing[1]
+    if dot <= 0:
+        raise ValueError("all candidate links must point forward")
+    return math.degrees(math.atan2(cross, dot))
+
+
+def _trace(scene: dict) -> tuple[str, float]:
+    nodes = _node_map(scene)
+    graph = _adjacency(scene)
+    starts = [node_id for node_id, node in nodes.items() if node["kind"] == "start"]
+    if len(starts) != 1 or len(graph[starts[0]]) != 1:
+        raise ValueError("scene must have one degree-one START")
+    previous = starts[0]
+    current = graph[previous][0]
+    choose_left = True
+    gaps: list[float] = []
+    visited = {previous}
+    while nodes[current]["kind"] == "junction":
+        if current in visited:
+            raise ValueError("route revisits a junction")
+        visited.add(current)
+        candidates = [node_id for node_id in graph[current] if node_id != previous]
+        if len(candidates) != 2:
+            raise ValueError("each visited junction must expose two forward branches")
+        turns = []
+        for node_id in candidates:
+            old, here, nxt = nodes[previous], nodes[current], nodes[node_id]
+            turns.append(
+                _signed_turn_degrees(
+                    old["x"], old["y"], here["x"], here["y"], nxt["x"], nxt["y"]
+                )
+            )
+        gaps.append(abs(turns[0] - turns[1]))
+        selected_index = max(range(2), key=turns.__getitem__) if choose_left else min(
+            range(2), key=turns.__getitem__
+        )
+        previous, current = current, candidates[selected_index]
+        choose_left = not choose_left
+    terminal = nodes[current]
+    if terminal["kind"] != "terminal" or terminal["color"] not in TERMINAL_COLORS:
+        raise ValueError("alternating route did not end at a colored terminal")
+    if not gaps:
+        raise ValueError("route contains no junction")
+    return terminal["color"], min(gaps)
+
+
+def analytic_gold(scene: dict) -> str:
+    return _trace(scene)[0]
+
+
+def margin(scene: dict) -> float:
+    return _trace(scene)[1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        return margin(scene) < QUARANTINE_DEGREES
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["edges"] = list(reversed(twin["edges"]))
+    return [("reverse_undirected_edge_serialization", twin)]
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only public visual evidence; no answer annotation or metadata."""
+    nodes = _node_map(scene)
+    edges = scene["edges"]
+    stroke_width = int(scene["stroke_width"])
+    scale = 4
+    image = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    for left, right in edges:
+        a, b = nodes[left], nodes[right]
+        draw.line(
+            [(a["x"] * scale, a["y"] * scale), (b["x"] * scale, b["y"] * scale)],
+            fill=INK,
+            width=stroke_width * scale,
+        )
+
+    for node in scene["nodes"]:
+        radius = 15 if node["kind"] in {"start", "terminal"} else 12
+        x, y = node["x"] * scale, node["y"] * scale
+        box = ((x - radius * scale, y - radius * scale), (x + radius * scale, y + radius * scale))
+        draw.ellipse(box, fill=PALETTE[node["color"]], outline=INK, width=2 * scale)
+        if node["kind"] == "start":
+            inner = 4 * scale
+            draw.ellipse((x - inner, y - inner, x + inner, y + inner), fill=BACKGROUND)
+
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)

@@ -1,0 +1,306 @@
+"""Renderer for flip_stack_shade_binding.
+
+Scene: one reference token and three candidate tokens. A token is a vertical
+stack of four flat gray tiles plus one black marker tab attached to exactly one
+end of the stack. The tab end is the start of the token's shade sequence, so a
+token whose tab sits at the bottom is read bottom-to-top. Every token in a scene
+uses the same multiset of four shades, so only the order of the shades - read
+from the tab end - distinguishes the tokens. Exactly one candidate reads out the
+same shade sequence as the reference; the answer is that candidate's letter
+(left to right) together with the color of the halo drawn around it.
+"""
+
+from __future__ import annotations
+
+import random
+from itertools import permutations
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "flip_stack_shade_binding-renderer-0.1.0"
+
+CANVAS = (600, 500)
+BACKGROUND = (255, 255, 255)
+INK = (0, 0, 0)
+
+TILE_W = 84
+TILE_H = 30
+TILE_GAP = 8
+N_TILES = 4
+STACK_H = N_TILES * TILE_H + (N_TILES - 1) * TILE_GAP  # 144
+
+TAB_W = 44
+TAB_H = 16
+TAB_CLEAR = 2
+
+HALO_PAD_X = 16
+HALO_PAD_Y = 30
+HALO_WIDTH = 6
+
+# Three well separated gray bands; class boundaries sit at 127.5 and 182.5.
+BAND_BASE = (100, 155, 210)
+BAND_JITTER = 8
+THRESHOLDS = (127.5, 182.5)
+
+HALO_COLORS = {
+    "red": (214, 32, 32),
+    "blue": (32, 64, 214),
+    "green": (24, 140, 56),
+}
+HALO_NAMES = ("red", "blue", "green")
+
+LETTERS = ("A", "B", "C")
+
+REF_CX = 300
+REF_TOP = 56
+CAND_CX = (120, 300, 480)
+CAND_TOP = 280
+
+QUARANTINE_MARGIN = 8.0
+MIN_STRUCTURAL_GAP = 2
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _band_of(value: float) -> int:
+    if value < THRESHOLDS[0]:
+        return 0
+    if value < THRESHOLDS[1]:
+        return 1
+    return 2
+
+
+def _arrangements(multiset: tuple[int, ...]) -> list[tuple[int, ...]]:
+    return sorted(set(permutations(multiset)))
+
+
+def _token(rng: random.Random, sequence: tuple[int, ...], flipped: bool) -> list[dict]:
+    """Tiles in drawn order (top to bottom) for a token read from its tab end."""
+    drawn = list(reversed(sequence)) if flipped else list(sequence)
+    tiles = []
+    for position, band in enumerate(drawn):
+        value = BAND_BASE[band] + rng.randint(-BAND_JITTER, BAND_JITTER)
+        tiles.append({"position": position, "value": int(value)})
+    return tiles
+
+
+def _tighten(rng: random.Random, tile: dict) -> None:
+    """Push one tile's gray level close to a class boundary, same class."""
+    band = _band_of(tile["value"])
+    delta = rng.randint(2, 12)
+    if band == 0:
+        value = THRESHOLDS[0] - delta
+    elif band == 2:
+        value = THRESHOLDS[1] + delta
+    else:
+        value = (THRESHOLDS[0] + delta) if rng.random() < 0.5 else (THRESHOLDS[1] - delta)
+    tile["value"] = int(round(value))
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+
+    duplicated = rng.randrange(3)
+    others = [b for b in range(3) if b != duplicated]
+    multiset = tuple(sorted([duplicated, duplicated] + others))
+    options = _arrangements(multiset)
+
+    ref_sequence = list(options[rng.randrange(len(options))])
+    pool = [opt for opt in options if list(opt) != ref_sequence]
+    rng.shuffle(pool)
+    distractors = [list(pool[0]), list(pool[1])]
+
+    answer_index = rng.randrange(3)
+    sequences: list[list[int]] = []
+    for index in range(3):
+        if index == answer_index:
+            sequences.append(list(ref_sequence))
+        else:
+            sequences.append(distractors.pop())
+
+    halos = list(HALO_NAMES)
+    rng.shuffle(halos)
+
+    ref_flipped = rng.random() < 0.5
+    scene = {
+        "canvas": list(CANVAS),
+        "reference": {
+            "origin": [REF_CX + rng.randint(-8, 8), REF_TOP + rng.randint(-5, 5)],
+            "flipped": ref_flipped,
+            "tiles": _token(rng, tuple(ref_sequence), ref_flipped),
+        },
+        "candidates": [],
+    }
+    for index in range(3):
+        flipped = rng.random() < 0.5
+        scene["candidates"].append(
+            {
+                "origin": [
+                    CAND_CX[index] + rng.randint(-7, 7),
+                    CAND_TOP + rng.randint(-6, 6),
+                ],
+                "halo": halos[index],
+                "flipped": flipped,
+                "tiles": _token(rng, tuple(sequences[index]), flipped),
+            }
+        )
+
+    if rng.random() < 0.22:
+        tokens = [scene["reference"]] + scene["candidates"]
+        token = tokens[rng.randrange(len(tokens))]
+        _tighten(rng, token["tiles"][rng.randrange(N_TILES)])
+
+    return scene
+
+
+# --------------------------------------------------------------------------
+# geometry helpers shared by rendering and analytic gold
+# --------------------------------------------------------------------------
+def _ordered_tiles(token: dict) -> list[dict]:
+    return sorted(token["tiles"], key=lambda tile: tile["position"])
+
+
+def _ordered_candidates(scene: dict) -> list[dict]:
+    return sorted(scene["candidates"], key=lambda cand: cand["origin"][0])
+
+
+def _read_sequence(scene: dict, token_ref) -> list[int]:
+    """Shade classes of one token in reading order: starting at its tab end.
+
+    `token_ref` is either the string "reference" or a left-to-right candidate
+    index, so every token the gold looks at is selected from the scene itself.
+    """
+    token = scene["reference"] if token_ref == "reference" else _ordered_candidates(scene)[token_ref]
+    tiles = sorted(token["tiles"], key=lambda tile: tile["position"])
+    drawn = [_band_of(tile["value"]) for tile in tiles]
+    return list(reversed(drawn)) if token["flipped"] else drawn
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _font(size: int):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # pragma: no cover - very old Pillow
+        return ImageFont.load_default()
+
+
+def _text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font) -> None:
+    try:
+        draw.text(xy, text, fill=INK, font=font, anchor="mm")
+    except (ValueError, AttributeError):  # pragma: no cover - bitmap fallback font
+        draw.text((xy[0] - 4 * len(text), xy[1] - 6), text, fill=INK, font=font)
+
+
+def _draw_token(draw: ImageDraw.ImageDraw, token: dict) -> None:
+    cx, top = token["origin"]
+    left = cx - TILE_W // 2
+    for tile in _ordered_tiles(token):
+        y0 = top + tile["position"] * (TILE_H + TILE_GAP)
+        value = int(tile["value"])
+        draw.rectangle(
+            [left, y0, left + TILE_W - 1, y0 + TILE_H - 1],
+            fill=(value, value, value),
+        )
+    tab_left = cx - TAB_W // 2
+    if token["flipped"]:
+        tab_top = top + STACK_H + TAB_CLEAR
+    else:
+        tab_top = top - TAB_CLEAR - TAB_H
+    draw.rectangle([tab_left, tab_top, tab_left + TAB_W - 1, tab_top + TAB_H - 1], fill=INK)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", tuple(scene["canvas"]), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    label_font = _font(24)
+
+    _draw_token(draw, scene["reference"])
+    ref_cx, ref_top = scene["reference"]["origin"]
+    _text(draw, (ref_cx - 132, ref_top + STACK_H // 2), "REF", label_font)
+
+    for letter, cand in zip(LETTERS, _ordered_candidates(scene)):
+        cx, top = cand["origin"]
+        x0 = cx - TILE_W // 2 - HALO_PAD_X
+        x1 = cx + TILE_W - TILE_W // 2 + HALO_PAD_X
+        y0 = top - HALO_PAD_Y
+        y1 = top + STACK_H + HALO_PAD_Y
+        draw.rectangle([x0, y0, x1, y1], outline=HALO_COLORS[cand["halo"]], width=HALO_WIDTH)
+        _draw_token(draw, cand)
+        _text(draw, (cx, y1 + 22), letter, label_font)
+
+    return image
+
+
+# --------------------------------------------------------------------------
+# analytic gold, margin, quarantine, aliases
+# --------------------------------------------------------------------------
+def _matches(scene: dict) -> list[int]:
+    reference = _read_sequence(scene, "reference")
+    return [
+        index
+        for index in range(len(_ordered_candidates(scene)))
+        if _read_sequence(scene, index) == reference
+    ]
+
+
+def analytic_gold(scene: dict) -> str:
+    matched = _matches(scene)
+    if len(matched) != 1:
+        return "abstain"
+    index = matched[0]
+    cand = _ordered_candidates(scene)[index]
+    return f"{LETTERS[index]}:{cand['halo']}"
+
+
+def structural_gap(scene: dict) -> int:
+    reference = _read_sequence(scene, "reference")
+    gaps = []
+    for index in range(len(_ordered_candidates(scene))):
+        sequence = _read_sequence(scene, index)
+        distance = sum(1 for a, b in zip(reference, sequence) if a != b)
+        if distance:
+            gaps.append(distance)
+    return min(gaps) if gaps else 0
+
+
+def shade_margin(scene: dict) -> float:
+    worst = None
+    for token in [scene["reference"]] + list(scene["candidates"]):
+        for tile in token["tiles"]:
+            distance = min(abs(float(tile["value"]) - t) for t in THRESHOLDS)
+            worst = distance if worst is None else min(worst, distance)
+    return float(worst if worst is not None else 0.0)
+
+
+def margin(scene: dict) -> float:
+    """Weakest visual evidence: the tightest shade-class decision in the scene."""
+    return round(shade_margin(scene), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    if analytic_gold(scene) == "abstain":
+        return True
+    if shade_margin(scene) < QUARANTINE_MARGIN:
+        return True
+    return structural_gap(scene) < MIN_STRUCTURAL_GAP
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Label-preserving, pixel-identical re-orderings of latent record lists."""
+    import copy
+
+    aliases: list[tuple[str, dict]] = []
+
+    reversed_records = copy.deepcopy(scene)
+    reversed_records["candidates"] = list(reversed(reversed_records["candidates"]))
+    aliases.append(("candidate_record_permutation", reversed_records))
+
+    rotated_tiles = copy.deepcopy(scene)
+    for token in [rotated_tiles["reference"]] + rotated_tiles["candidates"]:
+        token["tiles"] = token["tiles"][1:] + token["tiles"][:1]
+    aliases.append(("tile_record_rotation", rotated_tiles))
+
+    return aliases

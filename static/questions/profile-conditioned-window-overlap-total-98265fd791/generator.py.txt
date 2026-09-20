@@ -1,0 +1,251 @@
+"""Scene sampler, rasterizer and analytic gold for window_overlap_total.
+
+Two shaded grey windows run the full height of the picture. Five horizontal
+bars are drawn across them: four coloured bars and one black distractor. A
+coloured bar's score is the total number of its columns that fall inside the
+two windows, so the answer is an argmax over a clipped-and-summed length, not
+over any drawn extent.
+
+Everything is integer pixel geometry drawn with hard edges, so the analytic
+arm and a pixel arm read exactly the same numbers.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "window_overlap_total-renderer-1.0.0"
+
+WIDTH = 660
+HEIGHT = 400
+
+BACKGROUND = (255, 255, 255)
+WINDOW_RGB = (226, 226, 226)
+DISTRACTOR_RGB = (16, 16, 16)
+
+COLOR_NAMES = ("red", "green", "blue", "orange")
+COLOR_RGB = {
+    "red": (222, 32, 32),
+    "green": (24, 148, 64),
+    "blue": (36, 72, 214),
+    "orange": (240, 152, 24),
+    "black": DISTRACTOR_RGB,
+}
+
+QUARANTINE_PX = 12.0
+MIN_MARGIN_PX = 3.0  # never sample a scene closer to the boundary than this
+EDGE_CLEARANCE_PX = 6  # no bar end may sit this close to a window edge
+MIN_SCORE_PX = 12  # every coloured bar really is inside the windows somewhere
+BAR_ROWS = (58, 96, 134, 172, 210, 248, 286, 324)
+TOP_CLEAR_ROW = 8  # rows kept free of bars, where the windows are readable
+BOTTOM_CLEAR_ROW = HEIGHT - 9
+
+_CUES = (
+    "longest_bar",
+    "thickest_bar",
+    "most_ink_inside",
+    "single_window_max",
+    "leftmost_start",
+    "black_tops_overlap",
+)
+
+
+def _overlap(lo: int, hi: int, band: list) -> int:
+    """Number of shared columns between an inclusive span and a window."""
+    return max(0, min(hi, band[1]) - max(lo, band[0]) + 1)
+
+
+def _scores_for(bars: list, bands: list) -> list:
+    return [_overlap(bar[0], bar[2], bands[0]) + _overlap(bar[0], bar[2], bands[1]) for bar in bars]
+
+
+def _argmax(values: list) -> int:
+    best = 0
+    for index in range(1, len(values)):
+        if values[index] > values[best]:
+            best = index
+    return best
+
+
+def _colored_slots(scene: dict) -> list:
+    return [index for index, name in enumerate(scene["slot_colors"]) if name != "black"]
+
+
+def scores(scene: dict) -> dict:
+    """Per-colour score in columns; the distractor is not scored."""
+    values = _scores_for(scene["bars"], scene["bands"])
+    return {scene["slot_colors"][index]: values[index] for index in _colored_slots(scene)}
+
+
+def _sample_geometry(rng: random.Random) -> dict | None:
+    left_width = rng.randint(70, 150)
+    right_width = rng.randint(70, 150)
+    left_start = rng.randint(45, 190)
+    gap = rng.randint(45, 150)
+    right_start = left_start + left_width + gap
+    if right_start + right_width > WIDTH - 45:
+        return None
+    bands = [
+        [left_start, left_start + left_width - 1],
+        [right_start, right_start + right_width - 1],
+    ]
+    edges = [bands[0][0], bands[0][1], bands[1][0], bands[1][1]]
+
+    rows = sorted(rng.sample(BAR_ROWS, 5))
+    rng.shuffle(rows)
+    bars = []
+    for row in rows:
+        placed = None
+        for _ in range(60):
+            x0 = rng.randint(18, WIDTH - 100)
+            x1 = x0 + rng.randint(70, 520)
+            if x1 > WIDTH - 18:
+                continue
+            if any(abs(x0 - edge) < EDGE_CLEARANCE_PX or abs(x1 - edge) < EDGE_CLEARANCE_PX for edge in edges):
+                continue
+            placed = (x0, x1)
+            break
+        if placed is None:
+            return None
+        thickness = rng.randint(7, 16)
+        bars.append([placed[0], row, placed[1], row + thickness - 1])
+    return {"bands": bands, "bars": bars}
+
+
+def _profile(seed: int) -> dict:
+    """Deterministic per-scene cue profile, so no cheap cue tracks the answer."""
+    key = (seed * 2654435761) & 0xFFFFFFFF
+    return {
+        "answer_index": key % 4,
+        "longest_bar": (key >> 2) % 4 == 0,
+        "single_window_max": (key >> 4) % 2 == 0,
+        "most_ink_inside": (key >> 5) % 4 == 0,
+        "black_tops_overlap": (key >> 7) % 2 == 0,
+        "tight_margin": (key >> 8) % 3 == 0,
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    target = _profile(seed)
+    relax = 0
+    for attempt in range(60000):
+        if attempt == 20000:
+            relax = 1  # drop the ink constraint before ever failing to sample
+        if attempt == 40000:
+            relax = 2
+        geometry = _sample_geometry(rng)
+        if geometry is None:
+            continue
+        bars, bands = geometry["bars"], geometry["bands"]
+        black_slot = rng.randrange(5)
+        values = _scores_for(bars, bands)
+        colored = [index for index in range(5) if index != black_slot]
+        if min(values[index] for index in colored) < MIN_SCORE_PX:
+            continue
+        ranked = sorted((values[index] for index in colored), reverse=True)
+        margin = float(ranked[0] - ranked[1])
+        if margin < MIN_MARGIN_PX:
+            continue
+        if target["tight_margin"]:
+            if margin >= QUARANTINE_PX:
+                continue
+        elif margin < 16.0:
+            continue
+        winner = max(colored, key=lambda index: (values[index], -index))
+
+        lengths = {index: bars[index][2] - bars[index][0] + 1 for index in colored}
+        thick = {index: bars[index][3] - bars[index][1] + 1 for index in colored}
+        ink = {index: values[index] * thick[index] for index in colored}
+        single = {
+            index: max(
+                _overlap(bars[index][0], bars[index][2], bands[0]),
+                _overlap(bars[index][0], bars[index][2], bands[1]),
+            )
+            for index in colored
+        }
+        flags = {
+            "longest_bar": max(colored, key=lambda i: (lengths[i], -i)) == winner,
+            "single_window_max": max(colored, key=lambda i: (single[i], -i)) == winner,
+            "most_ink_inside": max(colored, key=lambda i: (ink[i], -i)) == winner,
+            "black_tops_overlap": values[black_slot] > max(values[i] for i in colored),
+        }
+        if flags["longest_bar"] != target["longest_bar"]:
+            continue
+        if flags["single_window_max"] != target["single_window_max"]:
+            continue
+        if flags["black_tops_overlap"] != target["black_tops_overlap"] and relax < 2:
+            continue
+        if flags["most_ink_inside"] != target["most_ink_inside"] and relax < 1:
+            continue
+
+        names = list(COLOR_NAMES)
+        rng.shuffle(names)
+        chosen = COLOR_NAMES[target["answer_index"]]
+        names.remove(chosen)
+        slot_colors = ["black"] * 5
+        remaining = iter(names)
+        for index in colored:
+            slot_colors[index] = chosen if index == winner else next(remaining)
+        return {
+            "bands": bands,
+            "bars": bars,
+            "slot_colors": slot_colors,
+        }
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for band in scene["bands"]:
+        draw.rectangle([band[0], 0, band[1], HEIGHT - 1], fill=WINDOW_RGB)
+    for bar, name in zip(scene["bars"], scene["slot_colors"]):
+        draw.rectangle([bar[0], bar[1], bar[2], bar[3]], fill=COLOR_RGB[name])
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    table = scores(scene)
+    return max(sorted(table), key=lambda name: table[name])
+
+
+def margin(scene: dict) -> float:
+    ranked = sorted(scores(scene).values(), reverse=True)
+    return float(ranked[0] - ranked[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent alias exists: every sampled field is drawn exactly."""
+    return []
+
+
+def cue_congruence(scene: dict) -> dict:
+    bars, bands = scene["bars"], scene["bands"]
+    values = _scores_for(bars, bands)
+    colored = _colored_slots(scene)
+    black_slot = scene["slot_colors"].index("black")
+    winner = max(colored, key=lambda index: (values[index], -index))
+    lengths = {i: bars[i][2] - bars[i][0] + 1 for i in colored}
+    thick = {i: bars[i][3] - bars[i][1] + 1 for i in colored}
+    single = {
+        i: max(_overlap(bars[i][0], bars[i][2], bands[0]), _overlap(bars[i][0], bars[i][2], bands[1]))
+        for i in colored
+    }
+    return {
+        "longest_bar": max(colored, key=lambda i: (lengths[i], -i)) == winner,
+        "thickest_bar": max(colored, key=lambda i: (thick[i], -i)) == winner,
+        "most_ink_inside": max(colored, key=lambda i: (values[i] * thick[i], -i)) == winner,
+        "single_window_max": max(colored, key=lambda i: (single[i], -i)) == winner,
+        "leftmost_start": min(colored, key=lambda i: (bars[i][0], i)) == winner,
+        "black_tops_overlap": values[black_slot] > max(values[i] for i in colored),
+    }
+
+
+CUES = _CUES

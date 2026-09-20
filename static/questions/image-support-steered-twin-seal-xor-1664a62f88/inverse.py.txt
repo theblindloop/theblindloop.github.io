@@ -1,0 +1,149 @@
+"""Pixel-only inverse arm for twin_seal_xor.
+
+Receives only the final PNG. Locates the two disconnected dot-grid seals,
+reads each cell's colour (amber=1, gray=0), forms the cell-wise XOR of the two
+seals (the declared difference transform) and returns the revealed symbol.
+Abstains by raising ValueError when the raster is not confidently readable.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+SYMBOLS = {
+    "exe": {(0, 0), (0, 2), (1, 1), (2, 0), (2, 2)},
+    "plus": {(1, 0), (1, 1), (1, 2), (0, 1), (2, 1)},
+    "frame": {
+        (0, 0), (0, 1), (0, 2),
+        (1, 0), (1, 2),
+        (2, 0), (2, 1), (2, 2),
+    },
+    "block": {(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)},
+}
+
+SYMBOL_ORDER = tuple(sorted(SYMBOLS))
+
+AMBER = (247, 170, 50)
+GRAY = (150, 150, 150)
+WHITE = (255, 255, 255)
+
+W = 400
+
+
+def _is_dot(rgb) -> bool:
+    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+    return max(abs(r - WHITE[0]), abs(g - WHITE[1]), abs(b - WHITE[2])) > 24
+
+
+def _is_amber(rgb) -> bool:
+    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+    return max(abs(r - AMBER[0]), abs(g - AMBER[1]), abs(b - AMBER[2])) <= 40
+
+
+def _components(mask: np.ndarray):
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    comps = []
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x] or seen[y, x]:
+                continue
+            stack = [(y, x)]
+            seen[y, x] = True
+            pixels = []
+            while stack:
+                cy, cx = stack.pop()
+                pixels.append((cy, cx))
+                for ny, nx in (
+                    (cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1),
+                ):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+            comps.append(pixels)
+    return comps
+
+
+def _cluster_1d(values, k=3):
+    values = np.asarray(values, dtype=float)
+    if np.ptp(values) == 0:
+        return np.zeros(len(values), dtype=int), np.array([values[0]] * k)
+    centroids = np.linspace(float(np.min(values)), float(np.max(values)), k)
+    for _ in range(30):
+        labels = np.argmin(np.abs(values[:, None] - centroids[None, :]), axis=1)
+        new = np.array(
+            [
+                float(values[labels == j].mean()) if np.any(labels == j) else float(centroids[j])
+                for j in range(k)
+            ]
+        )
+        if np.allclose(new, centroids):
+            centroids = new
+            break
+        centroids = new
+    return labels, centroids
+
+
+def _seal_bits(dots) -> list[list[int]]:
+    if len(dots) != 9:
+        raise ValueError("seal does not expose all nine cells")
+    ys = [d[0] for d in dots]
+    xs = [d[1] for d in dots]
+    ly, cy = _cluster_1d(ys)
+    lx, cx = _cluster_1d(xs)
+    row_of = {float(c): i for i, c in enumerate(sorted(cy))}
+    col_of = {float(c): j for j, c in enumerate(sorted(cx))}
+    bits = [[None] * 3 for _ in range(3)]
+    for (y, x, bit), rl, cl in zip(dots, ly, lx):
+        try:
+            rr, cc = row_of[float(cy[rl])], col_of[float(cx[cl])]
+        except KeyError:
+            raise ValueError("seal grid not resolvable")
+        if bits[rr][cc] is not None:
+            raise ValueError("seal cells collide")
+        bits[rr][cc] = bit
+    if any(any(v is None for v in row) for row in bits):
+        raise ValueError("seal has a missing cell")
+    return bits
+
+
+def _match(xor_bits) -> str:
+    cells = {(r, c) for r in range(3) for c in range(3) if xor_bits[r][c]}
+    best_name = None
+    best_dist = None
+    for name in SYMBOL_ORDER:
+        dist = sum(int(((r, c) in cells) != ((r, c) in SYMBOLS[name])) for r in range(3) for c in range(3))
+        if best_dist is None or dist < best_dist:
+            best_dist, best_name = dist, name
+    if best_dist != 0:
+        raise ValueError(f"revealed mask not a declared symbol (dist {best_dist})")
+    return best_name
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    mask = np.zeros(array.shape[:2], dtype=bool)
+    for i in range(array.shape[0]):
+        for j in range(array.shape[1]):
+            mask[i, j] = _is_dot(array[i, j])
+    comps = _components(mask)
+    if len(comps) != 18:
+        raise ValueError(f"expected 18 seal dots, found {len(comps)}")
+    dots = []
+    for pixels in comps:
+        pts = np.asarray(pixels)
+        cy, cx = pts.mean(axis=0)
+        r, g, b = array[int(round(cy)), int(round(cx))]
+        bit = 1 if _is_amber((r, g, b)) else 0
+        dots.append((float(cy), float(cx), bit))
+    left = [d for d in dots if d[1] < W / 2]
+    right = [d for d in dots if d[1] >= W / 2]
+    if len(left) != 9 or len(right) != 9:
+        raise ValueError("seals not cleanly separated")
+    left_bits = _seal_bits([(cy, cx, bit) for cy, cx, bit in left])
+    right_bits = _seal_bits([(cy, cx, bit) for cy, cx, bit in right])
+    xor_bits = [
+        [int(left_bits[r][c] ^ right_bits[r][c]) for c in range(3)] for r in range(3)
+    ]
+    return _match(xor_bits)

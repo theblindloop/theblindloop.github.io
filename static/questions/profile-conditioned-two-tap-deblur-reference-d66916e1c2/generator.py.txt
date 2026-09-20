@@ -1,0 +1,219 @@
+"""Deterministic renderer for a visibly declared two-exposure deblur task."""
+
+from __future__ import annotations
+
+import copy
+import random
+
+from PIL import Image, ImageDraw
+
+N = 9
+ANSWERS = ("A", "B", "C", "D")
+BACKGROUND = (250, 248, 242)
+GRID = (61, 68, 76)
+CYAN = (22, 166, 184)
+CORAL = (218, 91, 76)
+GOLD = (232, 177, 42)
+DISTRACTOR = (174, 178, 180)
+
+
+def _grid_from_points(points: set[tuple[int, int]]) -> list[list[int]]:
+    return [[int((r, c) in points) for c in range(N)] for r in range(N)]
+
+
+BASE_PATTERNS = (
+    _grid_from_points({(r, 4) for r in range(1, 8)} | {(4, c) for c in range(1, 8)}),
+    _grid_from_points({(r, r) for r in range(1, 8)} | {(r, 8 - r) for r in range(1, 8)}),
+    _grid_from_points({(r, c) for r in range(N) for c in range(N)
+                       if abs(r - 4) + abs(c - 4) == 3}),
+    _grid_from_points({(r, c) for r in range(2, 7) for c in range(2, 7)
+                       if r in (2, 6) or c in (2, 6)}),
+)
+
+PALETTES = (
+    ((247, 244, 235), (139, 151, 161), (31, 58, 82)),
+    ((246, 242, 231), (154, 137, 151), (62, 32, 71)),
+    ((245, 246, 235), (139, 153, 119), (33, 61, 42)),
+    ((247, 241, 229), (162, 139, 107), (77, 38, 31)),
+)
+
+
+def _transform(grid: list[list[int]], code: int) -> list[list[int]]:
+    out = [row[:] for row in grid]
+    if code >= 4:
+        out = [list(reversed(row)) for row in out]
+    for _ in range(code % 4):
+        out = [list(row) for row in zip(*out[::-1])]
+    return out
+
+
+def _blur(source: list[list[int]]) -> list[list[int]]:
+    """Return twice the horizontal average: levels 0, 1, or 2."""
+    return [
+        [int(row[c]) + (int(row[c - 1]) if c else 0) for c in range(N)]
+        for row in source
+    ]
+
+
+def _deblur(levels: list[list[int]]) -> list[list[int]]:
+    source: list[list[int]] = []
+    for row in levels:
+        left = 0
+        recovered = []
+        for value in row:
+            current = int(value) - left
+            if current not in (0, 1):
+                raise ValueError("levels are not a valid blank-boundary two-tap blur")
+            recovered.append(current)
+            left = current
+        source.append(recovered)
+    return source
+
+
+def _hamming(left: list[list[int]], right: list[list[int]]) -> int:
+    return sum(a != b for ra, rb in zip(left, right) for a, b in zip(ra, rb))
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    target_position = int(seed) % 4
+    target_pattern = (int(seed) // 4) % 4
+
+    # Put the target canonical pattern at a seed-balanced displayed position.
+    other_patterns = [value for value in range(4) if value != target_pattern]
+    rng.shuffle(other_patterns)
+    order: list[int] = []
+    for position in range(4):
+        order.append(target_pattern if position == target_position else other_patterns.pop())
+
+    code = rng.randrange(8)
+    transformed = [_transform(grid, code) for grid in BASE_PATTERNS]
+    # A common sparse carrier makes scenes visually varied while preserving every
+    # pairwise reference distance and the relational answer.
+    carrier = [[0 for _ in range(N)] for _ in range(N)]
+    for index in rng.sample(range(N * N), 10):
+        carrier[index // N][index % N] = 1
+    transformed = [
+        [[grid[r][c] ^ carrier[r][c] for c in range(N)] for r in range(N)]
+        for grid in transformed
+    ]
+    references = [transformed[index] for index in order]
+    source = references[target_position]
+
+    cell_px = rng.choice((38, 40, 42))
+    ref_cell_px = rng.choice((12, 13, 14))
+    main_x = (900 - N * cell_px) // 2 + rng.randint(-12, 12)
+    main_y = 64 + rng.randint(-5, 5)
+    total_refs = 4 * N * ref_cell_px + 3 * 30
+    ref_x = (900 - total_refs) // 2 + rng.randint(-8, 8)
+    ref_y = 535 + rng.randint(-5, 5)
+
+    palette = [list(value) for value in PALETTES[rng.randrange(len(PALETTES))]]
+    # The middle display color is an exact raster-space average, even after a
+    # nuisance palette choice.
+    palette[1] = [(palette[0][i] + palette[2][i]) // 2 for i in range(3)]
+    distractors = []
+    for index in range(8):
+        side_x = 34 + (index % 2) * 812 + rng.randint(-5, 5)
+        side_y = 70 + (index // 2) * 132 + rng.randint(-8, 8)
+        radius = rng.choice((5, 6, 7))
+        distractors.append([side_x, side_y, radius])
+
+    return {
+        "reference_grids": references,
+        "blurred_levels": _blur(source),
+        "palette_rgb": palette,
+        "cell_px": cell_px,
+        "main_origin_x": main_x,
+        "main_origin_y": main_y,
+        "reference_cell_px": ref_cell_px,
+        "reference_origin_x": ref_x,
+        "reference_origin_y": ref_y,
+        "distractors": distractors,
+        "canvas_width": 900,
+        "canvas_height": 720,
+    }
+
+
+def _draw_tile_grid(
+    draw: ImageDraw.ImageDraw,
+    values: list[list[int]],
+    x0: int,
+    y0: int,
+    cell: int,
+    colors: list[tuple[int, int, int]],
+    frame: tuple[int, int, int],
+    frame_pad: int,
+) -> None:
+    size = N * cell
+    draw.rectangle(
+        (x0 - frame_pad, y0 - frame_pad, x0 + size + frame_pad - 1,
+         y0 + size + frame_pad - 1),
+        fill=frame,
+    )
+    draw.rectangle((x0, y0, x0 + size - 1, y0 + size - 1), fill=GRID)
+    inset = 2 if cell >= 30 else 1
+    for r in range(N):
+        for c in range(N):
+            xa = x0 + c * cell + inset
+            ya = y0 + r * cell + inset
+            xb = x0 + (c + 1) * cell - inset - 1
+            yb = y0 + (r + 1) * cell - inset - 1
+            draw.rectangle((xa, ya, xb, yb), fill=colors[int(values[r][c])])
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new(
+        "RGB", (int(scene["canvas_width"]), int(scene["canvas_height"])), BACKGROUND
+    )
+    draw = ImageDraw.Draw(image)
+    for x, y, radius in scene["distractors"]:
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=DISTRACTOR)
+
+    palette = [tuple(int(channel) for channel in color) for color in scene["palette_rgb"]]
+    cell = int(scene["cell_px"])
+    mx, my = int(scene["main_origin_x"]), int(scene["main_origin_y"])
+    _draw_tile_grid(
+        draw, scene["blurred_levels"], mx, my, cell, palette, CYAN, frame_pad=8
+    )
+
+    # Visible two-cell averaging key. Its located span is checked by the oracle.
+    key_y = my - 34
+    key_x = mx + (N * cell - 2 * cell) // 2
+    draw.rectangle((key_x, key_y, key_x + 2 * cell - 1, key_y + 9), fill=GOLD)
+    draw.line((key_x + cell, key_y, key_x + cell, key_y + 9), fill=GRID, width=2)
+
+    ref_cell = int(scene["reference_cell_px"])
+    rx, ry = int(scene["reference_origin_x"]), int(scene["reference_origin_y"])
+    for position, grid in enumerate(scene["reference_grids"]):
+        x = rx + position * (N * ref_cell + 30)
+        _draw_tile_grid(draw, grid, x, ry, ref_cell, [palette[0], palette[2]], CORAL, 5)
+        # One through four coral dots provide a non-textual reading-order check.
+        dot_y = ry - 16
+        dot_start = x + (N * ref_cell - (2 * position + 1) * 5) // 2
+        for mark in range(position + 1):
+            cx = dot_start + mark * 10
+            draw.ellipse((cx - 2, dot_y - 2, cx + 2, dot_y + 2), fill=CORAL)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    source = _deblur(scene["blurred_levels"])
+    distances = [_hamming(source, grid) for grid in scene["reference_grids"]]
+    return ANSWERS[min(range(4), key=lambda index: distances[index])]
+
+
+def margin(scene: dict) -> float:
+    source = _deblur(scene["blurred_levels"])
+    distances = sorted(_hamming(source, grid) for grid in scene["reference_grids"])
+    return float(distances[1] - distances[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 8.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["distractors"] = list(reversed(twin["distractors"]))
+    return [("reverse_nonoverlapping_distractor_serialization", twin)]

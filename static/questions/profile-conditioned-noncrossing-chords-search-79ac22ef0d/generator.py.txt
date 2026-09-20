@@ -1,0 +1,226 @@
+"""Deterministic renderer and analytic arm for the noncrossing-chords search."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH, HEIGHT = 760, 590
+CARD_W, CARD_H = 330, 220
+CARD_BOXES = ((40, 50), (390, 50), (40, 320), (390, 320))
+CARD_BASE = 246
+STROKE_WIDTH = 9
+INK_STRENGTH = 178
+LABELS = "ABCD"
+
+
+def _orientation(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _proper_intersection(
+    first: tuple[tuple[float, float], tuple[float, float]],
+    second: tuple[tuple[float, float], tuple[float, float]],
+) -> tuple[bool, float]:
+    """Return proper-crossing status and a continuous crossing robustness."""
+    a, b = first
+    c, d = second
+    rx, ry = b[0] - a[0], b[1] - a[1]
+    sx, sy = d[0] - c[0], d[1] - c[1]
+    denominator = rx * sy - ry * sx
+    if abs(denominator) < 1e-8:
+        return False, 0.0
+    qx, qy = c[0] - a[0], c[1] - a[1]
+    t = (qx * sy - qy * sx) / denominator
+    u = (qx * ry - qy * rx) / denominator
+    if 0.0 < t < 1.0 and 0.0 < u < 1.0:
+        la = math.hypot(rx, ry)
+        lb = math.hypot(sx, sy)
+        sine = abs(denominator) / max(la * lb, 1e-9)
+        robustness = min(t, 1.0 - t, u, 1.0 - u) * min(la, lb) * sine
+        return True, robustness
+    return False, 0.0
+
+
+def _point_segment_distance(point: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    wx, wy = point[0] - a[0], point[1] - a[1]
+    denom = vx * vx + vy * vy
+    t = 0.0 if denom == 0 else max(0.0, min(1.0, (wx * vx + wy * vy) / denom))
+    px, py = a[0] + t * vx, a[1] + t * vy
+    return math.hypot(point[0] - px, point[1] - py)
+
+
+def _pair_margin(
+    first: tuple[tuple[float, float], tuple[float, float]],
+    second: tuple[tuple[float, float], tuple[float, float]],
+) -> float:
+    crosses, robustness = _proper_intersection(first, second)
+    if crosses:
+        return -robustness
+    a, b = first
+    c, d = second
+    distance = min(
+        _point_segment_distance(a, c, d),
+        _point_segment_distance(b, c, d),
+        _point_segment_distance(c, a, b),
+        _point_segment_distance(d, a, b),
+    )
+    return distance - STROKE_WIDTH
+
+
+def _panel_score(panel: list[dict]) -> float:
+    endpoints = [(tuple(segment["p1"]), tuple(segment["p2"])) for segment in panel]
+    return min(
+        _pair_margin(endpoints[i], endpoints[j])
+        for i in range(3)
+        for j in range(i + 1, 3)
+    )
+
+
+def _crossing_count(panel: list[dict]) -> int:
+    endpoints = [(tuple(segment["p1"]), tuple(segment["p2"])) for segment in panel]
+    return sum(
+        _proper_intersection(endpoints[i], endpoints[j])[0]
+        for i in range(3)
+        for j in range(i + 1, 3)
+    )
+
+
+def _segment(center: tuple[float, float], angle_degrees: float, length: float, channel: int) -> dict:
+    theta = math.radians(angle_degrees)
+    dx, dy = 0.5 * length * math.cos(theta), 0.5 * length * math.sin(theta)
+    return {
+        "channel": int(channel),
+        "p1": [round(center[0] - dx, 3), round(center[1] - dy, 3)],
+        "p2": [round(center[0] + dx, 3), round(center[1] + dy, 3)],
+    }
+
+
+def _sample_panel(
+    rng: random.Random,
+    box: tuple[int, int],
+    angles: list[float],
+    length: float,
+    desired_crossings: int,
+) -> list[dict]:
+    x0, y0 = box
+    for _ in range(30000):
+        channels = [0, 1, 2]
+        rng.shuffle(channels)
+        segments: list[dict] = []
+        centers: list[tuple[float, float]] = []
+        for angle, channel in zip(angles, channels, strict=True):
+            theta = math.radians(angle)
+            hx = abs(0.5 * length * math.cos(theta))
+            hy = abs(0.5 * length * math.sin(theta))
+            center = (
+                rng.uniform(x0 + 24 + hx, x0 + CARD_W - 24 - hx),
+                rng.uniform(y0 + 57 + hy, y0 + CARD_H - 21 - hy),
+            )
+            centers.append(center)
+            segments.append(_segment(center, angle, length, channel))
+        span_x = max(p[0] for p in centers) - min(p[0] for p in centers)
+        span_y = max(p[1] for p in centers) - min(p[1] for p in centers)
+        if not (88 <= span_x <= 205 and 42 <= span_y <= 122):
+            continue
+        count = _crossing_count(segments)
+        score = _panel_score(segments)
+        if count != desired_crossings:
+            continue
+        if desired_crossings == 0 and 15.0 <= score <= 48.0:
+            return segments
+        if desired_crossings > 0 and -36.0 <= score <= -12.0:
+            return segments
+    raise RuntimeError(f"could not sample panel with {desired_crossings} crossings")
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample four balanced panels; answer identity cycles exactly with the seed."""
+    rng = random.Random((int(seed) << 7) ^ 0x5A17C0DE)
+    jitter = rng.uniform(-5.0, 5.0)
+    angles = [-57.0 + jitter, 3.0 + jitter, 62.0 + jitter]
+    length = float(rng.choice((106, 110, 114)))
+    answer_index = int(seed) % 4
+    distractor_roles = [1, 1, 2]
+    rng.shuffle(distractor_roles)
+    roles: list[int] = []
+    for index in range(4):
+        roles.append(0 if index == answer_index else distractor_roles.pop())
+    panels = [
+        _sample_panel(rng, box, angles, length, role)
+        for box, role in zip(CARD_BOXES, roles, strict=True)
+    ]
+    return {"panels": panels}
+
+
+def render(scene: dict) -> Image.Image:
+    """Render with subtractive channel masks so overlap never changes total ink."""
+    panels = scene["panels"]
+    image = Image.new("RGB", (WIDTH, HEIGHT), (255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=22)
+    for index, (x0, y0) in enumerate(CARD_BOXES):
+        draw.rounded_rectangle(
+            (x0, y0, x0 + CARD_W, y0 + CARD_H),
+            radius=12,
+            fill=(CARD_BASE, CARD_BASE, CARD_BASE),
+            outline=(205, 208, 214),
+            width=2,
+        )
+        draw.text((x0 + 14, y0 + 12), LABELS[index], fill=(37, 43, 55), font=font)
+
+    scale = 4
+    masks = [Image.new("L", (WIDTH * scale, HEIGHT * scale), 0) for _ in range(3)]
+    mask_draws = [ImageDraw.Draw(mask) for mask in masks]
+    for panel in panels:
+        for segment in panel:
+            p1 = tuple(round(value * scale) for value in segment["p1"])
+            p2 = tuple(round(value * scale) for value in segment["p2"])
+            channel = int(segment["channel"])
+            mask_draws[channel].line((p1, p2), fill=255, width=STROKE_WIDTH * scale)
+            radius = STROKE_WIDTH * scale // 2
+            for px, py in (p1, p2):
+                mask_draws[channel].ellipse(
+                    (px - radius, py - radius, px + radius, py + radius), fill=255
+                )
+    masks = [mask.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS) for mask in masks]
+    array = np.asarray(image, dtype=np.int16).copy()
+    for channel, mask in enumerate(masks):
+        contribution = np.rint(INK_STRENGTH * np.asarray(mask, dtype=np.float64) / 255.0)
+        array[:, :, channel] = np.clip(array[:, :, channel] - contribution, 0, 255)
+    return Image.fromarray(array.astype(np.uint8), "RGB")
+
+
+def _scores(scene: dict) -> list[float]:
+    return [_panel_score(panel) for panel in scene["panels"]]
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _scores(scene)
+    winners = [index for index, score in enumerate(scores) if score > 0.0]
+    if len(winners) != 1:
+        raise ValueError(f"expected one noncrossing panel, found {winners}")
+    return LABELS[winners[0]]
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_scores(scene), reverse=True)
+    return float(scores[0] - scores[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = _scores(scene)
+    return margin(scene) < 20.0 or max(scores) < 10.0 or sum(score > 0.0 for score in scores) != 1
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    for panel in twin["panels"]:
+        panel.reverse()
+    return [("reverse_per_panel_segment_record_order", twin)]

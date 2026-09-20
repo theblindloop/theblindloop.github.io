@@ -1,0 +1,225 @@
+"""Deterministic sampler and raster renderer for nearest-assignment search."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+
+LABELS = ("A", "B", "C", "D")
+PANEL_ORIGINS = ((34, 38), (326, 38), (34, 338), (326, 338))
+PANEL_SIZE = (280, 264)
+SQUARE_HALF = 14
+DOT_RADIUS = 9
+SUPER_SAMPLE = 3
+
+THEMES = (
+    {
+        "background": "#f3f1ea", "panel_fill": "#ffffff", "frame_color": "#c8c5ba",
+        "badge_color": "#7b5ca7", "square_color": "#173f5f", "dot_color": "#e66a32",
+    },
+    {
+        "background": "#f2f4ef", "panel_fill": "#ffffff", "frame_color": "#c5cbc1",
+        "badge_color": "#486f9b", "square_color": "#315d43", "dot_color": "#d95f32",
+    },
+    {
+        "background": "#f5f1f5", "panel_fill": "#ffffff", "frame_color": "#cec4ce",
+        "badge_color": "#397a78", "square_color": "#573b68", "dot_color": "#df6f2f",
+    },
+)
+
+_CENTER = (145, 146)
+_BASE_ANCHOR_VECTORS = ((0, -64), (-58, 44), (58, 44))
+_BASE_DOT_OFFSETS = ((34, 0), (-17, 29), (-17, -29))
+_SCALES = (0.82, 0.94, 1.06, 1.18)
+
+
+def _transform(vector: tuple[int, int], quarter_turns: int, mirror: bool) -> tuple[int, int]:
+    x, y = vector
+    if mirror:
+        x = -x
+    for _ in range(quarter_turns % 4):
+        x, y = -y, x
+    return x, y
+
+
+def _make_panel(
+    assignments: list[int], rng: random.Random, scale: float
+) -> dict[str, list[dict[str, int]]]:
+    """Use the same three local offset lengths in every panel.
+
+    Only the global coverage of their nearest square differs. Rotations,
+    reflections, and small translations prevent a fixed-position shortcut.
+    """
+    quarter = rng.randrange(4)
+    mirror = bool(rng.randrange(2))
+    tx, ty = rng.randint(-4, 4), rng.randint(-3, 3)
+    square_centers: list[tuple[int, int]] = []
+    for vx, vy in _BASE_ANCHOR_VECTORS:
+        scaled = (round(vx * scale), round(vy * scale))
+        dx, dy = _transform(scaled, quarter, mirror)
+        square_centers.append((_CENTER[0] + tx + dx, _CENTER[1] + ty + dy))
+
+    offsets = [_transform(vector, quarter, mirror) for vector in _BASE_DOT_OFFSETS]
+    rng.shuffle(offsets)
+    rng.shuffle(assignments)
+    dots = []
+    for assignment, (dx, dy) in zip(assignments, offsets, strict=True):
+        sx, sy = square_centers[assignment]
+        dots.append({"cx": sx + dx, "cy": sy + dy})
+    squares = [{"cx": x, "cy": y} for x, y in square_centers]
+    return {"squares": squares, "dots": dots}
+
+
+def sample_scene(seed: int) -> dict:
+    """Consecutive seeds cycle the unique answer A/B/C/D exactly."""
+    seed = int(seed)
+    rng = random.Random(seed)
+    answer_index = seed % 4
+    scale = _SCALES[(seed // 4) % len(_SCALES)]
+    distractor_patterns = ([0, 0, 1], [1, 1, 2], [2, 2, 0])
+    patterns = iter(distractor_patterns)
+    panels = []
+    for index in range(4):
+        assignment = [0, 1, 2] if index == answer_index else list(next(patterns))
+        panels.append(_make_panel(assignment, rng, scale))
+    theme = THEMES[(seed // 16) % len(THEMES)]
+    canvas = {"width": 640, "height": 640, **theme}
+    return {"canvas": canvas, "panels": panels}
+
+
+def _panel_measurements(_scene_container: dict, panel: dict) -> tuple[list[int], list[float]]:
+    """Measure one nested panel while retaining its enclosing scene boundary."""
+    squares = panel.get("squares", [])
+    dots = panel.get("dots", [])
+    if len(squares) != 3 or len(dots) != 3:
+        raise ValueError("every panel must visibly contain exactly three squares and three dots")
+    assignments: list[int] = []
+    gaps: list[float] = []
+    for dot in dots:
+        distances = sorted(
+            (
+                math.hypot(float(dot["cx"]) - float(square["cx"]),
+                           float(dot["cy"]) - float(square["cy"])),
+                index,
+            )
+            for index, square in enumerate(squares)
+        )
+        gap = distances[1][0] - distances[0][0]
+        if gap <= 1e-9:
+            raise ValueError("a dot is tied between nearest squares")
+        assignments.append(distances[0][1])
+        gaps.append(gap)
+    return assignments, gaps
+
+
+def _coverages_and_gaps(scene: dict) -> tuple[list[int], list[float]]:
+    if len(scene.get("panels", [])) != 4:
+        raise ValueError("scene must contain four panels")
+    coverages, gaps = [], []
+    for panel in scene["panels"]:
+        assignments, local_gaps = _panel_measurements(scene, panel)
+        coverages.append(len(set(assignments)))
+        gaps.extend(local_gaps)
+    return coverages, gaps
+
+
+def analytic_gold(scene: dict) -> str:
+    coverages, _ = _coverages_and_gaps(scene)
+    winners = [index for index, coverage in enumerate(coverages) if coverage == 3]
+    if len(winners) != 1:
+        raise ValueError(f"expected one distinct-nearest panel, found {winners} from {coverages}")
+    return LABELS[winners[0]]
+
+
+def margin(scene: dict) -> float:
+    coverages, gaps = _coverages_and_gaps(scene)
+    ordered = sorted(coverages, reverse=True)
+    # One coverage unit is treated as 100 px; the returned conservative margin
+    # is limited by the nearest visible local distance boundary.
+    return float(min(100.0 * (ordered[0] - ordered[1]), min(gaps)))
+
+
+def _minimum_clearance(scene: dict) -> float:
+    clearances: list[float] = []
+    for panel in scene["panels"]:
+        squares = panel["squares"]
+        dots = panel["dots"]
+        for i in range(3):
+            for j in range(i + 1, 3):
+                clearances.append(
+                    math.hypot(dots[i]["cx"] - dots[j]["cx"], dots[i]["cy"] - dots[j]["cy"])
+                    - 2 * DOT_RADIUS
+                )
+        for dot in dots:
+            for square in squares:
+                dx = abs(dot["cx"] - square["cx"])
+                dy = abs(dot["cy"] - square["cy"])
+                edge_dx = max(dx - SQUARE_HALF, 0)
+                edge_dy = max(dy - SQUARE_HALF, 0)
+                clearances.append(math.hypot(edge_dx, edge_dy) - DOT_RADIUS)
+    return min(clearances)
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        coverages, gaps = _coverages_and_gaps(scene)
+    except (KeyError, TypeError, ValueError):
+        return True
+    return (
+        sorted(coverages, reverse=True) != [3, 2, 2, 2]
+        or min(gaps) < 20.0
+        or _minimum_clearance(scene) < 3.0
+        or margin(scene) < 20.0
+    )
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    transformed = copy.deepcopy(scene)
+    for panel in transformed["panels"]:
+        panel["squares"].reverse()
+        panel["dots"].reverse()
+    return [("reverse_same-style_object_lists", transformed)]
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def render(scene: dict) -> Image.Image:
+    canvas = scene["canvas"]
+    ss = SUPER_SAMPLE
+    width, height = int(canvas["width"]), int(canvas["height"])
+    image = Image.new("RGB", (width * ss, height * ss), canvas["background"])
+    draw = ImageDraw.Draw(image)
+    label_font = _font(25 * ss)
+    for index, panel in enumerate(scene["panels"]):
+        ox, oy = PANEL_ORIGINS[index]
+        pw, ph = PANEL_SIZE
+        draw.rounded_rectangle(
+            (ox * ss, oy * ss, (ox + pw) * ss, (oy + ph) * ss),
+            radius=14 * ss, fill=canvas["panel_fill"], outline=canvas["frame_color"], width=3 * ss,
+        )
+        bx, by = ox + 28, oy + 28
+        draw.ellipse(((bx - 19) * ss, (by - 19) * ss, (bx + 19) * ss, (by + 19) * ss),
+                     fill=canvas["badge_color"])
+        draw.text((bx * ss, (by - 1) * ss), LABELS[index], font=label_font,
+                  fill="white", anchor="mm")
+        for square in panel["squares"]:
+            cx, cy = ox + int(square["cx"]), oy + int(square["cy"])
+            draw.rectangle(((cx - SQUARE_HALF) * ss, (cy - SQUARE_HALF) * ss,
+                            (cx + SQUARE_HALF) * ss, (cy + SQUARE_HALF) * ss),
+                           fill=canvas["square_color"])
+        for dot in panel["dots"]:
+            cx, cy = ox + int(dot["cx"]), oy + int(dot["cy"])
+            draw.ellipse(((cx - DOT_RADIUS) * ss, (cy - DOT_RADIUS) * ss,
+                          (cx + DOT_RADIUS) * ss, (cy + DOT_RADIUS) * ss),
+                         fill=canvas["dot_color"])
+    return image.resize((width, height), Image.Resampling.LANCZOS)

@@ -1,0 +1,133 @@
+"""Independent pixel-only inverse for the transposed-address cards."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+PALE = np.array((232, 237, 244), dtype=np.int16)
+INK = np.array((24, 38, 64), dtype=np.int16)
+COLORS = {
+    "gold": np.array((225, 172, 24), dtype=np.int16),
+    "red": np.array((218, 65, 74), dtype=np.int16),
+    "green": np.array((36, 160, 92), dtype=np.int16),
+    "blue": np.array((48, 105, 210), dtype=np.int16),
+}
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[tuple[int, int, int, int, int]] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        ys = [point[0] for point in points]
+        xs = [point[1] for point in points]
+        output.append((min(xs), min(ys), max(xs), max(ys), len(points)))
+    return output
+
+
+def _near_color(array: np.ndarray, color: np.ndarray, tolerance: int = 12) -> np.ndarray:
+    return np.max(np.abs(array.astype(np.int16) - color), axis=2) <= tolerance
+
+
+def _tag_centers(array: np.ndarray) -> dict[str, tuple[float, float]]:
+    centers: dict[str, tuple[float, float]] = {}
+    for name, color in COLORS.items():
+        components = [item for item in _components(_near_color(array, color)) if item[4] >= 20]
+        if len(components) != 1:
+            raise ValueError(f"expected one intact {name} tag")
+        x0, y0, x1, y1, area = components[0]
+        if not 28 <= area <= 60:
+            raise ValueError(f"damaged {name} tag")
+        centers[name] = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+    return centers
+
+
+def _cards(array: np.ndarray) -> list[tuple[int, int, int, int]]:
+    cards = []
+    for x0, y0, x1, y1, area in _components(_near_color(array, PALE)):
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        if 14 <= width <= 24 and 14 <= height <= 24 and area >= 170:
+            cards.append((x0, y0, x1, y1))
+    if len(cards) != 4:
+        raise ValueError("expected four intact card fields")
+    return cards
+
+
+def _card_for_tag(
+    tag: tuple[float, float], cards: list[tuple[int, int, int, int]]
+) -> tuple[int, int, int, int]:
+    tx, ty = tag
+    scored = []
+    for card in cards:
+        x0, y0, x1, y1 = card
+        cy = (y0 + y1) / 2.0
+        # The public visual grammar places a tag immediately left of its card.
+        penalty = abs(cy - ty) + abs((x0 - 4.0) - tx)
+        scored.append((penalty, card))
+    scored.sort(key=lambda item: item[0])
+    if len(scored) < 2 or scored[0][0] > 4.5 or scored[1][0] - scored[0][0] < 4.0:
+        raise ValueError("tag-to-card assignment is ambiguous")
+    return scored[0][1]
+
+
+def _read_bits(array: np.ndarray, card: tuple[int, int, int, int], rows: int, cols: int) -> list[int]:
+    x0, y0, x1, y1 = card
+    xs = np.linspace(x0 + 5, x1 - 4, cols)
+    ys = np.linspace(y0 + 5, y1 - 4, rows)
+    ink = _near_color(array, INK, tolerance=18)
+    bits = []
+    for y in ys:
+        for x in xs:
+            ix, iy = int(round(x)), int(round(y))
+            patch = ink[max(0, iy - 2) : iy + 3, max(0, ix - 2) : ix + 3]
+            count = int(patch.sum())
+            if count >= 9:
+                bits.append(1)
+            elif count <= 2:
+                bits.append(0)
+            else:
+                raise ValueError("ambiguous dot occupancy")
+    return bits
+
+
+def _transpose(bits: list[int]) -> list[int]:
+    return [bits[r * 3 + c] for c in range(3) for r in range(2)]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tags = _tag_centers(array)
+    cards = _cards(array)
+    assignments = {name: _card_for_tag(center, cards) for name, center in tags.items()}
+    if len(set(assignments.values())) != 4:
+        raise ValueError("multiple tags map to one card")
+
+    reference = _read_bits(array, assignments["gold"], 2, 3)
+    target = _transpose(reference)
+    scores: list[tuple[int, str]] = []
+    for name in ("red", "green", "blue"):
+        candidate = _read_bits(array, assignments[name], 3, 2)
+        scores.append((sum(a != b for a, b in zip(target, candidate, strict=True)), name))
+    scores.sort()
+    if scores[0][0] != 0 or scores[1][0] == scores[0][0]:
+        raise ValueError("no unique exact transposed match")
+    return scores[0][1]
+

@@ -1,0 +1,243 @@
+"""Renderer for the spiral-chirality reveal world.
+
+One thin wire winds as a rectangular spiral across the whole canvas. At
+twenty-five widely separated stations the wire steps out of its lane into a
+small square detour, either to the walker's left or to the walker's right. The
+handedness of those detours, taken in the order they are met while walking from
+the beaded tip, spells one abstract glyph on a five by five grid.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "spiral_chirality_reveal-renderer-0.1.0"
+CANVAS = 640
+STATIONS = 25
+RINGS = 3
+STROKE_HALF = 1
+DETOUR_WIDTH = 16
+QUARANTINE_DEPTH = 10
+
+GLYPHS = ("ell", "ex", "plus", "tee")
+
+GLYPH_CELLS: dict[str, tuple[int, ...]] = {
+    "tee": (0, 1, 2, 3, 4, 7, 12, 17, 22),
+    "ell": (0, 5, 10, 15, 20, 21, 22, 23, 24),
+    "plus": (2, 7, 10, 11, 12, 13, 14, 17, 22),
+    "ex": (0, 4, 6, 8, 12, 16, 18, 20, 24),
+}
+
+PALETTES = (
+    ((246, 244, 238), (26, 58, 92), (172, 168, 158)),
+    ((238, 242, 246), (122, 32, 46), (160, 170, 178)),
+    ((242, 240, 232), (32, 82, 60), (176, 166, 150)),
+    ((236, 236, 244), (70, 40, 108), (158, 160, 178)),
+)
+
+
+def _glyph_bits(glyph: str) -> tuple[int, ...]:
+    cells = set(GLYPH_CELLS[glyph])
+    return tuple(1 if index in cells else 0 for index in range(STATIONS))
+
+
+def hamming_separation(glyph: str) -> int:
+    """Minimum number of grid cells separating this glyph from every other."""
+    bits = _glyph_bits(glyph)
+    best = STATIONS
+    for other in GLYPHS:
+        if other == glyph:
+            continue
+        other_bits = _glyph_bits(other)
+        best = min(best, sum(1 for a, b in zip(bits, other_bits) if a != b))
+    return best
+
+
+def spiral_points(margin: int, gap: int) -> list[tuple[int, int]]:
+    """Corner list of the base rectangular spiral, walked from its outer tip."""
+    left, right = margin, CANVAS - margin
+    top, bottom = margin, CANVAS - margin
+    points = [(left, top)]
+    for _ in range(RINGS):
+        points.append((right, top))
+        points.append((right, bottom))
+        points.append((left, bottom))
+        top += gap
+        points.append((left, top))
+        left += gap
+        right -= gap
+        bottom -= gap
+    return points
+
+
+def _allocate(lengths: list[int], total: int) -> list[int]:
+    span = sum(lengths)
+    raw = [length * total / span for length in lengths]
+    counts = [int(value) for value in raw]
+    order = sorted(range(len(raw)), key=lambda i: (-(raw[i] - counts[i]), i))
+    index = 0
+    while sum(counts) < total:
+        counts[order[index % len(order)]] += 1
+        index += 1
+    return counts
+
+
+def station_plan(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Segment index and along-segment offset for every station, in walk order."""
+    lengths = [
+        abs(points[i + 1][0] - points[i][0]) + abs(points[i + 1][1] - points[i][1])
+        for i in range(len(points) - 1)
+    ]
+    counts = _allocate(lengths, STATIONS)
+    plan: list[tuple[int, int]] = []
+    for index, (length, count) in enumerate(zip(lengths, counts)):
+        if count <= 0:
+            continue
+        start, end = 40, length - 40
+        if count == 1:
+            offsets = [(start + end) // 2]
+        else:
+            step = (end - start) / (count - 1)
+            offsets = [int(round(start + step * j)) for j in range(count)]
+        for offset in offsets:
+            plan.append((index, offset))
+    return plan
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene; every field drives visible pixels."""
+    # the fixed second stream entry decorrelates consecutive dataset seeds, which
+    # otherwise share a first draw and would starve one glyph class
+    rng = np.random.default_rng([int(seed), 0x5EED])
+    glyph = GLYPHS[int(rng.integers(len(GLYPHS)))]
+    depth = int(rng.integers(9, 16))
+    palette_index = int(rng.integers(len(PALETTES)))
+    scene = {
+        "canvas": CANVAS,
+        "glyph": glyph,
+        "margin": int(rng.integers(24, 31)),
+        "gap": int(rng.integers(46, 53)),
+        "depth": depth,
+        "mirrored": bool(rng.integers(2)),
+        "start_inner": bool(rng.integers(2)),
+        "bead_radius": int(rng.integers(5, 8)),
+        "palette": palette_index,
+        "background": list(PALETTES[palette_index][0]),
+        "wire_color": list(PALETTES[palette_index][1]),
+        "mark_color": list(PALETTES[palette_index][2]),
+        "distractors": [],
+    }
+    path = walk_path(scene)
+    occupied = np.zeros((CANVAS, CANVAS), dtype=bool)
+    _stamp_path(occupied, path, STROKE_HALF + 13)
+    marks: list[list[int]] = []
+    tries = 0
+    wanted = int(rng.integers(3, 8))
+    while len(marks) < wanted and tries < 400:
+        tries += 1
+        size = int(rng.integers(4, 9))
+        x = int(rng.integers(10, CANVAS - 10 - size))
+        y = int(rng.integers(10, CANVAS - 10 - size))
+        if occupied[y - 6 : y + size + 6, x - 6 : x + size + 6].any():
+            continue
+        occupied[y - 8 : y + size + 8, x - 8 : x + size + 8] = True
+        marks.append([x, y, size])
+    scene["distractors"] = marks
+    return scene
+
+
+def walk_path(scene: dict) -> list[tuple[int, int]]:
+    """Full wire polyline including detours, ordered from the beaded tip."""
+    points = spiral_points(int(scene["margin"]), int(scene["gap"]))
+    if scene["mirrored"]:
+        points = [(CANVAS - x, y) for x, y in points]
+    if scene["start_inner"]:
+        points = list(reversed(points))
+    plan = station_plan(points)
+    bits = _glyph_bits(str(scene["glyph"]))
+    depth = int(scene["depth"])
+    by_segment: dict[int, list[tuple[int, int]]] = {}
+    for station, (segment, offset) in enumerate(plan):
+        by_segment.setdefault(segment, []).append((offset, bits[station]))
+
+    path: list[tuple[int, int]] = [points[0]]
+    for index in range(len(points) - 1):
+        ax, ay = points[index]
+        bx, by = points[index + 1]
+        length = abs(bx - ax) + abs(by - ay)
+        dx = (bx - ax) // length
+        dy = (by - ay) // length
+        # left of travel in image coordinates (y grows downward)
+        lx, ly = dy, -dx
+        for offset, bit in sorted(by_segment.get(index, [])):
+            side = (lx, ly) if bit else (-lx, -ly)
+            start = offset - DETOUR_WIDTH // 2
+            sx, sy = ax + dx * start, ay + dy * start
+            path.append((sx, sy))
+            path.append((sx + side[0] * depth, sy + side[1] * depth))
+            path.append((sx + side[0] * depth + dx * DETOUR_WIDTH, sy + side[1] * depth + dy * DETOUR_WIDTH))
+            path.append((sx + dx * DETOUR_WIDTH, sy + dy * DETOUR_WIDTH))
+        path.append((bx, by))
+    return path
+
+
+def _stamp_path(canvas: np.ndarray, path: list[tuple[int, int]], half: int) -> None:
+    for (ax, ay), (bx, by) in zip(path, path[1:]):
+        x0, x1 = sorted((ax, bx))
+        y0, y1 = sorted((ay, by))
+        canvas[
+            max(0, y0 - half) : min(canvas.shape[0], y1 + half + 1),
+            max(0, x0 - half) : min(canvas.shape[1], x1 + half + 1),
+        ] = True
+
+
+def _stamp_disc(canvas: np.ndarray, cx: int, cy: int, radius: int) -> None:
+    ys, xs = np.mgrid[0 : canvas.shape[0], 0 : canvas.shape[1]]
+    canvas |= (xs - cx) ** 2 + (ys - cy) ** 2 <= radius * radius
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize one scene as flat colors with no antialiasing."""
+    size = int(scene["canvas"])
+    image = np.zeros((size, size, 3), dtype=np.uint8)
+    image[:, :] = np.array(scene["background"], dtype=np.uint8)
+
+    marks = np.zeros((size, size), dtype=bool)
+    for x, y, side in scene["distractors"]:
+        marks[y : y + side, x : x + side] = True
+    image[marks] = np.array(scene["mark_color"], dtype=np.uint8)
+
+    path = walk_path(scene)
+    wire = np.zeros((size, size), dtype=bool)
+    _stamp_path(wire, path, STROKE_HALF)
+    ax, ay = path[0]
+    bx, by = path[1]
+    length = abs(bx - ax) + abs(by - ay)
+    dx, dy = (bx - ax) // length, (by - ay) // length
+    radius = int(scene["bead_radius"])
+    _stamp_disc(wire, ax + dx * (radius + 3), ay + dy * (radius + 3), radius)
+    image[wire] = np.array(scene["wire_color"], dtype=np.uint8)
+    return Image.fromarray(image, mode="RGB")
+
+
+def analytic_gold(scene: dict) -> str:
+    """Glyph spelled by the detour handedness sequence in walking order."""
+    return str(scene["glyph"])
+
+
+def margin(scene: dict) -> float:
+    """Decision margin: grid separation against rendered detour clearance."""
+    separation = float(hamming_separation(str(scene["glyph"])))
+    clearance = float(int(scene["depth"]) - 6)
+    return float(min(separation, clearance))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Detours below the declared depth are excluded from headline claims."""
+    return int(scene["depth"]) < QUARANTINE_DEPTH
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases exist: every sampled field is rendered."""
+    return []

@@ -1,0 +1,162 @@
+"""Image-only inverse arm for `oneway_reachable_tank`.
+
+Input: the final PNG.  No scene, no renderer, no gold, no prompts.
+
+Pipeline
+1. exact-color segmentation into lane / arrowhead / junction masks;
+2. connected components give junction disk centers and their roles;
+3. a lane joins two junctions when the middle of the straight line between their
+   centers is covered by lane-or-arrow ink everywhere (a junction disk crossing
+   the line, or any white gap, refutes the lane);
+4. each arrowhead blob is bound to the lane whose midline it hugs, and its
+   direction is read from the taper: projected on the lane axis, the ink centroid
+   of a triangle sits one third of the height from the base, so the far side of
+   the projection is the tip side;
+5. directed BFS from the green disk; answer is the single reachable tank color.
+
+Any structural doubt (missing role, unbound arrowhead, lane without exactly one
+arrowhead, zero or several reachable tanks) returns "ambiguous" instead of a
+guess.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "oneway_reachable_tank-oracle-0.1.0"
+ABSTAIN = "ambiguous"
+
+LANE = (176, 176, 176)
+ARROW = (0, 0, 0)
+ROLE_RGB = {
+    "gray": (110, 110, 110),
+    "green": (0, 150, 60),
+    "blue": (30, 90, 220),
+    "orange": (235, 130, 20),
+    "purple": (140, 50, 170),
+}
+TANKS = ("blue", "orange", "purple")
+MIN_DISK_AREA = 300
+MIN_ARROW_AREA = 60
+
+
+def _mask(arr: np.ndarray, rgb) -> np.ndarray:
+    return (arr[:, :, 0] == rgb[0]) & (arr[:, :, 1] == rgb[1]) & (arr[:, :, 2] == rgb[2])
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[np.ndarray]:
+    """4-connected components of a boolean mask, as arrays of (y, x) pixels."""
+    todo = mask.copy()
+    h, w = todo.shape
+    out = []
+    ys, xs = np.nonzero(todo)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if not todo[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        todo[y0, x0] = False
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and todo[ny, nx]:
+                    todo[ny, nx] = False
+                    stack.append((ny, nx))
+        if len(pix) >= min_area:
+            out.append(np.array(pix, dtype=np.float64))
+    return out
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+
+    nodes: list[tuple[float, float]] = []
+    roles: list[str] = []
+    for role, rgb in ROLE_RGB.items():
+        comps = _components(_mask(arr, rgb), MIN_DISK_AREA)
+        if role != "gray" and len(comps) != 1:
+            return ABSTAIN
+        for pix in comps:
+            nodes.append((float(pix[:, 1].mean()), float(pix[:, 0].mean())))
+            roles.append(role)
+    if "green" not in roles or len(nodes) < 5:
+        return ABSTAIN
+
+    passable = _mask(arr, LANE) | _mask(arr, ARROW)
+    lanes: list[tuple[int, int]] = []
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if _line_is_inked(passable, nodes[i], nodes[j]):
+                lanes.append((i, j))
+    if not lanes:
+        return ABSTAIN
+
+    heads = _components(_mask(arr, ARROW), MIN_ARROW_AREA)
+    directed: list[tuple[int, int]] = []
+    for pix in heads:
+        pts = np.stack([pix[:, 1], pix[:, 0]], axis=1)
+        cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+        owner, best = None, 1e9
+        for k, (i, j) in enumerate(lanes):
+            d = _seg_dist((cx, cy), nodes[i], nodes[j])
+            if d < best:
+                owner, best = k, d
+        if owner is None or best > 6.0:
+            return ABSTAIN
+        i, j = lanes[owner]
+        ux = nodes[j][0] - nodes[i][0]
+        uy = nodes[j][1] - nodes[i][1]
+        L = math.hypot(ux, uy)
+        if L == 0:
+            return ABSTAIN
+        ux, uy = ux / L, uy / L
+        t = (pts[:, 0] - cx) * ux + (pts[:, 1] - cy) * uy
+        tip_reach, base_reach = float(t.max()), float(-t.min())
+        if abs(tip_reach - base_reach) < 1.0:
+            return ABSTAIN
+        directed.append((i, j) if tip_reach > base_reach else (j, i))
+
+    if len(directed) != len(lanes):
+        return ABSTAIN
+    if len({frozenset(e) for e in directed}) != len(lanes):
+        return ABSTAIN
+
+    start = roles.index("green")
+    adj: dict[int, list[int]] = {}
+    for a, b in directed:
+        adj.setdefault(a, []).append(b)
+    seen = {start}
+    stack = [start]
+    while stack:
+        u = stack.pop()
+        for v in adj.get(u, ()):
+            if v not in seen:
+                seen.add(v)
+                stack.append(v)
+    hit = [roles[i] for i in sorted(seen) if roles[i] in TANKS]
+    if len(hit) != 1:
+        return ABSTAIN
+    return hit[0]
+
+
+def _line_is_inked(passable: np.ndarray, p, q, samples: int = 41) -> bool:
+    h, w = passable.shape
+    for k in range(samples):
+        t = 0.30 + 0.40 * k / (samples - 1)
+        x = int(round(p[0] + t * (q[0] - p[0])))
+        y = int(round(p[1] + t * (q[1] - p[1])))
+        if not (0 <= x < w and 0 <= y < h) or not passable[y, x]:
+            return False
+    return True
+
+
+def _seg_dist(pt, a, b) -> float:
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    L2 = vx * vx + vy * vy
+    t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((pt[0] - a[0]) * vx + (pt[1] - a[1]) * vy) / L2))
+    return math.dist(pt, (a[0] + t * vx, a[1] + t * vy))

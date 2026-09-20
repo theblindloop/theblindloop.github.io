@@ -1,0 +1,358 @@
+"""Deterministic latent-scene sampling, rendering, gold and margin for
+``hinge_chain_joint_binding``.
+
+The scene is an open kinematic chain of six joints joined by five straight rods.
+The upper panel (REF) draws the chain in gray with one interior joint circled in
+black.  The lower panel (COPY) draws *the same chain* after a uniform rescale, a
+global turn, and a re-bend at every joint: the ordered sequence of rod lengths is
+preserved up to an overall scale factor and up to reading the chain from the
+opposite end, while every bend angle is resampled independently.  COPY's joints
+are painted with six distinct colors.
+
+The answer is the color of the COPY joint that is the same physical joint as the
+circled REF joint.  Because the bend angles carry no information and the overall
+scale is unknown, the correspondence can only be solved by aligning the two
+scale-normalized rod-length sequences and resolving the traversal direction.
+"""
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+# ---------------------------------------------------------------- constants --
+
+W, H = 660, 580
+PANEL_REF = (16, 16, 644, 280)
+PANEL_COPY = (16, 300, 644, 564)
+
+BG = (255, 255, 255)
+BORDER = (140, 140, 150)
+STROKE = (70, 70, 78)
+GRAY_JOINT = (150, 150, 158)
+PIN = (0, 0, 0)
+LABEL = (100, 100, 110)
+
+COLOR_NAMES = ("red", "orange", "yellow", "green", "blue", "purple")
+COLOR_RGB = {
+    "red": (214, 42, 48),
+    "orange": (232, 124, 20),
+    "yellow": (226, 198, 32),
+    "green": (36, 152, 66),
+    "blue": (44, 86, 208),
+    "purple": (146, 62, 186),
+}
+WARM = ("red", "orange", "yellow")
+
+N_SEG = 5
+N_JOINT = 6
+JOINT_R = 9
+STROKE_W = 5
+PIN_R = 16
+PIN_W = 3
+
+PAD = 24                    # joint centre inset from the panel frame
+MIN_SEG_PX = 52.0
+MAX_SEG_PX = 152.0
+MIN_NONADJ_JOINT = 34.0     # non-consecutive joint separation
+MIN_MARKED_JOINT = 44.0     # the circled joint keeps extra room for its ring
+MIN_JOINT_SEG = 30.0        # joint centre to non-incident rod
+MIN_UNCOVERED = 8           # of 25 probes on a non-adjacent chord
+COVER_SEG = 5.0             # analytic slack over the drawn rod half-width
+COVER_JOINT = 12.0
+COVER_PIN = 19.0
+
+QUARANTINE_MARGIN_PX = 30.0
+ACCEPT_MARGIN_PX = 32.0
+
+LABEL_BOX = (0, 0, 74, 26)  # panel-local box reserved for the REF/COPY caption
+
+
+# ------------------------------------------------------------------ geometry --
+
+def _dist(p, q):
+    return math.hypot(p[0] - q[0], p[1] - q[1])
+
+
+def _point_seg_dist(p, a, b):
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    vx, vy = bx - ax, by - ay
+    den = vx * vx + vy * vy
+    if den <= 1e-9:
+        return _dist(p, a)
+    t = ((px - ax) * vx + (py - ay) * vy) / den
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _segments_cross(a, b, c, d):
+    def orient(p, q, r):
+        v = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+        if v > 1e-9:
+            return 1
+        if v < -1e-9:
+            return -1
+        return 0
+
+    o1, o2 = orient(a, b, c), orient(a, b, d)
+    o3, o4 = orient(c, d, a), orient(c, d, b)
+    return o1 != o2 and o3 != o4
+
+
+def _lengths(points):
+    return [_dist(points[i], points[i + 1]) for i in range(len(points) - 1)]
+
+
+def _cum_norm(points):
+    """Normalized cumulative arclength of the joints along the chain."""
+    segs = _lengths(points)
+    total = sum(segs)
+    out, acc = [0.0], 0.0
+    for s in segs:
+        acc += s
+        out.append(acc / total)
+    return out, total
+
+
+# ------------------------------------------------------------ layout sampler --
+
+def _covered_analytic(p, points, marked_index):
+    """Mirror of the oracle's ink test, with slack, on ideal geometry."""
+    for i in range(N_SEG):
+        if _point_seg_dist(p, points[i], points[i + 1]) <= COVER_SEG:
+            return True
+    for q in points:
+        if _dist(p, q) <= COVER_JOINT:
+            return True
+    if marked_index is not None and _dist(p, points[marked_index]) <= COVER_PIN:
+        return True
+    return False
+
+
+def _layout_ok(points, marked_index):
+    for i in range(N_JOINT):
+        for j in range(i + 2, N_JOINT):
+            if _dist(points[i], points[j]) < MIN_NONADJ_JOINT:
+                return False
+    if marked_index is not None:
+        for j in range(N_JOINT):
+            if j != marked_index and _dist(points[marked_index], points[j]) < MIN_MARKED_JOINT:
+                return False
+    for i in range(N_JOINT):
+        for s in range(N_SEG):
+            if i in (s, s + 1):
+                continue
+            if _point_seg_dist(points[i], points[s], points[s + 1]) < MIN_JOINT_SEG:
+                return False
+    for s in range(N_SEG):
+        for t in range(s + 2, N_SEG):
+            if _segments_cross(points[s], points[s + 1], points[t], points[t + 1]):
+                return False
+    # every non-adjacent chord must stay visibly off the ink for the oracle
+    for i in range(N_JOINT):
+        for j in range(i + 2, N_JOINT):
+            a, b = points[i], points[j]
+            free = 0
+            for k in range(25):
+                t = 0.2 + 0.6 * k / 24.0
+                p = (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+                if not _covered_analytic(p, points, marked_index):
+                    free += 1
+            if free < MIN_UNCOVERED:
+                return False
+    return True
+
+
+def _layout(rng, seg_lengths, panel, marked_index):
+    x0, y0, x1, y1 = panel
+    lo_x, hi_x = x0 + PAD, x1 - PAD
+    lo_y, hi_y = y0 + PAD, y1 - PAD
+    box_w, box_h = hi_x - lo_x, hi_y - lo_y
+    for _ in range(20000):
+        theta = rng.uniform(0.0, 2.0 * math.pi)
+        pts = [(0.0, 0.0)]
+        for i, L in enumerate(seg_lengths):
+            if i > 0:
+                turn = rng.uniform(0.70, 2.44) * (1.0 if rng.random() < 0.5 else -1.0)
+                theta += turn
+            pts.append((pts[-1][0] + L * math.cos(theta), pts[-1][1] + L * math.sin(theta)))
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        w, h = max(xs) - min(xs), max(ys) - min(ys)
+        if w > box_w or h > box_h:
+            continue
+        ox = rng.uniform(lo_x - min(xs), hi_x - max(xs))
+        oy = rng.uniform(lo_y - min(ys), hi_y - max(ys))
+        placed = [(round(p[0] + ox, 2), round(p[1] + oy, 2)) for p in pts]
+        # keep the caption box clear
+        if any(p[0] - JOINT_R < x0 + LABEL_BOX[2] and p[1] - JOINT_R < y0 + LABEL_BOX[3]
+               for p in placed):
+            continue
+        if not _layout_ok(placed, marked_index):
+            continue
+        return [list(p) for p in placed]
+    return None
+
+
+# ------------------------------------------------------------------ sampling --
+
+def _sample_profile(rng):
+    """Normalized rod-length profile that is clearly not its own reverse."""
+    for _ in range(4000):
+        raw = [rng.uniform(0.10, 0.30) for _ in range(N_SEG)]
+        tot = sum(raw)
+        f = [v / tot for v in raw]
+        if max(f) / min(f) < 1.45:
+            continue
+        asym = max(abs(f[i] - f[N_SEG - 1 - i]) for i in range(N_SEG))
+        if asym < 0.055:
+            continue
+        return f
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one latent scene."""
+    rng = random.Random(seed * 7919 + 13)
+    marked_index = 1 + ((seed // 6) % 4)          # interior joints only, balanced
+    answer_color = COLOR_NAMES[seed % 6]          # balanced answer identity
+
+    for _ in range(400):
+        prof = _sample_profile(rng)
+        if prof is None:
+            continue
+        total_ref = rng.uniform(390.0, 470.0)
+        scale = rng.uniform(0.68, 1.40)
+        total_copy = total_ref * scale
+        ref_seg = [f * total_ref for f in prof]
+        if min(ref_seg) < MIN_SEG_PX or max(ref_seg) > MAX_SEG_PX:
+            continue
+        same_direction = rng.random() < 0.5
+        copy_prof = list(prof) if same_direction else list(reversed(prof))
+        copy_seg = [f * total_copy for f in copy_prof]
+        if min(copy_seg) < MIN_SEG_PX or max(copy_seg) > MAX_SEG_PX:
+            continue
+
+        ref_points = _layout(rng, ref_seg, PANEL_REF, marked_index)
+        if ref_points is None:
+            continue
+        copy_points = _layout(rng, copy_seg, PANEL_COPY, None)
+        if copy_points is None:
+            continue
+
+        answer_slot = marked_index if same_direction else (N_JOINT - 1 - marked_index)
+        rest = [c for c in COLOR_NAMES if c != answer_color]
+        rng.shuffle(rest)
+        joint_colors = []
+        k = 0
+        for idx in range(N_JOINT):
+            if idx == answer_slot:
+                joint_colors.append(answer_color)
+            else:
+                joint_colors.append(rest[k])
+                k += 1
+
+        scene = {
+            "ref_points": ref_points,
+            "copy_points": copy_points,
+            "marked_index": marked_index,
+            "joint_colors": joint_colors,
+            "traversal": "same" if same_direction else "reversed",
+        }
+        if margin(scene) < ACCEPT_MARGIN_PX:
+            continue
+        return scene
+    raise RuntimeError("sample_scene: no admissible layout for seed %d" % seed)
+
+
+# -------------------------------------------------------------- gold, margin --
+
+def _alignment(scene):
+    a, _ = _cum_norm(scene["ref_points"])
+    b, total_copy = _cum_norm(scene["copy_points"])
+    b_rev = [1.0 - b[N_JOINT - 1 - i] for i in range(N_JOINT)]
+    d_fwd = max(abs(a[i] - b[i]) for i in range(N_JOINT))
+    d_rev = max(abs(a[i] - b_rev[i]) for i in range(N_JOINT))
+    return d_fwd, d_rev, total_copy
+
+
+def analytic_gold(scene: dict) -> str:
+    d_fwd, d_rev, _ = _alignment(scene)
+    m = scene["marked_index"]
+    slot = m if d_fwd <= d_rev else (N_JOINT - 1 - m)
+    return scene["joint_colors"][slot]
+
+
+def margin(scene: dict) -> float:
+    """Arclength evidence, in COPY pixels, separating the two traversals."""
+    d_fwd, d_rev, total_copy = _alignment(scene)
+    return round(abs(d_rev - d_fwd) * total_copy, 3)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN_PX
+
+
+def latent_symmetries(scene: dict):
+    """Pixel-identical, label-preserving latent aliases.
+
+    The stored joint list of either chain carries an arbitrary traversal
+    direction; reversing it (and the fields indexed by it) is a different latent
+    scene that renders to a byte-identical PNG and keeps the same gold.
+    """
+    def rev_ref(s):
+        out = dict(s)
+        out["ref_points"] = list(reversed([list(p) for p in s["ref_points"]]))
+        out["marked_index"] = N_JOINT - 1 - s["marked_index"]
+        return out
+
+    def rev_copy(s):
+        out = dict(s)
+        out["copy_points"] = list(reversed([list(p) for p in s["copy_points"]]))
+        out["joint_colors"] = list(reversed(s["joint_colors"]))
+        out["traversal"] = "reversed" if s["traversal"] == "same" else "same"
+        return out
+
+    return [
+        ("reverse_reference_chain_indexing", rev_ref(scene)),
+        ("reverse_copy_chain_indexing", rev_copy(scene)),
+        ("reverse_both_chain_indexings", rev_copy(rev_ref(scene))),
+    ]
+
+
+# ------------------------------------------------------------------ renderer --
+
+def _canonical_segments(points):
+    segs = []
+    for i in range(len(points) - 1):
+        a = (round(points[i][0], 2), round(points[i][1], 2))
+        b = (round(points[i + 1][0], 2), round(points[i + 1][1], 2))
+        segs.append((a, b) if a <= b else (b, a))
+    segs.sort()
+    return segs
+
+
+def _draw_chain(d, points, colors, marked_index):
+    for a, b in _canonical_segments(points):
+        d.line([a, b], fill=STROKE, width=STROKE_W)
+    order = sorted(range(len(points)), key=lambda i: (points[i][0], points[i][1]))
+    for i in order:
+        x, y = points[i]
+        fill = GRAY_JOINT if colors is None else COLOR_RGB[colors[i]]
+        d.ellipse([x - JOINT_R, y - JOINT_R, x + JOINT_R, y + JOINT_R], fill=fill)
+    if marked_index is not None:
+        x, y = points[marked_index]
+        d.ellipse([x - PIN_R, y - PIN_R, x + PIN_R, y + PIN_R], outline=PIN, width=PIN_W)
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    for rect, cap in ((PANEL_REF, "REF"), (PANEL_COPY, "COPY")):
+        d.rectangle(list(rect), outline=BORDER, width=2)
+        d.text((rect[0] + 8, rect[1] + 7), cap, fill=LABEL)
+    _draw_chain(d, scene["ref_points"], None, scene["marked_index"])
+    _draw_chain(d, scene["copy_points"], scene["joint_colors"], None)
+    return img

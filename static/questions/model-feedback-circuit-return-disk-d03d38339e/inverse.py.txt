@@ -1,0 +1,204 @@
+"""Independent image-only decision recovery.
+
+The oracle never sees a latent scene. It recovers the corridor lattice from the
+black ink alone, decides for every pair of neighbouring cells whether a wall
+stands between them, then computes the cycle structure of that corridor graph.
+It reports the colour of the single disk whose cell shares a two-edge-connected
+component with the blue star, i.e. the one disk joined to the star by two routes
+that use no stretch of corridor twice.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+GRID = 8
+TOLERANCE = 30
+
+PALETTE = {
+    "wall": (0, 0, 0),
+    "start": (0, 90, 220),
+    "red": (220, 30, 30),
+    "gold": (235, 170, 0),
+    "magenta": (190, 0, 150),
+}
+DISK_COLORS = ("red", "gold", "magenta")
+
+
+class OracleError(RuntimeError):
+    """Raised when the raster does not expose exactly one round-trip disk."""
+
+
+def _mask(arr: np.ndarray, colour) -> np.ndarray:
+    target = np.asarray(colour, dtype=np.int16)
+    return np.max(np.abs(arr.astype(np.int16) - target), axis=2) <= TOLERANCE
+
+
+def _lattice(wall: np.ndarray):
+    ys, xs = np.nonzero(wall)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    span = x1 - x0 + 1
+    if span < 8 * GRID or (y1 - y0 + 1) < 8 * GRID:
+        raise OracleError("wall frame too small to be a corridor lattice")
+
+    runs = []
+    for x in range(x0, x1 + 1):
+        if not wall[y0, x]:
+            continue
+        run = 0
+        while y0 + run <= y1 and wall[y0 + run, x]:
+            run += 1
+        runs.append(run)
+    if not runs:
+        raise OracleError("no top frame found")
+    thickness = min(runs)
+    if thickness < 3:
+        raise OracleError("wall frame is too thin to measure")
+
+    cell = (span - thickness) / float(GRID)
+    if cell < 4 * thickness / 3.0:
+        raise OracleError("corridor pitch is not consistent with the frame")
+    origin_x = x0 + thickness / 2.0
+    origin_y = y0 + thickness / 2.0
+    return origin_x, origin_y, cell, thickness
+
+
+def _centre(origin_x, origin_y, cell, r, c):
+    return origin_x + (c + 0.5) * cell, origin_y + (r + 0.5) * cell
+
+
+def _cell_of(mask: np.ndarray, origin_x, origin_y, cell, name) -> tuple:
+    if mask.sum() < 150:
+        raise OracleError(f"{name} marker missing")
+    ys, xs = np.nonzero(mask)
+    cx, cy = float(xs.mean()), float(ys.mean())
+    c = int((cx - origin_x) // cell)
+    r = int((cy - origin_y) // cell)
+    if not (0 <= r < GRID and 0 <= c < GRID):
+        raise OracleError(f"{name} marker lies outside the lattice")
+    return r, c
+
+
+def _wall_between(wall, origin_x, origin_y, cell, thickness, a, b) -> bool:
+    (ar, ac), (br, bc) = a, b
+    ax, ay = _centre(origin_x, origin_y, cell, ar, ac)
+    bx, by = _centre(origin_x, origin_y, cell, br, bc)
+    mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+    half = thickness / 2.0 + 2.0
+    reach = cell * 0.28
+    if ar == br:
+        x_lo, x_hi = mx - half, mx + half
+        y_lo, y_hi = my - reach, my + reach
+    else:
+        x_lo, x_hi = mx - reach, mx + reach
+        y_lo, y_hi = my - half, my + half
+    x_lo = max(0, int(round(x_lo)))
+    y_lo = max(0, int(round(y_lo)))
+    x_hi = min(wall.shape[1], int(round(x_hi)) + 1)
+    y_hi = min(wall.shape[0], int(round(y_hi)) + 1)
+    if x_hi <= x_lo or y_hi <= y_lo:
+        raise OracleError("wall probe fell off the raster")
+    return bool(wall[y_lo:y_hi, x_lo:x_hi].any())
+
+
+def _edge_key(a, b):
+    return tuple(sorted((a, b)))
+
+
+def _bridges(graph) -> set:
+    order: dict = {}
+    low: dict = {}
+    bridges = set()
+    counter = [0]
+
+    def visit(cur, parent):
+        order[cur] = low[cur] = counter[0]
+        counter[0] += 1
+        for nb in graph[cur]:
+            if nb == parent:
+                continue
+            if nb in order:
+                low[cur] = min(low[cur], order[nb])
+                continue
+            visit(nb, cur)
+            low[cur] = min(low[cur], low[nb])
+            if low[nb] > order[cur]:
+                bridges.add(_edge_key(cur, nb))
+
+    for root in sorted(graph):
+        if root not in order:
+            visit(root, None)
+    return bridges
+
+
+def _components(graph, bridges) -> dict:
+    comp: dict = {}
+    for cell in sorted(graph):
+        if cell in comp:
+            continue
+        comp[cell] = cell
+        queue = deque([cell])
+        while queue:
+            cur = queue.popleft()
+            for nb in graph[cur]:
+                if nb in comp or _edge_key(cur, nb) in bridges:
+                    continue
+                comp[nb] = cell
+                queue.append(nb)
+    return comp
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3 or min(arr.shape[:2]) < 8 * GRID:
+        raise OracleError("unusable raster")
+
+    wall = _mask(arr, PALETTE["wall"])
+    if wall.sum() < 2000:
+        raise OracleError("no wall structure found")
+    origin_x, origin_y, cell, thickness = _lattice(wall)
+
+    graph = {(r, c): [] for r in range(GRID) for c in range(GRID)}
+    for r in range(GRID):
+        for c in range(GRID):
+            for nb in ((r + 1, c), (r, c + 1)):
+                if nb[0] >= GRID or nb[1] >= GRID:
+                    continue
+                if _wall_between(
+                    wall, origin_x, origin_y, cell, thickness, (r, c), nb
+                ):
+                    continue
+                graph[(r, c)].append(nb)
+                graph[nb].append((r, c))
+
+    star = _cell_of(
+        _mask(arr, PALETTE["start"]), origin_x, origin_y, cell, "star"
+    )
+    disks = {}
+    for colour in DISK_COLORS:
+        disks[colour] = _cell_of(
+            _mask(arr, PALETTE[colour]), origin_x, origin_y, cell, colour
+        )
+
+    reach = {star}
+    queue = deque([star])
+    while queue:
+        cur = queue.popleft()
+        for nb in graph[cur]:
+            if nb not in reach:
+                reach.add(nb)
+                queue.append(nb)
+    for colour, cellpos in disks.items():
+        if cellpos not in reach:
+            raise OracleError(f"{colour} disk is not on the star's floor")
+
+    comp = _components(graph, _bridges(graph))
+    home = comp[star]
+    hits = [colour for colour in DISK_COLORS if comp[disks[colour]] == home]
+    if len(hits) != 1:
+        raise OracleError(f"expected exactly one round-trip disk, found {hits}")
+    return hits[0]

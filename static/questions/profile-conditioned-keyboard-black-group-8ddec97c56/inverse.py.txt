@@ -1,0 +1,151 @@
+"""Pixel-only inverse arm for ``keyboard_black_group``.
+
+``decision_from_image`` receives the final RGB raster and nothing else: no scene
+dictionary, no renderer import, no analytic gold. It re-derives the answer with
+code that shares no geometry with the renderer.
+
+Method:
+
+1. Label a pixel as ink when all three channels are below ``DARK_CUT``. The page,
+   the frame, the key outlines and the white key surfaces are all far lighter,
+   so this isolates the black keys without knowing where they are.
+2. Reduce the ink mask to a column profile and cut it into maximal runs of
+   columns that carry ink. Each run is one candidate black key.
+3. Check every run is a solid, upright, same-band rectangle (density, height,
+   and a shared top/bottom edge). Anything else abstains.
+4. Read the white gaps between neighbouring runs, take the narrowest gap as the
+   within-group reference, and call a gap a group separator when it is more
+   than twice that reference. Gaps landing in the ambiguous band around the
+   declared factor of two abstain instead of guessing.
+5. The answer is the number of runs before the first separator.
+
+The returned runner-up margin is exported through ``measure`` for diagnostics;
+the decision itself is a decimal string, or ``"abstain"``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "keyboard_black_group-oracle-0.1.0"
+
+# Public visual specification, deliberately restated rather than imported.
+DARK_CUT = 90              # every channel below this is black-key ink
+MIN_KEY_COLUMNS = 8        # a black key is at least this many px wide
+MAX_KEY_COLUMNS = 60       # ... and no wider than this
+MIN_KEY_HEIGHT = 40        # ... and at least this tall
+MIN_COLUMN_INK = 24        # ink pixels needed for a column to count as a key column
+MIN_DENSITY = 0.88         # solid rectangle fill fraction of its bounding box
+EDGE_TOL_PX = 3            # tolerated top/bottom disagreement between keys
+AMBIGUOUS_LO = 1.5         # gap/narrowest ratios inside [LO, HI] are unreadable
+AMBIGUOUS_HI = 2.5
+MAX_GROUP = 4              # declared answer set is 1..4
+ABSTAIN = "abstain"
+
+
+@dataclass(frozen=True)
+class Measurement:
+    keys: list[tuple[int, int, int, int]]   # x0, x1, y0, y1 per black key
+    gaps: list[int]                          # white gaps between neighbours
+    narrowest: float
+    separators: list[int]                    # indices of group-separating gaps
+    left_group: int                          # 0 when unreadable
+    runner_up_margin: float                  # px to the nearest rival reading
+    notes: list[str]
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """Maximal runs of True columns as inclusive (start, end) pairs."""
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, f in enumerate(flags.tolist()):
+        if f and start is None:
+            start = i
+        elif not f and start is not None:
+            out.append((start, i - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def measure(image: Image.Image) -> Measurement:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    ink = (arr < DARK_CUT).all(axis=-1)
+    notes: list[str] = []
+
+    col_ink = ink.sum(axis=0)
+    runs = _runs(col_ink >= MIN_COLUMN_INK)
+    keys: list[tuple[int, int, int, int]] = []
+    for x0, x1 in runs:
+        width = x1 - x0 + 1
+        if width < MIN_KEY_COLUMNS:
+            notes.append(f"ink run at x={x0} is only {width}px wide")
+            continue
+        if width > MAX_KEY_COLUMNS:
+            notes.append(f"ink run at x={x0} is {width}px wide (merged keys?)")
+            return Measurement([], [], 0.0, [], 0, 0.0, notes)
+        block = ink[:, x0 : x1 + 1]
+        rows = np.nonzero(block.any(axis=1))[0]
+        y0, y1 = int(rows[0]), int(rows[-1])
+        height = y1 - y0 + 1
+        if height < MIN_KEY_HEIGHT:
+            notes.append(f"ink run at x={x0} is only {height}px tall")
+            return Measurement([], [], 0.0, [], 0, 0.0, notes)
+        density = float(block[y0 : y1 + 1].mean())
+        if density < MIN_DENSITY:
+            notes.append(f"ink run at x={x0} fills only {density:.2f} of its box")
+            return Measurement([], [], 0.0, [], 0, 0.0, notes)
+        keys.append((x0, x1, y0, y1))
+
+    if len(keys) < 2:
+        notes.append("fewer than two black keys recovered")
+        return Measurement(keys, [], 0.0, [], 0, 0.0, notes)
+
+    tops = [k[2] for k in keys]
+    bottoms = [k[3] for k in keys]
+    if max(tops) - min(tops) > EDGE_TOL_PX or max(bottoms) - min(bottoms) > EDGE_TOL_PX:
+        notes.append("black keys do not share one horizontal band")
+        return Measurement(keys, [], 0.0, [], 0, 0.0, notes)
+
+    gaps = [keys[i + 1][0] - keys[i][1] - 1 for i in range(len(keys) - 1)]
+    narrowest = float(min(gaps))
+    if narrowest <= 0:
+        notes.append("neighbouring keys touch")
+        return Measurement(keys, gaps, narrowest, [], 0, 0.0, notes)
+
+    for g in gaps:
+        ratio = g / narrowest
+        if AMBIGUOUS_LO <= ratio <= AMBIGUOUS_HI:
+            notes.append(f"gap {g}px is {ratio:.2f}x the narrowest gap — unreadable")
+            return Measurement(keys, gaps, narrowest, [], 0, 0.0, notes)
+
+    separators = [i for i, g in enumerate(gaps) if g > 2.0 * narrowest]
+    if not separators:
+        notes.append("no between-group gap found")
+        return Measurement(keys, gaps, narrowest, separators, 0, 0.0, notes)
+
+    left_group = separators[0] + 1
+    if left_group > MAX_GROUP:
+        notes.append(f"leftmost group of {left_group} is outside the declared answer set")
+        return Measurement(keys, gaps, narrowest, separators, 0, 0.0, notes)
+
+    # Runner-up margin: how many pixels the deciding gaps could move before the
+    # reading changes to the next-best leftmost group size.
+    wide = [g for g in gaps if g > 2.0 * narrowest]
+    narrow = [g for g in gaps if g <= 2.0 * narrowest]
+    slack_down = min(wide) - 2.0 * narrowest
+    slack_up = (2.0 * narrowest - max(narrow)) if narrow else slack_down
+    runner_up = float(min(slack_down, slack_up))
+    return Measurement(keys, gaps, narrowest, separators, left_group, runner_up, notes)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Leftmost black-key group size recovered from the raster alone."""
+    m = measure(image)
+    if m.left_group < 1:
+        return ABSTAIN
+    return str(m.left_group)

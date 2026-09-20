@@ -1,0 +1,214 @@
+"""Deterministic renderer for the Hinge Mirror Unfold question world."""
+
+from __future__ import annotations
+
+import random
+from copy import deepcopy
+
+from PIL import Image, ImageDraw
+
+
+CANVAS = 512
+BACKGROUND = (248, 247, 242)
+HINGE = (218, 55, 52)
+GRID = (102, 110, 122)
+DISTRACTOR = (205, 209, 214)
+PALETTES = (
+    ((25, 48, 76), (175, 222, 211)),
+    ((77, 34, 50), (237, 190, 157)),
+    ((31, 69, 48), (224, 207, 145)),
+)
+LABELS = ("X", "arrow", "crown")
+
+# Each row is the visible half of a bilaterally symmetric 7-by-7 glyph.  The
+# fourth column touches the hinge and is kept only once during reflection.
+HALF_TEMPLATES = {
+    "X": (
+        (1, 0, 0, 0),
+        (0, 1, 0, 0),
+        (0, 0, 1, 0),
+        (0, 0, 0, 1),
+        (0, 0, 1, 0),
+        (0, 1, 0, 0),
+        (1, 0, 0, 0),
+    ),
+    "arrow": (
+        (0, 0, 0, 1),
+        (0, 0, 1, 0),
+        (0, 1, 0, 0),
+        (1, 0, 0, 0),
+        (0, 0, 1, 0),
+        (0, 0, 1, 0),
+        (0, 0, 1, 0),
+    ),
+    "crown": (
+        (1, 0, 0, 1),
+        (1, 0, 1, 0),
+        (1, 1, 0, 0),
+        (1, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ),
+}
+
+
+def _unfold(cells: list[list[int]] | tuple[tuple[int, ...], ...]) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(row[:3]) + (row[3],) + tuple(reversed(row[:3])) for row in cells)
+
+
+FULL_TEMPLATES = {name: _unfold(cells) for name, cells in HALF_TEMPLATES.items()}
+
+
+def _distances(cells: list[list[int]] | tuple[tuple[int, ...], ...]) -> dict[str, int]:
+    unfolded = _unfold(cells)
+    return {
+        name: sum(a != b for row_a, row_b in zip(unfolded, template) for a, b in zip(row_a, row_b))
+        for name, template in FULL_TEMPLATES.items()
+    }
+
+
+def _classification(cells: list[list[int]] | tuple[tuple[int, ...], ...]) -> tuple[str, float]:
+    distances = _distances(cells)
+    ranked = sorted((distance, name) for name, distance in distances.items())
+    gap = float(ranked[1][0] - ranked[0][0])
+    return ("ambiguous" if gap == 0 else ranked[0][1], gap)
+
+
+def _variant(label: str, rng: random.Random, variant: int) -> list[list[int]]:
+    cells = [list(row) for row in HALF_TEMPLATES[label]]
+    if variant == 0:
+        return cells
+    competitor = "arrow" if label in {"X", "crown"} else "crown"
+    removals = [
+        (r, c)
+        for r in range(7)
+        for c in range(3)
+        if cells[r][c] == 1 and HALF_TEMPLATES[competitor][r][c] == 0
+    ]
+    additions = [
+        (r, c)
+        for r in range(7)
+        for c in range(3)
+        if cells[r][c] == 0 and HALF_TEMPLATES[competitor][r][c] == 1
+    ]
+    rng.shuffle(removals)
+    rng.shuffle(additions)
+    cells[removals[0][0]][removals[0][1]] = 0
+    cells[additions[0][0]][additions[0][1]] = 1
+    decision, gap = _classification(cells)
+    if decision != label or gap < 4:
+        raise AssertionError("sampled stencil perturbation crossed its visible decision boundary")
+    return cells
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced scene from a single integer seed."""
+
+    rng = random.Random(int(seed) ^ 0x5A17C0DE)
+    label = LABELS[int(seed) % len(LABELS)]
+    cells = _variant(label, rng, (int(seed) // 3) % 3)
+    cell_size = (10, 11, 12)[(int(seed) // 5) % 3]
+    rotation = (0, 90, 180, 270)[rng.randrange(4)]
+    hinge_width = max(3, cell_size // 3)
+    canonical_size = (4 * cell_size + hinge_width, 7 * cell_size)
+    patch_size = canonical_size if rotation in {0, 180} else canonical_size[::-1]
+    x = rng.randint(50, CANVAS - patch_size[0] - 50)
+    y = rng.randint(50, CANVAS - patch_size[1] - 50)
+
+    distractors = []
+    for _ in range(7):
+        for _attempt in range(200):
+            radius = rng.randint(4, 7)
+            dx = rng.randint(24, CANVAS - 25)
+            dy = rng.randint(24, CANVAS - 25)
+            outside_patch = not (
+                x - radius - 12 <= dx <= x + patch_size[0] + radius + 12
+                and y - radius - 12 <= dy <= y + patch_size[1] + radius + 12
+            )
+            separate = all(
+                (dx - item["x"]) ** 2 + (dy - item["y"]) ** 2
+                > (radius + item["r"] + 5) ** 2
+                for item in distractors
+            )
+            if outside_patch and separate:
+                distractors.append({"x": dx, "y": dy, "r": radius})
+                break
+        else:
+            raise RuntimeError("could not place neutral distractors")
+
+    return {
+        "cells": cells,
+        "x": x,
+        "y": y,
+        "cell_size": cell_size,
+        "rotation": rotation,
+        "palette": (int(seed) // 9) % len(PALETTES),
+        "distractors": distractors,
+    }
+
+
+def _patch(scene: dict) -> Image.Image:
+    cells = scene["cells"]
+    size = int(scene["cell_size"])
+    palette = PALETTES[int(scene["palette"])]
+    hinge_width = max(3, size // 3)
+    patch = Image.new("RGB", (4 * size + hinge_width, 7 * size), palette[1])
+    draw = ImageDraw.Draw(patch)
+    for row in range(7):
+        for col in range(4):
+            color = palette[0] if int(cells[row][col]) else palette[1]
+            draw.rectangle(
+                (col * size, row * size, (col + 1) * size - 1, (row + 1) * size - 1),
+                fill=color,
+            )
+    for col in range(5):
+        xx = min(col * size, 4 * size - 1)
+        draw.line((xx, 0, xx, 7 * size - 1), fill=GRID, width=1)
+    for row in range(8):
+        yy = min(row * size, 7 * size - 1)
+        draw.line((0, yy, 4 * size - 1, yy), fill=GRID, width=1)
+    draw.rectangle((4 * size, 0, 4 * size + hinge_width - 1, 7 * size - 1), fill=HINGE)
+    return patch
+
+
+def render(scene: dict) -> Image.Image:
+    """Render the latent scene to an RGB PNG-ready image."""
+
+    image = Image.new("RGB", (CANVAS, CANVAS), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for item in scene["distractors"]:
+        x, y, radius = int(item["x"]), int(item["y"]), int(item["r"])
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=DISTRACTOR)
+
+    patch = _patch(scene)
+    rotation = int(scene["rotation"])
+    if rotation == 90:
+        patch = patch.transpose(Image.Transpose.ROTATE_90)
+    elif rotation == 180:
+        patch = patch.transpose(Image.Transpose.ROTATE_180)
+    elif rotation == 270:
+        patch = patch.transpose(Image.Transpose.ROTATE_270)
+    elif rotation != 0:
+        raise ValueError(f"unsupported quarter-turn {rotation}")
+    image.paste(patch, (int(scene["x"]), int(scene["y"])))
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return _classification(scene["cells"])[0]
+
+
+def margin(scene: dict) -> float:
+    return _classification(scene["cells"])[1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 4.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = deepcopy(scene)
+    twin["distractors"] = list(reversed(twin["distractors"]))
+    return [("reverse_disjoint_distractor_order", twin)]
+

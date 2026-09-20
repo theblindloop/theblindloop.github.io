@@ -1,0 +1,479 @@
+"""Renderer, analytic gold and margin for the stile-arc census world.
+
+One dark blue wire wanders inside a single medium-sized box.  Two black-and-white
+square stiles are clamped on it; each stile is wider than the wire, so it covers
+the wire completely and cuts the ink into three arcs: the arc between the two
+stiles and the two outer arcs.  Eight orange beads are printed on the wire; every
+bead is narrower than the wire, so a bead never cuts it.  The decision is how
+many beads sit on the arc *between* the stiles, which can only be answered by
+following the wire's ink.
+
+Everything is drawn with axis-aligned filled rectangles, so the raster is exactly
+deterministic and every ink colour is an exact palette entry.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 760
+HEIGHT = 560
+
+BG = (247, 246, 242)
+WIRE = (40, 70, 110)
+BEAD = (226, 118, 30)
+STILE_EDGE = (0, 0, 0)
+STILE_CORE = (255, 255, 255)
+DECOY = (188, 190, 186)
+
+PITCH = 46
+WIRE_HALF = 7          # stroke width 15
+BEAD_HALF = 4          # bead side 9  (never cuts the wire)
+STILE_HALF = 11        # stile side 23 (always cuts the wire)
+STILE_CORE_HALF = 5
+
+COLS = 6
+ROWS = 5
+PATH_CELLS = 26        # centre line = 25 * PITCH = 1150 px
+
+BEAD_TOTAL = 8
+BEAD_OFF_LO = 16       # corner clearance for beads
+BEAD_OFF_HI = 30
+STILE_OFF_LO = 18      # corner clearance for stiles
+STILE_OFF_HI = 28
+
+MIN_BEAD_STILE = 41    # along-path centre separation -> >= 26 px background
+MIN_BEAD_BEAD = 34     # along-path centre separation -> >= 26 px background
+TIGHT_BEAD_STILE = (26, 33)   # deliberate near-boundary scenes -> 11..18 px
+
+EUCLID_BAND = (110.0, 250.0)  # stile straight-line separation, class independent
+MID_BBOX_MIN = (110, 90)      # the decisive arc must span a real region
+
+QUARANTINE_MARGIN = 22.0
+
+BOX_W = (COLS - 1) * PITCH + 2 * WIRE_HALF + 1
+BOX_H = (ROWS - 1) * PITCH + 2 * WIRE_HALF + 1
+
+
+# --------------------------------------------------------------------------- #
+# geometry helpers
+# --------------------------------------------------------------------------- #
+def _vertices(scene: dict) -> list[tuple[int, int]]:
+    layout = scene["layout"]
+    ox, oy = int(layout["ox"]), int(layout["oy"])
+    return [(ox + int(i) * PITCH, oy + int(j) * PITCH) for i, j in scene["path"]]
+
+
+def total_length(scene: dict) -> int:
+    return (len(scene["path"]) - 1) * PITCH
+
+
+def _point(vertices: list[tuple[int, int]], s: float) -> tuple[float, float]:
+    index = min(int(s // PITCH), len(vertices) - 2)
+    offset = s - index * PITCH
+    (x0, y0), (x1, y1) = vertices[index], vertices[index + 1]
+    step_x = (x1 - x0) // PITCH
+    step_y = (y1 - y0) // PITCH
+    return (x0 + step_x * offset, y0 + step_y * offset)
+
+
+def _arc_rects(vertices: list[tuple[int, int]], a: float, b: float) -> list[tuple[int, int, int, int]]:
+    """Rectangles covering the stroke of the centre line from arc a to arc b."""
+
+    rects = []
+    first = min(int(a // PITCH), len(vertices) - 2)
+    last = min(int(b // PITCH), len(vertices) - 2)
+    for index in range(first, last + 1):
+        lo = max(a, index * PITCH)
+        hi = min(b, (index + 1) * PITCH)
+        if hi < lo:
+            continue
+        px, py = _point(vertices, lo)
+        qx, qy = _point(vertices, hi)
+        rects.append(
+            (
+                int(round(min(px, qx))) - WIRE_HALF,
+                int(round(min(py, qy))) - WIRE_HALF,
+                int(round(max(px, qx))) + WIRE_HALF,
+                int(round(max(py, qy))) + WIRE_HALF,
+            )
+        )
+    return rects
+
+
+def _stiles(scene: dict) -> list[int]:
+    return sorted(int(item["s"]) for item in scene["stiles"])
+
+
+def _beads(scene: dict) -> list[int]:
+    return sorted(int(item["s"]) for item in scene["beads"])
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def _self_avoiding_path(rng: random.Random) -> list[tuple[int, int]] | None:
+    budget = [40_000]
+
+    def extend(path: list[tuple[int, int]], seen: set[tuple[int, int]]) -> bool:
+        if len(path) == PATH_CELLS:
+            spans_i = max(p[0] for p in path) - min(p[0] for p in path)
+            spans_j = max(p[1] for p in path) - min(p[1] for p in path)
+            return spans_i == COLS - 1 and spans_j == ROWS - 1
+        i, j = path[-1]
+        options = [(i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)]
+        options = [
+            cell
+            for cell in options
+            if 0 <= cell[0] < COLS and 0 <= cell[1] < ROWS and cell not in seen
+        ]
+        rng.shuffle(options)
+        for cell in options:
+            if budget[0] <= 0:
+                return False
+            budget[0] -= 1
+            path.append(cell)
+            seen.add(cell)
+            if extend(path, seen):
+                return True
+            path.pop()
+            seen.discard(cell)
+        return False
+
+    start = (rng.randrange(COLS), rng.randrange(ROWS))
+    path = [start]
+    if extend(path, {start}):
+        return path
+    return None
+
+
+def _place_stiles(rng: random.Random, vertices: list[tuple[int, int]]) -> tuple[int, int] | None:
+    last_segment = len(vertices) - 2
+    for _ in range(400):
+        k0 = rng.randint(4, 9)
+        k1 = rng.randint(k0 + 7, min(20, last_segment - 4))
+        if (k0 + 1) + (last_segment - k1) < 8:
+            continue
+        s0 = k0 * PITCH + rng.randint(STILE_OFF_LO, STILE_OFF_HI)
+        s1 = k1 * PITCH + rng.randint(STILE_OFF_LO, STILE_OFF_HI)
+        p0, p1 = _point(vertices, s0), _point(vertices, s1)
+        euclid = ((p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2) ** 0.5
+        if not EUCLID_BAND[0] <= euclid <= EUCLID_BAND[1]:
+            continue
+        mid = _arc_rects(vertices, s0, s1)
+        width = max(r[2] for r in mid) - min(r[0] for r in mid)
+        height = max(r[3] for r in mid) - min(r[1] for r in mid)
+        if width < MID_BBOX_MIN[0] or height < MID_BBOX_MIN[1]:
+            continue
+        return s0, s1
+    return None
+
+
+def _bbox_between_count(vertices, stiles: list[int], beads: list[int]) -> int:
+    """Cheap-cue reading: beads inside the axis-aligned box spanned by the stiles."""
+
+    p0 = _point(vertices, stiles[0])
+    p1 = _point(vertices, stiles[1])
+    lo_x, hi_x = min(p0[0], p1[0]) - 10, max(p0[0], p1[0]) + 10
+    lo_y, hi_y = min(p0[1], p1[1]) - 10, max(p0[1], p1[1]) + 10
+    count = 0
+    for s in beads:
+        x, y = _point(vertices, s)
+        if lo_x <= x <= hi_x and lo_y <= y <= hi_y:
+            count += 1
+    return count
+
+
+def _corridor_between_count(vertices, stiles: list[int], beads: list[int]) -> int:
+    """Cheap-cue reading: beads near the straight chord joining the two stiles."""
+
+    ax, ay = _point(vertices, stiles[0])
+    bx, by = _point(vertices, stiles[1])
+    dx, dy = bx - ax, by - ay
+    span = dx * dx + dy * dy
+    count = 0
+    for s in beads:
+        x, y = _point(vertices, s)
+        if span <= 0:
+            continue
+        t = ((x - ax) * dx + (y - ay) * dy) / span
+        if not 0.0 <= t <= 1.0:
+            continue
+        px, py = ax + t * dx, ay + t * dy
+        if ((x - px) ** 2 + (y - py) ** 2) ** 0.5 <= 30.0:
+            count += 1
+    return count
+
+
+def _place_beads(
+    rng: random.Random,
+    vertices: list[tuple[int, int]],
+    stiles: tuple[int, int],
+    inside_target: int,
+    tight: bool,
+) -> list[int] | None:
+    s0, s1 = stiles
+    last_segment = len(vertices) - 2
+    inside_segments = list(range(s0 // PITCH, s1 // PITCH + 1))
+    outside_segments = [k for k in range(0, last_segment + 1) if k not in inside_segments]
+
+    def try_layout() -> list[int] | None:
+        beads: list[int] = []
+
+        def ok(s: int, want_inside: bool, allow_tight: bool) -> bool:
+            if want_inside != (s0 < s < s1):
+                return False
+            for stile in (s0, s1):
+                gap = abs(s - stile)
+                if allow_tight and TIGHT_BEAD_STILE[0] <= gap <= TIGHT_BEAD_STILE[1]:
+                    continue
+                if gap < MIN_BEAD_STILE:
+                    return False
+            return all(abs(s - other) >= MIN_BEAD_BEAD for other in beads)
+
+        plan = [(True, i) for i in range(inside_target)]
+        plan += [(False, i) for i in range(BEAD_TOTAL - inside_target)]
+        tight_slot = 0 if tight else -1
+        for slot, (want_inside, _) in enumerate(plan):
+            pool = inside_segments if want_inside else outside_segments
+            placed = None
+            allow_tight = slot == tight_slot
+            for _ in range(300):
+                if allow_tight:
+                    distance = rng.randint(*TIGHT_BEAD_STILE)
+                    if rng.random() < 0.5:
+                        s = s0 + distance if want_inside else s0 - distance
+                    else:
+                        s = s1 - distance if want_inside else s1 + distance
+                    if not 0 < s < (len(vertices) - 1) * PITCH:
+                        continue
+                else:
+                    k = rng.choice(pool)
+                    s = k * PITCH + rng.randint(BEAD_OFF_LO, BEAD_OFF_HI)
+                if ok(s, want_inside, allow_tight):
+                    placed = s
+                    break
+            if placed is None:
+                return None
+            beads.append(placed)
+        return sorted(beads)
+
+    for _ in range(60):
+        beads = try_layout()
+        if beads is None:
+            continue
+        if tight and min(abs(b - s) for b in beads for s in (s0, s1)) >= MIN_BEAD_STILE:
+            continue
+        if not tight and min(abs(b - s) for b in beads for s in (s0, s1)) < MIN_BEAD_STILE:
+            continue
+        inside = sum(1 for b in beads if s0 < b < s1)
+        if inside != inside_target:
+            continue
+        stile_list = [s0, s1]
+        if _bbox_between_count(vertices, stile_list, beads) == inside_target:
+            continue
+        if _corridor_between_count(vertices, stile_list, beads) == inside_target:
+            continue
+        return beads
+    return None
+
+
+def _decoys(rng: random.Random, layout: dict) -> list[dict]:
+    ox, oy = int(layout["ox"]), int(layout["oy"])
+    if ox > WIDTH // 2:
+        band = (20, ox - 40)
+    else:
+        band = (ox + BOX_W + 34, WIDTH - 24)
+    items: list[dict] = []
+
+    # one gray squiggle, so "a folded stroke" is not by itself informative
+    step = 38
+    cells = [(0, 0)]
+    for _ in range(7):
+        i, j = cells[-1]
+        options = [(i + 1, j), (i, j + 1), (i - 1, j), (i, j - 1)]
+        options = [c for c in options if 0 <= c[0] < 3 and 0 <= c[1] < 4 and c not in cells]
+        if not options:
+            break
+        cells.append(rng.choice(options))
+    sx = rng.randint(band[0] + 12, max(band[0] + 12, band[1] - 2 * step - 14))
+    sy = rng.randint(40, HEIGHT - 4 * step - 40)
+    points = [(sx + i * step, sy + j * step) for i, j in cells]
+    for a, b in zip(points, points[1:]):
+        items.append(
+            {
+                "kind": "bar",
+                "rect": [
+                    min(a[0], b[0]) - 6,
+                    min(a[1], b[1]) - 6,
+                    max(a[0], b[0]) + 6,
+                    max(a[1], b[1]) + 6,
+                ],
+            }
+        )
+    for _ in range(rng.randint(4, 7)):
+        half = rng.choice([3, 6, 10])
+        cx = rng.randint(band[0] + half + 4, max(band[0] + half + 4, band[1] - half - 4))
+        cy = rng.randint(30 + half, HEIGHT - 30 - half)
+        items.append({"kind": "square", "rect": [cx - half, cy - half, cx + half, cy + half]})
+    return sorted(items, key=lambda item: (item["kind"], item["rect"]))
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random((int(seed) * 6_364_136 + 17) % (2**63))
+    inside_target = 2 + (int(seed) % 4)
+    tight = int(seed) % 11 == 0
+
+    for _ in range(80):
+        path = _self_avoiding_path(rng)
+        if path is None:
+            continue
+        if rng.random() < 0.5:
+            ox = rng.randint(30, 64)
+        else:
+            ox = rng.randint(WIDTH - BOX_W - 40, WIDTH - BOX_W - 12)
+        oy = rng.randint(44, HEIGHT - BOX_H - 44)
+        layout = {"ox": ox, "oy": oy, "cols": COLS, "rows": ROWS}
+        scene = {"layout": layout, "path": [[int(i), int(j)] for i, j in path]}
+        vertices = _vertices(scene)
+        stiles = _place_stiles(rng, vertices)
+        if stiles is None:
+            continue
+        beads = _place_beads(rng, vertices, stiles, inside_target, tight)
+        if beads is None:
+            continue
+        scene["stiles"] = [{"s": int(stiles[0])}, {"s": int(stiles[1])}]
+        scene["beads"] = [{"s": int(s)} for s in beads]
+        scene["decoys"] = _decoys(rng, layout)
+        scene["tight"] = bool(tight)
+        return scene
+    raise RuntimeError(f"sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------- #
+# drawing
+# --------------------------------------------------------------------------- #
+def _elements(scene: dict) -> list[dict]:
+    """Canonically ordered drawable items, each with a role and a rectangle."""
+
+    vertices = _vertices(scene)
+    stiles = _stiles(scene)
+    beads = _beads(scene)
+    total = total_length(scene)
+    items: list[dict] = []
+    for rect in _arc_rects(vertices, 0, total):
+        items.append({"role": "wire", "rect": rect, "fill": WIRE})
+    for rect in scene["decoys"]:
+        items.append({"role": "decoy_" + rect["kind"], "rect": tuple(rect["rect"]), "fill": DECOY})
+    for index, s in enumerate(beads):
+        x, y = _point(vertices, s)
+        x, y = int(round(x)), int(round(y))
+        role = "bead_in" if stiles[0] < s < stiles[1] else "bead_out"
+        items.append(
+            {
+                "role": f"{role}_{index}",
+                "rect": (x - BEAD_HALF, y - BEAD_HALF, x + BEAD_HALF, y + BEAD_HALF),
+                "fill": BEAD,
+            }
+        )
+    for index, s in enumerate(stiles):
+        x, y = _point(vertices, s)
+        x, y = int(round(x)), int(round(y))
+        items.append(
+            {
+                "role": f"stile_{index}",
+                "rect": (x - STILE_HALF, y - STILE_HALF, x + STILE_HALF, y + STILE_HALF),
+                "fill": STILE_EDGE,
+            }
+        )
+        items.append(
+            {
+                "role": f"stile_core_{index}",
+                "rect": (
+                    x - STILE_CORE_HALF,
+                    y - STILE_CORE_HALF,
+                    x + STILE_CORE_HALF,
+                    y + STILE_CORE_HALF,
+                ),
+                "fill": STILE_CORE,
+            }
+        )
+    return items
+
+
+def arc_rects_between(scene: dict) -> list[tuple[int, int, int, int]]:
+    """Stroke rectangles of the decisive arc (used by erasure tests only)."""
+
+    vertices = _vertices(scene)
+    stiles = _stiles(scene)
+    return _arc_rects(vertices, stiles[0] + STILE_HALF, stiles[1] - STILE_HALF)
+
+
+def arc_rects_outer(scene: dict) -> list[tuple[int, int, int, int]]:
+    vertices = _vertices(scene)
+    stiles = _stiles(scene)
+    total = total_length(scene)
+    return _arc_rects(vertices, 0, stiles[0] - STILE_HALF) + _arc_rects(
+        vertices, stiles[1] + STILE_HALF, total
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(image)
+    for item in _elements(scene):
+        draw.rectangle(list(item["rect"]), fill=item["fill"])
+    return image
+
+
+# --------------------------------------------------------------------------- #
+# gold, margin, quarantine, symmetries
+# --------------------------------------------------------------------------- #
+def analytic_gold(scene: dict) -> str:
+    stiles = _stiles(scene)
+    beads = _beads(scene)
+    return str(sum(1 for s in beads if stiles[0] < s < stiles[1]))
+
+
+def margin_terms(scene: dict) -> dict[str, float]:
+    stiles = _stiles(scene)
+    beads = _beads(scene)
+    bead_stile = min(abs(b - s) - BEAD_HALF - STILE_HALF for b in beads for s in stiles)
+    bead_bead = min(
+        (abs(a - b) - 2 * BEAD_HALF for i, a in enumerate(beads) for b in beads[i + 1 :]),
+        default=999.0,
+    )
+    return {
+        "bead_stile_gap": float(bead_stile),
+        "bead_bead_gap": float(bead_bead),
+        "fold_clearance": float(PITCH - (2 * WIRE_HALF + 1)),
+        "stile_overhang": float(2 * STILE_HALF - 2 * WIRE_HALF),
+    }
+
+
+def margin(scene: dict) -> float:
+    terms = margin_terms(scene)
+    return float(min(terms["bead_stile_gap"], terms["bead_bead_gap"]))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical latent rewrites: every drawn item is canonically ordered."""
+
+    out: list[tuple[str, dict]] = []
+    swapped = dict(scene)
+    swapped["stiles"] = list(reversed(scene["stiles"]))
+    out.append(("stile_records_swapped", swapped))
+    reversed_beads = dict(scene)
+    reversed_beads["beads"] = list(reversed(scene["beads"]))
+    out.append(("bead_records_reversed", reversed_beads))
+    if len(scene["decoys"]) > 1:
+        rotated = dict(scene)
+        rotated["decoys"] = scene["decoys"][1:] + scene["decoys"][:1]
+        out.append(("decoy_records_rotated", rotated))
+    return out

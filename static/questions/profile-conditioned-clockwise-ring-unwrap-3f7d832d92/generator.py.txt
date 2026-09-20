@@ -1,0 +1,162 @@
+"""Deterministic annular raster renderer and analytic arm."""
+
+from __future__ import annotations
+
+import math
+import random
+from copy import deepcopy
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+SYMBOLS = ("circle", "triangle", "plus", "x")
+SIZE = 9
+
+
+def _templates() -> dict[str, np.ndarray]:
+    out = {name: np.zeros((SIZE, SIZE), dtype=np.uint8) for name in SYMBOLS}
+    # Circle and diamond outlines carry a common center registration pixel; all
+    # four glyphs contain exactly 17 dark cells, blocking total-ink shortcuts.
+    circle = [(1, 3), (1, 4), (1, 5), (2, 2), (2, 6), (3, 1), (3, 7),
+              (4, 1), (4, 7), (5, 1), (5, 7), (6, 2), (6, 6),
+              (7, 3), (7, 4), (7, 5), (4, 4)]
+    triangle = [(0, 4), (1, 3), (1, 5), (2, 2), (2, 6), (3, 2), (3, 6),
+                (4, 1), (4, 7), (5, 1), (5, 7), (6, 1), (6, 7),
+                (7, 2), (7, 4), (7, 6), (4, 4)]
+    plus = [(4, c) for c in range(9)] + [(r, 4) for r in range(9) if r != 4]
+    cross = [(r, r) for r in range(9)] + [(r, 8 - r) for r in range(9) if r != 4]
+    for name, cells in (("circle", circle), ("triangle", triangle),
+                        ("plus", plus), ("x", cross)):
+        for r, c in cells:
+            out[name][r, c] = 1
+    return out
+
+
+TEMPLATES = _templates()
+
+
+def _grid_for_scene(scene: dict) -> np.ndarray:
+    base = TEMPLATES[scene["symbol"]].copy()
+    rival = TEMPLATES[scene["rival"]]
+    remove = sorted(map(tuple, np.argwhere((base == 1) & (rival == 0))))
+    add = sorted(map(tuple, np.argwhere((base == 0) & (rival == 1))))
+    for index in range(min(int(scene["noise_pairs"]), len(remove), len(add))):
+        base[remove[index]] = 0
+        base[add[index]] = 1
+    return base
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed) ^ 0xC10C5E)
+    symbol_index = int(seed) % len(SYMBOLS)
+    symbol = SYMBOLS[symbol_index]
+    rival = SYMBOLS[(symbol_index + 1 + (int(seed) // 4) % 3) % len(SYMBOLS)]
+    different_pairs = int(np.sum((TEMPLATES[symbol] == 1) & (TEMPLATES[rival] == 0)))
+    severity = (int(seed) // 16) % 4
+    # Retain at least a three-pair analytic lead so raster sampling errors do not
+    # cross the class boundary; the smallest remaining gap is still quarantined.
+    maximum = max(0, (different_pairs - 7) // 2)
+    noise_pairs = [0, max(1, maximum // 3), max(1, (2 * maximum) // 3), maximum][severity]
+    return {
+        "symbol": symbol,
+        "rival": rival,
+        "noise_pairs": min(noise_pairs, maximum),
+        "cx": rng.randint(198, 222),
+        "cy": rng.randint(198, 222),
+        "inner_radius": rng.choice([56, 60, 64]),
+        "cell_size": rng.choice([9, 10]),
+        "palette": rng.randrange(2),
+        "phase_alias": "zero" if rng.randrange(2) == 0 else "full_turn",
+        "seam_angle": rng.randrange(0, 36) * 10,
+        "distractor_phase": rng.randrange(8),
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["symbol"])
+
+
+def _scores(scene: dict) -> list[float]:
+    grid = _grid_for_scene(scene)
+    return sorted((1.0 - float(np.mean(grid != template)) for template in TEMPLATES.values()), reverse=True)
+
+
+def margin(scene: dict) -> float:
+    scores = _scores(scene)
+    return float(scores[0] - scores[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 0.20
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = deepcopy(scene)
+    twin["phase_alias"] = "full_turn" if scene["phase_alias"] == "zero" else "zero"
+    return [("equivalent_full_turn_phase", twin)]
+
+
+def _polar(cx: float, cy: float, radius: float, angle_deg: float, scale: int) -> tuple[float, float]:
+    a = math.radians(angle_deg)
+    return ((cx + radius * math.cos(a)) * scale, (cy + radius * math.sin(a)) * scale)
+
+
+def render(scene: dict) -> Image.Image:
+    scale = 3
+    width = height = 420
+    image = Image.new("RGB", (width * scale, height * scale), (250, 250, 247))
+    draw = ImageDraw.Draw(image)
+    cx, cy = float(scene["cx"]), float(scene["cy"])
+    inner = float(scene["inner_radius"])
+    cell = float(scene["cell_size"])
+    outer = inner + SIZE * cell
+    # Read the representational alias while deliberately mapping both names to
+    # the same canonical phase.
+    phase_alias = scene["phase_alias"]
+    seam = float(scene["seam_angle"]) + (0.0 if phase_alias in ("zero", "full_turn") else 0.0)
+    palette = int(scene["palette"])
+    dark, pale = (((28, 45, 74), (226, 218, 191)),
+                  ((65, 35, 78), (220, 232, 211)))[palette]
+    grid = _grid_for_scene(scene)
+    step = 360.0 / SIZE
+    for row in range(SIZE):
+        r_outer = outer - row * cell
+        r_inner = r_outer - cell
+        for col in range(SIZE):
+            a0, a1 = seam + col * step, seam + (col + 1) * step
+            points = []
+            for a in np.linspace(a0, a1, 10):
+                points.append(_polar(cx, cy, r_outer, float(a), scale))
+            for a in np.linspace(a1, a0, 10):
+                points.append(_polar(cx, cy, r_inner, float(a), scale))
+            draw.polygon(points, fill=dark if grid[row, col] else pale,
+                         outline=(247, 247, 244), width=2 * scale)
+    # Neutral inner/outer boundaries.
+    for radius in (inner, outer):
+        box = tuple(int((v) * scale) for v in (cx - radius, cy - radius, cx + radius, cy + radius))
+        draw.ellipse(box, outline=(95, 95, 92), width=2 * scale)
+    # Magenta cut seam, extending visibly on both sides of the annulus.
+    draw.line([_polar(cx, cy, inner - 5, seam, scale), _polar(cx, cy, outer + 8, seam, scale)],
+              fill=(220, 30, 150), width=4 * scale)
+    tip = _polar(cx, cy, outer + 8, seam, scale)
+    for delta in (-4.0, 4.0):
+        draw.line([tip, _polar(cx, cy, outer + 18, seam + delta, scale)],
+                  fill=(220, 30, 150), width=3 * scale)
+    # Cyan center fiducial and a separate clockwise curved arrow.
+    center_box = tuple(int(v * scale) for v in (cx - 4, cy - 4, cx + 4, cy + 4))
+    draw.ellipse(center_box, fill=(0, 175, 215))
+    arrow_r = outer + 24
+    arrow_points = [_polar(cx, cy, arrow_r, seam + a, scale) for a in np.linspace(9, 31, 24)]
+    draw.line(arrow_points, fill=(0, 120, 150), width=3 * scale)
+    arrow_tip = arrow_points[-1]
+    for da in (-7, 7):
+        draw.line([arrow_tip, _polar(cx, cy, arrow_r - 9, seam + 31 + da, scale)],
+                  fill=(0, 120, 150), width=3 * scale)
+    # Four equal neutral distractor dots rotate independently of the answer.
+    dp = int(scene["distractor_phase"])
+    for k in range(4):
+        a = 45 * dp + 90 * k
+        x, y = _polar(cx, cy, outer + 43, a, scale)
+        rr = 2 * scale
+        draw.ellipse((x - rr, y - rr, x + rr, y + rr), fill=(165, 165, 160))
+    return image.resize((width, height), Image.Resampling.LANCZOS)

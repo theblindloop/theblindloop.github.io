@@ -1,0 +1,211 @@
+"""Pixel-only oracle for pipe_sharpest_bend.
+
+Receives one rendered PNG and nothing else. It segments the grey strokes,
+groups them into pipes by connectivity, finds which pipe carries the green
+disc, assigns each coloured square to the pipe it lies beside, measures the
+turn angle of the two bends of the green-ended pipe directly from the stroke
+pixels, and names the colour of the square at the sharper one. It abstains with
+"ambiguous" whenever the picture does not present the structure the question
+declares, or when the two measured bends are too close to separate.
+
+It imports no renderer, prompt, generator, verifier or gold code and never sees
+scene data.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "pipe_sharpest_bend-oracle-0.1.0"
+ABSTAIN = "ambiguous"
+
+# anchors for the four colour words in the public answer set
+_COLOUR_ANCHORS = {
+    "red": (220, 30, 40),
+    "blue": (30, 70, 210),
+    "orange": (245, 150, 10),
+    "purple": (140, 40, 180),
+}
+
+_RADII = (24.0, 34.0)
+_ANNULUS = 3.0
+_CLUSTER_GAP = 0.55
+_MIN_OWNER_CONTRAST = 20.0
+_MIN_ANGLE_SEPARATION = 8.0
+
+
+def _components(mask: np.ndarray, min_size: int):
+    """4-connected components of a boolean mask, largest first."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys, xs):
+        if seen[sy, sx]:
+            continue
+        stack = deque([(sy, sx)])
+        seen[sy, sx] = True
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pix) >= min_size:
+            arr = np.asarray(pix, dtype=np.float64)
+            out.append(arr)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _angular_clusters(angles: np.ndarray):
+    order = np.argsort(angles)
+    a = angles[order]
+    groups = []
+    start = 0
+    for i in range(1, len(a)):
+        if a[i] - a[i - 1] > _CLUSTER_GAP:
+            groups.append(order[start:i])
+            start = i
+    groups.append(order[start:])
+    if len(groups) > 1:
+        wrap = (a[0] + 2.0 * math.pi) - a[-1]
+        if wrap <= _CLUSTER_GAP:
+            groups[0] = np.concatenate([groups[0], groups[-1]])
+            groups = groups[:-1]
+    return [g for g in groups if len(g) >= 8]
+
+
+def _arm_directions(pix: np.ndarray, cy: float, cx: float):
+    """Two outward direction vectors of the stroke arms meeting near (cy, cx)."""
+    dy = pix[:, 0] - cy
+    dx = pix[:, 1] - cx
+    dist = np.hypot(dx, dy)
+    per_radius = []
+    for r in _RADII:
+        sel = np.nonzero((dist > r - _ANNULUS) & (dist < r + _ANNULUS))[0]
+        if len(sel) < 16:
+            return None
+        ang = np.arctan2(dy[sel], dx[sel])
+        groups = _angular_clusters(ang)
+        if len(groups) != 2:
+            return None
+        info = []
+        for g in groups:
+            idx = sel[g]
+            mean_ang = math.atan2(
+                float(np.mean(np.sin(ang[g]))), float(np.mean(np.cos(ang[g])))
+            )
+            info.append((mean_ang, float(np.mean(dx[idx])), float(np.mean(dy[idx]))))
+        per_radius.append(info)
+
+    inner, outer = per_radius
+    dirs = []
+    used = set()
+    for mean_ang, ix, iy in inner:
+        best, best_d = None, None
+        for j, (oang, ox, oy) in enumerate(outer):
+            if j in used:
+                continue
+            d = abs(math.atan2(math.sin(oang - mean_ang), math.cos(oang - mean_ang)))
+            if best_d is None or d < best_d:
+                best, best_d = j, d
+        if best is None or best_d > 0.6:
+            return None
+        used.add(best)
+        _oa, ox, oy = outer[best]
+        vx, vy = ox - ix, oy - iy
+        n = math.hypot(vx, vy)
+        if n < 1e-6:
+            return None
+        dirs.append((vx / n, vy / n))
+    if len(dirs) != 2:
+        return None
+    return dirs
+
+
+def _deviation_deg(pix: np.ndarray, cy: float, cx: float):
+    dirs = _arm_directions(pix, cy, cx)
+    if dirs is None:
+        return None
+    (ax, ay), (bx, by) = dirs
+    dot = max(-1.0, min(1.0, ax * bx + ay * by))
+    return 180.0 - math.degrees(math.acos(dot))
+
+
+def _nearest(pix: np.ndarray, y: float, x: float):
+    d = np.hypot(pix[:, 0] - y, pix[:, 1] - x)
+    i = int(np.argmin(d))
+    return float(d[i]), float(pix[i, 0]), float(pix[i, 1])
+
+
+def decision_from_image(image: "Image.Image") -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    mx = arr.max(axis=2)
+    mn = arr.min(axis=2)
+    chroma = mx - mn
+    white = (mn > 200) & (chroma < 25)
+    grey = (~white) & (chroma < 40) & (mx < 220)
+    green = (g > r + 45) & (g > b + 45)
+    coloured = (~white) & (~grey) & (~green)
+
+    pipes = _components(grey, 400)
+    if len(pipes) != 2:
+        return ABSTAIN
+    squares = _components(coloured, 200)
+    if len(squares) != 4:
+        return ABSTAIN
+    gys, gxs = np.nonzero(green)
+    if len(gys) < 100:
+        return ABSTAIN
+    gy, gx = float(np.mean(gys)), float(np.mean(gxs))
+
+    d0 = _nearest(pipes[0], gy, gx)[0]
+    d1 = _nearest(pipes[1], gy, gx)[0]
+    if abs(d0 - d1) < 30.0:
+        return ABSTAIN
+    ring = 0 if d0 < d1 else 1
+    other = 1 - ring
+
+    ring_marks = []
+    names = []
+    for pix in squares:
+        cy, cx = float(np.mean(pix[:, 0])), float(np.mean(pix[:, 1]))
+        yy = pix[:, 0].astype(int)
+        xx = pix[:, 1].astype(int)
+        mean_rgb = (
+            float(np.mean(arr[yy, xx, 0])),
+            float(np.mean(arr[yy, xx, 1])),
+            float(np.mean(arr[yy, xx, 2])),
+        )
+        name = min(
+            _COLOUR_ANCHORS,
+            key=lambda k: sum((mean_rgb[i] - _COLOUR_ANCHORS[k][i]) ** 2 for i in range(3)),
+        )
+        names.append(name)
+        dr, ry, rx = _nearest(pipes[ring], cy, cx)
+        do, _oy, _ox = _nearest(pipes[other], cy, cx)
+        if abs(do - dr) < _MIN_OWNER_CONTRAST:
+            return ABSTAIN
+        if dr < do:
+            ring_marks.append((name, ry, rx))
+    if len(set(names)) != 4 or len(ring_marks) != 2:
+        return ABSTAIN
+
+    measured = []
+    for name, ry, rx in ring_marks:
+        dev = _deviation_deg(pipes[ring], ry, rx)
+        if dev is None:
+            return ABSTAIN
+        measured.append((dev, name))
+    measured.sort(reverse=True)
+    if measured[0][0] - measured[1][0] < _MIN_ANGLE_SEPARATION:
+        return ABSTAIN
+    return measured[0][1]

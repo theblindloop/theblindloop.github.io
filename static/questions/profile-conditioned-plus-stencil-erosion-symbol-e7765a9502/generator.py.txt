@@ -1,0 +1,198 @@
+"""Deterministic latent sampler and raster renderer for plus-stencil erosion."""
+
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+CANVAS = (760, 650)
+GRID_N = 13
+RESULT_N = 11
+SOURCE_INK = 120
+ORIENTATIONS = ("up", "right", "down", "left")
+KERNEL = ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))
+
+BACKGROUND = (250, 248, 241)
+LIGHT = (235, 232, 221)
+GRID_LINE = (183, 187, 181)
+FRAME = (25, 157, 179)
+GOLD = (236, 174, 45)
+KEY_LINE = (54, 61, 67)
+DARK_PALETTES = ((29, 47, 68), (48, 43, 68), (43, 55, 50), (57, 42, 49))
+
+# A thin U-like scaffold. Dilating it by the pictured plus and eroding once
+# yields the public 11x11 "open frame" template used for classification.
+_BASE_SCAFFOLD = (
+    "...........",
+    "...........",
+    "...........",
+    "..#.....#..",
+    "..#.....#..",
+    "..#.....#..",
+    "..#.....#..",
+    "..#.....#..",
+    "..#######..",
+    "...........",
+    "...........",
+)
+
+
+def _bits(rows: Iterable[str]) -> np.ndarray:
+    return np.array([[ch == "#" for ch in row] for row in rows], dtype=bool)
+
+
+def _rotated_scaffold(direction: str) -> np.ndarray:
+    base = _bits(_BASE_SCAFFOLD)
+    # np.rot90 is counterclockwise: an upward opening becomes a left opening.
+    turns = {"up": 0, "left": 1, "down": 2, "right": 3}[direction]
+    return np.rot90(base, turns).copy()
+
+
+def _dilate_to_source(mask: np.ndarray) -> np.ndarray:
+    source = np.zeros((GRID_N, GRID_N), dtype=bool)
+    for row, col in np.argwhere(mask):
+        for dr, dc in KERNEL:
+            source[row + 1 + dr, col + 1 + dc] = True
+    return source
+
+
+def _erode(source: np.ndarray) -> np.ndarray:
+    result = np.zeros((RESULT_N, RESULT_N), dtype=bool)
+    for row in range(RESULT_N):
+        for col in range(RESULT_N):
+            result[row, col] = all(
+                source[row + 1 + dr, col + 1 + dc] for dr, dc in KERNEL
+            )
+    return result
+
+
+def _templates() -> dict[str, np.ndarray]:
+    result: dict[str, np.ndarray] = {}
+    for direction in ORIENTATIONS:
+        result[direction] = _erode(_dilate_to_source(_rotated_scaffold(direction)))
+    return result
+
+
+def _classify(result: np.ndarray) -> tuple[str, float]:
+    scores = {
+        direction: int((result == template).sum())
+        for direction, template in _templates().items()
+    }
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    return ranked[0][0], float(ranked[0][1] - ranked[1][1])
+
+
+def _source(scene: dict) -> np.ndarray:
+    rows = scene["source_rows"]
+    if len(rows) != GRID_N or any(len(row) != GRID_N for row in rows):
+        raise ValueError("source_rows must be a 13-by-13 binary raster")
+    if any(ch not in "01" for row in rows for ch in row):
+        raise ValueError("source_rows contains a non-binary cell")
+    return np.array([[ch == "1" for ch in row] for row in rows], dtype=bool)
+
+
+def sample_scene(seed: int) -> dict:
+    """Construct a dense fixed-ink mosaic whose exact erosion is one orientation."""
+    direction = ORIENTATIONS[int(seed) % len(ORIENTATIONS)]
+    rng = random.Random((int(seed) + 0x5EED) * 1_000_003)
+    source = _dilate_to_source(_rotated_scaffold(direction))
+    target = _erode(source)
+
+    # Fill in random admissible distractors. A proposed tile is retained only if
+    # it cannot create any new eroded cell, so the declared transform stays exact.
+    cells = [(row, col) for row in range(GRID_N) for col in range(GRID_N)]
+    rng.shuffle(cells)
+    for row, col in cells:
+        if source[row, col]:
+            continue
+        source[row, col] = True
+        if np.any(_erode(source) & ~target):
+            source[row, col] = False
+        if int(source.sum()) == SOURCE_INK:
+            break
+    if int(source.sum()) != SOURCE_INK or not np.array_equal(_erode(source), target):
+        raise RuntimeError("failed to construct a balanced exact-erosion scene")
+
+    cell_size = rng.choice((27, 28, 29, 30))
+    origin_x = rng.randint(86, 104)
+    origin_y = rng.randint(144, 164)
+    dark_rgb = list(rng.choice(DARK_PALETTES))
+    return {
+        "source_rows": ["".join("1" if value else "0" for value in row) for row in source],
+        "cell_size": cell_size,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "dark_rgb": dark_rgb,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    source = _source(scene)
+    cell = int(scene["cell_size"])
+    x0 = int(scene["origin_x"])
+    y0 = int(scene["origin_y"])
+    dark = tuple(int(value) for value in scene["dark_rgb"])
+    if not 24 <= cell <= 34 or len(dark) != 3:
+        raise ValueError("unsupported render style")
+
+    image = Image.new("RGB", CANVAS, BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    width = GRID_N * cell
+    border = 7
+    draw.rectangle(
+        (x0 - border, y0 - border, x0 + width + border - 1, y0 + width + border - 1),
+        fill=FRAME,
+    )
+    for row in range(GRID_N):
+        for col in range(GRID_N):
+            left = x0 + col * cell
+            top = y0 + row * cell
+            fill = dark if source[row, col] else LIGHT
+            draw.rectangle((left, top, left + cell - 1, top + cell - 1), fill=fill)
+    for index in range(GRID_N + 1):
+        pos = index * cell
+        draw.line((x0 + pos, y0, x0 + pos, y0 + width), fill=GRID_LINE, width=1)
+        draw.line((x0, y0 + pos, x0 + width, y0 + pos), fill=GRID_LINE, width=1)
+
+    # The independent inverse arm finds and validates this visible structuring key.
+    key_cell = 22
+    key_x = x0 + width + 56
+    key_y = y0 + 74
+    draw.rectangle(
+        (key_x - 6, key_y - 6, key_x + 3 * key_cell + 5, key_y + 3 * key_cell + 5),
+        fill=KEY_LINE,
+    )
+    plus = {(0, 1), (1, 0), (1, 1), (1, 2), (2, 1)}
+    for row in range(3):
+        for col in range(3):
+            left = key_x + col * key_cell
+            top = key_y + row * key_cell
+            fill = GOLD if (row, col) in plus else BACKGROUND
+            draw.rectangle((left, top, left + key_cell - 1, top + key_cell - 1), fill=fill)
+            draw.rectangle(
+                (left, top, left + key_cell - 1, top + key_cell - 1),
+                outline=KEY_LINE,
+                width=2,
+            )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    decision, _ = _classify(_erode(_source(scene)))
+    return decision
+
+
+def margin(scene: dict) -> float:
+    _, value = _classify(_erode(_source(scene)))
+    return value
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 4.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

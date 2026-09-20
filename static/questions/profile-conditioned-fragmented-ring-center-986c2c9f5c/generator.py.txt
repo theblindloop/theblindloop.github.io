@@ -1,0 +1,163 @@
+"""Deterministic latent sampler and raster renderer for fragmented rings."""
+
+from __future__ import annotations
+
+import math
+import random
+from copy import deepcopy
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+BACKGROUND = [248, 247, 243]
+INK = (27, 31, 38)
+CYAN = (0, 169, 207)
+MAGENTA = (218, 52, 148)
+QUARANTINE_MARGIN = 12.0
+
+
+def _kmeans3(values: list[float]) -> tuple[list[float], float]:
+    """Deterministic one-dimensional three-cluster fit for ideal arc samples."""
+    data = np.asarray(values, dtype=np.float64)
+    centers = np.quantile(data, [0.18, 0.50, 0.82])
+    for _ in range(30):
+        labels = np.abs(data[:, None] - centers[None, :]).argmin(axis=1)
+        updated = np.array(
+            [data[labels == k].mean() if np.any(labels == k) else centers[k] for k in range(3)]
+        )
+        if np.max(np.abs(updated - centers)) < 1e-10:
+            centers = updated
+            break
+        centers = updated
+    residual = data - centers[labels]
+    return sorted(float(x) for x in centers), float(np.sqrt(np.mean(residual * residual)))
+
+
+def _ideal_radial_score(scene: dict, center: list[float]) -> float:
+    distances: list[float] = []
+    cx, cy = center
+    for arc in scene["arcs"]:
+        ring_center = arc["center"]
+        radius = float(arc["radius"])
+        start = float(arc["start_deg"])
+        end = float(arc["end_deg"])
+        for angle in np.linspace(start, end, 9):
+            theta = math.radians(float(angle))
+            x = ring_center[0] + radius * math.cos(theta)
+            y = ring_center[1] + radius * math.sin(theta)
+            distances.append(math.hypot(x - cx, y - cy))
+    return _kmeans3(distances)[1]
+
+
+def _build_scene(seed: int, attempt: int) -> dict:
+    rng = random.Random((seed + 1) * 1_000_003 + attempt * 97_409)
+    target_color = "cyan" if seed % 2 == 0 else "magenta"
+    cyan_on_left = ((seed // 2) % 2 == 0)
+
+    left = [171.0 + rng.uniform(-12, 12), 256.0 + rng.uniform(-28, 28)]
+    right = [341.0 + rng.uniform(-12, 12), 256.0 + rng.uniform(-28, 28)]
+    cyan_center, magenta_center = (left, right) if cyan_on_left else (right, left)
+    target_center = cyan_center if target_color == "cyan" else magenta_center
+
+    radii = [55.0 + rng.uniform(-3, 3), 91.0 + rng.uniform(-3, 3), 128.0 + rng.uniform(-3, 3)]
+    arcs = []
+    for ring_index, radius in enumerate(radii):
+        phase = rng.uniform(0, 72)
+        for fragment_index in range(5):
+            midpoint = phase + fragment_index * 72 + rng.uniform(-7, 7)
+            span = rng.uniform(13.0, 20.0)
+            arcs.append(
+                {
+                    "center": list(target_center),
+                    "radius": float(radius),
+                    "start_deg": float(midpoint - span / 2),
+                    "end_deg": float(midpoint + span / 2),
+                    "width": int(rng.choice([5, 6])),
+                }
+            )
+    rng.shuffle(arcs)
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "background": list(BACKGROUND),
+        "cyan_center": cyan_center,
+        "magenta_center": magenta_center,
+        "target_color": target_color,
+        "radii": radii,
+        "arcs": arcs,
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a balanced scene, rejecting weak analytic runner-up gaps."""
+    for attempt in range(100):
+        scene = _build_scene(int(seed), attempt)
+        if margin(scene) >= 18.0:
+            return scene
+    raise RuntimeError(f"could not sample a clear scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only declared scene fields, with supersampled antialiasing."""
+    scale = 3
+    width = int(scene["width"])
+    height = int(scene["height"])
+    target_center = (
+        scene["cyan_center"] if scene["target_color"] == "cyan" else scene["magenta_center"]
+    )
+    if any(arc["center"] != target_center for arc in scene["arcs"]):
+        raise ValueError("arc centers are inconsistent with the declared target color")
+    image = Image.new("RGB", (width * scale, height * scale), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    for arc in scene["arcs"]:
+        cx, cy = arc["center"]
+        radius = float(arc["radius"])
+        box = [
+            (cx - radius) * scale,
+            (cy - radius) * scale,
+            (cx + radius) * scale,
+            (cy + radius) * scale,
+        ]
+        draw.arc(
+            box,
+            start=float(arc["start_deg"]),
+            end=float(arc["end_deg"]),
+            fill=INK,
+            width=int(arc["width"]) * scale,
+        )
+
+    # Equal-size candidate dots are painted after the fragments so both remain legible.
+    for center, color in ((scene["cyan_center"], CYAN), (scene["magenta_center"], MAGENTA)):
+        cx, cy = center
+        radius = 9 * scale
+        draw.ellipse(
+            [cx * scale - radius, cy * scale - radius, cx * scale + radius, cy * scale + radius],
+            fill=color,
+        )
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["target_color"])
+
+
+def margin(scene: dict) -> float:
+    target = str(scene["target_color"])
+    cyan_score = _ideal_radial_score(scene, scene["cyan_center"])
+    magenta_score = _ideal_radial_score(scene, scene["magenta_center"])
+    true_score, false_score = (
+        (cyan_score, magenta_score) if target == "cyan" else (magenta_score, cyan_score)
+    )
+    return float(false_score - true_score)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = deepcopy(scene)
+    twin["arcs"] = list(reversed(twin["arcs"]))
+    return [("reverse_unordered_arc_records", twin)]

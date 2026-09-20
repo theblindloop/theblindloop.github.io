@@ -1,0 +1,126 @@
+"""Pixel-only inverse arm for the mirror-defect crossbar world.
+
+Receives one rasterized PNG and nothing else: no latent scene, no renderer, no
+prompt or gold code. It re-derives the mirror axis, the four crossbar bands and
+each band's left/right mirror mismatch directly from pixels, then requires a
+unique winner with a strictly positive runner-up margin.
+
+Route (deliberately different from the renderer's construction):
+  1. colour histogram -> background = modal colour;
+  2. among the remaining colours, the mirror marker is the one whose bounding box
+     is a few pixels wide and nearly image-tall; the structure ink is the other;
+  3. axis column c = centre of the marker's column extent;
+  4. crossbar rows = contiguous runs of rows whose ink count exceeds half the
+     maximum row ink count; band i = rows nearer crossbar i than any other;
+  5. mismatch_i = number of pixels in band i where ink at column c-k differs
+     from ink at column c+k, over all k;
+  6. decision = band with the largest mismatch, abstaining on a tie.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "mirror_defect_rung-oracle-0.1.0"
+
+LABELS = ("first", "second", "third", "fourth")
+ABSTAIN = "ambiguous"
+
+_MARKER_MAX_WIDTH = 9
+_MARKER_MIN_HEIGHT_FRAC = 0.5
+_MIN_COLOUR_PIXELS = 64
+_ROW_FRACTION = 0.5
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            out.append((start, index - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Everything the inverse arm can say about the raster, or None."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.int64)
+    if arr.ndim != 3 or arr.shape[0] < 32 or arr.shape[1] < 32:
+        return None
+    height, width = arr.shape[0], arr.shape[1]
+    keys = arr[:, :, 0] * 65536 + arr[:, :, 1] * 256 + arr[:, :, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    order = np.argsort(-counts)
+    values, counts = values[order], counts[order]
+    if len(values) < 3:
+        return None
+
+    marker_cols = None
+    ink_key = None
+    for value, count in zip(values[1:], counts[1:]):
+        if count < _MIN_COLOUR_PIXELS:
+            continue
+        mask = keys == int(value)
+        cols = np.flatnonzero(mask.any(axis=0))
+        rows = np.flatnonzero(mask.any(axis=1))
+        span_w = int(cols[-1] - cols[0] + 1)
+        span_h = int(rows[-1] - rows[0] + 1)
+        if span_w <= _MARKER_MAX_WIDTH and span_h >= _MARKER_MIN_HEIGHT_FRAC * height:
+            if marker_cols is None:
+                marker_cols = cols
+        elif ink_key is None:
+            ink_key = int(value)
+    if marker_cols is None or ink_key is None:
+        return None
+
+    axis = int(round((int(marker_cols[0]) + int(marker_cols[-1])) / 2.0))
+    ink = keys == ink_key
+    per_row = ink.sum(axis=1)
+    peak = int(per_row.max())
+    if peak <= 0:
+        return None
+    bars = _runs(per_row > _ROW_FRACTION * peak)
+    if len(bars) != len(LABELS):
+        return None
+    centres = sorted((lo + hi) // 2 for lo, hi in bars)
+
+    reach = min(axis, width - 1 - axis)
+    if reach < 4:
+        return None
+    left = ink[:, axis - reach:axis + 1][:, ::-1]
+    right = ink[:, axis:axis + reach + 1]
+    row_mismatch = np.logical_xor(left, right).sum(axis=1)
+
+    edges = [0]
+    for index in range(len(centres) - 1):
+        edges.append((centres[index] + centres[index + 1]) // 2)
+    edges.append(height)
+    scores = [int(row_mismatch[edges[i]:edges[i + 1]].sum()) for i in range(len(centres))]
+    ranked = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+    return {
+        "axis_x": axis,
+        "band_centres": centres,
+        "scores": scores,
+        "winner": ranked[0],
+        "pixel_margin": scores[ranked[0]] - scores[ranked[1]],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Image-only decision: which crossbar breaks mirror symmetry most."""
+
+    try:
+        report = measure_from_image(image)
+    except Exception:
+        return ABSTAIN
+    if report is None or len(report["scores"]) != len(LABELS):
+        return ABSTAIN
+    if report["pixel_margin"] <= 0:
+        return ABSTAIN
+    return LABELS[report["winner"]]

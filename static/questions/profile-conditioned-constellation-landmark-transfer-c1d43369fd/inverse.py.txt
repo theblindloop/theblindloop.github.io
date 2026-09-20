@@ -1,0 +1,163 @@
+"""Pixel-only decision arm.
+
+Receives a rendered PNG and nothing else. It segments the two panels, recovers
+the colored reference landmarks and the gray transformed landmarks, finds the
+circled gray landmark, solves the orientation-preserving similarity assignment
+between the two point sets, and reports the color bound to the matched
+reference landmark. Returns "abstain" when the image does not expose the
+structure the question declares.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+
+import numpy as np
+from PIL import Image
+
+_PROTOTYPES = {
+    "red": (214, 40, 40),
+    "blue": (40, 80, 200),
+    "green": (34, 139, 64),
+    "orange": (240, 150, 20),
+}
+_GRAY = (150, 150, 150)
+_TOLERANCE = 30
+_MIN_BLOB = 60
+_ABSTAIN = "abstain"
+
+
+def _mask_centroid(mask: np.ndarray) -> tuple[float, float] | None:
+    ys, xs = np.nonzero(mask)
+    if xs.size < _MIN_BLOB:
+        return None
+    return float(xs.mean()), float(ys.mean())
+
+
+def _near(arr: np.ndarray, rgb) -> np.ndarray:
+    target = np.array(rgb, dtype=np.int16)
+    return (np.abs(arr.astype(np.int16) - target) <= _TOLERANCE).all(axis=2)
+
+
+def _components(mask: np.ndarray, min_size: int) -> list[tuple[float, float]]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    height, width = mask.shape
+    out: list[tuple[float, float]] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny = y + dy
+                nx = x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= min_size:
+            out.append(
+                (
+                    float(sum(p[1] for p in pixels)) / len(pixels),
+                    float(sum(p[0] for p in pixels)) / len(pixels),
+                )
+            )
+    return out
+
+
+def _split_row(arr: np.ndarray) -> int | None:
+    dark = (arr.astype(np.int16) < 90).all(axis=2)
+    counts = dark.sum(axis=1)
+    width = arr.shape[1]
+    rows = np.nonzero(counts >= int(0.9 * width))[0]
+    if rows.size == 0:
+        return None
+    return int(rows.mean())
+
+
+def _residual(source, target) -> float:
+    n = len(source)
+    sx = sum(p[0] for p in source) / n
+    sy = sum(p[1] for p in source) / n
+    tx = sum(p[0] for p in target) / n
+    ty = sum(p[1] for p in target) / n
+    a = [(p[0] - sx, p[1] - sy) for p in source]
+    b = [(p[0] - tx, p[1] - ty) for p in target]
+    num_re = sum(a[i][0] * b[i][0] + a[i][1] * b[i][1] for i in range(n))
+    num_im = sum(a[i][0] * b[i][1] - a[i][1] * b[i][0] for i in range(n))
+    den = sum(a[i][0] ** 2 + a[i][1] ** 2 for i in range(n))
+    if den <= 0.0:
+        return float("inf")
+    kr = num_re / den
+    ki = num_im / den
+    total = 0.0
+    for i in range(n):
+        px = kr * a[i][0] - ki * a[i][1]
+        py = ki * a[i][0] + kr * a[i][1]
+        total += (px - b[i][0]) ** 2 + (py - b[i][1]) ** 2
+    return math.sqrt(total / n)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    split = _split_row(arr)
+    if split is None or split < 40 or split > arr.shape[0] - 40:
+        return _ABSTAIN
+
+    top = arr[: split - 4]
+    bottom = arr[split + 4 :]
+    offset = split + 4
+
+    reference: dict[str, tuple[float, float]] = {}
+    for name, rgb in _PROTOTYPES.items():
+        blobs = _components(_near(top, rgb), _MIN_BLOB)
+        if len(blobs) != 1:
+            return _ABSTAIN
+        reference[name] = blobs[0]
+    if len(reference) != 4:
+        return _ABSTAIN
+
+    gray_blobs = _components(_near(bottom, _GRAY), _MIN_BLOB)
+    if len(gray_blobs) != 4:
+        return _ABSTAIN
+    gray_blobs = [(x, y + offset) for x, y in gray_blobs]
+
+    ring = _mask_centroid((np.asarray(bottom, dtype=np.int16) < 90).all(axis=2))
+    if ring is None:
+        return _ABSTAIN
+    ring_point = (ring[0], ring[1] + offset)
+
+    distances = sorted(
+        (math.hypot(p[0] - ring_point[0], p[1] - ring_point[1]), index)
+        for index, p in enumerate(gray_blobs)
+    )
+    if distances[0][0] > 12.0 or distances[1][0] - distances[0][0] < 8.0:
+        return _ABSTAIN
+    marked = distances[0][1]
+
+    names = sorted(reference)
+    source = [reference[name] for name in names]
+    best = None
+    best_perm = None
+    second = None
+    for perm in itertools.permutations(range(4)):
+        residual = _residual(source, [gray_blobs[k] for k in perm])
+        if best is None or residual < best:
+            second = best
+            best = residual
+            best_perm = perm
+        elif second is None or residual < second:
+            second = residual
+    if best_perm is None or second is None or not math.isfinite(second):
+        return _ABSTAIN
+    if second - best < 0.75:
+        return _ABSTAIN
+    for slot, target_index in enumerate(best_perm):
+        if target_index == marked:
+            return names[slot]
+    return _ABSTAIN

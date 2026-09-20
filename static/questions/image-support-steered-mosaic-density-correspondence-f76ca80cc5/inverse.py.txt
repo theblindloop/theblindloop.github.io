@@ -1,0 +1,157 @@
+"""Independent image-only inverse for the compact quadrant-mass cassette.
+
+This module deliberately knows only the public raster layout: it finds the
+connected cassette from its visible palette, samples badge-relative cell
+centers, aggregates four quadrant counts, reflects candidate mosaics, and then
+reads the seal on the winning slot. It never imports or receives scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_CASSETTE = np.asarray((29, 82, 111), dtype=np.float32)
+_PANEL = np.asarray((238, 235, 224), dtype=np.float32)
+_PAPER = np.asarray((248, 244, 231), dtype=np.float32)
+_INK = np.asarray((42, 47, 52), dtype=np.float32)
+_AMBER = np.asarray((237, 163, 57), dtype=np.float32)
+_VIOLET = np.asarray((177, 110, 199), dtype=np.float32)
+_NEUTRAL = np.asarray((122, 171, 159), dtype=np.float32)
+
+_FRAME_MIN = 118
+_FRAME_MAX = 148
+_PANEL_SIZE = 52
+_PANEL_RELS = {"R": (8, 8), "A": (74, 8), "B": (8, 74)}
+_CELL = 7
+_CELL_ORIGIN = (12, 14)
+_GRID = 4
+_TARGET_CELLS = 8
+_TOL = 78.0
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float = _TOL) -> np.ndarray:
+    return np.linalg.norm(array - color, axis=2) < tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            component = np.zeros_like(mask, dtype=bool)
+            ys, xs = zip(*points, strict=True)
+            component[np.asarray(ys), np.asarray(xs)] = True
+            found.append(component)
+    return found
+
+
+def _bbox(component: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(component)
+    if len(ys) == 0:
+        raise ValueError("empty cassette component")
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _cassette_bbox(array: np.ndarray) -> tuple[int, int, int, int]:
+    components = _components(_mask(array, _CASSETTE, 64.0), 3500)
+    if len(components) != 1:
+        raise ValueError("expected one connected cassette")
+    bbox = _bbox(components[0])
+    x0, y0, x1, y1 = bbox
+    if not (_FRAME_MIN <= x1 - x0 + 1 <= _FRAME_MAX and _FRAME_MIN <= y1 - y0 + 1 <= _FRAME_MAX):
+        raise ValueError("cassette has unexpected dimensions")
+    return bbox
+
+
+def _nearest_name(pixel: np.ndarray, palette: tuple[tuple[str, np.ndarray], ...], limit: float = 90.0) -> str:
+    distances = [(name, float(np.linalg.norm(pixel - color))) for name, color in palette]
+    name, distance = min(distances, key=lambda item: item[1])
+    if distance >= limit:
+        raise ValueError("seal color is unreadable")
+    return name
+
+
+def _badge(array: np.ndarray, x: int, y: int, *, candidate: bool) -> tuple[list[list[int]], str]:
+    # A badge center is sampled from the public cassette geometry, not from a
+    # latent coordinate. Requiring its light body and every cell center makes
+    # destructive local ablations abstain instead of silently guessing.
+    body = array[y + 46, x + 26]
+    if float(np.linalg.norm(body - _PANEL)) >= 105.0:
+        raise ValueError("badge body is missing")
+    pattern: list[list[int]] = []
+    origin_x, origin_y = x + _CELL_ORIGIN[0], y + _CELL_ORIGIN[1]
+    for row in range(_GRID):
+        values: list[int] = []
+        for col in range(_GRID):
+            px = origin_x + col * _CELL + _CELL // 2
+            py = origin_y + row * _CELL + _CELL // 2
+            pixel = array[py, px]
+            ink_distance = float(np.linalg.norm(pixel - _INK))
+            paper_distance = float(np.linalg.norm(pixel - _PAPER))
+            if min(ink_distance, paper_distance) >= 82.0:
+                raise ValueError("mosaic cell is unreadable")
+            values.append(int(ink_distance < paper_distance))
+        pattern.append(values)
+    if sum(sum(row) for row in pattern) != _TARGET_CELLS:
+        raise ValueError("mosaic does not have the public equal-ink area")
+    if candidate:
+        seal_pixel = array[y + 9, x + 44]
+        seal = _nearest_name(seal_pixel, (("amber", _AMBER), ("violet", _VIOLET)))
+    else:
+        seal_pixel = array[y + 9, x + 44]
+        _nearest_name(seal_pixel, (("neutral", _NEUTRAL),))
+        seal = "neutral"
+    return pattern, seal
+
+
+def _reflect(pattern: list[list[int]]) -> list[list[int]]:
+    return [list(reversed(row)) for row in pattern]
+
+
+def _signature(pattern: list[list[int]]) -> tuple[int, int, int, int]:
+    return (
+        sum(pattern[row][col] for row in range(0, 2) for col in range(0, 2)),
+        sum(pattern[row][col] for row in range(0, 2) for col in range(2, 4)),
+        sum(pattern[row][col] for row in range(2, 4) for col in range(2, 4)),
+        sum(pattern[row][col] for row in range(2, 4) for col in range(0, 2)),
+    )
+
+
+def _error(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+    return sum(abs(a - b) for a, b in zip(left, right, strict=True))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the amber/violet seal on the best reflected mass-signature slot."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    x0, y0, _, _ = _cassette_bbox(array)
+    reference, _ = _badge(array, x0 + _PANEL_RELS["R"][0], y0 + _PANEL_RELS["R"][1], candidate=False)
+    candidate_a, seal_a = _badge(array, x0 + _PANEL_RELS["A"][0], y0 + _PANEL_RELS["A"][1], candidate=True)
+    candidate_b, seal_b = _badge(array, x0 + _PANEL_RELS["B"][0], y0 + _PANEL_RELS["B"][1], candidate=True)
+    target = _signature(reference)
+    errors = {
+        "A": _error(target, _signature(_reflect(candidate_a))),
+        "B": _error(target, _signature(_reflect(candidate_b))),
+    }
+    if errors["A"] == errors["B"]:
+        raise ValueError("transformed quadrant signatures are tied")
+    return seal_a if errors["A"] < errors["B"] else seal_b

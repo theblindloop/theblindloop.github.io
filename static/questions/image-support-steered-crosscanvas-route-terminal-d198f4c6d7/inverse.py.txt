@@ -1,0 +1,153 @@
+"""Independent pixel-only oracle for the cross-canvas route-terminal world.
+
+Receives only the final PNG and never the latent scene, renderer geometry, or
+analytic gold. It re-measures the raster independently:
+
+1. Classify every pixel as background / thin graphite trace / black source dot /
+   one of the three terminal colours, by nearest fixed world palette colour.
+2. Locate the (single) black source disc on the left.
+3. Find the thin graphite trace connected component that is 4-adjacent to that
+   source disc, i.e. the route that leaves the source.
+4. Read which terminal colour that same connected trace is 4-adjacent to. The
+   answer is the colour of the single terminal reached by the continuous route.
+
+The oracle must be able to FOLLOW the whole connected thin route from the source
+to the reached terminal. If the trace is severed anywhere along its span, the
+source-attached component no longer reaches any terminal and the oracle abstains
+by raising, so a crop covering only one side or a broken middle can never answer.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "crosscanvas_route_terminal-oracle-0.1.0"
+
+CANVAS = 512
+WHITE = (255, 255, 255)
+GRAPHITE = (72, 72, 72)
+SOURCE = (20, 20, 20)
+
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "coral": (232, 93, 77),
+    "teal": (31, 158, 141),
+    "violet": (106, 81, 176),
+}
+PALETTE_NAMES = tuple(PALETTE)
+
+# Ordinal markers: 0 white, 1 graphite, 2 source, 3.. palette terminals.
+_MARKERS = (WHITE, GRAPHITE, SOURCE) + tuple(PALETTE.values())
+_SOURCE_INDEX = 2
+_TERMINAL_OFFSET = 3
+
+
+class RouteCompromisedError(ValueError):
+    """The decisive connected thin route or a terminal is missing/damaged."""
+
+
+def _neighbor_counts(mask: np.ndarray, other: np.ndarray) -> bool:
+    any_in = np.any(other)
+    if not any_in:
+        return False
+    touched = mask & (
+        np.zeros_like(mask, dtype=bool)
+        | np.pad(other[:-1, :], ((1, 0), (0, 0)))
+        | np.pad(other[1:, :], ((0, 1), (0, 0)))
+        | np.pad(other[:, :-1], ((0, 0), (1, 0)))
+        | np.pad(other[:, 1:], ((0, 0), (0, 1)))
+    )
+    return bool(np.any(touched))
+
+
+def _components(mask: np.ndarray) -> list[set[tuple[int, int]]]:
+    """4-connected component labeling returning lists of (y, x) cell sets."""
+    seen = np.zeros(mask.shape, dtype=bool)
+    comps = []
+    h, w = mask.shape
+    for seed_y, seed_x in np.argwhere(mask):
+        seed = (int(seed_y), int(seed_x))
+        if seen[seed]:
+            continue
+        cells = set()
+        stack = [seed]
+        seen[seed] = True
+        while stack:
+            y, x = stack.pop()
+            cells.add((y, x))
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < h and 0 <= xx < w and mask[yy, xx] and not seen[yy, xx]:
+                    seen[yy, xx] = True
+                    stack.append((yy, xx))
+        comps.append(cells)
+    return comps
+
+
+def decision_from_image(image: Image.Image) -> str:
+    image = image.convert("RGB")
+    if image.size != (CANVAS, CANVAS):
+        raise RouteCompromisedError("unexpected image size")
+    arr = np.asarray(image, dtype=np.uint8)
+    pix = arr.reshape(-1, 3).astype(np.float32)
+    marker = np.asarray(_MARKERS, dtype=np.float32)
+    dists = np.linalg.norm(pix[:, None, :] - marker[None, :, :], axis=2)
+    nearest = np.argmin(dists, axis=1)
+    h, w = arr.shape[:2]
+    labels = nearest.reshape(h, w)
+
+    graphite = labels == 1
+    source = labels == _SOURCE_INDEX
+
+    # Exactly one source disc.
+    source_comps = _components(source)
+    if len(source_comps) != 1:
+        raise RouteCompromisedError(
+            f"expected exactly one source dot, found {len(source_comps)}"
+        )
+    source_cells = source_comps[0]
+
+    # The thin graphite trace attached to the source.
+    trace_comps = _components(graphite)
+    attached = None
+    for comp in trace_comps:
+        touch = set()
+        for y, x in comp:
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if (yy, xx) in source_cells:
+                    touch.add((yy, xx))
+        if touch:
+            if attached is not None:
+                raise RouteCompromisedError("multiple traces leave the source dot")
+            attached = comp
+    if attached is None:
+        raise RouteCompromisedError("no thin trace leaves the source dot")
+
+    # Which terminal colour does this one connected route reach?
+    reached = []
+    for idx, color in enumerate(PALETTE_NAMES):
+        term = labels == (_TERMINAL_OFFSET + idx)
+        if _adjacent_to(term, attached):
+            reached.append(color)
+    if len(reached) != 1:
+        raise RouteCompromisedError(
+            f"reached-terminal correspondence is ambiguous: {reached}"
+        )
+    return reached[0]
+
+
+def _mask_of(cells: set, h: int, w: int) -> np.ndarray:
+    mask = np.zeros((h, w), dtype=bool)
+    for y, x in cells:
+        mask[y, x] = True
+    return mask
+
+
+def _adjacent_to(term_mask: np.ndarray, cells: set) -> bool:
+    for y, x in cells:
+        for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= yy < term_mask.shape[0] and 0 <= xx < term_mask.shape[1]:
+                if term_mask[yy, xx]:
+                    return True
+    return False

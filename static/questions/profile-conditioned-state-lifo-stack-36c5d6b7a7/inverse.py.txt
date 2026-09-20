@@ -1,0 +1,196 @@
+"""Independent pixel-only inverse arm for the LIFO color-stack register.
+
+Receives only the final PNG. From the raster alone it:
+  1. segments the leftmost (tallest) stack panel and the smaller operator
+     frames by their gray border color and by frame height;
+  2. reads the initial stack as the ordered disc colours sitting on the base
+     line, bottom to top (the top, highest present disc is ringed);
+  3. reads each operator panel: a panel carrying a coloured disc on an upward
+     arrow is a PUSH of that colour; a panel carrying a dark downward arrow
+     over an empty slot is a POP;
+  4. replays the LIFO stack (push appends its colour on top; pop removes the
+     top, revealing the colour below) from the initial stack and returns the
+     final top colour, or "empty" if the stack was fully popped.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+BORDER = (200, 200, 200)
+INK = (0, 0, 0)
+BASE_LINE = (150, 150, 150)
+RING_MARK = (240, 150, 20)
+DARK = (60, 60, 60)
+
+RED = (200, 45, 45)
+GREEN = (40, 170, 60)
+BLUE = (40, 60, 200)
+
+PALETTE = [
+    BG,
+    BORDER,
+    INK,
+    BASE_LINE,
+    RING_MARK,
+    DARK,
+    RED,
+    GREEN,
+    BLUE,
+]
+_BG, _BRD, _INK, _BASE, _RING, _DARK, _RED, _GREEN, _BLUE = range(9)
+
+OP_COUNT = 4
+STACK_MIN_HEIGHT = 150
+OP_MAX_HEIGHT = 150
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected stack/operator structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points):
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _mean(points) -> tuple[int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return round(sum(xs) / len(xs)), round(sum(ys) / len(ys))
+
+
+def _color_name(label_id: int) -> str:
+    if label_id == _RED:
+        return "red"
+    if label_id == _GREEN:
+        return "green"
+    if label_id == _BLUE:
+        return "blue"
+    return None
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+    h, w = labels.shape
+
+    border_comps = [c for c in _components(labels == _BRD) if len(c) > 40]
+    if not border_comps:
+        raise UnreadableImageError("no panel frames found")
+    frames = [(*_bbox(c), len(c)) for c in border_comps]
+    frames.sort(key=lambda f: f[3], reverse=True)
+    stack_box = frames[0]
+    sx0, sy0, sx1, sy1, _ = stack_box
+    if (sy1 - sy0) < STACK_MIN_HEIGHT:
+        raise UnreadableImageError("stack panel too small")
+    stack_x = (sx0 + sx1) // 2
+
+    op_frames = [
+        f
+        for f in frames[1:]
+        if (f[3] - f[1]) < OP_MAX_HEIGHT and (f[2] - f[0]) > 60 and (f[3] - f[1]) > 60
+    ]
+    op_frames.sort(key=lambda f: f[0])
+    if len(op_frames) < OP_COUNT:
+        raise UnreadableImageError("not enough operator panels")
+
+    # Initial stack: disc colours on the base line, bottom to top.
+    base_mask = labels == _BASE
+    base_comps = [c for c in _components(base_mask) if len(c) > 10]
+    if not base_comps:
+        raise UnreadableImageError("stack base line not found")
+    base_y = _mean(max(base_comps, key=len))[1]
+
+    initial_colors = []
+    slot_step = 46
+    disc_r = 18
+    k = 0
+    while k < 8:
+        cy = base_y - 5 - k * slot_step
+        cx = stack_x
+        if cy - disc_r < sy0:
+            break
+        # sample the disc centre pixel and a ring of samples for robustness
+        patch = labels[max(0, cy - 4) : cy + 5, max(0, cx - 4) : cx + 5]
+        present = [labels[cy, cx]]
+        bincount = np.bincount(present, minlength=len(PALETTE))
+        lab = int(bincount.argmax())
+        name = _color_name(lab)
+        if name is None:
+            break
+        initial_colors.append(name)
+        k += 1
+    if not initial_colors:
+        raise UnreadableImageError("no stack discs found")
+
+    # Operators.
+    ops = []
+    for fx0, fy0, fx1, fy1, _ in op_frames[:OP_COUNT]:
+        ocx = (fx0 + fx1) // 2
+        # A PUSH carries a coloured disc above the arrow; a POP carries a dark
+        # down-arrow over an empty (background) slot. Sample the disc location.
+        disc_y = (fy0 + fy1) // 2 - 22
+        patch = labels[max(0, disc_y - 5) : disc_y + 6, max(0, ocx - 5) : ocx + 6]
+        bincount = np.bincount(patch.ravel(), minlength=len(PALETTE))
+        lab = int(bincount.argmax())
+        name = _color_name(lab)
+        if name is None:
+            ops.append(("pop", None))
+        else:
+            ops.append(("push", name))
+    if len(ops) < OP_COUNT:
+        raise UnreadableImageError("not enough operator reads")
+
+    stack = list(initial_colors)
+    for op, color in ops:
+        if op == "push":
+            stack.append(color)
+        elif op == "pop" and stack:
+            stack.pop()
+    return stack[-1] if stack else "empty"

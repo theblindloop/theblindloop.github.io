@@ -1,0 +1,163 @@
+"""Independent pixel-only graph reconstruction for Two-Colorable Trail."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+_PROTOTYPES = {
+    0: ((249, 247, 242), (246, 249, 247), (250, 246, 244)),
+    1: ((25, 48, 70), (34, 57, 79), (22, 45, 72)),
+    2: ((207, 221, 226), (216, 224, 226), (202, 216, 224)),
+}
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 200:
+        raise OracleAbstention("unsupported raster")
+    distances = []
+    for category in range(3):
+        colors = np.asarray(_PROTOTYPES[category], dtype=np.int32)
+        squared = ((array[:, :, None, :] - colors[None, None, :, :]) ** 2).sum(axis=3)
+        distances.append(squared.min(axis=2))
+    distance = np.stack(distances, axis=2)
+    # Antialiased navy/background blends can be perceptually close to the pale
+    # station fill. First split all pixels between background and navy, then
+    # claim station pixels only inside a tight prototype ball.
+    labels = distance[:, :, :2].argmin(axis=2)
+    labels[distance[:, :, 2] <= 225] = 2
+    return labels
+
+
+def _components(mask: np.ndarray, minimum: int = 100) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        queue = deque([(y0, x0)])
+        seen[y0, x0] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _recover_stations(labels: np.ndarray) -> list[tuple[float, float]]:
+    parts = _components(labels == 2)
+    if len(parts) != 10:
+        raise OracleAbstention(f"expected ten station interiors, found {len(parts)}")
+    centers: list[tuple[float, float]] = []
+    for part in parts:
+        area = len(part)
+        ys, xs = part[:, 0], part[:, 1]
+        if not 150 <= area <= 520 or np.ptp(xs) < 14 or np.ptp(ys) < 14:
+            raise OracleAbstention("a station is clipped, erased, merged, or malformed")
+        centers.append((float(xs.mean()), float(ys.mean())))
+    nearest = min(math.dist(centers[i], centers[j]) for i in range(10) for j in range(i + 1, 10))
+    if nearest < 42.0:
+        raise OracleAbstention("station centers are too close")
+    return centers
+
+
+def _corridor_coverage(
+    navy: np.ndarray,
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> float:
+    x1, y1 = first
+    x2, y2 = second
+    length = math.hypot(x2 - x1, y2 - y1)
+    guard = 20.0
+    if length <= 2 * guard + 8:
+        return 0.0
+    steps = max(10, int(length - 2 * guard) + 1)
+    hits = 0
+    for step in range(steps):
+        along = guard + (length - 2 * guard) * step / max(1, steps - 1)
+        ratio = along / length
+        x = int(round(x1 + ratio * (x2 - x1)))
+        y = int(round(y1 + ratio * (y2 - y1)))
+        patch = navy[max(0, y - 2):y + 3, max(0, x - 2):x + 3]
+        hits += int(patch.size > 0 and float(patch.mean()) >= 0.58)
+    return hits / steps
+
+
+def _recover_graph(centers: list[tuple[float, float]], navy: np.ndarray) -> list[tuple[int, int]]:
+    edges: list[tuple[int, int]] = []
+    ambiguous: list[float] = []
+    for left in range(10):
+        for right in range(left + 1, 10):
+            coverage = _corridor_coverage(navy, centers[left], centers[right])
+            if coverage >= 0.98:
+                edges.append((left, right))
+            elif coverage >= 0.95:
+                ambiguous.append(coverage)
+    if ambiguous:
+        raise OracleAbstention("one or more link corridors are incomplete or ambiguous")
+    if len(edges) != 11:
+        raise OracleAbstention(f"expected eleven complete links, found {len(edges)}")
+    adjacency = [[] for _ in range(10)]
+    for left, right in edges:
+        adjacency[left].append(right)
+        adjacency[right].append(left)
+    if sorted(len(items) for items in adjacency) != [2] * 8 + [3, 3]:
+        raise OracleAbstention(f"unexpected station degrees: {sorted(len(items) for items in adjacency)}")
+    seen = {0}
+    queue = deque([0])
+    while queue:
+        node = queue.popleft()
+        for neighbor in adjacency[node]:
+            if neighbor not in seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+    if len(seen) != 10:
+        raise OracleAbstention("recovered graph is disconnected")
+    return edges
+
+
+def _is_bipartite(edges: list[tuple[int, int]]) -> bool:
+    adjacency = [[] for _ in range(10)]
+    for left, right in edges:
+        adjacency[left].append(right)
+        adjacency[right].append(left)
+    colors = [-1] * 10
+    for start in range(10):
+        if colors[start] >= 0:
+            continue
+        colors[start] = 0
+        queue = deque([start])
+        while queue:
+            node = queue.popleft()
+            for neighbor in adjacency[node]:
+                if colors[neighbor] < 0:
+                    colors[neighbor] = 1 - colors[node]
+                    queue.append(neighbor)
+                elif colors[neighbor] == colors[node]:
+                    return False
+    return True
+
+
+def decision_from_image(image: Image.Image) -> str:
+    labels = _labels(image)
+    centers = _recover_stations(labels)
+    edges = _recover_graph(centers, labels == 1)
+    return "yes" if _is_bipartite(edges) else "no"

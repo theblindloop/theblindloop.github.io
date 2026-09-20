@@ -1,0 +1,197 @@
+"""Independent pixel-only arm for the vane-gate world.
+
+The oracle receives the final PNG and nothing else.  It segments the dark ink,
+isolates the conduit as the ink component nearest the green port, walks geodesic
+distances over that component to locate the junction and the two branches, binds
+each floating vane to the branch it lies beside, and compares the vane's apex
+direction with the branch tangent that leads away from the junction.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ABSTAIN = "abstain"
+
+_INK = (38, 38, 46)
+_PORT = (0, 150, 80)
+_PADS = {"blue": (30, 85, 205), "orange": (232, 124, 26)}
+
+_NEIGHBOURS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+def _mask(arr: np.ndarray, colour: tuple[int, int, int]) -> np.ndarray:
+    return (
+        (arr[:, :, 0] == colour[0])
+        & (arr[:, :, 1] == colour[1])
+        & (arr[:, :, 2] == colour[2])
+    )
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    height, width = mask.shape
+    out = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys, xs):
+        if seen[sy, sx]:
+            continue
+        stack = deque([(int(sy), int(sx))])
+        seen[sy, sx] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy, dx in _NEIGHBOURS:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        out.append(np.array(pixels, dtype=np.int32))
+    return out
+
+
+def _geodesic(mask: np.ndarray, sources: list[tuple[int, int]]) -> np.ndarray:
+    height, width = mask.shape
+    dist = np.full(mask.shape, -1, dtype=np.int32)
+    queue = deque()
+    for y, x in sources:
+        if dist[y, x] < 0:
+            dist[y, x] = 0
+            queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        base = dist[y, x] + 1
+        for dy, dx in _NEIGHBOURS:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and dist[ny, nx] < 0:
+                dist[ny, nx] = base
+                queue.append((ny, nx))
+    return dist
+
+
+def _nearest(pixels: np.ndarray, point: tuple[float, float]) -> tuple[int, int, float]:
+    dy = pixels[:, 0] - point[0]
+    dx = pixels[:, 1] - point[1]
+    d2 = dy * dy + dx * dx
+    index = int(np.argmin(d2))
+    return int(pixels[index, 0]), int(pixels[index, 1]), float(math.sqrt(d2[index]))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.array(image.convert("RGB"))
+    ink = _mask(arr, _INK)
+    port = _mask(arr, _PORT)
+    if not ink.any() or not port.any():
+        return ABSTAIN
+
+    pys, pxs = np.nonzero(port)
+    port_centre = (float(pys.mean()), float(pxs.mean()))
+
+    blobs = _components(ink)
+    if len(blobs) < 3:
+        return ABSTAIN
+    ranked = sorted(blobs, key=lambda p: _nearest(p, port_centre)[2])
+    tree_pixels = max(blobs, key=lambda p: len(p))
+    if len(ranked[0]) != len(tree_pixels) or not np.array_equal(ranked[0], tree_pixels):
+        return ABSTAIN
+
+    vane_blobs = [b for b in blobs if len(b) < len(tree_pixels) and 45 <= len(b) <= 240]
+    if len(vane_blobs) != 2:
+        return ABSTAIN
+
+    tree = np.zeros(ink.shape, dtype=bool)
+    tree[tree_pixels[:, 0], tree_pixels[:, 1]] = True
+
+    ends = {}
+    for name, colour in _PADS.items():
+        pad = _mask(arr, colour)
+        if not pad.any():
+            return ABSTAIN
+        ys, xs = np.nonzero(pad)
+        centre = (float(ys.mean()), float(xs.mean()))
+        py, px, gap = _nearest(tree_pixels, centre)
+        if gap > 14.0:
+            return ABSTAIN
+        ends[name] = (py, px)
+
+    root_y, root_x, root_gap = _nearest(tree_pixels, port_centre)
+    if root_gap > 14.0:
+        return ABSTAIN
+
+    d_root = _geodesic(tree, [(root_y, root_x)])
+    d_pad = {name: _geodesic(tree, [ends[name]]) for name in ends}
+    total = d_root.astype(np.int64)
+    for name in ends:
+        if d_pad[name][ends[name]] < 0:
+            return ABSTAIN
+        total = total + d_pad[name]
+    if (d_root[tree] < 0).any():
+        return ABSTAIN
+    junction_index = int(np.argmin(total[tree_pixels[:, 0], tree_pixels[:, 1]]))
+    jy, jx = int(tree_pixels[junction_index, 0]), int(tree_pixels[junction_index, 1])
+
+    names = sorted(ends)
+    branch = {}
+    for name in names:
+        # on a tree, the leg from the junction to a terminal is exactly the set of
+        # ink that is strictly nearer that terminal than the junction is
+        keep = (d_pad[name] >= 0) & (d_pad[name] < int(d_pad[name][jy, jx]) - 3)
+        keep &= d_root > int(d_root[jy, jx])
+        branch[name] = keep & tree
+
+    verdicts = {}
+    for blob in vane_blobs:
+        cy = float(blob[:, 0].mean())
+        cx = float(blob[:, 1].mean())
+        radial = np.hypot(blob[:, 0] - cy, blob[:, 1] - cx)
+        tip = blob[radial >= 0.82 * radial.max()]
+        ay = float(tip[:, 0].mean())
+        ax = float(tip[:, 1].mean())
+        vlen = math.hypot(ay - cy, ax - cx)
+        if vlen < 4.0:
+            return ABSTAIN
+        vdir = ((ay - cy) / vlen, (ax - cx) / vlen)
+
+        gaps = {}
+        for name in names:
+            pix = np.argwhere(branch[name])
+            if len(pix) < 25:
+                return ABSTAIN
+            gaps[name] = _nearest(pix, (cy, cx))
+        order = sorted(names, key=lambda n: gaps[n][2])
+        own, rival = order[0], order[1]
+        if gaps[rival][2] - gaps[own][2] < 3.0:
+            return ABSTAIN
+        if math.hypot(gaps[own][0] - jy, gaps[own][1] - jx) < 6.0:
+            return ABSTAIN
+
+        anchor_y, anchor_x = gaps[own][0], gaps[own][1]
+        pix = np.argwhere(branch[own])
+        near = pix[np.hypot(pix[:, 0] - anchor_y, pix[:, 1] - anchor_x) <= 9.0]
+        if len(near) < 8:
+            return ABSTAIN
+        along = d_pad[own][near[:, 0], near[:, 1]]
+        head = near[np.argmin(along)]
+        tail = near[np.argmax(along)]
+        step = math.hypot(float(head[0] - tail[0]), float(head[1] - tail[1]))
+        if step < 5.0:
+            return ABSTAIN
+        tangent = ((head[0] - tail[0]) / step, (head[1] - tail[1]) / step)
+        score = vdir[0] * tangent[0] + vdir[1] * tangent[1]
+        if abs(score) < 0.45:
+            return ABSTAIN
+        if own in verdicts:
+            return ABSTAIN
+        verdicts[own] = score > 0
+
+    if len(verdicts) != 2:
+        return ABSTAIN
+    open_pads = [name for name, is_open in verdicts.items() if is_open]
+    if len(open_pads) != 1:
+        return ABSTAIN
+    return open_pads[0]

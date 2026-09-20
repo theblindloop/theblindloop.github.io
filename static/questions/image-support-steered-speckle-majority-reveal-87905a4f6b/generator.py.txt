@@ -1,0 +1,267 @@
+"""Speckle-majority reveal world.
+
+One bordered square panel is tiled by a 7x7 grid of equal cells. Every cell is
+packed edge-to-edge with a fine speckle of exactly two inks (warm orange, cool
+blue) at a per-cell warm area fraction. The declared raster transform is a
+per-cell two-ink area majority: cells whose warm ink covers more than half of
+the cell are "shaded", and the shaded cells spell one abstract glyph on the
+7x7 grid.
+
+The panel is a single connected, fully inked area component that spans the
+image, and the glyph is a global property of 49 widely separated majority
+decisions: no local crop of the panel determines it. Nothing about the glyph is
+visible without executing the declared majority operation, because the warm
+fractions on both sides of the boundary (0.57-0.68 vs 0.32-0.43) are speckled
+at a 5px block scale rather than drawn as shapes.
+
+Latent state z = panel placement, palette, per-cell warm sub-block counts,
+per-cell speckle permutation seeds, reference-key placement and gray
+distractors. Analytic gold reads only the realized per-cell warm sub-block
+counts and the sub-block grid order, i.e. exactly the quantity the declared
+transform measures.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "speckle_majority_reveal-0.1.0"
+
+GRID = 7
+SUB = 12
+SUBPX = 5
+CANVAS = 512
+FRAME_PX = 5
+
+# Percentage-point clearance below which a cell's two-ink majority is treated as
+# a finite-resolution boundary case for a human/VLM reader.
+QUARANTINE_PP = 8.0
+
+GLYPH_NAMES = ("plus", "ex", "tee_up", "tee_right", "tee_down", "tee_left")
+
+
+def _glyph_cells(name: str) -> frozenset:
+    """The 7x7 cells that belong to one glyph. Every glyph uses 13 cells, so
+    total warm ink, shaded-cell count and total ink are counterbalanced."""
+    last = GRID - 1
+    mid = GRID // 2
+    if name == "plus":
+        cells = {(mid, c) for c in range(GRID)} | {(r, mid) for r in range(GRID)}
+    elif name == "ex":
+        cells = {(i, i) for i in range(GRID)} | {(i, last - i) for i in range(GRID)}
+    elif name == "tee_up":
+        cells = {(0, c) for c in range(GRID)} | {(r, mid) for r in range(1, GRID)}
+    elif name == "tee_down":
+        cells = {(last, c) for c in range(GRID)} | {(r, mid) for r in range(0, last)}
+    elif name == "tee_left":
+        cells = {(r, 0) for r in range(GRID)} | {(mid, c) for c in range(1, GRID)}
+    elif name == "tee_right":
+        cells = {(r, last) for r in range(GRID)} | {(mid, c) for c in range(0, last)}
+    else:
+        raise ValueError(f"unknown glyph {name!r}")
+    return frozenset(cells)
+
+
+GLYPH_CELLS = {name: _glyph_cells(name) for name in GLYPH_NAMES}
+
+
+def _shuffled_indices(count: int, seed: int) -> list[int]:
+    """Deterministic Fisher-Yates order from a 64-bit LCG.
+
+    Implemented in-module (not via ``random``/``numpy``) so the speckle layout is
+    byte-stable across interpreter and library versions.
+    """
+    mask = (1 << 64) - 1
+    state = (seed * 6364136223846793005 + 1442695040888963407) & mask
+    order = list(range(count))
+    for i in range(count - 1, 0, -1):
+        state = (state * 6364136223846793005 + 1442695040888963407) & mask
+        j = (state >> 33) % (i + 1)
+        order[i], order[j] = order[j], order[i]
+    return order
+
+
+def _speckle(count_on: int, seed: int, sub: int) -> np.ndarray:
+    flat = np.zeros(sub * sub, dtype=bool)
+    order = _shuffled_indices(sub * sub, seed)
+    for index in order[:count_on]:
+        flat[index] = True
+    return flat.reshape(sub, sub)
+
+
+def _slots() -> list[int]:
+    """x positions of the eight equal slots in the bottom margin band."""
+    return [6 + 63 * i for i in range(8)]
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene. Glyph identity and the boundary-case flag are
+    fixed by the seed so consecutive generator seeds are class balanced."""
+    rng = random.Random(0xC0FFEE ^ (seed * 2654435761))
+    glyph = GLYPH_NAMES[seed % len(GLYPH_NAMES)]
+    boundary_case = seed % 7 == 3
+
+    total = SUB * SUB
+    half = total // 2
+    on_cells = GLYPH_CELLS[glyph]
+    counts = []
+    for row in range(GRID):
+        line = []
+        for col in range(GRID):
+            delta = rng.randint(10, 26)
+            line.append(half + delta if (row, col) in on_cells else half - delta)
+        counts.append(line)
+    if boundary_case:
+        row = rng.randrange(GRID)
+        col = rng.randrange(GRID)
+        delta = rng.randint(2, 5)
+        counts[row][col] = half + delta if (row, col) in on_cells else half - delta
+
+    cell_seeds = [[rng.randrange(1, 2**31) for _ in range(GRID)] for _ in range(GRID)]
+
+    mosaic = GRID * SUB * SUBPX
+    origin_y = rng.randint(8, 14)
+    origin_x = rng.randint(8, CANVAS - mosaic - FRAME_PX - 8)
+
+    slots = _slots()
+    rng.shuffle(slots)
+    key_x = slots[0]
+    band_y = origin_y + mosaic + FRAME_PX + 4
+    cell_px = SUB * SUBPX
+    distractors = []
+    for slot_x in slots[1 : 1 + rng.randint(2, 3)]:
+        width = rng.randint(16, 40)
+        height = rng.randint(16, 40)
+        distractors.append(
+            [slot_x + rng.randint(0, 12), band_y + rng.randint(0, cell_px - height), width, height]
+        )
+
+    return {
+        "canvas": CANVAS,
+        "grid": GRID,
+        "sub": SUB,
+        "subpx": SUBPX,
+        "frame_px": FRAME_PX,
+        "origin": [origin_x, origin_y],
+        "orange_counts": counts,
+        "cell_seeds": cell_seeds,
+        "warm": [rng.randint(198, 228), rng.randint(84, 112), rng.randint(28, 60)],
+        "cool": [rng.randint(30, 58), rng.randint(100, 128), rng.randint(150, 182)],
+        "frame_rgb": [rng.randint(16, 40), rng.randint(16, 40), rng.randint(20, 48)],
+        "bg_rgb": [rng.randint(244, 252)] * 3,
+        "gray_rgb": [rng.randint(160, 190)] * 3,
+        "key_origin": [key_x, band_y],
+        "key_seed": rng.randrange(1, 2**31),
+        "distractors": distractors,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the panel, the reference key patch and the gray distractors.
+
+    Every primitive is an axis-aligned block fill with no antialiasing, so the
+    raster is byte-reproducible and each cell's two-ink area fractions are exact.
+    """
+    canvas = scene["canvas"]
+    grid = scene["grid"]
+    sub = scene["sub"]
+    subpx = scene["subpx"]
+    frame_px = scene["frame_px"]
+    origin_x, origin_y = scene["origin"]
+    counts = scene["orange_counts"]
+    cell_seeds = scene["cell_seeds"]
+    warm = np.array(scene["warm"], dtype=np.uint8)
+    cool = np.array(scene["cool"], dtype=np.uint8)
+
+    arr = np.empty((canvas, canvas, 3), dtype=np.uint8)
+    arr[:, :] = np.array(scene["bg_rgb"], dtype=np.uint8)
+
+    for x, y, width, height in scene["distractors"]:
+        arr[y : y + height, x : x + width] = np.array(scene["gray_rgb"], dtype=np.uint8)
+
+    mosaic = grid * sub * subpx
+    arr[
+        origin_y - frame_px : origin_y + mosaic + frame_px,
+        origin_x - frame_px : origin_x + mosaic + frame_px,
+    ] = np.array(scene["frame_rgb"], dtype=np.uint8)
+
+    field = np.zeros((grid * sub, grid * sub), dtype=bool)
+    for row in range(grid):
+        for col in range(grid):
+            field[row * sub : (row + 1) * sub, col * sub : (col + 1) * sub] = _speckle(
+                counts[row][col], cell_seeds[row][col], sub
+            )
+    big = np.kron(field, np.ones((subpx, subpx), dtype=bool))
+    panel = np.where(big[:, :, None], warm[None, None, :], cool[None, None, :]).astype(np.uint8)
+    arr[origin_y : origin_y + mosaic, origin_x : origin_x + mosaic] = panel
+
+    key_x, key_y = scene["key_origin"]
+    key_field = _speckle((sub * sub) // 2, scene["key_seed"], sub)
+    key_big = np.kron(key_field, np.ones((subpx, subpx), dtype=bool))
+    key_side = sub * subpx
+    arr[key_y : key_y + key_side, key_x : key_x + key_side] = np.where(
+        key_big[:, :, None], warm[None, None, :], cool[None, None, :]
+    ).astype(np.uint8)
+
+    return Image.fromarray(arr, mode="RGB")
+
+
+def _shaded_bitmap(scene: dict) -> list[list[int]]:
+    """Execute the declared transform on the latent: per-cell warm-ink majority."""
+    sub = scene["sub"]
+    counts = scene["orange_counts"]
+    return [[1 if 2 * value > sub * sub else 0 for value in line] for line in counts]
+
+
+def _match_bitmap(bitmap: list[list[int]]) -> str:
+    scored = []
+    for name in GLYPH_NAMES:
+        cells = GLYPH_CELLS[name]
+        distance = sum(
+            abs(bitmap[row][col] - (1 if (row, col) in cells else 0))
+            for row in range(len(bitmap))
+            for col in range(len(bitmap[row]))
+        )
+        scored.append((distance, name))
+    scored.sort()
+    return scored[0][1]
+
+
+def analytic_gold(scene: dict) -> str:
+    """The glyph spelled by the warm-majority cells of the rendered panel."""
+    return _match_bitmap(_shaded_bitmap(scene))
+
+
+def margin(scene: dict) -> float:
+    """Smallest per-cell two-ink majority clearance, in percentage points of
+    cell area. Zero would be an exactly half-and-half cell."""
+    sub = scene["sub"]
+    total = sub * sub
+    return min(
+        abs(2 * value - total) / total * 100.0
+        for line in scene["orange_counts"]
+        for value in line
+    )
+
+
+def is_quarantined(scene: dict) -> bool:
+    """True when some cell's majority is too close to the visible equal-mix
+    boundary to be read reliably at this raster resolution."""
+    return margin(scene) < QUARANTINE_PP
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Declared empty (``latent_alias.mode = not_applicable``).
+
+    Every latent field is rendered: placement moves the panel, palette sets the
+    ink colors, the per-cell counts set the exact two-ink areas, the per-cell
+    seeds set the visible speckle permutation, and the key/distractor fields
+    place visible blocks. Analytic gold reads only ``orange_counts`` and ``sub``,
+    both of which the raster exposes exactly (each cell's warm area is
+    ``orange_counts`` sub-blocks of ``subpx**2`` pixels), so there is no
+    nontrivial reparametrization that leaves the pixels fixed.
+    """
+    return []

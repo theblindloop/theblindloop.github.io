@@ -1,0 +1,302 @@
+"""Renderer for the half-cover cell tally world.
+
+A single ruled square panel carries exactly one solid navy region.  The
+decision is how many ruling cells have more than half of their interior area
+covered by that region.  All decisive evidence therefore lives inside the small
+connected navy blob and the ruling immediately under it.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "halfcover_cell_tally-0.1.0"
+
+WIDTH = 560
+HEIGHT = 400
+
+WHITE = (255, 255, 255)
+NAVY = (26, 43, 99)
+RULE_GREY = (206, 206, 206)
+FRAME_GREY = (108, 108, 108)
+DISTRACTOR_COLORS = (
+    (198, 86, 42),
+    (46, 132, 92),
+    (150, 96, 168),
+    (214, 168, 40),
+    (58, 122, 176),
+)
+
+PITCH_CHOICES = (16, 18, 20, 22, 24)
+CELLS_CHOICES = (6, 7, 8)
+
+MIN_COUNT = 2
+MAX_COUNT = 8
+ACCEPT_FRACTION_MARGIN = 0.035
+QUARANTINE_FRACTION_MARGIN = 0.06
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+PART_SLOTS = 3
+
+
+def _blob_parts(rng: random.Random, cx: int, cy: int, span: int) -> dict:
+    """Three overlapping opaque parts whose union is one connected blob.
+
+    Each part is stored as flat scalar scene fields so that the analytic gold
+    reads only top-level rendered scene fields.
+    """
+    base = rng.randint(max(8, int(span * 0.72)), max(10, span))
+    fields = {
+        "p0_cx": cx,
+        "p0_cy": cy,
+        "p0_rx": base,
+        "p0_ry": rng.randint(max(8, base - 5), base + 5),
+        "p0_rect": 0,
+    }
+    off = max(4, base // 2)
+    for slot in range(1, PART_SLOTS):
+        fields[f"p{slot}_cx"] = cx + rng.randint(-off, off)
+        fields[f"p{slot}_cy"] = cy + rng.randint(-off, off)
+        fields[f"p{slot}_rx"] = rng.randint(max(7, base - 6), base + 4)
+        fields[f"p{slot}_ry"] = rng.randint(max(7, base - 6), base + 4)
+        fields[f"p{slot}_rect"] = rng.randint(0, 1)
+    return fields
+
+
+def _part_box(scene: dict, slot: int) -> tuple[int, int, int, int]:
+    """Bounding box of one part slot, read through literal scene fields."""
+    cx = (scene["p0_cx"], scene["p1_cx"], scene["p2_cx"])[slot]
+    cy = (scene["p0_cy"], scene["p1_cy"], scene["p2_cy"])[slot]
+    rx = (scene["p0_rx"], scene["p1_rx"], scene["p2_rx"])[slot]
+    ry = (scene["p0_ry"], scene["p1_ry"], scene["p2_ry"])[slot]
+    return (cx - rx, cy - ry, cx + rx, cy + ry)
+
+
+def _part_is_rect(scene: dict, slot: int) -> bool:
+    return bool((scene["p0_rect"], scene["p1_rect"], scene["p2_rect"])[slot])
+
+
+def _boxes_overlap(a, b, pad: int = 0) -> bool:
+    return not (
+        a[2] + pad < b[0] or b[2] + pad < a[0] or a[3] + pad < b[1] or b[3] + pad < a[1]
+    )
+
+
+def _distractors(rng: random.Random, forbidden: tuple[int, int, int, int]) -> list[dict]:
+    placed: list[dict] = []
+    boxes: list[tuple[int, int, int, int]] = []
+    wanted = rng.randint(3, 5)
+    for _ in range(160):
+        if len(placed) >= wanted:
+            break
+        w = rng.randint(16, 44)
+        h = rng.randint(14, 40)
+        x0 = rng.randint(12, WIDTH - 12 - w)
+        y0 = rng.randint(12, HEIGHT - 12 - h)
+        box = (x0, y0, x0 + w, y0 + h)
+        if _boxes_overlap(box, forbidden, pad=10):
+            continue
+        if any(_boxes_overlap(box, other, pad=6) for other in boxes):
+            continue
+        boxes.append(box)
+        placed.append(
+            {
+                "kind": rng.choice(("disk", "block", "hollow", "ticks")),
+                "box": list(box),
+                "color": rng.randrange(len(DISTRACTOR_COLORS)),
+            }
+        )
+    return placed
+
+
+def _raw_scene(rng: random.Random, target: int) -> dict:
+    cells = rng.choice((7, 8) if target >= 6 else CELLS_CHOICES)
+    pitch = rng.choice(PITCH_CHOICES)
+    side = cells * pitch
+    ix0 = rng.randint(24, WIDTH - 24 - side)
+    iy0 = rng.randint(24, HEIGHT - 24 - side)
+
+    margin = 3
+    scale = (0.40 + 0.30 * target**0.5) * rng.uniform(0.88, 1.12)
+    span = max(8, min(int(round(pitch * scale)), int(side / 3.4)))
+    pad = int(round(1.6 * span)) + margin
+    cx = rng.randint(ix0 + pad, ix0 + side - pad)
+    cy = rng.randint(iy0 + pad, iy0 + side - pad)
+    frame = (ix0 - 6, iy0 - 6, ix0 + side + 6, iy0 + side + 6)
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "cells": cells,
+        "pitch": pitch,
+        "inset_x": ix0,
+        "inset_y": iy0,
+    }
+    scene.update(_blob_parts(rng, cx, cy, span))
+    scene["distractors"] = _distractors(rng, frame)
+    return scene
+
+
+def _blob_inside(scene: dict) -> bool:
+    ix0, iy0 = scene["inset_x"], scene["inset_y"]
+    side = scene["cells"] * scene["pitch"]
+    for slot in range(PART_SLOTS):
+        x0, y0, x1, y1 = _part_box(scene, slot)
+        if x0 < ix0 + 2 or y0 < iy0 + 2 or x1 > ix0 + side - 2 or y1 > iy0 + side - 2:
+            return False
+    return True
+
+
+def _connected(scene: dict) -> bool:
+    mask = np.asarray(_blob_mask(scene), dtype=bool)
+    if not mask.any():
+        return False
+    ys, xs = np.nonzero(mask)
+    seen = np.zeros_like(mask)
+    stack = [(int(ys[0]), int(xs[0]))]
+    seen[ys[0], xs[0]] = True
+    total = 1
+    height, width = mask.shape
+    while stack:
+        y, x = stack.pop()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                seen[ny, nx] = True
+                total += 1
+                stack.append((ny, nx))
+    return total == int(mask.sum())
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one answerable, legible scene."""
+    rng = random.Random(seed * 7919 + 13)
+    target = MIN_COUNT + (seed // 3) % (MAX_COUNT - MIN_COUNT + 1)
+    for _ in range(4000):
+        scene = _raw_scene(rng, target)
+        if not _blob_inside(scene):
+            continue
+        if not _connected(scene):
+            continue
+        count = int((cell_fractions(scene) > 0.5).sum())
+        if count != target:
+            continue
+        if fraction_margin(scene) < ACCEPT_FRACTION_MARGIN:
+            continue
+        return scene
+    raise RuntimeError(f"no answerable scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# geometry / gold
+# --------------------------------------------------------------------------
+def _draw_parts(draw: ImageDraw.ImageDraw, scene: dict, fill) -> None:
+    for slot in range(PART_SLOTS):
+        box = _part_box(scene, slot)
+        if box[2] < box[0] or box[3] < box[1]:
+            continue
+        if _part_is_rect(scene, slot):
+            draw.rectangle(box, fill=fill)
+        else:
+            draw.ellipse(box, fill=fill)
+
+
+def _blob_mask(scene: dict) -> Image.Image:
+    mask = Image.new("L", (scene["width"], scene["height"]), 0)
+    _draw_parts(ImageDraw.Draw(mask), scene, 255)
+    return mask
+
+
+def cell_fractions(scene: dict) -> np.ndarray:
+    """Per-cell covered fraction of the cell interior, from the blob geometry."""
+    mask = np.asarray(_blob_mask(scene), dtype=np.uint8) > 0
+    cells, pitch = scene["cells"], scene["pitch"]
+    ix0, iy0 = scene["inset_x"], scene["inset_y"]
+    out = np.zeros((cells, cells), dtype=float)
+    inner = (pitch - 1) * (pitch - 1)
+    for j in range(cells):
+        y0 = iy0 + j * pitch + 1
+        y1 = iy0 + (j + 1) * pitch
+        for i in range(cells):
+            x0 = ix0 + i * pitch + 1
+            x1 = ix0 + (i + 1) * pitch
+            out[j, i] = float(mask[y0:y1, x0:x1].sum()) / float(inner)
+    return out
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(int((cell_fractions(scene) > 0.5).sum()))
+
+
+def fraction_margin(scene: dict) -> float:
+    fractions = cell_fractions(scene)
+    return float(np.abs(fractions - 0.5).min())
+
+
+def margin(scene: dict) -> float:
+    """Pixels of cell-interior area separating the tightest cell from its flip."""
+    inner = (scene["pitch"] - 1) ** 2
+    return float(round(fraction_margin(scene) * inner, 6))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(fraction_margin(scene) < QUARANTINE_FRACTION_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabellings of the latent scene."""
+    out: list[tuple[str, dict]] = []
+    relabelled = dict(scene)
+    for key in ("cx", "cy", "rx", "ry", "rect"):
+        for slot in range(PART_SLOTS):
+            relabelled[f"p{slot}_{key}"] = scene[f"p{PART_SLOTS - 1 - slot}_{key}"]
+    out.append(("blob_part_slot_reversal", relabelled))
+    if len(scene["distractors"]) > 1:
+        flipped = dict(scene)
+        flipped["distractors"] = list(reversed(scene["distractors"]))
+        out.append(("distractor_order_reversal", flipped))
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (scene["width"], scene["height"]), WHITE)
+    draw = ImageDraw.Draw(image)
+
+    cells, pitch = scene["cells"], scene["pitch"]
+    ix0, iy0 = scene["inset_x"], scene["inset_y"]
+    side = cells * pitch
+
+    draw.rectangle(
+        (ix0 - 6, iy0 - 6, ix0 + side + 6, iy0 + side + 6), outline=FRAME_GREY, width=2
+    )
+    for i in range(cells + 1):
+        x = ix0 + i * pitch
+        draw.line((x, iy0, x, iy0 + side), fill=RULE_GREY, width=1)
+        y = iy0 + i * pitch
+        draw.line((ix0, y, ix0 + side, y), fill=RULE_GREY, width=1)
+
+    for item in scene["distractors"]:
+        x0, y0, x1, y1 = item["box"]
+        color = DISTRACTOR_COLORS[item["color"]]
+        kind = item["kind"]
+        if kind == "disk":
+            draw.ellipse((x0, y0, x1, y1), fill=color)
+        elif kind == "block":
+            draw.rectangle((x0, y0, x1, y1), fill=color)
+        elif kind == "hollow":
+            draw.rectangle((x0, y0, x1, y1), outline=color, width=2)
+        else:
+            step = max(5, (x1 - x0) // 4)
+            for x in range(x0, x1 - 1, step):
+                draw.line((x, y0, x, y1), fill=color, width=2)
+
+    _draw_parts(draw, scene, NAVY)
+    return image

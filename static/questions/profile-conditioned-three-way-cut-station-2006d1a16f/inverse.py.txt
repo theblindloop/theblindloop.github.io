@@ -1,0 +1,127 @@
+"""Independent pixel-only inverse arm for station-removal component counting."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "orange": np.array((235, 132, 28), dtype=np.int16),
+    "green": np.array((44, 160, 90), dtype=np.int16),
+    "purple": np.array((142, 80, 190), dtype=np.int16),
+}
+BLACK = np.array((28, 30, 36), dtype=np.int16)
+GRAY = np.array((126, 132, 142), dtype=np.int16)
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(int(y), int(x))])
+        pixels = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            groups.append(np.asarray(pixels))
+    return groups
+
+
+def _centroid(group: np.ndarray) -> tuple[float, float]:
+    return float(group[:, 1].mean()), float(group[:, 0].mean())
+
+
+def _line_support(gray: np.ndarray, first: tuple[float, float], second: tuple[float, float]) -> float:
+    height, width = gray.shape
+    samples = 90
+    hits = 0
+    total = 0
+    for t in np.linspace(0.13, 0.87, samples):
+        x = int(round(first[0] * (1 - t) + second[0] * t))
+        y = int(round(first[1] * (1 - t) + second[1] * t))
+        y0, y1 = max(0, y - 2), min(height, y + 3)
+        x0, x1 = max(0, x - 2), min(width, x + 3)
+        total += 1
+        hits += bool(gray[y0:y1, x0:x1].any())
+    return hits / max(total, 1)
+
+
+def _between(point: tuple[float, float], left: tuple[float, float], right: tuple[float, float]) -> bool:
+    vx, vy = right[0] - left[0], right[1] - left[1]
+    wx, wy = point[0] - left[0], point[1] - left[1]
+    denom = vx * vx + vy * vy
+    if denom == 0:
+        return False
+    t = (wx * vx + wy * vy) / denom
+    if not 0.12 < t < 0.88:
+        return False
+    projection = (left[0] + t * vx, left[1] + t * vy)
+    return math.dist(point, projection) < 25
+
+
+def _count_after(adjacency: list[set[int]], removed: int) -> int:
+    unseen = set(range(len(adjacency))) - {removed}
+    count = 0
+    while unseen:
+        count += 1
+        start = unseen.pop()
+        queue = deque([start])
+        while queue:
+            here = queue.popleft()
+            for nxt in adjacency[here] & unseen:
+                unseen.remove(nxt)
+                queue.append(nxt)
+    return count
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    color_centers: dict[str, tuple[float, float]] = {}
+    for name, rgb in PALETTE.items():
+        mask = np.linalg.norm(arr - rgb, axis=2) < 25
+        groups = _components(mask, minimum=200)
+        if len(groups) != 1:
+            raise ValueError(f"expected one {name} station, found {len(groups)}")
+        color_centers[name] = _centroid(groups[0])
+
+    black_mask = np.linalg.norm(arr - BLACK, axis=2) < 25
+    black_groups = _components(black_mask, minimum=200)
+    if len(black_groups) < 6:
+        raise ValueError("too few black stations")
+    centers = [_centroid(group) for group in black_groups]
+    color_index: dict[str, int] = {}
+    for name in ("orange", "green", "purple"):
+        color_index[name] = len(centers)
+        centers.append(color_centers[name])
+
+    gray = np.linalg.norm(arr - GRAY, axis=2) < 30
+    adjacency = [set() for _ in centers]
+    for i, left in enumerate(centers):
+        for j in range(i + 1, len(centers)):
+            right = centers[j]
+            if any(_between(point, left, right) for k, point in enumerate(centers) if k not in (i, j)):
+                continue
+            if _line_support(gray, left, right) > 0.82:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+
+    degrees = {name: len(adjacency[index]) for name, index in color_index.items()}
+    if set(degrees.values()) != {3}:
+        raise ValueError(f"candidate station degrees are not all three: {degrees}")
+    outcomes = {name: _count_after(adjacency, index) for name, index in color_index.items()}
+    matches = [name for name, count in outcomes.items() if count == 3]
+    if len(matches) != 1 or sorted(outcomes.values()) != [1, 2, 3]:
+        raise ValueError(f"ambiguous component outcomes: {outcomes}")
+    return matches[0]

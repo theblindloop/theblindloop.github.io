@@ -1,0 +1,142 @@
+"""Independent PNG-only inverse arm for Conditional Transfer Replay."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_CARD = np.array((222, 234, 247), dtype=np.int16)
+_START = np.array((250, 231, 173), dtype=np.int16)
+_ARROW = np.array((205, 47, 121), dtype=np.int16)
+_SYMBOL_COLORS = tuple(
+    np.array(rgb, dtype=np.int16)
+    for rgb in ((25, 111, 191), (25, 148, 102), (230, 126, 34), (126, 82, 171))
+)
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _near(arr: np.ndarray, color: np.ndarray, tolerance: int = 8) -> np.ndarray:
+    delta = arr.astype(np.int32) - color.astype(np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[dict[str, float | int]]:
+    work = mask.copy()
+    found: list[dict[str, float | int]] = []
+    height, width = work.shape
+    while work.any():
+        y, x = np.argwhere(work)[0]
+        queue: deque[tuple[int, int]] = deque([(int(y), int(x))])
+        work[y, x] = False
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and work[ny, nx]:
+                    work[ny, nx] = False
+                    queue.append((ny, nx))
+        if len(xs) >= minimum:
+            found.append(
+                {
+                    "area": len(xs), "x0": min(xs), "x1": max(xs),
+                    "y0": min(ys), "y1": max(ys),
+                    "cx": float(sum(xs)) / len(xs), "cy": float(sum(ys)) / len(ys),
+                }
+            )
+    return found
+
+
+def _symbol_mask(arr: np.ndarray) -> np.ndarray:
+    mask = np.zeros(arr.shape[:2], dtype=bool)
+    for color in _SYMBOL_COLORS:
+        mask |= _near(arr, color)
+    return mask
+
+
+def _classify_symbol(arr: np.ndarray, bounds: tuple[int, int, int, int]) -> str:
+    x0, y0, x1, y1 = bounds
+    crop = _symbol_mask(arr[y0:y1, x0:x1])
+    comps = _components(crop, minimum=700)
+    if len(comps) != 1:
+        raise PixelParseError(f"expected one station symbol, found {len(comps)}")
+    comp = comps[0]
+    width = int(comp["x1"]) - int(comp["x0"]) + 1
+    height = int(comp["y1"]) - int(comp["y0"]) + 1
+    if not (44 <= width <= 54 and 44 <= height <= 54):
+        raise PixelParseError(f"ambiguous station symbol size {width}x{height}")
+    fill = int(comp["area"]) / float(width * height)
+    rel_y = (float(comp["cy"]) - float(comp["y0"])) / max(height - 1, 1)
+    if fill > 0.93:
+        return "square"
+    if fill > 0.68:
+        return "circle"
+    if rel_y > 0.57:
+        return "triangle"
+    if 0.43 <= rel_y <= 0.57:
+        return "diamond"
+    raise PixelParseError("symbol contour is not one of the four public station glyphs")
+
+
+def _find_box(arr: np.ndarray, color: np.ndarray, expected: tuple[int, int], minimum: int) -> dict[str, float | int]:
+    boxes = []
+    for comp in _components(_near(arr, color), minimum=minimum):
+        width = int(comp["x1"]) - int(comp["x0"]) + 1
+        height = int(comp["y1"]) - int(comp["y0"]) + 1
+        if abs(width - expected[0]) <= 3 and abs(height - expected[1]) <= 3:
+            boxes.append(comp)
+    if len(boxes) != 1:
+        raise PixelParseError(f"expected one {expected[0]}x{expected[1]} box, found {len(boxes)}")
+    return boxes[0]
+
+
+def _parse_card(arr: np.ndarray, box: dict[str, float | int]) -> tuple[str, str]:
+    left, top = int(box["x0"]), int(box["y0"])
+    source = _classify_symbol(arr, (left + 14, top + 55, left + 75, top + 130))
+    destination = _classify_symbol(arr, (left + 125, top + 55, left + 181, top + 130))
+    arrow_crop = arr[top + 65 : top + 119, left + 70 : left + 144]
+    arrows = _components(_near(arrow_crop, _ARROW), minimum=500)
+    if len(arrows) != 1:
+        raise PixelParseError(f"card has {len(arrows)} recoverable arrows")
+    arrow = arrows[0]
+    width = int(arrow["x1"]) - int(arrow["x0"]) + 1
+    height = int(arrow["y1"]) - int(arrow["y0"]) + 1
+    rel_x = (float(arrow["cx"]) - float(arrow["x0"])) / max(width - 1, 1)
+    # The shaft-plus-head is a large, right-heavy connected component.
+    if width < 45 or height < 28 or rel_x < 0.505:
+        raise PixelParseError("route arrow is missing or not uniquely rightward")
+    return source, destination
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3 or arr.shape[0] < 520 or arr.shape[1] < 900:
+        raise PixelParseError("canvas is missing or too small")
+    start_box = _find_box(arr, _START, (213, 157), 25000)
+    sx0, sy0 = int(start_box["x0"]), int(start_box["y0"])
+    state = _classify_symbol(arr, (sx0 + 68, sy0 + 52, sx0 + 145, sy0 + 133))
+
+    cards = []
+    for comp in _components(_near(arr, _CARD), minimum=23000):
+        width = int(comp["x1"]) - int(comp["x0"]) + 1
+        height = int(comp["y1"]) - int(comp["y0"]) + 1
+        if 179 <= width <= 184 and 164 <= height <= 169:
+            cards.append(comp)
+    cards.sort(key=lambda item: float(item["cx"]))
+    if len(cards) != 4:
+        raise PixelParseError(f"expected four separated route cards, found {len(cards)}")
+    gaps = [float(cards[i + 1]["cx"]) - float(cards[i]["cx"]) for i in range(3)]
+    if min(gaps) < 200:
+        raise PixelParseError("left-to-right card order is ambiguous")
+    for card in cards:
+        source, destination = _parse_card(arr, card)
+        if state == source:
+            state = destination
+    return state

@@ -1,0 +1,123 @@
+"""Pixel-only inverse arm for the complement-tiling grid search world.
+
+The oracle receives a rasterized image and nothing else.  It locates the two
+horizontal bands of drawn boxes, splits the lower band into candidate boxes,
+reads the sixteen cell occupancies of every box by sampling cell centres, and
+selects the candidate whose overlay with the reference has no conflicting cell.
+It abstains when the layout is not recovered or the runner-up gap is too small.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+AMBIGUOUS = "ambiguous"
+CELLS = 4
+N_CELLS = CELLS * CELLS
+N_CANDIDATES = 5
+
+BOX_THRESHOLD = 40
+FILL_THRESHOLD = 150
+ABSTAIN_MARGIN_PERCENT = 9.0
+PATCH = 2
+
+
+def _modal_colour(pixels: np.ndarray) -> np.ndarray:
+    flat = pixels.reshape(-1, 3).astype(np.int64)
+    keys = (flat[:, 0] << 16) | (flat[:, 1] << 8) | flat[:, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    key = int(values[int(np.argmax(counts))])
+    return np.array([(key >> 16) & 255, (key >> 8) & 255, key & 255], dtype=np.int64)
+
+
+def _runs(flags: np.ndarray, min_length: int = 6) -> list:
+    runs = []
+    start = None
+    for index, flag in enumerate(flags):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            if index - start >= min_length:
+                runs.append((start, index))
+            start = None
+    if start is not None and len(flags) - start >= min_length:
+        runs.append((start, len(flags)))
+    return runs
+
+
+def _read_cells(distance: np.ndarray, box) -> list:
+    """Sample the sixteen cell centres of one box and report filled cells."""
+    left, right, top, bottom = box
+    width = right - left
+    height = bottom - top
+    if width < 4 * CELLS or height < 4 * CELLS:
+        return []
+    mask = []
+    for row in range(CELLS):
+        for column in range(CELLS):
+            cx = int(round(left + (column + 0.5) * width / CELLS))
+            cy = int(round(top + (row + 0.5) * height / CELLS))
+            patch = distance[
+                max(cy - PATCH, 0) : cy + PATCH + 1,
+                max(cx - PATCH, 0) : cx + PATCH + 1,
+            ]
+            if patch.size == 0:
+                return []
+            mask.append(1 if float(np.median(patch)) > FILL_THRESHOLD else 0)
+    return mask
+
+
+def analyse(image: Image.Image) -> dict:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int64)
+    background = _modal_colour(pixels)
+    distance = np.abs(pixels - background).sum(axis=2)
+    drawn = distance > BOX_THRESHOLD
+
+    empty = {"decision": AMBIGUOUS, "margin": 0.0, "scores": []}
+    bands = _runs(drawn.any(axis=1))
+    if len(bands) != 2:
+        return empty
+    (ref_top, ref_bottom), (cand_top, cand_bottom) = bands
+
+    ref_columns = _runs(drawn[ref_top:ref_bottom, :].any(axis=0))
+    if len(ref_columns) != 1:
+        return empty
+    reference = _read_cells(
+        distance, (ref_columns[0][0], ref_columns[0][1], ref_top, ref_bottom)
+    )
+    if len(reference) != N_CELLS:
+        return empty
+
+    cand_columns = _runs(drawn[cand_top:cand_bottom, :].any(axis=0))
+    if len(cand_columns) != N_CANDIDATES:
+        return empty
+
+    scores = []
+    for left, right in cand_columns:
+        rows = _runs(drawn[:, left:right].any(axis=1))
+        box_rows = [run for run in rows if run[0] >= cand_top - 1]
+        if len(box_rows) != 1:
+            return empty
+        mask = _read_cells(distance, (left, right, box_rows[0][0], box_rows[0][1]))
+        if len(mask) != N_CELLS:
+            return empty
+        scores.append(sum(1 for a, b in zip(reference, mask) if a == b))
+
+    order = sorted(range(N_CANDIDATES), key=lambda index: scores[index])
+    gap = 100.0 * (scores[order[1]] - scores[order[0]]) / N_CELLS
+    if gap < ABSTAIN_MARGIN_PERCENT:
+        return {"decision": AMBIGUOUS, "margin": float(gap), "scores": scores}
+    return {
+        "decision": f"grid-{order[0] + 1}",
+        "margin": round(float(gap), 9),
+        "scores": scores,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return analyse(image)["decision"]
+
+
+def margin_from_image(image: Image.Image) -> float:
+    return round(float(analyse(image)["margin"]), 9)

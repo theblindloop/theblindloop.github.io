@@ -1,0 +1,290 @@
+"""Renderer and analytic arm for colored-landmark similarity correspondence.
+
+Each scene contains one reference constellation and three labeled test cards.
+The matching card is an orientation-preserving similarity of the reference.  A
+second card is a reflected copy and a third rebinds the same four colors to the
+same unlabeled geometry.  Thus all cards have the same color inventory, marker
+count, radius, and total ink; the color-to-relation binding is decisive.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 640
+HEIGHT = 540
+SUPERSAMPLE = 3
+LABELS = ("A", "B", "C")
+
+PALETTES = (
+    ((213, 58, 67), (42, 111, 211), (36, 157, 92), (226, 146, 31)),
+    ((190, 54, 126), (25, 148, 181), (103, 76, 196), (218, 116, 34)),
+    ((205, 70, 48), (38, 128, 191), (50, 153, 75), (177, 86, 177)),
+)
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    path = Path("/usr/share/fonts/truetype/dejavu") / name
+    try:
+        return ImageFont.truetype(str(path), size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _center_and_normalize(points: list[list[float]]) -> list[list[float]]:
+    cx = sum(point[0] for point in points) / len(points)
+    cy = sum(point[1] for point in points) / len(points)
+    centered = [[point[0] - cx, point[1] - cy] for point in points]
+    radius = max(math.hypot(x, y) for x, y in centered)
+    return [[x / radius, y / radius] for x, y in centered]
+
+
+def _shape_ok(points: list[list[float]]) -> bool:
+    gaps = [
+        math.hypot(points[i][0] - points[j][0], points[i][1] - points[j][1])
+        for i in range(4)
+        for j in range(i + 1, 4)
+    ]
+    if min(gaps) < 0.48:
+        return False
+    xx = sum(point[0] ** 2 for point in points) / 4.0
+    yy = sum(point[1] ** 2 for point in points) / 4.0
+    xy = sum(point[0] * point[1] for point in points) / 4.0
+    trace = xx + yy
+    disc = math.sqrt(max((xx - yy) ** 2 + 4.0 * xy * xy, 0.0))
+    small = (trace - disc) / 2.0
+    large = (trace + disc) / 2.0
+    return large > 0.0 and small / large > 0.16
+
+
+def _transform(
+    points: list[list[float]], center: tuple[float, float], scale: float, angle: float
+) -> list[list[float]]:
+    cosine, sine = math.cos(angle), math.sin(angle)
+    cx, cy = center
+    return [
+        [
+            cx + scale * (cosine * point[0] - sine * point[1]),
+            cy + scale * (sine * point[0] + cosine * point[1]),
+        ]
+        for point in points
+    ]
+
+
+def _similarity_residual(
+    reference: list[list[float]], test: list[list[float]], color_order: list[int]
+) -> float:
+    """Normalized RMS after the best translation/rotation/uniform scale fit."""
+
+    by_color: list[list[float] | None] = [None, None, None, None]
+    for point, color_index in zip(test, color_order, strict=True):
+        by_color[int(color_index)] = point
+    if any(point is None for point in by_color):
+        return float("inf")
+    source = [complex(float(x), float(y)) for x, y in reference]
+    target = [complex(float(point[0]), float(point[1])) for point in by_color if point is not None]
+    source_mean = sum(source) / 4.0
+    target_mean = sum(target) / 4.0
+    centered_source = [value - source_mean for value in source]
+    centered_target = [value - target_mean for value in target]
+    denominator = sum(abs(value) ** 2 for value in centered_source)
+    coefficient = sum(
+        left.conjugate() * right
+        for left, right in zip(centered_source, centered_target, strict=True)
+    ) / denominator
+    predicted = [target_mean + coefficient * value for value in centered_source]
+    rms = math.sqrt(
+        sum(abs(pred - actual) ** 2 for pred, actual in zip(predicted, target, strict=True))
+        / 4.0
+    )
+    target_radius = math.sqrt(sum(abs(value) ** 2 for value in centered_target) / 4.0)
+    return rms / target_radius
+
+
+def _card_scores(scene: dict) -> list[float]:
+    return [
+        _similarity_residual(scene["reference_points"], points, order)
+        for points, order in zip(
+            scene["test_points"], scene["test_color_orders"], strict=True
+        )
+    ]
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    for _ in range(10_000):
+        raw = [[rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0)] for _ in range(4)]
+        local = _center_and_normalize(raw)
+        if not _shape_ok(local):
+            continue
+        mirrored = [[-point[0], point[1]] for point in local]
+        mirror_score = _similarity_residual(local, mirrored, [0, 1, 2, 3])
+        permutations = []
+        base_order = [0, 1, 2, 3]
+        for _perm_try in range(60):
+            order = list(base_order)
+            rng.shuffle(order)
+            if order == base_order:
+                continue
+            score = _similarity_residual(local, local, order)
+            if score >= 0.24:
+                permutations.append((score, order))
+        if mirror_score >= 0.24 and permutations:
+            permutation = rng.choice(permutations)[1]
+            break
+    else:
+        raise RuntimeError("could not sample an asymmetric landmark constellation")
+
+    reference_points = _transform(
+        local,
+        (320.0 + rng.uniform(-10.0, 10.0), 162.0 + rng.uniform(-5.0, 5.0)),
+        rng.uniform(82.0, 94.0),
+        rng.uniform(-math.pi, math.pi),
+    )
+
+    correct_index = int(seed) % 3
+    remaining = [index for index in range(3) if index != correct_index]
+    if rng.random() < 0.5:
+        mirror_index, permutation_index = remaining
+    else:
+        permutation_index, mirror_index = remaining
+    kinds = ["permutation", "permutation", "permutation"]
+    kinds[correct_index] = "match"
+    kinds[mirror_index] = "mirror"
+
+    card_centers = ((108.0, 414.0), (320.0, 414.0), (532.0, 414.0))
+    test_points: list[list[list[float]]] = []
+    test_color_orders: list[list[int]] = []
+    for index, center in enumerate(card_centers):
+        source = mirrored if kinds[index] == "mirror" else local
+        points = _transform(
+            source,
+            (center[0] + rng.uniform(-3.0, 3.0), center[1] + rng.uniform(-4.0, 4.0)),
+            rng.uniform(54.0, 61.0),
+            rng.uniform(-math.pi, math.pi),
+        )
+        test_points.append(points)
+        test_color_orders.append(permutation if index == permutation_index else list(base_order))
+
+    palette = [list(color) for color in rng.choice(PALETTES)]
+    rng.shuffle(palette)
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "reference_points": reference_points,
+        "test_points": test_points,
+        "test_color_orders": test_color_orders,
+        "card_labels": list(LABELS),
+        "marker_radius": rng.randint(10, 12),
+        "palette": palette,
+    }
+    if is_quarantined(scene):
+        raise RuntimeError("internal sampler produced a quarantined scene")
+    return scene
+
+
+def analytic_gold(scene: dict) -> str:
+    scores = _card_scores(scene)
+    winner = min(range(len(scores)), key=scores.__getitem__)
+    return str(scene["card_labels"][winner])
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_card_scores(scene))
+    return float(scores[1] - scores[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = sorted(_card_scores(scene))
+    return scores[0] > 0.01 or scores[1] - scores[0] < 0.12
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Reverse each card's parallel landmark records without changing pixels."""
+
+    twin = dict(scene)
+    twin["test_points"] = [list(reversed(points)) for points in scene["test_points"]]
+    twin["test_color_orders"] = [
+        list(reversed(order)) for order in scene["test_color_orders"]
+    ]
+    return [("reverse_parallel_landmark_records", twin)]
+
+
+def _draw_marker(
+    draw: ImageDraw.ImageDraw,
+    point: list[float],
+    radius: float,
+    color: tuple[int, int, int],
+    scale: int,
+) -> None:
+    x, y = point
+    outer = tuple(
+        int(round(value * scale))
+        for value in (x - radius - 2, y - radius - 2, x + radius + 2, y + radius + 2)
+    )
+    inner = tuple(
+        int(round(value * scale))
+        for value in (x - radius, y - radius, x + radius, y + radius)
+    )
+    draw.ellipse(outer, fill=(48, 52, 57))
+    draw.ellipse(inner, fill=color)
+
+
+def render(scene: dict) -> Image.Image:
+    scale = SUPERSAMPLE
+    width, height = int(scene["width"]), int(scene["height"])
+    image = Image.new("RGB", (width * scale, height * scale), (246, 245, 242))
+    draw = ImageDraw.Draw(image)
+
+    def box(values: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+        return tuple(int(round(value * scale)) for value in values)
+
+    draw.rounded_rectangle(
+        box((18, 42, width - 18, 260)),
+        radius=15 * scale,
+        fill=(255, 255, 255),
+        outline=(193, 198, 203),
+        width=2 * scale,
+    )
+    for left in (12, 224, 436):
+        draw.rounded_rectangle(
+            box((left, 294, left + 192, 526)),
+            radius=14 * scale,
+            fill=(255, 255, 255),
+            outline=(193, 198, 203),
+            width=2 * scale,
+        )
+
+    heading = _font(14 * scale, bold=True)
+    body = _font(12 * scale)
+    label_font = _font(22 * scale, bold=True)
+    draw.text((32 * scale, 55 * scale), "REFERENCE", fill=(62, 67, 73), font=heading)
+    draw.text(
+        (143 * scale, 56 * scale),
+        "match colored positions after rotation + uniform resize",
+        fill=(91, 96, 101),
+        font=body,
+    )
+    draw.text((25 * scale, 272 * scale), "TEST CARDS", fill=(62, 67, 73), font=heading)
+    for index, label in enumerate(scene["card_labels"]):
+        draw.text(
+            ((28 + 212 * index) * scale, 306 * scale),
+            str(label),
+            fill=(52, 57, 63),
+            font=label_font,
+        )
+
+    palette = [tuple(int(channel) for channel in color) for color in scene["palette"]]
+    radius = float(scene["marker_radius"])
+    for color, point in zip(palette, scene["reference_points"], strict=True):
+        _draw_marker(draw, point, radius + 2.0, color, scale)
+    for points, order in zip(scene["test_points"], scene["test_color_orders"], strict=True):
+        for point, color_index in zip(points, order, strict=True):
+            _draw_marker(draw, point, radius, palette[int(color_index)], scale)
+
+    return image.resize((width, height), Image.Resampling.LANCZOS)

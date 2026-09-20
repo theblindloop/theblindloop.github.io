@@ -1,0 +1,135 @@
+"""Independent pixel-only inverse for the four tabbed tiles."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+LABELS = ("circle", "diamond", "plus", "X")
+
+
+def _cyan(a: np.ndarray) -> np.ndarray:
+    return (a[:, :, 0] < 90) & (a[:, :, 1] > 115) & (a[:, :, 2] > 145)
+
+
+def _magenta(a: np.ndarray) -> np.ndarray:
+    return (a[:, :, 0] > 150) & (a[:, :, 1] < 100) & (a[:, :, 2] > 115)
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    points = set(map(tuple, np.argwhere(mask)))
+    result = []
+    while points:
+        start = points.pop()
+        queue = [start]
+        ys = [start[0]]
+        xs = [start[1]]
+        while queue:
+            y, x = queue.pop()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if neighbor in points:
+                    points.remove(neighbor)
+                    queue.append(neighbor)
+                    ys.append(neighbor[0])
+                    xs.append(neighbor[1])
+        if len(xs) > 500:
+            result.append((min(xs), min(ys), max(xs), max(ys), len(xs)))
+    return result
+
+
+def _shape_cost(kind: str, x: int, y: int) -> float:
+    mid = 11.5
+    if kind == "circle":
+        return abs(math.hypot(x - mid, y - mid) - 8.2)
+    if kind == "diamond":
+        return abs(abs(x - mid) + abs(y - mid) - 11.0)
+    if kind == "plus":
+        return min(abs(x - mid), abs(y - mid))
+    return min(abs(x - y), abs((x - mid) + (y - mid)))
+
+
+def _reference(kind: str) -> np.ndarray:
+    chosen = sorted((_shape_cost(kind, x, y), y, x) for y in range(12) for x in range(12))[:24]
+    out = np.zeros((24, 24), dtype=np.uint8)
+    for _, y, x in chosen:
+        out[y, x] = out[y, 23 - x] = out[23 - y, x] = out[23 - y, 23 - x] = 1
+    return out
+
+
+def _ccw_corner(corner: tuple[int, int]) -> tuple[int, int]:
+    return 1 - corner[1], corner[0]
+
+
+def _sample_tile(a: np.ndarray, box: tuple[int, int, int, int, int]) -> tuple[np.ndarray, tuple[int, int], tuple[float, float]]:
+    x0, y0, x1, y1, _ = box
+    cyan = _cyan(a)
+    center_y = (y0 + y1) // 2
+    center_x = (x0 + x1) // 2
+    left_run = 0
+    while x0 + left_run <= x1 and cyan[center_y, x0 + left_run]:
+        left_run += 1
+    top_run = 0
+    while y0 + top_run <= y1 and cyan[y0 + top_run, center_x]:
+        top_run += 1
+    right_run = 0
+    while x1 - right_run >= x0 and cyan[center_y, x1 - right_run]:
+        right_run += 1
+    bottom_run = 0
+    while y1 - bottom_run >= y0 and cyan[y1 - bottom_run, center_x]:
+        bottom_run += 1
+    ix0, ix1 = x0 + left_run, x1 - right_run
+    iy0, iy1 = y0 + top_run, y1 - bottom_run
+    if min(left_run, top_run, right_run, bottom_run) < 3:
+        raise ValueError("incomplete cyan frame")
+    tile = np.zeros((12, 12), dtype=np.uint8)
+    for row in range(12):
+        for col in range(12):
+            cx = int(round(ix0 + (col + 0.5) * (ix1 - ix0 + 1) / 12 - 0.5))
+            cy = int(round(iy0 + (row + 0.5) * (iy1 - iy0 + 1) / 12 - 0.5))
+            patch = a[max(0, cy - 2):cy + 3, max(0, cx - 2):cx + 3]
+            tile[row, col] = int(np.mean(np.max(patch, axis=2) < 80) > 0.55)
+    mag = _magenta(a[max(0, y0 - 3):y1 + 4, max(0, x0 - 3):x1 + 4])
+    coords = np.argwhere(mag)
+    if len(coords) < 20:
+        raise ValueError("missing magenta tab")
+    my = float(coords[:, 0].mean() + max(0, y0 - 3))
+    mx = float(coords[:, 1].mean() + max(0, x0 - 3))
+    corner = (int(my > (y0 + y1) / 2), int(mx > (x0 + x1) / 2))
+    return tile, corner, ((x0 + x1) / 2, (y0 + y1) / 2)
+
+
+def decision_details(image: Image.Image) -> dict:
+    a = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    boxes = _components(_cyan(a))
+    if len(boxes) != 4:
+        raise ValueError(f"expected four cyan tile frames, found {len(boxes)}")
+    measured = [_sample_tile(a, box) for box in boxes]
+    measured.sort(key=lambda item: item[2][1])
+    top = sorted(measured[:2], key=lambda item: item[2][0])
+    bottom = sorted(measured[2:], key=lambda item: item[2][0])
+    ordered = top + bottom
+    desired = ((1, 1), (1, 0), (0, 1), (0, 0))
+    corrected = []
+    for (tile, corner, _), target in zip(ordered, desired):
+        probe = corner
+        for turns in range(4):
+            if probe == target:
+                corrected.append(np.rot90(tile, turns))
+                break
+            probe = _ccw_corner(probe)
+        else:
+            raise ValueError("tab orientation is ambiguous")
+    assembled = np.block([[corrected[0], corrected[1]], [corrected[2], corrected[3]]])
+    scores = {label: int(np.count_nonzero(assembled != _reference(label))) for label in LABELS}
+    ranked = sorted(scores.items(), key=lambda item: (item[1], LABELS.index(item[0])))
+    margin = float(ranked[1][1] - ranked[0][1])
+    if margin < 12:
+        raise ValueError(f"ambiguous reconstruction: runner-up margin {margin}")
+    return {"decision": ranked[0][0], "margin": margin, "scores": scores}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(decision_details(image)["decision"])

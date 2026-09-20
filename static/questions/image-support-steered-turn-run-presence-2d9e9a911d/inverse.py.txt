@@ -1,0 +1,154 @@
+"""Independent pixel-only inverse arm for ordered turn-run detection."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+_TRACE = np.array((23, 52, 93), dtype=np.int16)
+_START = np.array((24, 165, 88), dtype=np.int16)
+_FINISH = np.array((220, 63, 69), dtype=np.int16)
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: int = 8) -> np.ndarray:
+    return np.max(np.abs(array.astype(np.int16) - color), axis=2) <= tolerance
+
+
+def _centroid(mask: np.ndarray, name: str) -> tuple[float, float]:
+    yy, xx = np.nonzero(mask)
+    if not 180 <= len(xx) <= 420:
+        raise ValueError(f"missing or malformed {name} marker")
+    return float(xx.mean()), float(yy.mean())
+
+
+def _component_count(mask: np.ndarray) -> int:
+    unseen = {tuple(v) for v in np.argwhere(mask).tolist()}
+    count = 0
+    while unseen:
+        count += 1
+        stack = [unseen.pop()]
+        while stack:
+            y, x = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    nxt = (y+dy, x+dx)
+                    if nxt in unseen:
+                        unseen.remove(nxt)
+                        stack.append(nxt)
+    return count
+
+
+def _nearest(points: np.ndarray, center: tuple[float, float]) -> tuple[int, int]:
+    delta = points.astype(float) - np.array((center[1], center[0]))
+    y, x = points[int(np.argmin(np.sum(delta * delta, axis=1)))]
+    return int(y), int(x)
+
+
+def _shortest_path(mask: np.ndarray, start: tuple[int, int], finish: tuple[int, int]):
+    queue = deque([start])
+    parent = {start: None}
+    while queue:
+        point = queue.popleft()
+        if point == finish:
+            break
+        y, x = point
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dx or dy):
+                    continue
+                nxt = (y+dy, x+dx)
+                if (0 <= nxt[0] < mask.shape[0] and 0 <= nxt[1] < mask.shape[1]
+                        and mask[nxt] and nxt not in parent):
+                    parent[nxt] = point
+                    queue.append(nxt)
+    if finish not in parent:
+        raise ValueError("navy centerline is broken")
+    path = []
+    point = finish
+    while point is not None:
+        path.append((float(point[1]), float(point[0])))
+        point = parent[point]
+    return list(reversed(path))
+
+
+def _axis_centerline(mask: np.ndarray, start_center, finish_center):
+    """Recover the median centerline along the trace's visible monotone axis."""
+    yy, xx = np.nonzero(mask)
+    values = []
+    if abs(finish_center[0] - start_center[0]) >= abs(finish_center[1] - start_center[1]):
+        for x in range(int(xx.min()), int(xx.max()) + 1):
+            ys = yy[xx == x]
+            if len(ys):
+                values.append((float(x), float(np.median(ys))))
+        if start_center[0] > finish_center[0]:
+            values.reverse()
+    else:
+        for y in range(int(yy.min()), int(yy.max()) + 1):
+            xs = xx[yy == y]
+            if len(xs):
+                values.append((float(np.median(xs)), float(y)))
+        if start_center[1] > finish_center[1]:
+            values.reverse()
+    if len(values) < 400:
+        raise ValueError("trace has insufficient axis span")
+    return values
+
+
+def _distance_to_segment(point, a, b) -> float:
+    px, py = point; ax, ay = a; bx, by = b
+    vx, vy = bx-ax, by-ay
+    denom = vx*vx + vy*vy
+    if denom == 0:
+        return math.hypot(px-ax, py-ay)
+    t = max(0.0, min(1.0, ((px-ax)*vx + (py-ay)*vy) / denom))
+    return math.hypot(px-(ax+t*vx), py-(ay+t*vy))
+
+
+def _rdp(points, epsilon: float):
+    if len(points) <= 2:
+        return points
+    distances = [_distance_to_segment(p, points[0], points[-1]) for p in points[1:-1]]
+    if not distances or max(distances) <= epsilon:
+        return [points[0], points[-1]]
+    index = 1 + int(np.argmax(distances))
+    left = _rdp(points[:index+1], epsilon)
+    right = _rdp(points[index:], epsilon)
+    return left[:-1] + right
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape[:2] != (640, 640):
+        raise ValueError("unsupported raster size")
+    start_center = _centroid(_mask(array, _START), "green")
+    finish_center = _centroid(_mask(array, _FINISH), "red")
+    trace = _mask(array, _TRACE)
+    points = np.argwhere(trace)
+    if not 1800 <= len(points) <= 4200 or _component_count(trace) != 1:
+        raise ValueError("missing, broken, or extraneous navy centerline")
+    # Connectedness is verified above. Median sampling across the visibly
+    # monotone long axis avoids choosing an arbitrary edge of the thick raster
+    # stroke while remaining entirely image-derived.
+    ordered = _axis_centerline(trace, start_center, finish_center)
+    vertices = []
+    for epsilon in (3.0, 3.25, 3.5, 3.75, 4.0, 4.25, 4.5):
+        proposal = _rdp(ordered, epsilon)
+        if len(proposal) == 10:
+            vertices = proposal
+            break
+        vertices = proposal
+    if len(vertices) != 10:
+        raise ValueError(f"expected eight resolved bends, found {len(vertices)-2}")
+    signs = []
+    for i in range(1, 9):
+        u = (vertices[i][0]-vertices[i-1][0], vertices[i][1]-vertices[i-1][1])
+        v = (vertices[i+1][0]-vertices[i][0], vertices[i+1][1]-vertices[i][1])
+        cross = u[0]*v[1] - u[1]*v[0]
+        sine = abs(cross) / max(1.0, math.hypot(*u)*math.hypot(*v))
+        if sine < 0.11:
+            raise ValueError("ambiguous bend")
+        signs.append(1 if cross > 0 else -1)
+    return "yes" if any(a == b for a, b in zip(signs, signs[1:])) else "no"

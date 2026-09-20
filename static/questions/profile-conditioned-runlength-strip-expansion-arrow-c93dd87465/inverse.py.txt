@@ -1,0 +1,135 @@
+"""Independent image-only inverse arm for calibrated run strips.
+
+This module intentionally duplicates only the public palette and arrow contract.
+It imports no renderer, scene, prompt, generator, verifier, or gold code.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+CYAN = (30, 160, 180)
+GOLD = (228, 170, 45)
+DARKS = ((35, 55, 90), (92, 42, 65), (35, 78, 55))
+PALES = ((185, 211, 225), (226, 193, 204), (190, 220, 194))
+LABELS = ("up", "right", "down", "left")
+BASE_UP = (
+    "000010000", "000111000", "001111100", "011111110", "000111000",
+    "000111000", "000111000", "000111000", "000111000",
+)
+
+
+class PixelDecodeError(ValueError):
+    pass
+
+
+def _rotate(grid: list[list[int]]) -> list[list[int]]:
+    return [list(row) for row in zip(*grid[::-1])]
+
+
+def _templates() -> dict[str, list[list[int]]]:
+    grid = [[int(v) for v in row] for row in BASE_UP]
+    out = {}
+    for label in LABELS:
+        out[label] = [row[:] for row in grid]
+        grid = _rotate(grid)
+    return out
+
+
+def _rectangles(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Recover exact solid-rectangle components from horizontal scan intervals."""
+    completed: list[tuple[int, int, int, int]] = []
+    active: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    for y in np.flatnonzero(mask.any(axis=1)).tolist():
+        xs = np.flatnonzero(mask[y])
+        intervals = []
+        if len(xs):
+            cuts = np.flatnonzero(np.diff(xs) > 1)
+            starts = np.r_[0, cuts + 1]
+            ends = np.r_[cuts, len(xs) - 1]
+            intervals = [(int(xs[a]), int(xs[b])) for a, b in zip(starts, ends)]
+        current = {}
+        for interval in intervals:
+            prior = active.get(interval)
+            if prior is not None and prior[3] == y - 1:
+                current[interval] = (prior[0], prior[1], prior[2], y)
+            else:
+                if prior is not None:
+                    completed.append(prior)
+                current[interval] = (interval[0], y, interval[1], y)
+        for interval, box in active.items():
+            if interval not in current:
+                completed.append(box)
+        active = current
+    completed.extend(active.values())
+    return completed
+
+
+def analyze_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    cyan = np.all(arr == np.array(CYAN, dtype=np.uint8), axis=2)
+    cy, cx = np.where(cyan)
+    if len(cx) < 100:
+        raise PixelDecodeError("missing cyan payload frame")
+    x0, x1, y0, y1 = int(cx.min()), int(cx.max()), int(cy.min()), int(cy.max())
+    if x1 - x0 < 250 or y1 - y0 < 350:
+        raise PixelDecodeError("cyan frame is incomplete")
+    gold = np.all(arr == np.array(GOLD, dtype=np.uint8), axis=2)
+    gy, gx = np.where(gold)
+    if len(gx) < 20:
+        raise PixelDecodeError("missing gold unit bar")
+    unit = int(gx.max() - gx.min() + 1)
+    if unit not in range(10, 19):
+        raise PixelDecodeError(f"implausible visible unit {unit}")
+
+    inner = arr[y0 + 5:y1 - 3, x0 + 5:x1 - 3]
+    tokens: list[tuple[int, int, int, int, int]] = []
+    for rgb in DARKS + PALES:
+        mask = np.all(inner == np.array(rgb, dtype=np.uint8), axis=2)
+        bit = 1 if rgb in DARKS else 0
+        for bx0, by0, bx1, by1 in _rectangles(mask):
+            width, height = bx1 - bx0 + 1, by1 - by0 + 1
+            if height >= 18 and width >= unit:
+                tokens.append((bx0, by0, bx1, by1, bit))
+    centers = sorted({(box[1] + box[3]) // 2 for box in tokens})
+    if len(centers) != 9:
+        raise PixelDecodeError(f"expected nine visible lanes, found {len(centers)}")
+    grid: list[list[int]] = []
+    for center in centers:
+        row_tokens = sorted(
+            (box for box in tokens if (box[1] + box[3]) // 2 == center), key=lambda box: box[0]
+        )
+        values: list[int] = []
+        for bx0, _, bx1, _, bit in row_tokens:
+            raw = (bx1 - bx0 + 1) / unit
+            length = int(round(raw))
+            if length < 1 or abs(raw - length) > 0.08:
+                raise PixelDecodeError("a run width is not an integer gold unit")
+            values.extend([bit] * length)
+        if len(values) != 9:
+            raise PixelDecodeError(f"expanded lane has {len(values)} rather than nine tiles")
+        grid.append(values)
+
+    scores = {}
+    for label, template in _templates().items():
+        scores[label] = sum(
+            int(grid[y][x] == template[y][x]) for y in range(9) for x in range(9)
+        )
+    order = sorted(scores, key=lambda label: (-scores[label], LABELS.index(label)))
+    gap = scores[order[0]] - scores[order[1]]
+    if gap <= 0:
+        raise PixelDecodeError("top arrow templates tie; abstaining")
+    return {
+        "decision": order[0],
+        "runner_up": order[1],
+        "margin": float(gap),
+        "scores": scores,
+        "unit_px": unit,
+        "grid": grid,
+        "quarantined": gap <= 4,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

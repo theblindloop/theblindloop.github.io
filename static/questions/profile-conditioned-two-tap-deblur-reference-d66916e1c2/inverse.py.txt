@@ -1,0 +1,204 @@
+"""PNG-only inverse arm for the two-tap deblur reference world.
+
+The oracle locates colored frame components rather than using renderer positions.
+It learns the two endpoint colors from visible reference cards, decodes the three
+average levels in the cyan field, validates the gold two-cell key, performs the
+declared causal deconvolution, and compares the recovered bits with the cards.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+N = 9
+ANSWERS = ("A", "B", "C", "D")
+CYAN = np.array((22, 166, 184), dtype=np.int16)
+CORAL = np.array((218, 91, 76), dtype=np.int16)
+GOLD = np.array((232, 177, 42), dtype=np.int16)
+
+
+class PixelDecodeError(ValueError):
+    pass
+
+
+def _near(arr: np.ndarray, color: np.ndarray, tolerance: int = 18) -> np.ndarray:
+    return np.max(np.abs(arr.astype(np.int16) - color), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[tuple[int, int, int, int, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[tuple[int, int, int, int, int]] = []
+    for start_y, start_x in np.argwhere(mask):
+        y0, x0 = int(start_y), int(start_x)
+        if seen[y0, x0]:
+            continue
+        queue = deque([(x0, y0)])
+        seen[y0, x0] = True
+        count = 0
+        xmin = xmax = x0
+        ymin = ymax = y0
+        while queue:
+            x, y = queue.popleft()
+            count += 1
+            xmin, xmax = min(xmin, x), max(xmax, x)
+            ymin, ymax = min(ymin, y), max(ymax, y)
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if 0 <= nx < width and 0 <= ny < height and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((nx, ny))
+        if count >= minimum:
+            components.append((xmin, ymin, xmax, ymax, count))
+    return components
+
+
+def _frame_geometry(
+    component: tuple[int, int, int, int, int], pad: int
+) -> tuple[int, int, int]:
+    xmin, ymin, xmax, ymax, _ = component
+    width, height = xmax - xmin + 1, ymax - ymin + 1
+    if abs(width - height) > 2:
+        raise PixelDecodeError("a located tile frame is not square")
+    numerator = round((width + height) / 2) - 2 * pad
+    cell = int(round(numerator / N))
+    if cell < 8 or abs(numerator - N * cell) > 2:
+        raise PixelDecodeError("a located frame does not calibrate a 9-by-9 grid")
+    return xmin + pad, ymin + pad, cell
+
+
+def _sample_grid(arr: np.ndarray, x0: int, y0: int, cell: int) -> np.ndarray:
+    samples = np.empty((N, N, 3), dtype=np.float64)
+    radius = max(1, min(3, cell // 5))
+    for r in range(N):
+        for c in range(N):
+            x = int(round(x0 + (c + 0.5) * cell))
+            y = int(round(y0 + (r + 0.5) * cell))
+            patch = arr[y - radius:y + radius + 1, x - radius:x + radius + 1]
+            if patch.shape[:2] != (2 * radius + 1, 2 * radius + 1):
+                raise PixelDecodeError("a grid sample falls outside the raster")
+            samples[r, c] = np.median(patch.reshape(-1, 3), axis=0)
+    return samples
+
+
+def _endpoint_palette(reference_samples: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    samples = np.concatenate([item.reshape(-1, 3) for item in reference_samples], axis=0)
+    rounded = np.rint(samples).astype(np.int16)
+    colors, counts = np.unique(rounded, axis=0, return_counts=True)
+    substantial = colors[counts >= 8]
+    if len(substantial) != 2:
+        raise PixelDecodeError("reference cards do not expose exactly two stable tile colors")
+    luminance = substantial @ np.array((0.2126, 0.7152, 0.0722))
+    ink = substantial[int(np.argmin(luminance))].astype(np.float64)
+    blank = substantial[int(np.argmax(luminance))].astype(np.float64)
+    if float(np.linalg.norm(blank - ink)) < 90:
+        raise PixelDecodeError("reference ink and blank are not visually separated")
+    return blank, ink
+
+
+def _decode_binary(samples: np.ndarray, blank: np.ndarray, ink: np.ndarray) -> list[list[int]]:
+    direction = ink - blank
+    denom = float(direction @ direction)
+    values: list[list[int]] = []
+    for row in samples:
+        decoded = []
+        for color in row:
+            t = float((color - blank) @ direction / denom)
+            bit = int(t >= 0.5)
+            expected = ink if bit else blank
+            if float(np.linalg.norm(color - expected)) > 20:
+                raise PixelDecodeError("reference tile is not an endpoint palette color")
+            decoded.append(bit)
+        values.append(decoded)
+    return values
+
+
+def _decode_levels(samples: np.ndarray, blank: np.ndarray, ink: np.ndarray) -> list[list[int]]:
+    direction = ink - blank
+    denom = float(direction @ direction)
+    levels: list[list[int]] = []
+    for row in samples:
+        decoded = []
+        for color in row:
+            t = float((color - blank) @ direction / denom)
+            level = int(round(2.0 * t))
+            if level not in (0, 1, 2):
+                raise PixelDecodeError("main tile lies outside the three average levels")
+            expected = blank + (level / 2.0) * direction
+            if abs(t - level / 2.0) > 0.13 or float(np.linalg.norm(color - expected)) > 25:
+                raise PixelDecodeError("main tile is not a valid endpoint average")
+            decoded.append(level)
+        levels.append(decoded)
+    return levels
+
+
+def _deblur(levels: list[list[int]]) -> list[list[int]]:
+    source = []
+    for row in levels:
+        left = 0
+        recovered = []
+        for level in row:
+            current = int(level) - left
+            if current not in (0, 1):
+                raise PixelDecodeError("average levels violate blank-boundary deconvolution")
+            recovered.append(current)
+            left = current
+        source.append(recovered)
+    return source
+
+
+def _hamming(left: list[list[int]], right: list[list[int]]) -> int:
+    return sum(a != b for ra, rb in zip(left, right) for a, b in zip(ra, rb))
+
+
+def measurement_from_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    cyan_components = _components(_near(arr, CYAN), minimum=400)
+    if len(cyan_components) != 1:
+        raise PixelDecodeError(f"expected one cyan mosaic frame, found {len(cyan_components)}")
+    main_component = cyan_components[0]
+    main_x, main_y, main_cell = _frame_geometry(main_component, pad=8)
+
+    coral_components = _components(_near(arr, CORAL), minimum=300)
+    card_components = [item for item in coral_components if item[2] - item[0] > 80]
+    if len(card_components) != 4:
+        raise PixelDecodeError(f"expected four coral reference frames, found {len(card_components)}")
+    card_components.sort(key=lambda item: (item[1] // 40, item[0]))
+    card_geometry = [_frame_geometry(item, pad=5) for item in card_components]
+    if max(cell for _, _, cell in card_geometry) != min(cell for _, _, cell in card_geometry):
+        raise PixelDecodeError("reference cards disagree on tile calibration")
+
+    gold_points = np.argwhere(_near(arr, GOLD))
+    if len(gold_points) < 40:
+        raise PixelDecodeError("gold two-cell blur key is missing")
+    gy0, gx0 = gold_points.min(axis=0)
+    gy1, gx1 = gold_points.max(axis=0)
+    key_width, key_height = int(gx1 - gx0 + 1), int(gy1 - gy0 + 1)
+    if abs(key_width - 2 * main_cell) > 3 or not (7 <= key_height <= 13):
+        raise PixelDecodeError("gold key does not span exactly two calibrated cells")
+    if int(gy1) >= main_component[1] or not (main_component[0] <= int(gx0) <= main_component[2]):
+        raise PixelDecodeError("gold blur key is not registered above the cyan field")
+
+    reference_samples = [_sample_grid(arr, x, y, cell) for x, y, cell in card_geometry]
+    blank, ink = _endpoint_palette(reference_samples)
+    references = [_decode_binary(samples, blank, ink) for samples in reference_samples]
+    main_samples = _sample_grid(arr, main_x, main_y, main_cell)
+    levels = _decode_levels(main_samples, blank, ink)
+    source = _deblur(levels)
+    distances = [_hamming(source, reference) for reference in references]
+    order = sorted(range(4), key=lambda index: (distances[index], index))
+    margin = distances[order[1]] - distances[order[0]]
+    if margin < 1:
+        raise PixelDecodeError("deblurred source ties multiple visible references")
+    return {
+        "decision": ANSWERS[order[0]],
+        "margin": int(margin),
+        "distances": [int(value) for value in distances],
+        "source": source,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measurement_from_image(image)["decision"])

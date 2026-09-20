@@ -1,0 +1,298 @@
+"""Slab-stack replay world: sampling, rendering, analytic gold, margins.
+
+One compact slab of sixteen abutting tiles is drawn somewhere on the canvas.
+The top-left tile is filled edge to edge with one colour: the chip already on an
+imaginary spike (the marked initial state). The remaining fifteen tiles are
+instructions read row by row: a small coloured disk pushes a chip of that
+colour, a dark cross pops the top chip. The decision is the colour of the chip
+on top after all fifteen instructions.
+
+Every instruction tile matters: a pop late in the reading order decides which
+earlier push survives, so the decisive evidence is the whole slab area rather
+than any single tile. Marks outside the slab are inert grey decoration.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "slab_stack_replay-0.1.0"
+
+CANVAS = 512
+ROWS = 4
+COLS = 4
+N_CELLS = ROWS * COLS
+N_OPS = N_CELLS - 1
+
+BACKGROUND = (255, 255, 255)
+TILE = (226, 214, 184)
+INK = (40, 44, 52)
+DECOR = (150, 155, 165)
+
+COLOUR_NAMES = ("red", "green", "blue", "purple")
+COLOUR_RGB = {
+    "red": (206, 58, 52),
+    "green": (54, 148, 84),
+    "blue": (52, 96, 196),
+    "purple": (140, 74, 176),
+}
+
+POP = "pop"
+PUSH_PREFIX = "push_"
+
+QUARANTINE_MARGIN_PX = 3.0
+SUPERSAMPLE = 3
+
+
+# --------------------------------------------------------------------------
+# analytic gold (reads only base_colour and ops)
+# --------------------------------------------------------------------------
+def _replay(base, ops):
+    """Return the stack after applying ops to a spike holding one base chip."""
+    stack = [base]
+    for op in ops:
+        if op == POP:
+            if len(stack) < 2:
+                raise ValueError("illegal pop: the stack would be emptied")
+            stack.pop()
+        else:
+            stack.append(op[len(PUSH_PREFIX) :])
+    if not stack:
+        raise ValueError("empty final stack")
+    return stack
+
+
+def analytic_gold(scene) -> str:
+    """Colour name of the chip on top of the spike after the whole slab."""
+    return _replay(scene["base_colour"], scene["ops"])[-1]
+
+
+# --------------------------------------------------------------------------
+# margins and quarantine (pixel-scale legibility of the tile glyphs)
+# --------------------------------------------------------------------------
+def margin(scene) -> float:
+    """Smallest pixel-scale separation the pixel arm must resolve.
+
+    Two quantities decide whether a tile is legible at all: the ring of tile
+    colour left visible between a push disk and its cell border (this is what
+    separates a push disk from the edge-to-edge base fill) and the stroke width
+    of a pop cross. The scene margin is the smaller of the two.
+    """
+    clearance = scene["cell_px"] / 2.0 - scene["disk_radius_px"]
+    return float(min(clearance, float(scene["pop_stroke_px"])))
+
+
+def is_quarantined(scene) -> bool:
+    """True when a glyph feature is too thin to be certified at pixel scale."""
+    return margin(scene) < QUARANTINE_MARGIN_PX
+
+
+def latent_symmetries(scene):
+    """No latent aliases: every sampled field is drawn (see candidate.json)."""
+    return []
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _decisive_index(base, ops):
+    """Index of the instruction that produced the final top chip, else -1.
+
+    Scanning backwards, each pop cancels the next push; the first uncancelled
+    push is the surviving top. -1 means the base chip survived.
+    """
+    pending = 0
+    for index in range(len(ops) - 1, -1, -1):
+        if ops[index] == POP:
+            pending += 1
+        elif pending:
+            pending -= 1
+        else:
+            return index
+    return -1
+
+
+def _sample_ops(rng, pop_probability):
+    ops = []
+    depth = 1
+    for _ in range(N_OPS):
+        if depth >= 2 and rng.random() < pop_probability:
+            ops.append(POP)
+            depth -= 1
+        else:
+            ops.append(PUSH_PREFIX + rng.choice(COLOUR_NAMES))
+            depth += 1
+    return ops
+
+
+def _ops_accepted(base, ops, target, want_base, want_last_push, want_frequent, band, stage):
+    try:
+        stack = _replay(base, ops)
+    except ValueError:
+        return False
+    if stack[-1] != target:
+        return False
+    decisive = _decisive_index(base, ops)
+    if want_base != (decisive < 0):
+        return False
+    pushes = [index for index, op in enumerate(ops) if op != POP]
+    if not pushes or len(ops) - len(pushes) < 3:
+        return False
+    counts = {name: sum(1 for op in ops if op == PUSH_PREFIX + name) for name in COLOUR_NAMES}
+    if min(counts.values()) < 1 or max(counts.values()) > 5:
+        return False
+    if stage >= 2:
+        return True
+    if not want_base:
+        if want_last_push != (decisive == pushes[-1]):
+            return False
+    top_count = max(counts.values())
+    unique_top = [name for name in COLOUR_NAMES if counts[name] == top_count]
+    frequent_match = len(unique_top) == 1 and unique_top[0] == target
+    if want_frequent != frequent_match:
+        return False
+    if stage >= 1 or want_base:
+        return True
+    low, high = ((0, 4), (5, 9), (10, 14))[band]
+    return low <= decisive <= high
+
+
+def _sample_decor(rng, forbidden):
+    """Inert grey decoration placed clear of the slab and of the canvas border."""
+    items = []
+    left, top, right, bottom = forbidden
+    for _ in range(rng.randint(5, 9)):
+        for _attempt in range(200):
+            size = rng.randint(9, 22)
+            x = rng.randint(10, CANVAS - 10 - size)
+            y = rng.randint(10, CANVAS - 10 - size)
+            if x + size + 12 < left or x - 12 > right or y + size + 12 < top or y - 12 > bottom:
+                items.append([rng.choice(["dot", "bar", "tick"]), x, y, size])
+                break
+    return items
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one scene. All randomness is derived from the integer seed."""
+    rng = random.Random(f"{RENDERER_VERSION}|{int(seed)}")
+
+    cell_px = rng.randint(42, 52)
+    frame_px = 3
+    grid_px = 2
+    slab = COLS * cell_px
+    origin_x = rng.randint(38, CANVAS - slab - 38)
+    origin_y = rng.randint(38, CANVAS - slab - 38)
+    disk_radius_px = max(6, int(round(rng.uniform(0.16, 0.24) * cell_px)))
+    pop_stroke_px = 2 if int(seed) % 17 == 0 else rng.randint(3, 7)
+    pop_arm_px = int(round(0.30 * cell_px))
+
+    # Counterbalance schedule. The answer colour cycles with the seed so every
+    # colour is equally often correct; the two cheap colour heuristics are made
+    # correct at chance rate (one in four) rather than never, because a
+    # never-correct heuristic is itself an exploitable regularity. With fifteen
+    # instructions the stack parity forbids the start chip from surviving, so
+    # the start tile colour is drawn from the three colours that are not the
+    # answer and that exclusion is disclosed in deviations.md.
+    target = COLOUR_NAMES[int(seed) % 4]
+    want_last_push = rng.random() < 0.25
+    want_frequent = rng.random() < 0.25
+    want_base = False
+    band = int(rng.random() * 3.0)
+    base_colour = rng.choice([name for name in COLOUR_NAMES if name != target])
+    pop_probability = rng.uniform(0.30, 0.45)
+
+    ops = None
+    for stage in (0, 1, 2):
+        for _attempt in range(20000):
+            trial = _sample_ops(rng, pop_probability)
+            if _ops_accepted(
+                base_colour, trial, target, want_base, want_last_push, want_frequent, band, stage
+            ):
+                ops = trial
+                break
+        if ops is not None:
+            break
+    if ops is None:  # pragma: no cover - staged relaxation always terminates
+        raise RuntimeError(f"could not sample a valid slab for seed {seed}")
+
+    slab_box = (origin_x, origin_y, origin_x + slab, origin_y + slab)
+    return {
+        "width": CANVAS,
+        "height": CANVAS,
+        "cell_px": cell_px,
+        "frame_px": frame_px,
+        "grid_px": grid_px,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "disk_radius_px": disk_radius_px,
+        "pop_stroke_px": pop_stroke_px,
+        "pop_arm_px": pop_arm_px,
+        "base_colour": base_colour,
+        "ops": ops,
+        "decor": _sample_decor(rng, slab_box),
+    }
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _draw_decor(items, draw, scale):
+    for item in items:
+        kind, x, y, size = item[0], item[1] * scale, item[2] * scale, item[3] * scale
+        if kind == "dot":
+            draw.ellipse([x, y, x + size, y + size], fill=DECOR)
+        elif kind == "bar":
+            draw.rectangle([x, y + size * 0.35, x + size, y + size * 0.65], fill=DECOR)
+        else:
+            draw.line([x, y + size, x + size, y], fill=DECOR, width=max(1, int(2 * scale)))
+
+
+def render(scene) -> Image.Image:
+    """Rasterise the scene; supersampled then box-filtered for stable edges."""
+    scale = SUPERSAMPLE
+    width, height = scene["width"], scene["height"]
+    image = Image.new("RGB", (width * scale, height * scale), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    _draw_decor(scene["decor"], draw, scale)
+
+    cell = scene["cell_px"] * scale
+    ox, oy = scene["origin_x"] * scale, scene["origin_y"] * scale
+    frame = scene["frame_px"] * scale
+    grid = scene["grid_px"] * scale
+    radius = scene["disk_radius_px"] * scale
+    stroke = scene["pop_stroke_px"] * scale
+    arm = scene["pop_arm_px"] * scale
+
+    draw.rectangle(
+        [ox - frame, oy - frame, ox + COLS * cell + frame - 1, oy + ROWS * cell + frame - 1],
+        fill=INK,
+    )
+    draw.rectangle([ox, oy, ox + COLS * cell - 1, oy + ROWS * cell - 1], fill=TILE)
+
+    glyphs = [PUSH_PREFIX + scene["base_colour"]] + list(scene["ops"])
+    for index, glyph in enumerate(glyphs):
+        row, col = divmod(index, COLS)
+        x0, y0 = ox + col * cell, oy + row * cell
+        x1, y1 = x0 + cell - 1, y0 + cell - 1
+        if index == 0:
+            draw.rectangle([x0, y0, x1, y1], fill=COLOUR_RGB[scene["base_colour"]])
+            continue
+        cx, cy = x0 + cell / 2.0, y0 + cell / 2.0
+        if glyph == POP:
+            draw.line([cx - arm, cy - arm, cx + arm, cy + arm], fill=INK, width=int(stroke))
+            draw.line([cx - arm, cy + arm, cx + arm, cy - arm], fill=INK, width=int(stroke))
+        else:
+            colour = COLOUR_RGB[glyph[len(PUSH_PREFIX) :]]
+            draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=colour)
+
+    for step in range(1, COLS):
+        x = ox + step * cell
+        draw.rectangle([x - grid // 2, oy, x + grid - grid // 2 - 1, oy + ROWS * cell - 1], fill=INK)
+    for step in range(1, ROWS):
+        y = oy + step * cell
+        draw.rectangle([ox, y - grid // 2, ox + COLS * cell - 1, y + grid - grid // 2 - 1], fill=INK)
+
+    return image.resize((width, height), Image.BOX)

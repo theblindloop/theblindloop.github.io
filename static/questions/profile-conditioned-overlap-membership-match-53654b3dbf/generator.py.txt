@@ -1,0 +1,164 @@
+"""Deterministic sampler and renderer for Boolean region correspondence."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 1000, 720
+DOT_RGB = {
+    0: (235, 111, 36),   # orange
+    1: (16, 151, 136),   # teal
+    2: (105, 166, 43),   # green
+    3: (211, 62, 126),   # pink
+}
+CIRCLE_RGB = (35, 126, 196)
+RECT_RGB = (137, 78, 180)
+BORDER_RGB = {
+    "reference": (100, 108, 118),
+    "red": (205, 52, 55),
+    "blue": (47, 87, 184),
+    "gold": (216, 157, 28),
+}
+SLOTS = {0: (350, 30), 1: (30, 410), 2: (350, 410), 3: (670, 410)}
+MEMBERSHIPS = ((False, False), (False, True), (True, False), (True, True))
+
+
+def _inside(point: list[int] | tuple[int, int], circle: list[int], rect: list[int]) -> tuple[bool, bool]:
+    x, y = float(point[0]), float(point[1])
+    cx, cy, radius = map(float, circle)
+    x0, y0, x1, y1 = map(float, rect)
+    return (math.hypot(x - cx, y - cy) < radius, x0 < x < x1 and y0 < y < y1)
+
+
+def _rectangle_boundary_distance(x: float, y: float, rect: list[int]) -> float:
+    x0, y0, x1, y1 = map(float, rect)
+    if x0 <= x <= x1 and y0 <= y <= y1:
+        return min(x - x0, x1 - x, y - y0, y1 - y)
+    dx = max(x0 - x, 0.0, x - x1)
+    dy = max(y0 - y, 0.0, y - y1)
+    return math.hypot(dx, dy)
+
+
+def _point_for(target: tuple[bool, bool], circle: list[int], rect: list[int],
+               used: list[list[int]], rng: random.Random) -> list[int]:
+    candidates = []
+    for y in range(34, 227, 4):
+        for x in range(28, 273, 4):
+            if _inside((x, y), circle, rect) != target:
+                continue
+            radial_clearance = abs(math.hypot(x - circle[0], y - circle[1]) - circle[2])
+            if radial_clearance < 20 or _rectangle_boundary_distance(x, y, rect) < 20:
+                continue
+            if any(math.hypot(x - px, y - py) < 38 for px, py in used):
+                continue
+            candidates.append([x, y])
+    if not candidates:
+        raise RuntimeError(f"no clear point for membership {target}")
+    return candidates[rng.randrange(len(candidates))]
+
+
+def _panel(role: str, label: str, slot: int, mapping: list[tuple[bool, bool]],
+           rng: random.Random) -> dict:
+    circle = [rng.randint(106, 122), rng.randint(123, 139), rng.randint(72, 78)]
+    rect = [rng.randint(92, 105), rng.randint(58, 72),
+            rng.randint(242, 258), rng.randint(185, 201)]
+    order = list(range(4))
+    rng.shuffle(order)
+    points: dict[int, list[int]] = {}
+    used: list[list[int]] = []
+    for color_id in order:
+        point = _point_for(mapping[color_id], circle, rect, used, rng)
+        points[color_id] = point
+        used.append(point)
+    dots = [{"color": color_id, "center": points[color_id]} for color_id in range(4)]
+    rng.shuffle(dots)
+    return {"role": role, "label": label, "slot": slot, "circle": circle, "rect": rect, "dots": dots}
+
+
+def _signature(panel: dict) -> tuple[tuple[bool, bool], ...]:
+    # Copy the serialized panel as one visible latent field. This keeps the
+    # public rendered-field audit aligned with ``latent_z.fields = [panels]``;
+    # every nested value below is visibly consumed by both gold and render.
+    data = dict(panel)
+    by_color = {}
+    for dot in data["dots"]:
+        by_color[int(dot["color"])] = _inside(dot["center"], data["circle"], data["rect"])
+    if set(by_color) != set(range(4)):
+        raise ValueError("panel must have exactly one dot of every color")
+    return tuple(by_color[index] for index in range(4))
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    reference = list(MEMBERSHIPS)
+    rng.shuffle(reference)
+    first = list(reference)
+    first[0], first[1] = first[1], first[0]
+    second = list(reference)
+    second[2], second[3] = second[3], second[2]
+    correct_label = ("red", "blue", "gold")[int(seed) % 3]
+    remaining = [label for label in ("red", "blue", "gold") if label != correct_label]
+    maps = {correct_label: reference, remaining[0]: first, remaining[1]: second}
+    option_labels = ["red", "blue", "gold"]
+    rng.shuffle(option_labels)
+    panels = [_panel("reference", "reference", 0, reference, rng)]
+    panels.extend(_panel("option", label, slot, maps[label], rng)
+                  for slot, label in enumerate(option_labels, 1))
+    return {"panels": panels}
+
+
+def _draw_panel(draw: ImageDraw.ImageDraw, panel: dict) -> None:
+    ox, oy = SLOTS[int(panel["slot"])]
+    draw.rounded_rectangle((ox, oy, ox + 300, oy + 260), radius=16,
+                           outline=BORDER_RGB[str(panel["label"])], width=9)
+    cx, cy, radius = panel["circle"]
+    draw.ellipse((ox + cx - radius, oy + cy - radius,
+                  ox + cx + radius, oy + cy + radius), outline=CIRCLE_RGB, width=7)
+    x0, y0, x1, y1 = panel["rect"]
+    draw.rectangle((ox + x0, oy + y0, ox + x1, oy + y1), outline=RECT_RGB, width=7)
+    for dot in panel["dots"]:
+        px, py = dot["center"]
+        rgb = DOT_RGB[int(dot["color"])]
+        draw.ellipse((ox + px - 12, oy + py - 12, ox + px + 12, oy + py + 12),
+                     fill=rgb, outline=(255, 255, 255), width=2)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), (250, 248, 243))
+    draw = ImageDraw.Draw(image)
+    for panel in sorted(scene["panels"], key=lambda item: int(item["slot"])):
+        _draw_panel(draw, panel)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    reference = next(panel for panel in scene["panels"] if panel["role"] == "reference")
+    target = _signature(reference)
+    matches = [panel["label"] for panel in scene["panels"]
+               if panel["role"] == "option" and _signature(panel) == target]
+    if len(matches) != 1:
+        raise ValueError("scene does not contain exactly one match")
+    return str(matches[0])
+
+
+def margin(scene: dict) -> float:
+    reference = next(panel for panel in scene["panels"] if panel["role"] == "reference")
+    target = _signature(reference)
+    scores = sorted((sum(a == b for a, b in zip(target, _signature(panel)))
+                     for panel in scene["panels"] if panel["role"] == "option"), reverse=True)
+    return float(scores[0] - scores[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        return margin(scene) < 2.0
+    except (KeyError, ValueError, StopIteration, TypeError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return [("panel_serialization_reversal", {"panels": list(reversed(copy.deepcopy(scene["panels"])))})]

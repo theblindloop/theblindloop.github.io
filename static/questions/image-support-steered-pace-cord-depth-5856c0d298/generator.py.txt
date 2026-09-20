@@ -1,0 +1,333 @@
+"""Pace-cord depth transfer: two far-apart cords, normalized along-cord position.
+
+Latent scene z = {canvas, pace, roster}.
+
+Each of the two cords is an x-monotone (after an optional axis transpose)
+zigzag polyline of constant stroke width, confined to its own widely separated
+box. One end of every cord carries a black start square. The pace cord carries
+one gray disk; the roster cord carries three distinctly coloured disks.
+
+For a disk on a cord, its *depth* is the arclength from that cord's start
+square to the disk divided by the cord's total arclength. The decision is which
+roster colour has depth closest to the pace disk's depth. The measure is
+normalized, so the two cords may have very different absolute lengths.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "pace_cord_depth-0.1.0"
+
+CANVAS = (900, 620)
+STROKE = 7
+DISK_R = 11
+SQUARE_HALF = 8
+
+BACKGROUND = (255, 255, 255)
+CORD_RGB = (34, 46, 74)
+START_RGB = (0, 0, 0)
+PACE_RGB = (128, 128, 128)
+ROSTER_RGB = {
+    "red": (214, 40, 40),
+    "green": (26, 148, 62),
+    "blue": (60, 110, 226),
+}
+ROSTER_COLORS = ("red", "green", "blue")
+
+# Two widely separated boxes, used as a diagonal pair.
+BOX_TL = (20, 20, 440, 280)
+BOX_BR = (460, 340, 880, 600)
+BOX_TR = (460, 20, 880, 280)
+BOX_BL = (20, 340, 440, 600)
+
+MARGIN_QUARANTINE = 9.0  # percent of cord length
+
+
+def _polyline(rng: random.Random, box: tuple[int, int, int, int]) -> list[list[float]]:
+    """x-monotone zigzag inside ``box``; optionally transposed to run vertically.
+
+    x-monotonicity makes self-intersection impossible and forces non-adjacent
+    segments at least one x-step apart, so the stroke never touches itself.
+    """
+    x0, y0, x1, y1 = box
+    transpose = rng.random() < 0.5
+    if transpose:
+        # Build in a transposed frame, then map back into the real box.
+        w = y1 - y0
+        h = x1 - x0
+        ax0, ay0 = 0.0, 0.0
+        ax1, ay1 = float(w), float(h)
+    else:
+        ax0, ay0, ax1, ay1 = float(x0), float(y0), float(x1), float(y1)
+
+    pad = SQUARE_HALF + 4
+    n = rng.randint(4, 6)
+    left = ax0 + pad + rng.uniform(0.0, 22.0)
+    right = ax1 - pad - rng.uniform(0.0, 22.0)
+    weights = [rng.uniform(0.82, 1.18) for _ in range(n)]
+    total = sum(weights)
+    xs = [left]
+    for w_i in weights:
+        xs.append(xs[-1] + (right - left) * w_i / total)
+
+    lo_band = (ay0 + pad, ay0 + pad + 0.22 * (ay1 - ay0))
+    hi_band = (ay1 - pad - 0.22 * (ay1 - ay0), ay1 - pad)
+    start_low = rng.random() < 0.5
+    pts = []
+    for i, x in enumerate(xs):
+        band = lo_band if (i % 2 == 0) == start_low else hi_band
+        pts.append([x, rng.uniform(*band)])
+
+    if transpose:
+        # (a, b) in the transposed frame -> (x0 + b, y0 + a) in the real box.
+        pts = [[x0 + b, y0 + a] for a, b in pts]
+    if rng.random() < 0.5:
+        pts.reverse()
+    return [[round(px, 3), round(py, 3)] for px, py in pts]
+
+
+def _seglens(pts: list[list[float]]) -> list[float]:
+    return [math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+
+
+def _total_len(pts: list[list[float]]) -> float:
+    return sum(_seglens(pts))
+
+
+def _point_at(pts: list[list[float]], frac: float) -> tuple[float, float]:
+    lens = _seglens(pts)
+    target = frac * sum(lens)
+    acc = 0.0
+    for i, seg in enumerate(lens):
+        if acc + seg >= target or i == len(lens) - 1:
+            t = 0.0 if seg <= 0 else (target - acc) / seg
+            t = min(max(t, 0.0), 1.0)
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            return (ax + t * (bx - ax), ay + t * (by - ay))
+        acc += seg
+    raise AssertionError("unreachable")
+
+
+def _roster_fracs(rng: random.Random, pace_frac: float, near_boundary: bool):
+    """Three distinct depths; the winner hugs ``pace_frac``.
+
+    ``near_boundary`` pulls the runner-up close to the winner so that the
+    decision margin approaches the quarantine threshold.
+    """
+    lo, hi = 0.08, 0.92
+    for _ in range(4000):
+        win = pace_frac + rng.uniform(-0.035, 0.035)
+        if not lo <= win <= hi:
+            continue
+        wgap = abs(win - pace_frac)
+        if near_boundary:
+            need = wgap + rng.uniform(0.115, 0.22)
+        else:
+            need = wgap + rng.uniform(0.25, 0.45)
+        others = []
+        for _try in range(200):
+            cand = rng.uniform(lo, hi)
+            if abs(cand - pace_frac) < need:
+                continue
+            if abs(cand - win) < 0.11:
+                continue
+            if any(abs(cand - o) < 0.11 for o in others):
+                continue
+            others.append(cand)
+            if len(others) == 2:
+                break
+        if len(others) != 2:
+            continue
+        return win, others
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(f"pace_cord_depth::{int(seed)}")
+    diagonal = rng.random() < 0.5
+    boxes = (BOX_TL, BOX_BR) if diagonal else (BOX_TR, BOX_BL)
+    if rng.random() < 0.5:
+        pace_box, roster_box = boxes
+    else:
+        roster_box, pace_box = boxes
+
+    near_boundary = rng.random() < 0.2
+    for _attempt in range(200):
+        pace_pts = _polyline(rng, pace_box)
+        roster_pts = _polyline(rng, roster_box)
+        pace_frac = rng.uniform(0.14, 0.86)
+        built = _roster_fracs(rng, pace_frac, near_boundary)
+        if built is None:
+            continue
+        win, others = built
+        colors = list(ROSTER_COLORS)
+        rng.shuffle(colors)
+        fracs = [win] + others
+        disks = [
+            {"color": c, "frac": round(f, 5)} for c, f in zip(colors, fracs)
+        ]
+        rng.shuffle(disks)
+        scene = {
+            "canvas": list(CANVAS),
+            "pace": {
+                "poly": pace_pts,
+                "start_at_first": bool(rng.random() < 0.5),
+                "disk_frac": round(pace_frac, 5),
+            },
+            "roster": {
+                "poly": roster_pts,
+                "start_at_first": bool(rng.random() < 0.5),
+                "disks": disks,
+            },
+        }
+        # Sampling screen: quarantined scenes are defined and flagged by the
+        # public rule below, but they are never emitted, so every published
+        # scene carries a decision margin the pixel arm can certify.
+        if is_quarantined(scene):
+            continue
+        return scene
+    raise RuntimeError(f"could not sample scene for seed {seed}")
+
+
+# --- analytic gold -----------------------------------------------------------
+
+
+def _depths(scene: dict):
+    """Normalized depths. Reads only the two declared label-input fields."""
+    pace = scene["pace"]
+    roster = scene["roster"]
+
+    def oriented(part):
+        pts = [list(p) for p in part["poly"]]
+        if not part["start_at_first"]:
+            pts.reverse()
+        return pts
+
+    pace_pts = oriented(pace)
+    roster_pts = oriented(roster)
+    pace_depth = pace["disk_frac"] if pace["start_at_first"] else 1.0 - pace["disk_frac"]
+    out = {}
+    for disk in roster["disks"]:
+        f = disk["frac"] if roster["start_at_first"] else 1.0 - disk["frac"]
+        out[disk["color"]] = f
+    return pace_depth, out, pace_pts, roster_pts
+
+
+def analytic_gold(scene: dict) -> str:
+    pace_depth, depths, _p, _r = _depths(scene)
+    ranked = sorted(depths.items(), key=lambda kv: (abs(kv[1] - pace_depth), kv[0]))
+    return ranked[0][0]
+
+
+def margin(scene: dict) -> float:
+    """Gap between runner-up and winner absolute depth error, in percent."""
+    pace_depth, depths, _p, _r = _depths(scene)
+    errs = sorted(abs(v - pace_depth) for v in depths.values())
+    return round(100.0 * (errs[1] - errs[0]), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < MARGIN_QUARANTINE
+
+
+def latent_symmetries(scene: dict):
+    """Nontrivial pixel-identical latent aliases.
+
+    The roster disk list is an unordered set of disjoint disks: permuting the
+    list only changes draw order between non-overlapping shapes, so the raster
+    is byte-identical and the gold answer is unchanged. The same holds for
+    reversing a cord's vertex list together with flipping its start flag and
+    complementing every stored fraction: that is the same drawn cord with the
+    same start square and the same disks at the same points.
+    """
+    out = []
+    rotated = dict(scene)
+    roster = dict(scene["roster"])
+    disks = list(roster["disks"])
+    roster["disks"] = disks[1:] + disks[:1]
+    rotated["roster"] = roster
+    out.append(("rotate_roster_disk_list", rotated))
+
+    reparam = dict(scene)
+    for key in ("pace", "roster"):
+        part = dict(scene[key])
+        part["poly"] = [list(p) for p in reversed(part["poly"])]
+        part["start_at_first"] = not part["start_at_first"]
+        if key == "pace":
+            part["disk_frac"] = round(1.0 - part["disk_frac"], 5)
+        else:
+            part["disks"] = [
+                {"color": d["color"], "frac": round(1.0 - d["frac"], 5)}
+                for d in part["disks"]
+            ]
+        reparam[key] = part
+    out.append(("reverse_cord_parametrization", reparam))
+    return out
+
+
+# --- rendering ---------------------------------------------------------------
+
+
+def render(scene: dict) -> Image.Image:
+    w, h = scene["canvas"]
+    img = Image.new("RGB", (int(w), int(h)), BACKGROUND)
+    draw = ImageDraw.Draw(img)
+
+    parts = []
+    pace = scene["pace"]
+    roster = scene["roster"]
+    parts.append((pace["poly"], pace["start_at_first"]))
+    parts.append((roster["poly"], roster["start_at_first"]))
+
+    for poly, _flag in parts:
+        flat = [(float(x), float(y)) for x, y in poly]
+        draw.line(flat, fill=CORD_RGB, width=STROKE, joint="curve")
+
+    # Markers on top of the stroke; the oracle unions them back into the cord.
+    for poly, start_first in parts:
+        sx, sy = poly[0] if start_first else poly[-1]
+        draw.rectangle(
+            [sx - SQUARE_HALF, sy - SQUARE_HALF, sx + SQUARE_HALF, sy + SQUARE_HALF],
+            fill=START_RGB,
+        )
+
+    px, py = _point_at([list(p) for p in pace["poly"]], float(pace["disk_frac"]))
+    draw.ellipse([px - DISK_R, py - DISK_R, px + DISK_R, py + DISK_R], fill=PACE_RGB)
+
+    for disk in roster["disks"]:
+        dx, dy = _point_at([list(p) for p in roster["poly"]], float(disk["frac"]))
+        draw.ellipse(
+            [dx - DISK_R, dy - DISK_R, dx + DISK_R, dy + DISK_R],
+            fill=ROSTER_RGB[disk["color"]],
+        )
+    return img
+
+
+# --- diagnostics -------------------------------------------------------------
+
+
+def raw_length_answer(scene: dict) -> str:
+    """Answer a solver would give by matching absolute arclength, not depth.
+
+    Reported as a cheap-cue diagnostic: when it disagrees with the gold answer,
+    absolute distance is not a usable shortcut.
+    """
+    pace_depth, depths, pace_pts, roster_pts = _depths(scene)
+    lp = _total_len(pace_pts)
+    lr = _total_len(roster_pts)
+    target = pace_depth * lp
+    ranked = sorted(depths.items(), key=lambda kv: (abs(kv[1] * lr - target), kv[0]))
+    return ranked[0][0]
+
+
+def order_rank_of_answer(scene: dict) -> int:
+    """0-based rank of the gold disk by depth along the roster cord."""
+    pace_depth, depths, _p, _r = _depths(scene)
+    gold = analytic_gold(scene)
+    order = sorted(depths.items(), key=lambda kv: kv[1])
+    return [c for c, _ in order].index(gold)

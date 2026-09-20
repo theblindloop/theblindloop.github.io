@@ -1,0 +1,146 @@
+"""Image-only inverse arm for trace_crossing_band.
+
+Receives a rendered PNG and nothing else: no scene, no renderer constants, no
+gold. It rebuilds the page from ink alone —
+
+1. near-neutral dark ink bounds the plot frame;
+2. interior columns whose dark coverage is a large fraction of the frame height
+   are the dashed partition lines, clustered into partition abscissas;
+3. the saturated red and blue pixels give, column by column, the two traces'
+   centre rows, whose difference is a signed vertical-order signal;
+4. the single sign reversal of that signal is interpolated to a sub-column
+   abscissa and counted against the partitions.
+
+Damaged or ambiguous structure returns "abstain" instead of a guess.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "trace_crossing_band-oracle-1.0.0"
+
+DARK_MAX = 95            # every channel below this, and near-neutral, is black ink
+NEUTRAL_SPREAD = 45
+PARTITION_FRACTION = 0.25
+PARTITION_COUNT = 3
+MIN_FRAME_WIDTH = 240
+MIN_FRAME_HEIGHT = 120
+FIT_HALF_WINDOW = 42     # columns each side of the reversal used for the local fit
+FIT_MIN_ABS = 6.0        # skip columns where the two strokes overlap and occlude
+FIT_MAX_ABS = 60.0
+MIN_FIT_POINTS = 6
+ABSTAIN = "abstain"
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """Inclusive [start, end] index runs of True in a 1-D boolean array."""
+    out: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            out.append((start, index - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def _column_centres(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    rows = np.arange(mask.shape[0], dtype=np.float64)[:, None]
+    counts = mask.sum(axis=0)
+    totals = (mask * rows).sum(axis=0)
+    present = counts > 0
+    centres = np.zeros(mask.shape[1], dtype=np.float64)
+    centres[present] = totals[present] / counts[present]
+    return centres, present
+
+
+def _zero_crossing(xs: np.ndarray, gaps: np.ndarray) -> float | None:
+    # Columns where the two strokes coincide give a zero difference; they carry
+    # no order information, so the reversal is bracketed by the nearest columns
+    # that still separate the traces.
+    resolved = np.abs(gaps) >= 0.5
+    if int(resolved.sum()) < 8:
+        return None
+    resolved_x = xs[resolved]
+    resolved_gaps = gaps[resolved]
+    signs = np.sign(resolved_gaps)
+    changes = np.nonzero(signs[:-1] * signs[1:] < 0)[0]
+    if changes.size == 0:
+        return None
+    # Several reversals can only come from noise around the true one, so require
+    # a single narrow reversal region.
+    if changes.size > 1 and float(resolved_x[changes[-1]] - resolved_x[changes[0]]) > 20.0:
+        return None
+    index = int(changes[0])
+    left_x, right_x = float(resolved_x[index]), float(resolved_x[index + 1])
+    left_gap, right_gap = float(resolved_gaps[index]), float(resolved_gaps[index + 1])
+    bracket = left_x + (right_x - left_x) * (-left_gap) / (right_gap - left_gap)
+
+    # Refine with a local straight-line fit that ignores the few columns where
+    # the two strokes overlap, so the last-painted trace cannot bias the answer.
+    window = (np.abs(xs - bracket) <= FIT_HALF_WINDOW) & (np.abs(gaps) >= FIT_MIN_ABS)
+    window &= np.abs(gaps) <= FIT_MAX_ABS
+    if int(window.sum()) >= MIN_FIT_POINTS:
+        picked_x = xs[window].astype(np.float64)
+        picked_gap = gaps[window].astype(np.float64)
+        if picked_gap.min() < 0.0 < picked_gap.max():
+            slope, intercept = np.polyfit(picked_x, picked_gap, 1)
+            if abs(slope) > 1e-6:
+                refined = -intercept / slope
+                if abs(refined - bracket) <= 20.0:
+                    return float(refined)
+    return float(bracket)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB")).astype(np.int16)
+    red_channel = array[:, :, 0]
+    green_channel = array[:, :, 1]
+    blue_channel = array[:, :, 2]
+    brightest = array.max(axis=2)
+    dimmest = array.min(axis=2)
+
+    dark = (brightest < DARK_MAX) & ((brightest - dimmest) < NEUTRAL_SPREAD)
+    if int(dark.sum()) < 400:
+        return ABSTAIN
+    dark_rows = np.nonzero(dark.any(axis=1))[0]
+    dark_cols = np.nonzero(dark.any(axis=0))[0]
+    top, bottom = int(dark_rows[0]), int(dark_rows[-1])
+    left, right = int(dark_cols[0]), int(dark_cols[-1])
+    if right - left < MIN_FRAME_WIDTH or bottom - top < MIN_FRAME_HEIGHT:
+        return ABSTAIN
+
+    interior = dark[top + 8 : bottom - 7, left + 6 : right - 5]
+    if interior.size == 0:
+        return ABSTAIN
+    coverage = interior.sum(axis=0)
+    partitions = [
+        left + 6 + 0.5 * (start + end)
+        for start, end in _runs(coverage > PARTITION_FRACTION * interior.shape[0])
+    ]
+    if len(partitions) != PARTITION_COUNT:
+        return ABSTAIN
+
+    red = (red_channel > 150) & (red_channel - green_channel > 60) & (red_channel - blue_channel > 60)
+    blue = (blue_channel > 140) & (blue_channel - red_channel > 60) & (blue_channel - green_channel > 40)
+    if int(red.sum()) < 200 or int(blue.sum()) < 200:
+        return ABSTAIN
+
+    red_centres, red_present = _column_centres(red)
+    blue_centres, blue_present = _column_centres(blue)
+    columns = np.arange(array.shape[1])
+    usable = red_present & blue_present & (columns > left + 2) & (columns < right - 2)
+    if int(usable.sum()) < 60:
+        return ABSTAIN
+
+    xs = columns[usable].astype(np.float64)
+    gaps = (red_centres - blue_centres)[usable]
+    crossing = _zero_crossing(xs, gaps)
+    if crossing is None or not (left < crossing < right):
+        return ABSTAIN
+    return str(1 + sum(1 for edge in partitions if edge < crossing))

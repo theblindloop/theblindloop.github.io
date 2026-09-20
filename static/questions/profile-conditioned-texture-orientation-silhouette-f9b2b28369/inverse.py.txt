@@ -1,0 +1,116 @@
+"""Independent pixel-only inverse arm for the orientation-texture world.
+
+This module deliberately has no access to latent scenes or rendering code. It
+segments dark pixels, recovers connected dash components, estimates each dash's
+orientation by second moments, then fits generic regular-polygon models to the
+minority orientation field.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found = []
+    for y0, x0 in np.argwhere(mask):
+        if seen[y0, x0]:
+            continue
+        stack = [(int(y0), int(x0))]
+        seen[y0, x0] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if 22 <= len(pixels) <= 90:
+            found.append(np.asarray(pixels, dtype=float))
+    return found
+
+
+def _recover_field(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    darkness = rgb.mean(axis=2) < 100
+    components = _components(darkness)
+    if not 270 <= len(components) <= 305:
+        raise ValueError(f"expected a dense separated dash field, found {len(components)} components")
+    points = []
+    signs = []
+    for component in components:
+        yx = component.mean(axis=0)
+        centered = component - yx
+        cov_xy = float(np.mean(centered[:, 1] * centered[:, 0]))
+        points.append((float(yx[1]), float(yx[0])))
+        signs.append(cov_xy > 0.0)
+    points_array = np.asarray(points, dtype=float)
+    signs_array = np.asarray(signs, dtype=bool)
+    target = signs_array if signs_array.sum() < len(signs_array) / 2 else ~signs_array
+    if not 35 <= int(target.sum()) <= 105:
+        raise ValueError("orientation classes do not expose one bounded central field")
+    return points_array, target
+
+
+def _inside_regular(points: np.ndarray, cx: float, cy: float, radius: float, sides: int, rotation: float) -> np.ndarray:
+    angles = rotation + np.arange(sides) * (2.0 * math.pi / sides)
+    vertices = np.column_stack((cx + radius * np.cos(angles), cy + radius * np.sin(angles)))
+    cross_values = []
+    for index in range(sides):
+        a = vertices[index]
+        b = vertices[(index + 1) % sides]
+        cross_values.append((b[0] - a[0]) * (points[:, 1] - a[1]) - (b[1] - a[1]) * (points[:, 0] - a[0]))
+    crosses = np.stack(cross_values, axis=1)
+    return (crosses.min(axis=1) >= -1e-7) | (crosses.max(axis=1) <= 1e-7)
+
+
+def _fit(points: np.ndarray, target: np.ndarray, sides: int) -> float:
+    focus = points[target]
+    center = focus.mean(axis=0)
+    pairwise = np.sqrt(((points[:, None, :] - points[None, :, :]) ** 2).sum(axis=2))
+    pairwise[pairwise == 0] = np.inf
+    spacing = float(np.median(pairwise.min(axis=1)))
+    sampled_area = float(target.sum()) * spacing * spacing
+    radius_hint = math.sqrt(2.0 * sampled_area / (sides * math.sin(2.0 * math.pi / sides)))
+    best = 0.0
+    for dx in (-0.45 * spacing, 0.0, 0.45 * spacing):
+        for dy in (-0.45 * spacing, 0.0, 0.45 * spacing):
+            for scale in (0.90, 0.97, 1.04, 1.11):
+                for degrees in range(0, 180, 5):
+                    predicted = _inside_regular(
+                        points,
+                        float(center[0] + dx),
+                        float(center[1] + dy),
+                        radius_hint * scale,
+                        sides,
+                        math.radians(degrees),
+                    )
+                    intersection = int(np.count_nonzero(predicted & target))
+                    union = int(np.count_nonzero(predicted | target))
+                    score = intersection / max(union, 1)
+                    if score > best:
+                        best = score
+    return best
+
+
+def scores_from_image(image: Image.Image) -> dict[str, float]:
+    points, target = _recover_field(image)
+    return {"triangle": _fit(points, target, 3), "hexagon": _fit(points, target, 6)}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    scores = scores_from_image(image)
+    ordered = sorted(scores, key=scores.get, reverse=True)
+    if scores[ordered[0]] - scores[ordered[1]] < 0.08:
+        raise ValueError("ambiguous texture silhouette")
+    return ordered[0]

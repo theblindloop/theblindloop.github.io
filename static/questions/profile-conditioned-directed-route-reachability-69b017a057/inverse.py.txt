@@ -1,0 +1,176 @@
+"""Independent pixel-only inverse for directed route reachability.
+
+Only the final RGB image is accepted.  This module repeats no renderer helper
+and imports no candidate source.  It locates the three terminal colors and the
+green source, estimates the common junction from dark-ink density, then
+assigns each orange connected component to the nearest recovered arm.  The
+long-axis skew of each filled orange triangle gives its tip direction.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+COLORS = {
+    "navy": np.array([31.0, 52.0, 82.0]),
+    "orange": np.array([235.0, 112.0, 38.0]),
+    "green": np.array([48.0, 157.0, 96.0]),
+    "red": np.array([208.0, 70.0, 76.0]),
+    "blue": np.array([57.0, 111.0, 187.0]),
+    "gold": np.array([218.0, 163.0, 47.0]),
+}
+
+
+def _mask(rgb: np.ndarray, color: np.ndarray, threshold: float = 92.0) -> np.ndarray:
+    distance = np.sqrt(np.sum((rgb.astype(np.float32) - color) ** 2, axis=2))
+    return distance <= threshold
+
+
+def _centroid(rgb: np.ndarray, color_name: str) -> np.ndarray:
+    # Keep the marker threshold below the nearest orange/gold color distance;
+    # this prevents arrowhead pixels from biasing a terminal centroid.
+    ys, xs = np.where(_mask(rgb, COLORS[color_name], 48.0))
+    if len(xs) < 40:
+        raise ValueError(f"missing marker color {color_name}")
+    return np.array([float(xs.mean()), float(ys.mean())])
+
+
+def _orange_components(mask: np.ndarray) -> list[np.ndarray]:
+    """Connected components over the sparse orange mask without a dependency."""
+
+    ys, xs = np.where(mask)
+    remaining = set(zip(xs.tolist(), ys.tolist()))
+    components: list[np.ndarray] = []
+    while remaining:
+        first = remaining.pop()
+        queue = deque([first])
+        points = [first]
+        while queue:
+            x, y = queue.popleft()
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1),
+                           (x - 1, y - 1), (x - 1, y + 1), (x + 1, y - 1),
+                           (x + 1, y + 1)):
+                point = (nx, ny)
+                if point in remaining:
+                    remaining.remove(point)
+                    queue.append(point)
+                    points.append(point)
+        if len(points) >= 35:
+            components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _tip_vector(points: np.ndarray) -> tuple[np.ndarray, float]:
+    center = points.mean(axis=0)
+    centered = points - center
+    covariance = centered.T @ centered / max(1, len(points) - 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    axis = eigenvectors[:, int(np.argmax(eigenvalues))]
+    projection = centered @ axis
+    positive = float(projection.max())
+    negative = float(-projection.min())
+    if negative > positive:
+        axis = -axis
+    return axis / max(1e-9, np.linalg.norm(axis)), float(np.linalg.norm(centered, axis=1).max())
+
+
+def _point_segment_distance(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    direction = b - a
+    denominator = float(direction @ direction)
+    if denominator <= 1e-9:
+        return float(np.linalg.norm(point - a))
+    t = float(((point - a) @ direction) / denominator)
+    t = min(1.0, max(0.0, t))
+    projection = a + t * direction
+    return float(np.linalg.norm(point - projection))
+
+
+def _junction(rgb: np.ndarray, markers: list[np.ndarray]) -> np.ndarray:
+    dark = _mask(rgb, COLORS["navy"], 82.0)
+    # A box-blurred dark occupancy map peaks at the four-arm junction.  Marker
+    # outlines are masked out before selecting the peak.
+    occupancy = np.asarray(
+        Image.fromarray((dark.astype(np.uint8) * 255), mode="L").filter(ImageFilter.BoxBlur(17)),
+        dtype=np.float32,
+    )
+    yy, xx = np.indices(occupancy.shape)
+    valid = np.ones(occupancy.shape, dtype=bool)
+    for marker in markers:
+        valid &= (xx - marker[0]) ** 2 + (yy - marker[1]) ** 2 > 52.0 ** 2
+    valid[:40, :] = False
+    valid[-40:, :] = False
+    valid[:, :40] = False
+    valid[:, -40:] = False
+    occupancy[~valid] = -1.0
+    y, x = np.unravel_index(int(np.argmax(occupancy)), occupancy.shape)
+    if occupancy[y, x] <= 0:
+        raise ValueError("cannot recover a junction")
+    return np.array([float(x), float(y)])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the uniquely reachable terminal color from pixels alone."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    source = _centroid(rgb, "green")
+    terminal_centers = {name: _centroid(rgb, name) for name in ("red", "blue", "gold")}
+    markers = [source, *terminal_centers.values()]
+    junction = _junction(rgb, markers)
+
+    # Gold and red are visually near orange in RGB space, so use a tight
+    # interior-color threshold for arrowheads rather than a broad nearest-color
+    # threshold that would absorb marker disks.
+    orange = _mask(rgb, COLORS["orange"], 50.0)
+    components = _orange_components(orange)
+    if len(components) != 4:
+        raise ValueError(f"expected four arrowheads, found {len(components)}")
+
+    arrows = []
+    for component in components:
+        center = component.mean(axis=0)
+        direction, extent = _tip_vector(component)
+        if extent < 7.0:
+            raise ValueError("arrowhead has insufficient pixel extent")
+        arrows.append((center, direction))
+
+    # Assign one arrow to source-to-junction and one to each terminal arm.
+    arm_names = ["source", "red", "blue", "gold"]
+    arm_segments = [(source, junction)] + [
+        (junction, terminal_centers[name]) for name in ("red", "blue", "gold")
+    ]
+    assignments: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
+    for center, direction in arrows:
+        distances = [
+            _point_segment_distance(center, start, end)
+            for start, end in arm_segments
+        ]
+        arm_index = int(np.argmin(distances))
+        if distances[arm_index] > 35.0:
+            raise ValueError("arrowhead is not on a recovered arm")
+        name = arm_names[arm_index]
+        if name in assignments:
+            raise ValueError("two arrowheads assigned to one arm")
+        assignments[name] = (center, direction, distances[arm_index])
+    if set(assignments) != set(arm_names):
+        raise ValueError("arrowhead-to-arm assignment is incomplete")
+
+    source_direction = assignments["source"][1]
+    source_forward = (junction - source) / max(1e-9, np.linalg.norm(junction - source))
+    if float(source_direction @ source_forward) < 0.45:
+        raise ValueError("source arrow does not point toward the junction")
+
+    outgoing: list[tuple[str, float]] = []
+    for name in ("red", "blue", "gold"):
+        direction = assignments[name][1]
+        forward = (terminal_centers[name] - junction)
+        forward = forward / max(1e-9, np.linalg.norm(forward))
+        score = float(direction @ forward)
+        if score > 0.45:
+            outgoing.append((name, score))
+    if len(outgoing) != 1:
+        raise ValueError(f"expected one outward terminal branch, found {outgoing}")
+    return outgoing[0][0]

@@ -1,0 +1,186 @@
+"""Independent pixel-only inverse for the alternating-vertex reflection trail.
+
+This module intentionally does not import any candidate module. It segments the
+publicly described fiducials, verifies that they all lie on one continuous
+carrier, orders the beads by the measured endpoint chord, applies the declared
+alternating reflection, and performs an independently implemented template fit.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+MARKER = np.asarray((35, 174, 186), dtype=np.float32)
+RED = np.asarray((222, 62, 72), dtype=np.float32)
+GOLD = np.asarray((239, 174, 45), dtype=np.float32)
+PROTOTYPES = {
+    "arch": np.asarray((1, 2, 3, 4, 3, 2, 1), dtype=float),
+    "cup": np.asarray((-1, -2, -3, -4, -3, -2, -1), dtype=float),
+    "wave": np.asarray((2, 4, 2, 0, -2, -4, -2), dtype=float),
+}
+MIN_MARGIN = 20.0
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _border_background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (array[:3].reshape(-1, 3), array[-3:].reshape(-1, 3), array[:, :3].reshape(-1, 3), array[:, -3:].reshape(-1, 3)),
+        axis=0,
+    )
+    return np.median(border, axis=0)
+
+
+def _near(array: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    return np.linalg.norm(array.astype(np.float32) - color, axis=2) < tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    remaining = {tuple(map(int, point)) for point in np.argwhere(mask)}
+    output = []
+    while remaining:
+        start = remaining.pop()
+        queue = [start]
+        points = [start]
+        while queue:
+            y, x = queue.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    other = (y + dy, x + dx)
+                    if 0 <= other[0] < height and 0 <= other[1] < width and other in remaining:
+                        remaining.remove(other)
+                        queue.append(other)
+                        points.append(other)
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=int))
+    return output
+
+
+def _centers(mask: np.ndarray, *, count: int, minimum: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    components = _components(mask, minimum=minimum)
+    if len(components) != count:
+        raise OracleError(f"expected {count} fiducial component(s), found {len(components)}")
+    centers = [np.asarray((points[:, 1].mean(), points[:, 0].mean()), dtype=float) for points in components]
+    return centers, components
+
+
+def _carrier_labels(mask: np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
+    height, width = mask.shape
+    labels = np.zeros((height, width), dtype=np.int32)
+    sizes: dict[int, int] = {}
+    label = 0
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if labels[y0, x0]:
+            continue
+        label += 1
+        labels[y0, x0] = label
+        queue = deque(((y0, x0),))
+        size = 0
+        while queue:
+            y, x = queue.popleft()
+            size += 1
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and labels[ny, nx] == 0:
+                        labels[ny, nx] = label
+                        queue.append((ny, nx))
+        sizes[label] = size
+    return labels, sizes
+
+
+def _component_label(labels: np.ndarray, points: np.ndarray) -> int:
+    values = labels[points[:, 0], points[:, 1]]
+    values = values[values > 0]
+    if not len(values):
+        raise OracleError("fiducial is detached from the carrier")
+    ids, counts = np.unique(values, return_counts=True)
+    return int(ids[int(np.argmax(counts))])
+
+
+def _distance(values: np.ndarray, prototype: np.ndarray, allow_sign: bool) -> float:
+    trials = (prototype, -prototype) if allow_sign else (prototype,)
+    energy = max(float(values @ values), 1e-9)
+    best = float("inf")
+    for trial in trials:
+        scale = max(0.0, float(values @ trial) / float(trial @ trial))
+        residual = values - scale * trial
+        best = min(best, float(residual @ residual) / energy)
+    return best
+
+
+def analyze_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 200 or array.shape[1] < 400:
+        raise OracleError("unexpected raster dimensions")
+    background = _border_background(array)
+    marker_mask = _near(array, MARKER, 58.0)
+    red_mask = _near(array, RED, 58.0)
+    gold_mask = _near(array, GOLD, 58.0)
+    marker_centers, marker_parts = _centers(marker_mask, count=7, minimum=45)
+    red_centers, red_parts = _centers(red_mask, count=1, minimum=100)
+    gold_centers, gold_parts = _centers(gold_mask, count=1, minimum=100)
+    red = red_centers[0]
+    gold = gold_centers[0]
+
+    chord = gold - red
+    length = float(np.linalg.norm(chord))
+    if not 430.0 <= length <= 520.0:
+        raise OracleError(f"endpoint chord length is invalid: {length:.1f}")
+    along = chord / length
+    normal = np.asarray((along[1], -along[0]), dtype=float)
+
+    # The contrast carrier deliberately excludes pale decorative marks.
+    carrier = np.linalg.norm(array.astype(np.float32) - background.astype(np.float32), axis=2) > 72.0
+    labels, sizes = _carrier_labels(carrier)
+    all_parts = [red_parts[0], *marker_parts, gold_parts[0]]
+    carrier_ids = [_component_label(labels, part) for part in all_parts]
+    if len(set(carrier_ids)) != 1:
+        raise OracleError("fiducials do not lie on one continuous carrier")
+    carrier_id = carrier_ids[0]
+    if sizes.get(carrier_id, 0) < 3000:
+        raise OracleError("continuous carrier has insufficient ink")
+
+    ordered = sorted(marker_centers, key=lambda point: float((point - red) @ along))
+    fractions = np.asarray([float((point - red) @ along) / length for point in ordered])
+    expected = np.arange(1, 8, dtype=float) / 8.0
+    if float(np.max(np.abs(fractions - expected))) > 0.035:
+        raise OracleError("beads are missing, reordered, or off their seven stations")
+
+    displayed = np.asarray([float((point - red) @ normal) for point in ordered], dtype=float)
+    transformed = displayed.copy()
+    transformed[[1, 3, 5]] *= -1.0
+    if float(np.max(np.abs(transformed))) < 30.0:
+        raise OracleError("reflected path has insufficient visible amplitude")
+
+    distances = {
+        name: _distance(transformed, prototype, allow_sign=(name == "wave"))
+        for name, prototype in PROTOTYPES.items()
+    }
+    ranking = sorted(distances, key=lambda name: (distances[name], name))
+    margin = (distances[ranking[1]] - distances[ranking[0]]) * 100.0
+    if margin < MIN_MARGIN:
+        raise OracleError(f"ambiguous transformed path: margin {margin:.2f}")
+    return {
+        "decision": ranking[0],
+        "margin": round(float(margin), 6),
+        "distances": {key: round(float(value), 8) for key, value in distances.items()},
+        "chord_length": round(length, 4),
+        "bead_fractions": [round(float(value), 5) for value in fractions],
+        "carrier_pixels": int(sizes[carrier_id]),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

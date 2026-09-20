@@ -1,0 +1,333 @@
+"""Scene sampler, renderer and analytic gold for the spoke-degree hub search world.
+
+A small framed KEY box at the top holds one hub: a filled dot with a number of
+straight spokes radiating from it. Below it stand five framed panels, each
+holding three hubs. Exactly one hub in the whole image carries the same number
+of spokes as the key hub, and the answer is the panel that contains it.
+
+Every panel carries the same total number of spokes, so per-panel ink and the
+per-panel spoke count are pinned and cannot separate the panels; only the
+spoke count of an individual hub can.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw, ImageFont
+
+CANVAS = (900, 540)
+
+BACKGROUND = (250, 250, 250)
+FRAME = (168, 168, 168)
+LABEL = (150, 150, 150)
+SPOKE = (58, 58, 58)
+
+# Hub fill colours. Every colour is strongly saturated, and colours are dealt
+# independently of a hub's role, so colour never carries information.
+PALETTES = (
+    ((198, 52, 44), (36, 96, 180), (24, 132, 84)),
+    ((176, 64, 152), (196, 118, 24), (40, 118, 156)),
+    ((160, 52, 96), (52, 104, 200), (32, 128, 120)),
+)
+
+KEY_BOX = (350, 16, 550, 166)
+KEY_CENTER = (450, 91)
+PANEL_TOP = 196
+PANEL_BOTTOM = 524
+PANEL_WIDTH = 164
+PANEL_PITCH = 176
+PANEL_LEFT = 16
+SLOT_Y = (250, 360, 470)
+
+HUB_RADIUS = 8
+SPOKE_LENGTH = 32
+SPOKE_WIDTH = 3
+RING_RADIUS = 20
+
+PANEL_SPOKE_TOTAL = 11
+MIN_DEGREE = 2
+MAX_DEGREE = 6
+KEY_DEGREES = (3, 4, 5)
+MIN_GAP_DEG = 34.0
+RESOLVABLE_GAP_DEG = 30.0
+LEGIBILITY_CAP = 1.5
+QUARANTINE_MARGIN = 1.0
+
+DECISIONS = ("panel-1", "panel-2", "panel-3", "panel-4", "panel-5")
+
+
+# --------------------------------------------------------------------------
+# degree bookkeeping
+# --------------------------------------------------------------------------
+def _triples(total: int):
+    out = []
+    for a in range(MIN_DEGREE, MAX_DEGREE + 1):
+        for b in range(a, MAX_DEGREE + 1):
+            c = total - a - b
+            if b <= c <= MAX_DEGREE:
+                out.append((a, b, c))
+    return out
+
+
+_ALL_TRIPLES = _triples(PANEL_SPOKE_TOTAL)
+
+
+def _target_triples(key_degree: int):
+    """Triples holding exactly one hub of the key degree."""
+    return [t for t in _ALL_TRIPLES if t.count(key_degree) == 1]
+
+
+def _distractor_triples(key_degree: int):
+    """Triples holding no key-degree hub but at least one near miss."""
+    out = []
+    for t in _ALL_TRIPLES:
+        if key_degree in t:
+            continue
+        if any(abs(d - key_degree) == 1 for d in t):
+            out.append(t)
+    return out
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _sample_angles(rng: random.Random, degree: int) -> list:
+    """Spoke bearings whose consecutive angular gaps are all at least MIN_GAP_DEG."""
+    slack = 360.0 - MIN_GAP_DEG * degree
+    cuts = sorted(rng.random() for _ in range(degree - 1))
+    gaps = []
+    previous = 0.0
+    for cut in cuts + [1.0]:
+        gaps.append(MIN_GAP_DEG + slack * (cut - previous))
+        previous = cut
+    start = rng.uniform(0.0, 360.0)
+    angles = []
+    running = start
+    for gap in gaps[:-1]:
+        angles.append(round(running % 360.0, 4))
+        running += gap
+    angles.append(round(running % 360.0, 4))
+    return angles
+
+
+def _sample_hub(rng: random.Random, degree: int, slot: int, palette_size: int) -> dict:
+    return {
+        "slot": slot,
+        "degree": degree,
+        "angles": _sample_angles(rng, degree),
+        "color": rng.randrange(palette_size),
+        "dx": rng.randint(-14, 14),
+        "dy": rng.randint(-10, 10),
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    palette_index = rng.randrange(len(PALETTES))
+    palette_size = len(PALETTES[palette_index % len(PALETTES)])
+
+    key_degree = KEY_DEGREES[seed % len(KEY_DEGREES)]
+    target_panel = seed % 5
+
+    target_pool = _target_triples(key_degree)
+    distractor_pool = _distractor_triples(key_degree)
+
+    panels = []
+    for index in range(5):
+        pool = target_pool if index == target_panel else distractor_pool
+        triple = list(rng.choice(pool))
+        rng.shuffle(triple)
+        panels.append(
+            [_sample_hub(rng, triple[slot], slot, palette_size) for slot in range(3)]
+        )
+
+    key = {
+        "slot": 0,
+        "degree": key_degree,
+        "angles": _sample_angles(rng, key_degree),
+        "color": rng.randrange(palette_size),
+        "dx": rng.randint(-8, 8),
+        "dy": rng.randint(-8, 8),
+    }
+    return {
+        "canvas": list(CANVAS),
+        "palette": palette_index,
+        "key": key,
+        "panels": panels,
+    }
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+def _panel_center_x(index: int) -> int:
+    return PANEL_LEFT + index * PANEL_PITCH + PANEL_WIDTH // 2
+
+
+def _hub_center(region: int, hub: dict):
+    if region < 0:
+        return (KEY_CENTER[0] + hub["dx"], KEY_CENTER[1] + hub["dy"])
+    return (_panel_center_x(region) + hub["dx"], SLOT_Y[hub["slot"]] + hub["dy"])
+
+
+def _hubs(scene: dict):
+    """Every hub as (region, slot, record); region -1 is the key box."""
+    out = [(-1, 0, scene["key"])]
+    for index, panel in enumerate(scene["panels"]):
+        for hub in panel:
+            out.append((index, hub["slot"], hub))
+    return out
+
+
+def _min_gap(angles) -> float:
+    if len(angles) < 2:
+        return 360.0
+    ordered = sorted(float(a) % 360.0 for a in angles)
+    gaps = [
+        (ordered[(i + 1) % len(ordered)] - ordered[i]) % 360.0
+        for i in range(len(ordered))
+    ]
+    return min(gaps)
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _font(size: int):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # pragma: no cover - very old Pillow
+        return ImageFont.load_default()
+
+
+def render(scene: dict) -> Image.Image:
+    width, height = (int(scene["canvas"][0]), int(scene["canvas"][1]))
+    image = Image.new("RGB", (width, height), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    palette = PALETTES[int(scene["palette"]) % len(PALETTES)]
+
+    draw.rectangle(KEY_BOX, outline=FRAME, width=2)
+    font = _font(20)
+    draw.text((KEY_BOX[0] + 8, KEY_BOX[1] + 4), "KEY", fill=LABEL, font=font)
+    for index in range(5):
+        x0 = PANEL_LEFT + index * PANEL_PITCH
+        draw.rectangle(
+            (x0, PANEL_TOP, x0 + PANEL_WIDTH, PANEL_BOTTOM), outline=FRAME, width=2
+        )
+        draw.text((x0 + 6, PANEL_TOP - 26), str(index + 1), fill=LABEL, font=font)
+
+    ordered = sorted(_hubs(scene), key=lambda item: (item[0], item[1]))
+
+    # Spokes first, then discs, both in canonical order, so the painted result
+    # never depends on the order of hub records inside a panel list.
+    for region, _slot, hub in ordered:
+        cx, cy = _hub_center(region, hub)
+        for angle in hub["angles"]:
+            theta = math.radians(float(angle))
+            draw.line(
+                (
+                    cx,
+                    cy,
+                    cx + SPOKE_LENGTH * math.cos(theta),
+                    cy + SPOKE_LENGTH * math.sin(theta),
+                ),
+                fill=SPOKE,
+                width=SPOKE_WIDTH,
+            )
+    for region, _slot, hub in ordered:
+        cx, cy = _hub_center(region, hub)
+        draw.ellipse(
+            (cx - HUB_RADIUS, cy - HUB_RADIUS, cx + HUB_RADIUS, cy + HUB_RADIUS),
+            fill=palette[int(hub["color"]) % len(palette)],
+        )
+    return image
+
+
+# --------------------------------------------------------------------------
+# analytic arm
+# --------------------------------------------------------------------------
+def _winners(scene: dict):
+    key_degree = int(scene["key"]["degree"])
+    return [
+        (region, hub)
+        for region, _slot, hub in _hubs(scene)
+        if region >= 0 and int(hub["degree"]) == key_degree
+    ]
+
+
+def analytic_gold(scene: dict) -> str:
+    winners = _winners(scene)
+    if len(winners) != 1:
+        raise ValueError("scene does not hold a unique key-degree hub")
+    return DECISIONS[winners[0][0]]
+
+
+def margin(scene: dict) -> float:
+    """Degree separation of the winner, discounted by spoke resolvability.
+
+    The first factor is the smallest spoke-count difference between the winning
+    hub and any other hub in the image. The second is how far the tightest spoke
+    pair anywhere in the image sits above the resolvable angular gap, capped so
+    a generously spread scene cannot mask a weak degree separation.
+    """
+    key_degree = int(scene["key"]["degree"])
+    winners = _winners(scene)
+    if len(winners) != 1:
+        degree_gap = 0.0
+    else:
+        winner = winners[0][1]
+        others = [
+            hub
+            for region, _slot, hub in _hubs(scene)
+            if region >= 0 and hub is not winner
+        ]
+        degree_gap = float(min(abs(int(h["degree"]) - key_degree) for h in others))
+    tightest = min(_min_gap(hub["angles"]) for _r, _s, hub in _hubs(scene))
+    legibility = min(tightest / RESOLVABLE_GAP_DEG, LEGIBILITY_CAP)
+    return round(degree_gap * legibility, 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+# --------------------------------------------------------------------------
+# declared latent aliases
+# --------------------------------------------------------------------------
+def _copy(scene: dict) -> dict:
+    return {
+        "canvas": list(scene["canvas"]),
+        "palette": scene["palette"],
+        "key": {**scene["key"], "angles": list(scene["key"]["angles"])},
+        "panels": [
+            [{**hub, "angles": list(hub["angles"])} for hub in panel]
+            for panel in scene["panels"]
+        ],
+    }
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Transforms that leave the raster byte-identical and the answer unchanged."""
+    out = []
+
+    periodic = _copy(scene)
+    periodic["palette"] = int(scene["palette"]) + len(PALETTES)
+    out.append(("palette_period", periodic))
+
+    reversed_panel = _copy(scene)
+    reversed_panel["panels"][0] = list(reversed(reversed_panel["panels"][0]))
+    out.append(("panel_hub_list_reversal", reversed_panel))
+
+    swapped = _copy(scene)
+    panel = swapped["panels"][2]
+    panel[0], panel[1] = panel[1], panel[0]
+    out.append(("panel_hub_record_swap", swapped))
+
+    rotated = _copy(scene)
+    angles = rotated["key"]["angles"]
+    rotated["key"]["angles"] = angles[1:] + angles[:1]
+    out.append(("key_spoke_list_rotation", rotated))
+
+    return out

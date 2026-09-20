@@ -1,0 +1,324 @@
+"""Abductive gate-selection world.
+
+A ball enters a four-level routing tree of fifteen wedge-shaped gates and falls
+into one of sixteen colored cups.  Four gates carry colored rings.  A goal color
+is drawn as a swatch in the top-left corner.  Exactly one of the four ringed
+gates, if that gate alone were turned to point the other way, would send the
+ball into a cup of the goal color.  The decision is that ring's color.
+
+Nothing about the edited board is drawn: the solver must run the factual route,
+then run up to four counterfactual routes, each of which passes through gates
+the factual route never visits.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 1040
+HEIGHT = 760
+
+# --- palette (exact, non-antialiased) ---------------------------------------
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+GRAY = (140, 140, 140)
+
+RING_NAMES = ("blue", "crimson", "green", "violet")
+RING_RGB = {
+    "blue": (30, 70, 205),
+    "crimson": (200, 20, 50),
+    "green": (25, 145, 60),
+    "violet": (135, 40, 185),
+}
+
+CUP_NAMES = ("orange", "pink", "teal", "yellow")
+CUP_RGB = {
+    "orange": (250, 150, 20),
+    "pink": (240, 90, 175),
+    "teal": (0, 160, 165),
+    "yellow": (245, 220, 45),
+}
+
+# --- geometry ---------------------------------------------------------------
+DEPTH = 4                     # gate rows 0..3
+N_GATES = 2 ** DEPTH - 1      # 15
+N_CUPS = 2 ** DEPTH           # 16
+
+X0 = 55
+PITCH = 62
+ROW_Y = (130, 258, 386, 514)
+CUP_TOP = 610
+CUP_BOT = 700
+CUP_HALFW = 23
+
+TRI_APEX = 28
+TRI_BASE = 20
+TRI_HALFH = 26
+TRI_RADIUS = math.hypot(TRI_BASE, TRI_HALFH)
+
+RING_R = 52
+RING_W = 7
+
+BALL_R = 14
+BALL_Y = 46
+
+SWATCH = (30, 30, 118, 118)
+JIT_X = 3
+JIT_Y = 4
+
+QUARANTINE_PX = 11.0
+
+LEFT, RIGHT = 0, 1
+
+
+# --- tree helpers -----------------------------------------------------------
+def _depth(node: int) -> int:
+    d = 0
+    while node >= 2 ** (d + 1) - 1:
+        d += 1
+    return d
+
+
+def _row_index(node: int) -> int:
+    return node - (2 ** _depth(node) - 1)
+
+
+def _gate_center_x(node: int) -> float:
+    d = _depth(node)
+    span = N_CUPS // (2 ** d)
+    first = _row_index(node) * span
+    return X0 + PITCH * (first + (span - 1) / 2.0)
+
+
+def _gate_xy(scene: dict, node: int) -> tuple[float, float]:
+    dx, dy = scene["jitter"][node]
+    return _gate_center_x(node) + dx, ROW_Y[_depth(node)] + dy
+
+
+def _cup_x(cup: int) -> float:
+    return X0 + PITCH * cup
+
+
+def _route(dirs: list[int], flip: int | None = None) -> tuple[list[int], int]:
+    """Return (visited gate nodes, terminal cup index)."""
+    node = 0
+    path = []
+    for _ in range(DEPTH):
+        path.append(node)
+        d = dirs[node]
+        if flip is not None and node == flip:
+            d = 1 - d
+        if _depth(node) == DEPTH - 1:
+            return path, 2 * _row_index(node) + d
+        node = 2 * node + 1 + d
+    raise AssertionError
+
+
+def _subtree_cups(node: int) -> list[int]:
+    d = _depth(node)
+    span = N_CUPS // (2 ** d)
+    first = _row_index(node) * span
+    return list(range(first, first + span))
+
+
+# --- sampling ---------------------------------------------------------------
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 1000003 + 17)
+    for _ in range(4000):
+        scene = _try_scene(rng)
+        if scene is not None:
+            return scene
+    raise RuntimeError("sampler failed to find an admissible scene")
+
+
+def _try_scene(rng: random.Random) -> dict | None:
+    dirs = [rng.randint(0, 1) for _ in range(N_GATES)]
+    cups = [name for name in CUP_NAMES for _ in range(N_CUPS // len(CUP_NAMES))]
+    rng.shuffle(cups)
+
+    path, fact_cup = _route(dirs)
+    fact_color = cups[fact_cup]
+
+    ring_nodes = rng.sample(range(N_GATES), 4)
+    on_path = [n for n in ring_nodes if n in path]
+    off_path = [n for n in ring_nodes if n not in path]
+    if len(on_path) < 2 or len(off_path) < 1:
+        return None
+
+    outcome = {}
+    for node in ring_nodes:
+        _, cup = _route(dirs, flip=node)
+        outcome[node] = cups[cup]
+
+    # exactly one ringed gate reaches some goal color that is not the drawn one
+    counts: dict[str, list[int]] = {}
+    for node in ring_nodes:
+        counts.setdefault(outcome[node], []).append(node)
+    viable = [c for c, ns in counts.items() if len(ns) == 1 and c != fact_color]
+    if not viable:
+        return None
+    target = rng.choice(viable)
+    answer_node = counts[target][0]
+
+    # the answer must leave at least one downstream gate to be read
+    if _depth(answer_node) > DEPTH - 2:
+        return None
+    # the shallowest ringed gate on the drawn route must not be the answer
+    if min(on_path, key=_depth) == answer_node:
+        return None
+
+    # decoy: some other on-route ringed gate opens a subtree that *contains* a
+    # goal-colored cup, yet the drawn downstream gates route away from it.
+    decoy = False
+    for node in on_path:
+        if node == answer_node:
+            continue
+        d = dirs[node]
+        sibling = 2 * node + 1 + (1 - d) if _depth(node) < DEPTH - 1 else None
+        if sibling is None:
+            cup = 2 * _row_index(node) + (1 - d)
+            pool = [cup]
+        else:
+            pool = _subtree_cups(sibling)
+        if any(cups[c] == target for c in pool):
+            decoy = True
+    if not decoy:
+        return None
+
+    ring_colors = list(RING_NAMES)
+    rng.shuffle(ring_colors)
+    rings = sorted(
+        [[node, color] for node, color in zip(ring_nodes, ring_colors)],
+        key=lambda item: item[0],
+    )
+
+    jitter = [
+        [rng.randint(-JIT_X, JIT_X), rng.randint(-JIT_Y, JIT_Y)]
+        for _ in range(N_GATES)
+    ]
+    return {
+        "dirs": dirs,
+        "cups": cups,
+        "rings": rings,
+        "target": target,
+        "jitter": jitter,
+    }
+
+
+# --- gold, margin, symmetries ----------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    dirs = list(scene["dirs"])
+    cups = list(scene["cups"])
+    target = scene["target"]
+    winners = []
+    for node, color in scene["rings"]:
+        _, cup = _route(dirs, flip=int(node))
+        if cups[cup] == target:
+            winners.append(color)
+    if len(winners) != 1:
+        raise ValueError("scene does not have a unique decisive ringed gate")
+    return winners[0]
+
+
+def margin(scene: dict) -> float:
+    ring_nodes = [int(node) for node, _ in scene["rings"]]
+    centers = {n: _gate_xy(scene, n) for n in range(N_GATES)}
+    clear = [float(RING_R - RING_W) - TRI_RADIUS]
+
+    for i, a in enumerate(ring_nodes):
+        for b in ring_nodes[i + 1:]:
+            ax, ay = centers[a]
+            bx, by = centers[b]
+            clear.append(math.hypot(ax - bx, ay - by) - 2.0 * RING_R)
+    for a in ring_nodes:
+        for b in range(N_GATES):
+            if b == a:
+                continue
+            ax, ay = centers[a]
+            bx, by = centers[b]
+            clear.append(math.hypot(ax - bx, ay - by) - RING_R - TRI_RADIUS)
+    for a in range(N_GATES):
+        for b in range(a + 1, N_GATES):
+            ax, ay = centers[a]
+            bx, by = centers[b]
+            clear.append(math.hypot(ax - bx, ay - by) - 2.0 * TRI_RADIUS)
+    clear.append(float(PITCH - 2 * CUP_HALFW))
+    clear.append(float(ROW_Y[0] - JIT_Y - RING_R - BALL_Y - BALL_R))
+    clear.append(float(CUP_TOP - (ROW_Y[-1] + JIT_Y + RING_R)))
+    return round(min(clear), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict) -> list:
+    return []
+
+
+# --- rendering --------------------------------------------------------------
+def _triangle(cx: float, cy: float, direction: int) -> list[tuple[float, float]]:
+    if direction == RIGHT:
+        return [
+            (cx + TRI_APEX, cy),
+            (cx - TRI_BASE, cy - TRI_HALFH),
+            (cx - TRI_BASE, cy + TRI_HALFH),
+        ]
+    return [
+        (cx - TRI_APEX, cy),
+        (cx + TRI_BASE, cy - TRI_HALFH),
+        (cx + TRI_BASE, cy + TRI_HALFH),
+    ]
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
+    draw = ImageDraw.Draw(image)
+
+    # gray wiring
+    for node in range(N_GATES):
+        cx, cy = _gate_xy(scene, node)
+        if _depth(node) < DEPTH - 1:
+            for child in (2 * node + 1, 2 * node + 2):
+                kx, ky = _gate_xy(scene, child)
+                draw.line([(cx, cy + 34), (kx, ky - 34)], fill=GRAY, width=5)
+        else:
+            base = 2 * _row_index(node)
+            for cup in (base, base + 1):
+                draw.line(
+                    [(cx, cy + 34), (_cup_x(cup), CUP_TOP - 8)], fill=GRAY, width=5
+                )
+
+    # cups
+    for cup, name in enumerate(scene["cups"]):
+        x = _cup_x(cup)
+        draw.rectangle(
+            [x - CUP_HALFW, CUP_TOP, x + CUP_HALFW, CUP_BOT], fill=CUP_RGB[name]
+        )
+
+    # goal swatch
+    draw.rectangle(list(SWATCH), fill=CUP_RGB[scene["target"]], outline=GRAY, width=6)
+
+    # rings
+    for node, color in scene["rings"]:
+        cx, cy = _gate_xy(scene, int(node))
+        draw.ellipse(
+            [cx - RING_R, cy - RING_R, cx + RING_R, cy + RING_R],
+            outline=RING_RGB[color],
+            width=RING_W,
+        )
+
+    # gates
+    for node in range(N_GATES):
+        cx, cy = _gate_xy(scene, node)
+        draw.polygon(_triangle(cx, cy, scene["dirs"][node]), fill=BLACK)
+
+    # ball
+    bx = _gate_xy(scene, 0)[0]
+    draw.ellipse(
+        [bx - BALL_R, BALL_Y - BALL_R, bx + BALL_R, BALL_Y + BALL_R], fill=BLACK
+    )
+    return image

@@ -1,0 +1,198 @@
+"""Pixel-only inverse arm for the rose-frame bearing world.
+
+This module receives a rasterised PNG and nothing else.  It imports no renderer,
+prompt, generator, verifier or analytic-gold code, and it never sees a latent
+scene.  The public visual specification below is restated deliberately rather
+than imported.
+
+Recovery plan, entirely from pixels:
+
+1. Segment the two ink families by nearest reference colour.
+2. Navy family -> the compass rose.  Its four tips are separate blobs; their
+   mean centroid is the rose centre and the largest-area blob is the solid
+   triangular tip, so ``tip_centroid - centre`` is the north vector.
+3. Crimson family -> the arrow.  Principal-axis analysis gives the arrow line;
+   the axial station carrying the widest cross-section is the head shoulder, so
+   the side of the axis midpoint holding it fixes the pointing sense.
+4. Report the rose direction whose angle is closest to the arrow heading.
+
+Both measurements are required: the navy blobs alone leave the heading unknown
+and the crimson blob alone leaves the frame unknown.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "rose_frame_bearing-oracle-0.1.0"
+
+REFERENCE_COLORS = {
+    "white": (255, 255, 255),
+    "navy": (30, 45, 120),
+    "crimson": (200, 30, 60),
+    "grey": (150, 150, 150),
+}
+
+MATCH_TOLERANCE = 46.0
+MIN_ROSE_BLOB = 40
+MIN_ARROW_BLOB = 400
+UNREADABLE = "unreadable"
+DIRECTIONS = ("north", "east", "south", "west")
+
+
+def _color_mask(array: np.ndarray, name: str) -> np.ndarray:
+    """Pixels whose nearest reference colour is ``name`` and close enough to it."""
+    names = list(REFERENCE_COLORS)
+    stack = np.stack(
+        [
+            np.sqrt(
+                ((array - np.array(REFERENCE_COLORS[key], dtype=np.float64)) ** 2).sum(axis=2)
+            )
+            for key in names
+        ],
+        axis=0,
+    )
+    nearest = np.argmin(stack, axis=0)
+    index = names.index(name)
+    return (nearest == index) & (stack[index] <= MATCH_TOLERANCE)
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[np.ndarray]:
+    """Four-connected blobs of a boolean mask, as arrays of (row, col)."""
+    seen = np.zeros(mask.shape, dtype=bool)
+    blobs = []
+    rows, cols = np.nonzero(mask)
+    for start_row, start_col in zip(rows.tolist(), cols.tolist()):
+        if seen[start_row, start_col]:
+            continue
+        queue = deque([(start_row, start_col)])
+        seen[start_row, start_col] = True
+        pixels = []
+        while queue:
+            row, col = queue.popleft()
+            pixels.append((row, col))
+            for next_row, next_col in (
+                (row - 1, col),
+                (row + 1, col),
+                (row, col - 1),
+                (row, col + 1),
+            ):
+                if (
+                    0 <= next_row < mask.shape[0]
+                    and 0 <= next_col < mask.shape[1]
+                    and mask[next_row, next_col]
+                    and not seen[next_row, next_col]
+                ):
+                    seen[next_row, next_col] = True
+                    queue.append((next_row, next_col))
+        if len(pixels) >= min_area:
+            blobs.append(np.array(pixels, dtype=np.float64))
+    return blobs
+
+
+def _bearing(dx: float, dy: float) -> float:
+    """Clockwise-from-up screen bearing of a vector, in degrees."""
+    return math.degrees(math.atan2(dx, -dy)) % 360.0
+
+
+def _rose_north(mask: np.ndarray):
+    blobs = _components(mask, MIN_ROSE_BLOB)
+    if len(blobs) < 4:
+        return None
+    blobs.sort(key=len, reverse=True)
+    blobs = blobs[:4]
+    centroids = np.array([blob.mean(axis=0) for blob in blobs])
+    centre = centroids.mean(axis=0)
+    areas = [len(blob) for blob in blobs]
+    order = sorted(range(4), key=lambda i: areas[i], reverse=True)
+    if areas[order[0]] < 1.35 * areas[order[1]]:
+        return None  # no unambiguous triangular tip
+    tip = centroids[order[0]]
+    dy = float(tip[0] - centre[0])
+    dx = float(tip[1] - centre[1])
+    if math.hypot(dx, dy) < 12.0:
+        return None
+    return _bearing(dx, dy)
+
+
+def _arrow_heading(mask: np.ndarray):
+    blobs = _components(mask, MIN_ARROW_BLOB)
+    if not blobs:
+        return None
+    blob = max(blobs, key=len)
+    points = blob[:, ::-1]  # (x, y)
+    centre = points.mean(axis=0)
+    centred = points - centre
+    covariance = np.cov(centred, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    axis = vectors[:, int(np.argmax(values))]
+    if abs(axis[0]) > abs(axis[1]):
+        if axis[0] < 0:
+            axis = -axis
+    elif axis[1] < 0:
+        axis = -axis
+    normal = np.array([-axis[1], axis[0]])
+
+    along = centred @ axis
+    across = centred @ normal
+    low = float(along.min())
+    high = float(along.max())
+    if high - low < 40.0:
+        return None
+
+    bins = 24
+    edges = np.linspace(low, high, bins + 1)
+    slot = np.clip(np.digitize(along, edges) - 1, 0, bins - 1)
+    widest_value = -1.0
+    widest_station = None
+    for index in range(bins):
+        chosen = slot == index
+        if chosen.sum() < 4:
+            continue
+        width = float(across[chosen].max() - across[chosen].min())
+        if width > widest_value:
+            widest_value = width
+            widest_station = float(along[chosen].mean())
+    if widest_station is None:
+        return None
+
+    midpoint = (low + high) / 2.0
+    if abs(widest_station - midpoint) < 1.0:
+        return None
+    sense = 1.0 if widest_station > midpoint else -1.0
+    heading = axis * sense
+    return _bearing(float(heading[0]), float(heading[1]))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.float64)
+    north = _rose_north(_color_mask(array, "navy"))
+    heading = _arrow_heading(_color_mask(array, "crimson"))
+    if north is None or heading is None:
+        return UNREADABLE
+    offset = (heading - north) % 360.0
+    index = int(math.floor(offset / 90.0 + 0.5)) % 4
+    return DIRECTIONS[index]
+
+
+def measurement_from_image(image: Image.Image) -> dict:
+    """Diagnostic view of the same pixel measurement (used by verify.py)."""
+    array = np.asarray(image.convert("RGB"), dtype=np.float64)
+    north = _rose_north(_color_mask(array, "navy"))
+    heading = _arrow_heading(_color_mask(array, "crimson"))
+    if north is None or heading is None:
+        return {"decision": UNREADABLE, "north_deg": north, "heading_deg": heading}
+    offset = (heading - north) % 360.0
+    residual = offset % 90.0
+    if residual > 45.0:
+        residual = 90.0 - residual
+    return {
+        "decision": DIRECTIONS[int(math.floor(offset / 90.0 + 0.5)) % 4],
+        "north_deg": north,
+        "heading_deg": heading,
+        "pixel_margin_deg": 45.0 - residual,
+    }

@@ -1,0 +1,156 @@
+"""Pixel-only inverse arm for the jog-indexed rail walk.
+
+Receives one PIL image and nothing else: no renderer, prompt, generator,
+verifier or analytic-gold import, and no latent scene input.
+
+Steps: (1) segment the teal staircase and count its downward drops from the
+stroke's upper profile; (2) segment the rail together with its coloured bands
+into one connected structure; (3) locate the hollow green marker and start a
+breadth-first geodesic walk from the rail pixel nearest to it; (4) order the
+coloured bands by their along-rail distance and report the N-th one.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+UNDETERMINED = "undetermined"
+
+_TEAL = (18, 142, 150)
+_RAIL = (44, 48, 58)
+_GREEN = (32, 158, 72)
+_BANDS = {
+    "orange": (232, 124, 28),
+    "purple": (124, 56, 182),
+    "yellow": (232, 214, 46),
+}
+
+_TOL = 30
+_MIN_JUMP = 20
+_MIN_PLATEAU = 22
+_MIN_BAND_PIXELS = 150
+_MAX_BAND_PIXELS = 450
+_MIN_GEODESIC_GAP = 8
+_MIN_RING_PIXELS = 60
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    diff = arr.astype(np.int32) - np.array(rgb, dtype=np.int32)
+    return np.abs(diff).sum(axis=2) <= _TOL
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    best: list[tuple[int, int]] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) > len(best):
+            best = pixels
+    out = np.zeros(mask.shape, dtype=bool)
+    if best:
+        arr = np.array(best)
+        out[arr[:, 0], arr[:, 1]] = True
+    return out
+
+
+def _count_drops(teal: np.ndarray) -> int | None:
+    """Number of downward jumps in the upper profile of the staircase."""
+
+    columns = np.nonzero(teal.any(axis=0))[0]
+    if columns.size < 40:
+        return None
+    x0, x1 = int(columns[0]), int(columns[-1])
+    if columns.size != x1 - x0 + 1:
+        return None                      # the stroke is not contiguous in x
+    tops = teal[:, x0 : x1 + 1].argmax(axis=0).astype(np.int64)
+
+    jumps = []
+    for index in range(1, tops.size):
+        step = int(tops[index] - tops[index - 1])
+        if step <= -_MIN_JUMP:
+            return None                  # profile rises: not a descending staircase
+        if step >= _MIN_JUMP:
+            jumps.append(index)
+        elif step != 0:
+            return None                  # ragged profile
+    bounds = [0] + jumps + [int(tops.size)]
+    for left, right in zip(bounds, bounds[1:]):
+        if right - left < _MIN_PLATEAU:
+            return None
+    if not 1 <= len(jumps) <= 3:
+        return None
+    return len(jumps)
+
+
+def _geodesic(rail: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = rail.shape
+    dist = np.full(rail.shape, -1, dtype=np.int32)
+    dist[start] = 0
+    queue = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        nd = dist[y, x] + 1
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and rail[ny, nx] and dist[ny, nx] < 0:
+                dist[ny, nx] = nd
+                queue.append((ny, nx))
+    return dist
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+
+    index = _count_drops(_largest_component(_mask(arr, _TEAL)))
+    if index is None:
+        return UNDETERMINED
+
+    band_masks = {name: _mask(arr, rgb) for name, rgb in _BANDS.items()}
+    structure = _mask(arr, _RAIL)
+    for band in band_masks.values():
+        structure = structure | band
+    rail = _largest_component(structure)
+    if int(rail.sum()) < 1500:
+        return UNDETERMINED
+
+    ring = _mask(arr, _GREEN)
+    if int(ring.sum()) < _MIN_RING_PIXELS:
+        return UNDETERMINED
+    ys, xs = np.nonzero(ring)
+    ring_y, ring_x = float(ys.mean()), float(xs.mean())
+
+    rys, rxs = np.nonzero(rail)
+    offsets = (rys - ring_y) ** 2 + (rxs - ring_x) ** 2
+    pick = int(np.argmin(offsets))
+    dist = _geodesic(rail, (int(rys[pick]), int(rxs[pick])))
+
+    ranked = []
+    for name, band in band_masks.items():
+        pixels = band & rail
+        count = int(pixels.sum())
+        if not _MIN_BAND_PIXELS <= count <= _MAX_BAND_PIXELS:
+            return UNDETERMINED
+        values = dist[pixels]
+        if values.size == 0 or int(values.min()) < 0:
+            return UNDETERMINED
+        ranked.append((int(values.min()), name))
+    ranked.sort()
+    for (left, _), (right, _) in zip(ranked, ranked[1:]):
+        if right - left < _MIN_GEODESIC_GAP:
+            return UNDETERMINED
+    return ranked[index - 1][1]

@@ -1,0 +1,178 @@
+"""Pixel-only inverse arm for the keyring_gate_corridor world.
+
+It receives one rendered RGB image and nothing else: no scene, no latent
+fields, no gold, no renderer code.  From the pixels alone it
+
+1. finds the dark corridor ink and the coloured marks by exact colour class;
+2. locates the start bead as the thickest patch of corridor ink;
+3. measures geodesic distance along the corridor from that bead, so the
+   coloured marks can be put into the order in which a walk meets them;
+4. classifies every coloured mark as a round key disk or an elongated gate bar
+   from its own bounding box;
+5. replays the walk, collecting key colours and stopping at the first gate whose
+   colour is not yet on the ring.
+
+It abstains when the bead, the corridor, the marks or their order along the
+corridor are not legible.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "keyring_gate_corridor-oracle-0.1.0"
+ABSTAIN = "abstain"
+
+_INK = (28, 28, 34)
+_COLOURS: dict[str, tuple[int, int, int]] = {
+    "red": (198, 42, 42),
+    "green": (32, 138, 66),
+    "blue": (40, 84, 200),
+    "purple": (142, 48, 168),
+}
+
+_BEAD_WINDOW = 17
+_BEAD_MIN_INK = 160
+_MIN_MARK_AREA = 24
+_GATE_ASPECT = 3.0
+_MIN_ORDER_GAP = 6
+
+
+def _class_mask(arr: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    return (
+        (arr[:, :, 0] == rgb[0]) & (arr[:, :, 1] == rgb[1]) & (arr[:, :, 2] == rgb[2])
+    )
+
+
+def _window_sums(mask: np.ndarray, size: int) -> np.ndarray:
+    """Sum of `mask` over every size x size window, indexed by window centre."""
+    integral = np.zeros((mask.shape[0] + 1, mask.shape[1] + 1), dtype=np.int32)
+    integral[1:, 1:] = np.cumsum(np.cumsum(mask.astype(np.int32), axis=0), axis=1)
+    half = size // 2
+    height, width = mask.shape
+    out = np.zeros_like(mask, dtype=np.int32)
+    for row in range(half, height - half):
+        r0, r1 = row - half, row + half + 1
+        block = (
+            integral[r1, size:width]
+            - integral[r0, size:width]
+            - integral[r1, 0 : width - size]
+            + integral[r0, 0 : width - size]
+        )
+        out[row, half : width - half - 1] = block
+    return out
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    """Four-connected components of a small boolean mask."""
+    seen = np.zeros(mask.shape, dtype=bool)
+    groups = []
+    rows, cols = np.nonzero(mask)
+    for start_r, start_c in zip(rows, cols):
+        if seen[start_r, start_c]:
+            continue
+        stack = [(int(start_r), int(start_c))]
+        seen[start_r, start_c] = True
+        pixels = []
+        while stack:
+            r, c = stack.pop()
+            pixels.append((r, c))
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < mask.shape[0] and 0 <= nc < mask.shape[1]:
+                    if mask[nr, nc] and not seen[nr, nc]:
+                        seen[nr, nc] = True
+                        stack.append((nr, nc))
+        groups.append(pixels)
+    return groups
+
+
+def _geodesic(path: np.ndarray, source: tuple[int, int]) -> np.ndarray:
+    """Four-connected geodesic distance inside `path` from one source pixel."""
+    dist = np.full(path.shape, -1, dtype=np.int32)
+    frontier = np.zeros(path.shape, dtype=bool)
+    frontier[source] = True
+    dist[source] = 0
+    step = 0
+    while frontier.any():
+        step += 1
+        grown = np.zeros(path.shape, dtype=bool)
+        grown[1:, :] |= frontier[:-1, :]
+        grown[:-1, :] |= frontier[1:, :]
+        grown[:, 1:] |= frontier[:, :-1]
+        grown[:, :-1] |= frontier[:, 1:]
+        frontier = grown & path & (dist < 0)
+        dist[frontier] = step
+    return dist
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+
+    ink = _class_mask(arr, _INK)
+    if ink.sum() < 200:
+        return ABSTAIN
+
+    colour_masks = {name: _class_mask(arr, rgb) for name, rgb in _COLOURS.items()}
+    any_colour = np.zeros(ink.shape, dtype=bool)
+    for mask in colour_masks.values():
+        any_colour |= mask
+    if not any_colour.any():
+        return ABSTAIN
+
+    # the start bead is the only place where the corridor ink is a thick blob
+    sums = _window_sums(ink, _BEAD_WINDOW)
+    bead_value = int(sums.max())
+    if bead_value < _BEAD_MIN_INK:
+        return ABSTAIN
+    bead = np.unravel_index(int(np.argmax(sums)), sums.shape)
+    if not ink[bead]:
+        return ABSTAIN
+
+    path = ink | any_colour
+    rows, cols = np.nonzero(path)
+    r0, r1 = int(rows.min()), int(rows.max()) + 1
+    c0, c1 = int(cols.min()), int(cols.max()) + 1
+    crop = path[r0:r1, c0:c1]
+    dist = _geodesic(crop, (int(bead[0]) - r0, int(bead[1]) - c0))
+
+    marks = []
+    for name, mask in colour_masks.items():
+        local = mask[r0:r1, c0:c1]
+        if not local.any():
+            continue
+        for pixels in _components(local):
+            if len(pixels) < _MIN_MARK_AREA:
+                continue
+            rs = [p[0] for p in pixels]
+            cs = [p[1] for p in pixels]
+            height = max(rs) - min(rs) + 1
+            width = max(cs) - min(cs) + 1
+            aspect = max(height, width) / max(1, min(height, width))
+            reach = [int(dist[p]) for p in pixels if dist[p] >= 0]
+            if not reach:
+                return ABSTAIN  # a mark unreachable from the bead is illegible
+            marks.append(
+                {
+                    "colour": name,
+                    "kind": "gate" if aspect >= _GATE_ASPECT else "key",
+                    "at": min(reach),
+                }
+            )
+    if not marks:
+        return ABSTAIN
+
+    marks.sort(key=lambda m: m["at"])
+    for earlier, later in zip(marks, marks[1:]):
+        if later["at"] - earlier["at"] < _MIN_ORDER_GAP:
+            return ABSTAIN  # two marks too close to order along the corridor
+
+    ring: list[str] = []
+    for mark in marks:
+        if mark["kind"] == "key":
+            if mark["colour"] not in ring:
+                ring.append(mark["colour"])
+        elif mark["colour"] not in ring:
+            return mark["colour"]
+    return ABSTAIN  # no gate blocks the walk, so no colour can be reported

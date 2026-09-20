@@ -1,0 +1,265 @@
+"""Independent inverse arm using only visible raster evidence."""
+
+from __future__ import annotations
+
+from collections import Counter
+
+import numpy as np
+from PIL import Image
+
+# Public visual vocabulary, deliberately duplicated instead of imported.
+_FRAME = np.array((91, 105, 121), dtype=np.uint8)
+_INK = np.array((20, 38, 63), dtype=np.uint8)
+_GOLD = np.array((242, 171, 35), dtype=np.uint8)
+_LABELS = ("up", "right", "down", "left")
+
+
+class OracleAbstention(ValueError):
+    """Raised when visible fiducials or the recovered shape are ambiguous."""
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[dict]:
+    height, width = mask.shape
+    remaining = set(int(value) for value in np.flatnonzero(mask))
+    found: list[dict] = []
+    while remaining:
+        seed = remaining.pop()
+        stack = [seed]
+        area = 0
+        min_x = max_x = seed % width
+        min_y = max_y = seed // width
+        sum_x = sum_y = 0
+        while stack:
+            value = stack.pop()
+            y, x = divmod(value, width)
+            area += 1
+            sum_x += x
+            sum_y += y
+            min_x, max_x = min(min_x, x), max(max_x, x)
+            min_y, max_y = min(min_y, y), max(max_y, y)
+            if x and value - 1 in remaining:
+                remaining.remove(value - 1)
+                stack.append(value - 1)
+            if x + 1 < width and value + 1 in remaining:
+                remaining.remove(value + 1)
+                stack.append(value + 1)
+            if y and value - width in remaining:
+                remaining.remove(value - width)
+                stack.append(value - width)
+            if y + 1 < height and value + width in remaining:
+                remaining.remove(value + width)
+                stack.append(value + width)
+        if area >= minimum:
+            found.append({
+                "area": area,
+                "bbox": (min_x, min_y, max_x, max_y),
+                "center": (sum_x / area, sum_y / area),
+            })
+    return found
+
+
+def _rotate_cw(grid: list[list[int]], turns: int) -> list[list[int]]:
+    out = [row[:] for row in grid]
+    for _ in range(turns % 4):
+        out = [list(row) for row in zip(*out[::-1])]
+    return out
+
+
+def _signal_up() -> list[list[int]]:
+    grid = [[0 for _ in range(10)] for _ in range(10)]
+    for x in (4, 5):
+        grid[1][x] = 1
+    for x in range(3, 7):
+        grid[2][x] = 1
+    for x in range(2, 8):
+        grid[3][x] = 1
+    for y in range(4, 9):
+        grid[y][4] = grid[y][5] = 1
+    return grid
+
+
+def _signal_templates() -> dict[str, list[list[int]]]:
+    base = _signal_up()
+    return {label: _rotate_cw(base, index) for index, label in enumerate(_LABELS)}
+
+
+def _frame_boxes(arr: np.ndarray) -> tuple[dict, list[dict]]:
+    mask = np.all(arr == _FRAME, axis=2)
+    components = _components(mask, minimum=500)
+    if len(components) != 5:
+        raise OracleAbstention(f"expected five visible grid frames, found {len(components)}")
+    target = max(components, key=lambda item: item["area"])
+    sources = [item for item in components if item is not target]
+    sources.sort(key=lambda item: item["center"][0])
+    tw = target["bbox"][2] - target["bbox"][0]
+    widths = [item["bbox"][2] - item["bbox"][0] for item in sources]
+    if tw < 1.4 * max(widths) or max(widths) - min(widths) > 2:
+        raise OracleAbstention("frame geometry is not uniquely separated into map and cards")
+    return target, sources
+
+
+def _badge_centers(arr: np.ndarray) -> dict[tuple[int, int, int], tuple[tuple[float, float], tuple[float, float]]]:
+    colors, counts = np.unique(arr.reshape(-1, 3), axis=0, return_counts=True)
+    result = {}
+    for color_arr, count in zip(colors, counts, strict=True):
+        color = tuple(int(value) for value in color_arr)
+        spread = max(color) - min(color)
+        if not (900 <= int(count) <= 1800 and spread >= 65):
+            continue
+        if np.linalg.norm(color_arr.astype(float) - _GOLD.astype(float)) < 50:
+            continue
+        ys, xs = np.nonzero(np.all(arr == color_arr, axis=2))
+        if len(ys) < 2:
+            continue
+        order = np.argsort(ys)
+        sorted_y = ys[order]
+        gaps = np.diff(sorted_y)
+        split = int(np.argmax(gaps)) + 1
+        if gaps[split - 1] < 40:
+            continue
+        top_indices, bottom_indices = order[:split], order[split:]
+        top = (float(xs[top_indices].mean()), float(ys[top_indices].mean()))
+        bottom = (float(xs[bottom_indices].mean()), float(ys[bottom_indices].mean()))
+        result[color] = (top, bottom)
+    if len(result) != 4:
+        raise OracleAbstention(f"expected four matched badge colors, found {len(result)}")
+    return result
+
+
+def _quadrant(point: tuple[float, float], target: dict) -> int:
+    cx, cy = target["center"]
+    x, y = point
+    return (2 if y > cy else 0) + (1 if x > cx else 0)
+
+
+def _read_card(arr: np.ndarray, frame: dict) -> list[list[int]]:
+    x0, y0, x1, y1 = frame["bbox"]
+    width, height = x1 - x0, y1 - y0
+    if abs(width - height) > 2:
+        raise OracleAbstention("source card is not square")
+    matrix = []
+    for row in range(5):
+        values = []
+        for col in range(5):
+            cx = int(round(x0 + (col + 0.5) * width / 5.0))
+            cy = int(round(y0 + (row + 0.5) * height / 5.0))
+            patch = arr[cy - 4 : cy + 5, cx - 4 : cx + 5]
+            ink_fraction = float(np.mean(np.all(patch == _INK, axis=2)))
+            if ink_fraction > 0.8:
+                values.append(1)
+            elif ink_fraction < 0.05:
+                values.append(0)
+            else:
+                raise OracleAbstention("ambiguous tile fill")
+        matrix.append(values)
+    if sum(map(sum, matrix)) != 9:
+        raise OracleAbstention("a source card does not contain the balanced nine-cell ink count")
+    return matrix
+
+
+def _notch_turn(arr: np.ndarray, frame: dict) -> int:
+    x0, y0, x1, y1 = frame["bbox"]
+    gold = np.all(arr == _GOLD, axis=2)
+    ys, xs = np.nonzero(gold)
+    keep = (xs >= x0 - 22) & (xs <= x1 + 22) & (ys >= y0 - 22) & (ys <= y1 + 22)
+    if int(keep.sum()) < 80:
+        raise OracleAbstention("missing gold card orientation notch")
+    gx, gy = float(xs[keep].mean()), float(ys[keep].mean())
+    cx, cy = frame["center"]
+    dx, dy = gx - cx, gy - cy
+    if max(abs(dx), abs(dy)) < 0.42 * (x1 - x0):
+        raise OracleAbstention("orientation notch is not on a unique edge")
+    if abs(dx) > abs(dy):
+        return 1 if dx > 0 else 3
+    return 2 if dy > 0 else 0
+
+
+def _largest_component(grid: list[list[int]]) -> list[list[int]]:
+    mask = np.array(grid, dtype=bool)
+    parts = _components(mask, minimum=1)
+    if not parts:
+        raise OracleAbstention("assembled grid contains no ink")
+    # Recompute cell membership for the largest component on the tiny 10x10 grid.
+    remaining = {(y, x) for y, x in zip(*np.nonzero(mask), strict=True)}
+    groups = []
+    while remaining:
+        seed = remaining.pop()
+        group = {seed}
+        stack = [seed]
+        while stack:
+            y, x = stack.pop()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    group.add(neighbor)
+                    stack.append(neighbor)
+        groups.append(group)
+    groups.sort(key=len, reverse=True)
+    if len(groups[0]) < 18 or any(len(group) != 1 for group in groups[1:]):
+        raise OracleAbstention("there is not exactly one arrow-sized component plus isolated cells")
+    out = [[0 for _ in range(10)] for _ in range(10)]
+    for y, x in groups[0]:
+        out[y][x] = 1
+    return out
+
+
+def _decode(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    target, source_frames = _frame_boxes(arr)
+    badges = _badge_centers(arr)
+
+    target_for_color = {}
+    source_for_color = {}
+    for color, (map_center, source_center) in badges.items():
+        quadrant = _quadrant(map_center, target)
+        if quadrant in target_for_color.values():
+            raise OracleAbstention("two target badges occupy the same quadrant")
+        target_for_color[color] = quadrant
+        distances = [
+            (source_center[0] - frame["center"][0]) ** 2 + (source_center[1] - frame["center"][1]) ** 2
+            for frame in source_frames
+        ]
+        slot = int(np.argmin(distances))
+        if slot in source_for_color.values():
+            raise OracleAbstention("two source badges select the same card")
+        source_for_color[color] = slot
+
+    assembled = [[0 for _ in range(10)] for _ in range(10)]
+    for color in badges:
+        frame = source_frames[source_for_color[color]]
+        displayed = _read_card(arr, frame)
+        turn = _notch_turn(arr, frame)
+        canonical = _rotate_cw(displayed, (-turn) % 4)
+        quadrant = target_for_color[color]
+        row0, col0 = 5 * (quadrant // 2), 5 * (quadrant % 2)
+        for row in range(5):
+            for col in range(5):
+                assembled[row0 + row][col0 + col] = canonical[row][col]
+
+    signal = _largest_component(assembled)
+    templates = _signal_templates()
+    distances = {
+        label: sum(
+            value != templates[label][row][col]
+            for row, values in enumerate(signal)
+            for col, value in enumerate(values)
+        )
+        for label in _LABELS
+    }
+    ranked = sorted(distances.items(), key=lambda item: (item[1], item[0]))
+    best_label, best_distance = ranked[0]
+    runner_gap = float(ranked[1][1] - best_distance)
+    if best_distance > 2 or runner_gap < 8:
+        raise OracleAbstention(
+            f"template classification ambiguous: best={best_distance}, runner_gap={runner_gap}"
+        )
+    return best_label, runner_gap
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    """Return the pixel decision and top-vs-runner-up Hamming margin."""
+    return _decode(image)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _decode(image)[0]

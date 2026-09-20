@@ -1,0 +1,290 @@
+"""Rung-removal-replay world: replay a drop after one visible rung is deleted.
+
+A ladder of six vertical lines is crossed by sixteen horizontal rungs, each
+joining two neighbouring lines. A token drops from a black arrow: it slides
+down its line and swaps to the neighbouring line at every rung it meets. The
+route the token takes *in the ladder as drawn* is painted as a pale yellow
+band behind the ink, so the current outcome is given away for free.
+
+Exactly one rung is red. The question asks for the slot the token reaches in
+the counterfactual ladder in which that red rung has been deleted. Scenes are
+sampled so that the red rung lies on the drawn route, so the drawn route's
+endpoint is never the answer, and so the "go straight through the gap and then
+repeat the old route's remaining sideways steps" shortcut is also wrong: after
+the deletion the token meets a genuinely different set of rungs.
+
+The renderer owns scene sampling, rasterization and the structural analytic
+gold. The independent pixel-only inverse arm (``oracle.py``) recovers the same
+decision from the final PNG alone.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 980
+HEIGHT = 700
+BACKGROUND = (255, 255, 255)
+
+N_LINES = 6
+ROWS = 16
+X0 = 115
+X_STEP = 150
+TOP_Y = 95
+BOTTOM_Y = 640
+ROW_Y0 = 128
+ROW_STEP = 32
+JITTER = 7
+
+SLOT_CY = 650
+SLOT_HALF = 15
+
+LINE_COLOR = (72, 72, 78)
+RUNG_COLOR = (38, 92, 176)
+CUT_COLOR = (198, 44, 44)
+HALO_COLOR = (250, 224, 138)
+MARKER_COLOR = (0, 0, 0)
+
+LINE_W = 6
+RUNG_W = 8
+HALO_W = 18
+QUARANTINE_MIN_GAP = 20.0
+
+
+def _line_x(index: int) -> int:
+    return X0 + X_STEP * int(index)
+
+
+def _walk(rungs, start, removed):
+    """Descend the ladder, skipping rung index ``removed`` (-1 skips nothing).
+
+    ``rungs`` is a list of ``[left_line, y]`` pairs; a rung joins ``left_line``
+    and ``left_line + 1``. Returns the zero-based bottom line index reached.
+    """
+    order = sorted(
+        (idx for idx in range(len(rungs)) if idx != removed),
+        key=lambda idx: (rungs[idx][1], rungs[idx][0]),
+    )
+    cur = int(start)
+    for idx in order:
+        left = int(rungs[idx][0])
+        if cur == left:
+            cur = left + 1
+        elif cur == left + 1:
+            cur = left
+    return cur
+
+
+def _route(rungs, start, removed):
+    """Return (final_line, crossed_rung_indices) for one descent."""
+    order = sorted(
+        (idx for idx in range(len(rungs)) if idx != removed),
+        key=lambda idx: (rungs[idx][1], rungs[idx][0]),
+    )
+    cur = int(start)
+    crossed = []
+    for idx in order:
+        left = int(rungs[idx][0])
+        if cur == left:
+            cur = left + 1
+            crossed.append(idx)
+        elif cur == left + 1:
+            cur = left
+            crossed.append(idx)
+    return cur, crossed
+
+
+def _gaps(rungs) -> list[float]:
+    ys = sorted(float(y) for (_, y) in rungs)
+    gaps = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
+    gaps.append(ys[0] - 86.0)
+    gaps.append(float(SLOT_CY - SLOT_HALF) - ys[-1])
+    return gaps
+
+
+def _rungs_readable(rungs) -> bool:
+    """Reject ladders in which two nearly level rungs could read as one.
+
+    Rungs closer than ``QUARANTINE_MIN_GAP`` pixels vertically must be at
+    least two gaps apart horizontally, so they never touch, never share a
+    vertical line, and never merge into a single long stroke.
+    """
+    for i in range(len(rungs)):
+        for j in range(i + 1, len(rungs)):
+            if abs(float(rungs[i][1]) - float(rungs[j][1])) < QUARANTINE_MIN_GAP:
+                if abs(int(rungs[i][0]) - int(rungs[j][0])) < 2:
+                    return False
+    return True
+
+
+def _shortcut_slot(rungs, start, removed) -> int:
+    """The 'straight through, then repeat the old sideways steps' shortcut.
+
+    A tempting shortcut is to take the drawn route, refuse the deleted swap,
+    and then reuse the drawn route's remaining sideways steps unchanged. This
+    is wrong in general because the token now sits on a different line and
+    meets a different set of rungs.
+    """
+    _, crossed = _route(rungs, start, -1)
+    if removed not in crossed:
+        return -1
+    position = crossed.index(removed)
+    cur = int(start)
+    for idx in crossed[:position]:
+        left = int(rungs[idx][0])
+        cur = left + 1 if cur == left else left
+    for idx in crossed[position + 1:]:
+        left = int(rungs[idx][0])
+        delta = 1 if cur <= left else -1
+        cur = min(max(cur + delta, 0), N_LINES - 1)
+    return cur
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``.
+
+    Tiered rejection sampling keeps the counterfactual essential: the deleted
+    rung is on the drawn route, the drawn endpoint is not the answer, the two
+    differ by more than one slot, several rungs are met after the divergence,
+    and the sideways-step shortcut gives a different slot.
+    """
+    rng = np.random.default_rng(int(seed) * 2 + 1)
+    tiers = (
+        {"spread": 2, "after": 4, "block_shortcut": True},
+        {"spread": 2, "after": 3, "block_shortcut": True},
+        {"spread": 1, "after": 3, "block_shortcut": True},
+        {"spread": 1, "after": 2, "block_shortcut": False},
+    )
+    for tier in tiers:
+        for _ in range(900):
+            lefts = [int(rng.integers(0, N_LINES - 1)) for _ in range(ROWS)]
+            ys = [
+                float(ROW_Y0 + ROW_STEP * k + int(rng.integers(-JITTER, JITTER + 1)))
+                for k in range(ROWS)
+            ]
+            rungs = [[lefts[k], ys[k]] for k in range(ROWS)]
+            if not _rungs_readable(rungs):
+                continue
+            start = int(rng.integers(0, N_LINES))
+            actual, crossed = _route(rungs, start, -1)
+            if len(crossed) < 5:
+                continue
+            limit = max(1, int(len(crossed) * 0.6))
+            choices = crossed[:limit]
+            removed = int(choices[int(rng.integers(0, len(choices)))])
+            after = len(crossed) - crossed.index(removed) - 1
+            if after < tier["after"]:
+                continue
+            counterfactual = _walk(rungs, start, removed)
+            if counterfactual == actual:
+                continue
+            if abs(counterfactual - actual) < tier["spread"]:
+                continue
+            if tier["block_shortcut"]:
+                if _shortcut_slot(rungs, start, removed) == counterfactual:
+                    continue
+            paint_order = list(range(ROWS))
+            rng.shuffle(paint_order)
+            return {
+                "n_lines": N_LINES,
+                "rungs": rungs,
+                "start": start,
+                "removed": removed,
+                "paint_order": [int(v) for v in paint_order],
+            }
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the latent scene (deterministic, anti-aliasing free)."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    d = ImageDraw.Draw(img)
+
+    n_lines = int(scene["n_lines"])
+    rungs = scene["rungs"]
+    start = int(scene["start"])
+    removed = int(scene["removed"])
+    paint_order = scene["paint_order"]
+
+    # Pale route halo, painted first so all ink stays fully readable on top.
+    cur = start
+    y_cursor = float(TOP_Y)
+    for idx in sorted(range(len(rungs)), key=lambda i: (rungs[i][1], rungs[i][0])):
+        left = int(rungs[idx][0])
+        y = float(rungs[idx][1])
+        if cur not in (left, left + 1):
+            continue
+        d.line([(_line_x(cur), y_cursor), (_line_x(cur), y)], fill=HALO_COLOR, width=HALO_W)
+        nxt = left + 1 if cur == left else left
+        d.line([(_line_x(cur), y), (_line_x(nxt), y)], fill=HALO_COLOR, width=HALO_W)
+        cur = nxt
+        y_cursor = y
+    d.line([(_line_x(cur), y_cursor), (_line_x(cur), SLOT_CY)], fill=HALO_COLOR, width=HALO_W)
+
+    # Vertical lines and their numbered bottom slots.
+    for i in range(n_lines):
+        x = _line_x(i)
+        d.line([(x, TOP_Y), (x, BOTTOM_Y)], fill=LINE_COLOR, width=LINE_W)
+        d.rectangle(
+            [x - SLOT_HALF, SLOT_CY - SLOT_HALF, x + SLOT_HALF, SLOT_CY + SLOT_HALF],
+            outline=LINE_COLOR,
+            width=4,
+        )
+
+    # Rungs; the deleted one is red. Paint order is photometrically invisible.
+    for idx in paint_order:
+        left = int(rungs[idx][0])
+        y = float(rungs[idx][1])
+        color = CUT_COLOR if idx == removed else RUNG_COLOR
+        d.line(
+            [(_line_x(left), y), (_line_x(left + 1), y)],
+            fill=color,
+            width=RUNG_W,
+        )
+
+    # Black start arrow above the starting line.
+    sx = _line_x(start)
+    d.polygon([(sx - 17, 52), (sx + 17, 52), (sx, 86)], fill=MARKER_COLOR)
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Structural gold: the slot reached once the red rung has been deleted."""
+    slot = _walk(scene["rungs"], scene["start"], scene["removed"])
+    return f"slot-{slot + 1}"
+
+
+def margin(scene: dict) -> float:
+    """Commitment magnitude: the tightest vertical clearance in the ladder.
+
+    Every rung must be separated from its neighbours (and from the arrow and
+    the slot row) by enough pixels that the pale route band stays a single
+    readable ribbon rather than a merged blob.
+    """
+    return float(min(_gaps(scene["rungs"])))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine ladders whose route band merges across neighbouring rungs."""
+    return margin(scene) < QUARANTINE_MIN_GAP
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Rung paint order is photometrically invisible.
+
+    No two rungs overlap in pixels (their centre lines are at least sixteen
+    pixels apart and each is eight pixels thick), so permuting the declared
+    ``paint_order`` yields a byte-identical raster while the analytic gold,
+    which reads only the rung geometry, the start and the deleted index, is
+    unchanged.
+    """
+    order = list(scene["paint_order"])
+    rotated = [order[-1]] + order[:-1]
+    reversed_order = list(reversed(order))
+    twins = []
+    for name, twin_order in (("rotated_paint_order", rotated), ("reversed_paint_order", reversed_order)):
+        twin = dict(scene)
+        twin["paint_order"] = twin_order
+        twins.append((name, twin))
+    return twins

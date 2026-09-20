@@ -1,0 +1,170 @@
+"""Independent pixel-only inverse for the ascending-run route world.
+
+The oracle knows only the public palette/visual contract.  It enumerates every
+terminal color, associates it with a black connected component and cyan start,
+recovers the two vertical turns, reconstructs five ordered run lengths, and
+requires a unique strict-increase winner with a runner-up margin.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BLACK = np.array((34, 38, 43), dtype=np.int16)
+CYAN = np.array((0, 170, 190), dtype=np.int16)
+COLORS = {
+    "red": np.array((214, 58, 63), dtype=np.int16),
+    "gold": np.array((222, 159, 24), dtype=np.int16),
+    "violet": np.array((132, 82, 190), dtype=np.int16),
+    "green": np.array((42, 151, 91), dtype=np.int16),
+}
+
+
+def _mask(arr: np.ndarray, color: np.ndarray, tol: int = 8) -> np.ndarray:
+    return np.max(np.abs(arr.astype(np.int16) - color), axis=2) <= tol
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    out: list[np.ndarray] = []
+    h, w = mask.shape
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        q = deque([(int(y), int(x))])
+        seen[y, x] = True
+        pts = []
+        while q:
+            yy, xx = q.popleft()
+            pts.append((yy, xx))
+            for dy, dx in ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)):
+                ny, nx = yy+dy, xx+dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    q.append((ny, nx))
+        if len(pts) >= minimum:
+            out.append(np.asarray(pts, dtype=np.float64))
+    return out
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _distance(component: np.ndarray, point: tuple[float, float]) -> float:
+    x, y = point
+    return float(np.sqrt(((component[:, 1]-x)**2 + (component[:, 0]-y)**2).min()))
+
+
+def _groups(values: np.ndarray) -> list[np.ndarray]:
+    vals = sorted(set(int(v) for v in values))
+    if not vals:
+        return []
+    groups = [[vals[0]]]
+    for value in vals[1:]:
+        if value == groups[-1][-1] + 1:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+    return [np.asarray(g, dtype=float) for g in groups]
+
+
+def _pixel_path(component: np.ndarray, start: tuple[float,float], end: tuple[float,float]) -> np.ndarray:
+    pixels = {(int(y), int(x)) for y, x in component}
+    def nearest(point: tuple[float,float]) -> tuple[int,int]:
+        x, y = point
+        return min(pixels, key=lambda p: (p[1]-x)**2 + (p[0]-y)**2)
+    source, target = nearest(start), nearest(end)
+    queue = deque([source])
+    parent = {source: None}
+    while queue:
+        point = queue.popleft()
+        if point == target:
+            break
+        y, x = point
+        for nxt in ((y-1,x),(y+1,x),(y,x-1),(y,x+1),(y-1,x-1),(y-1,x+1),(y+1,x-1),(y+1,x+1)):
+            if nxt in pixels and nxt not in parent:
+                parent[nxt] = point
+                queue.append(nxt)
+    if target not in parent:
+        raise ValueError("route trace is disconnected")
+    path = []
+    point = target
+    while point is not None:
+        path.append((float(point[1]), float(point[0])))
+        point = parent[point]
+    path.reverse()
+    return np.asarray([start, *path, end], dtype=np.float64)
+
+
+def _rdp(points: np.ndarray, epsilon: float) -> np.ndarray:
+    if len(points) <= 2:
+        return points
+    a, b = points[0], points[-1]
+    vector = b-a
+    norm = float(np.linalg.norm(vector))
+    if norm == 0:
+        distances = np.linalg.norm(points-a, axis=1)
+    else:
+        delta = points-a
+        distances = np.abs(vector[0]*delta[:,1] - vector[1]*delta[:,0]) / norm
+    index = int(np.argmax(distances))
+    if float(distances[index]) <= epsilon:
+        return np.asarray([a,b])
+    left = _rdp(points[:index+1], epsilon)
+    right = _rdp(points[index:], epsilon)
+    return np.vstack((left[:-1], right))
+
+
+def _route_lengths(component: np.ndarray, start: tuple[float,float], end: tuple[float,float]) -> list[float]:
+    simplified = _rdp(_pixel_path(component, start, end), 1.05)
+    # Raster staircases can retain a one-pixel kink. Increase tolerance only
+    # enough to remove that quantization artifact, never enough to erase a bend.
+    if len(simplified) != 6:
+        simplified = _rdp(_pixel_path(component, start, end), 1.55)
+    if len(simplified) != 6:
+        raise ValueError(f"route has {len(simplified)-1} recoverable straight runs")
+    lengths = np.linalg.norm(np.diff(simplified, axis=0), axis=1).tolist()
+    if min(lengths) < 4:
+        raise ValueError("degenerate recovered run")
+    return [float(v) for v in lengths]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    black_components = _components(_mask(arr, BLACK), minimum=5)
+    cyan_components = _components(_mask(arr, CYAN), minimum=12)
+    if not black_components or not cyan_components:
+        raise ValueError("no measurable route and cyan start")
+    starts = [_centroid(c) for c in cyan_components]
+    scores: list[tuple[float, str]] = []
+    used: set[int] = set()
+    for name, rgb in COLORS.items():
+        terminal_components = _components(_mask(arr, rgb), minimum=12)
+        if len(terminal_components) != 1:
+            continue
+        endpoint = _centroid(terminal_components[0])
+        distances = [_distance(c, endpoint) for c in black_components]
+        ci = int(np.argmin(distances))
+        if ci in used or distances[ci] > 8:
+            continue
+        used.add(ci)
+        start_distances = [_distance(black_components[ci], p) for p in starts]
+        si = int(np.argmin(start_distances))
+        if start_distances[si] > 8:
+            continue
+        try:
+            lengths = _route_lengths(black_components[ci], starts[si], endpoint)
+        except ValueError:
+            continue
+        score = min(b-a for a,b in zip(lengths, lengths[1:]))
+        scores.append((float(score), name))
+    scores.sort(reverse=True)
+    if not scores or scores[0][0] <= 1.0:
+        raise ValueError(f"no unique strict-increase winner with margin: {scores}")
+    if len(scores) >= 2 and (scores[1][0] >= -1.0 or scores[0][0] - scores[1][0] <= 3.0):
+        raise ValueError(f"runner-up is too close: {scores}")
+    return scores[0][1]

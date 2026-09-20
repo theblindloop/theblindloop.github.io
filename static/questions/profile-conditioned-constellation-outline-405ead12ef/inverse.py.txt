@@ -1,0 +1,149 @@
+"""Independent PNG-only inverse for connected-contour shape identity."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_SHAPES = ("circle", "triangle", "diamond")
+_NODE_COUNT = 12
+_TARGET_PERIMETER = 2.0 * math.pi
+
+
+def _vertices(label: str) -> list[tuple[float, float]]:
+    if label == "circle":
+        return [
+            (
+                math.cos(-math.pi / 2.0 + 2.0 * math.pi * index / _NODE_COUNT),
+                math.sin(-math.pi / 2.0 + 2.0 * math.pi * index / _NODE_COUNT),
+            )
+            for index in range(_NODE_COUNT)
+        ]
+    if label == "triangle":
+        return [(0.0, -1.0), (math.sqrt(3.0) / 2.0, 0.5), (-math.sqrt(3.0) / 2.0, 0.5)]
+    if label == "diamond":
+        return [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)]
+    raise ValueError(label)
+
+
+def _resample_closed(vertices: list[tuple[float, float]], count: int = 480) -> np.ndarray:
+    perimeter = sum(
+        math.hypot(
+            vertices[(index + 1) % len(vertices)][0] - vertices[index][0],
+            vertices[(index + 1) % len(vertices)][1] - vertices[index][1],
+        )
+        for index in range(len(vertices))
+    )
+    scale = _TARGET_PERIMETER / perimeter
+    scaled = [(x * scale, y * scale) for x, y in vertices]
+    lengths = [
+        math.hypot(
+            scaled[(index + 1) % len(scaled)][0] - scaled[index][0],
+            scaled[(index + 1) % len(scaled)][1] - scaled[index][1],
+        )
+        for index in range(len(scaled))
+    ]
+    total = sum(lengths)
+    points = []
+    edge = 0
+    walked = 0.0
+    for index in range(count):
+        target = total * index / count
+        while edge < len(scaled) - 1 and target > walked + lengths[edge]:
+            walked += lengths[edge]
+            edge += 1
+        start = scaled[edge]
+        end = scaled[(edge + 1) % len(scaled)]
+        fraction = 0.0 if lengths[edge] <= 1e-12 else (target - walked) / lengths[edge]
+        points.append(
+            (
+                start[0] + fraction * (end[0] - start[0]),
+                start[1] + fraction * (end[1] - start[1]),
+            )
+        )
+    return np.asarray(points, dtype=np.float64)
+
+
+def _signature(points: np.ndarray) -> np.ndarray:
+    center = points.mean(axis=0)
+    complex_points = (points[:, 0] - center[0]) + 1j * (points[:, 1] - center[1])
+    radius = np.sqrt(np.mean(np.abs(complex_points) ** 2))
+    if radius <= 1e-9:
+        raise ValueError("degenerate connected contour")
+    normalized = complex_points / radius
+    # Magnitudes discard the unknown translation, scale, and rotation.  The
+    # first few complex moments distinguish the three global corner patterns.
+    return np.asarray(
+        [abs(np.mean(normalized ** power)) for power in range(2, 9)],
+        dtype=np.float64,
+    )
+
+
+_TEMPLATES = {
+    label: _signature(_resample_closed(_vertices(label))) for label in _SHAPES
+}
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    return array.mean(axis=2) < 190.0
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for row, column in zip(*np.nonzero(mask)):
+        row = int(row)
+        column = int(column)
+        if visited[row, column]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(row, column)])
+        visited[row, column] = True
+        component: list[tuple[int, int]] = []
+        while queue:
+            current_row, current_column = queue.popleft()
+            component.append((current_column, current_row))
+            for delta_row in (-1, 0, 1):
+                for delta_column in (-1, 0, 1):
+                    if delta_row == 0 and delta_column == 0:
+                        continue
+                    next_row = current_row + delta_row
+                    next_column = current_column + delta_column
+                    if (
+                        0 <= next_row < height
+                        and 0 <= next_column < width
+                        and mask[next_row, next_column]
+                        and not visited[next_row, next_column]
+                    ):
+                        visited[next_row, next_column] = True
+                        queue.append((next_row, next_column))
+        if len(component) > len(best):
+            best = component
+    if len(best) < 80:
+        raise ValueError("connected contour is not observable")
+    points = np.asarray(best, dtype=np.float64)
+    # The component is already isolated from distractors.  A deterministic
+    # thinning-by-stride keeps moment work bounded without reading scene data.
+    if len(points) > 9000:
+        stride = int(math.ceil(len(points) / 9000.0))
+        points = points[::stride]
+    return points
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Classify the largest connected contour from the supplied PNG only."""
+
+    if not isinstance(image, Image.Image):
+        raise TypeError("decision_from_image expects a PIL image")
+    points = _largest_component(_ink_mask(image))
+    observed = _signature(points)
+    scores = {
+        label: float(np.linalg.norm(observed - template))
+        for label, template in _TEMPLATES.items()
+    }
+    return min(scores, key=lambda label: (scores[label], label))

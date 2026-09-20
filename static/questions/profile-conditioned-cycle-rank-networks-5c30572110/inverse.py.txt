@@ -1,0 +1,147 @@
+"""Independent raster-only inverse for the cycle-rank network world."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BACKGROUND = (248, 248, 244)
+CHARCOAL = (47, 54, 64)
+PALETTE = {
+    "red": (214, 67, 73),
+    "blue": (62, 103, 193),
+    "green": (54, 157, 94),
+}
+NODE_RADIUS = 17.0
+
+
+def _masks(image: Image.Image) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Segment full-color node ink and charcoal link ink from final pixels.
+
+    Nearest-palette assignment alone can label a one-pixel charcoal/background
+    blend as green.  A conservative distance band keeps those antialiased
+    fringes out of the colored-node components while retaining the large solid
+    node interiors and link cores.
+    """
+
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int32)
+    node_masks = {
+        color: ((pixels - np.asarray(rgb, dtype=np.int32)) ** 2).sum(axis=2) <= 45**2
+        for color, rgb in PALETTE.items()
+    }
+    charcoal_mask = (
+        ((pixels - np.asarray(CHARCOAL, dtype=np.int32)) ** 2).sum(axis=2) <= 70**2
+    )
+    return node_masks, charcoal_mask
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for sy, sx in zip(*np.where(mask)):
+        if visited[sy, sx]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(int(sy), int(sx))])
+        visited[sy, sx] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _node_centers(mask: np.ndarray, color: str) -> list[tuple[float, float]]:
+    components = [comp for comp in _components(mask) if len(comp) >= 180]
+    if len(components) != 5:
+        raise ValueError(f"expected five {color} node components, found {len(components)}")
+    centers = [(float(comp[:, 1].mean()), float(comp[:, 0].mean())) for comp in components]
+    return sorted(centers, key=lambda point: (point[1], point[0]))
+
+
+def _nearest_node(component: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    points = component[:, [1, 0]].astype(np.float64)
+    distances = np.sqrt(((points[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))
+    return distances.min(axis=0)
+
+
+def _union_find(count: int, edges: list[tuple[int, int]]) -> int:
+    parent = list(range(count))
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    for left, right in edges:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[b] = a
+    return len({find(index) for index in range(count)})
+
+
+def _recover_edges(
+    charcoal_mask: np.ndarray,
+    nodes: list[tuple[str, float, float]],
+) -> dict[str, list[tuple[int, int]]]:
+    charcoal_components = [comp for comp in _components(charcoal_mask) if len(comp) >= 80]
+    centers = np.asarray([[x, y] for _, x, y in nodes], dtype=np.float64)
+    result: dict[str, set[tuple[int, int]]] = {color: set() for color in PALETTE}
+    node_colors = [color for color, _, _ in nodes]
+    for component in charcoal_components:
+        distances = _nearest_node(component, centers)
+        order = np.argsort(distances)
+        first, second = int(order[0]), int(order[1])
+        if distances[second] > 31.0:
+            continue
+        if len(order) > 2 and distances[int(order[2])] < distances[second] + 14.0:
+            continue
+        if node_colors[first] != node_colors[second]:
+            continue
+        if first == second:
+            continue
+        local_indices = [index for index, (color, _, _) in enumerate(nodes) if color == node_colors[first]]
+        local_first = local_indices.index(first)
+        local_second = local_indices.index(second)
+        result[node_colors[first]].add(tuple(sorted((local_first, local_second))))
+    return {color: sorted(edges) for color, edges in result.items()}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the color whose raster-reconstructed graph has rank two."""
+
+    node_masks, charcoal_mask = _masks(image)
+    centers_by_color = {
+        "red": _node_centers(node_masks["red"], "red"),
+        "blue": _node_centers(node_masks["blue"], "blue"),
+        "green": _node_centers(node_masks["green"], "green"),
+    }
+    nodes: list[tuple[str, float, float]] = []
+    for color in ("red", "blue", "green"):
+        nodes.extend((color, x, y) for x, y in centers_by_color[color])
+    recovered = _recover_edges(charcoal_mask, nodes)
+    ranks: dict[str, int] = {}
+    for color, edges in recovered.items():
+        rank = len(edges) - 5 + _union_find(5, edges)
+        ranks[color] = rank
+    matches = [color for color, rank in ranks.items() if rank == 2]
+    if len(matches) != 1:
+        raise ValueError(f"expected one rank-two network, recovered {ranks}")
+    return matches[0]

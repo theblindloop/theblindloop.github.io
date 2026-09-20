@@ -1,0 +1,139 @@
+"""Independent inverse arm: recover and replay the visual grammar from RGB pixels only."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+INK_LIMIT = 70
+PAWN_COLORS = {(190, 35, 120), (120, 60, 195), (220, 70, 50)}
+GATE_COLORS = {(35, 105, 190), (20, 150, 140), (105, 75, 180)}
+FLIP_COLORS = {(244, 190, 50), (238, 145, 45), (225, 190, 25)}
+MOVE_COLORS = {(45, 155, 95), (196, 60, 60), (30, 135, 190)}
+
+
+def _mask_for(arr: np.ndarray, colors: set[tuple[int, int, int]]) -> np.ndarray:
+    mask = np.zeros(arr.shape[:2], dtype=bool)
+    for color in colors:
+        mask |= np.all(arr == np.asarray(color, dtype=np.uint8), axis=2)
+    return mask
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            py, px = queue.popleft()
+            points.append((py, px))
+            for ny, nx in ((py - 1, px), (py + 1, px), (py, px - 1), (py, px + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            ys = [p[0] for p in points]
+            xs = [p[1] for p in points]
+            output.append({"area": len(points), "box": (min(xs), min(ys), max(xs), max(ys)), "cx": sum(xs) / len(xs), "cy": sum(ys) / len(ys)})
+    return output
+
+
+def _parse_rooms_and_cards(black: np.ndarray) -> tuple[list[dict], list[dict]]:
+    large = _components(black, minimum=250)
+    rooms = []
+    cards = []
+    for item in large:
+        x0, y0, x1, y1 = item["box"]
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if 115 <= width <= 155 and 115 <= height <= 155:
+            rooms.append(item)
+        elif 90 <= width <= 125 and 170 <= height <= 210:
+            cards.append(item)
+    rooms.sort(key=lambda item: item["cx"])
+    cards.sort(key=lambda item: item["cx"])
+    if len(rooms) != 4 or len(cards) != 6:
+        raise ValueError(f"visual grammar damaged: found {len(rooms)} rooms and {len(cards)} cards")
+    return rooms, cards
+
+
+def _interior_components(mask: np.ndarray, box: tuple[int, int, int, int]) -> list[dict]:
+    x0, y0, x1, y1 = box
+    pad = 12
+    crop = mask[y0 + pad:y1 - pad + 1, x0 + pad:x1 - pad + 1]
+    return _components(crop, minimum=20)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 300 or arr.shape[1] < 600:
+        raise ValueError("image is too small")
+    black = np.all(arr < INK_LIMIT, axis=2)
+    rooms, cards = _parse_rooms_and_cards(black)
+
+    pawn_parts = _components(_mask_for(arr, PAWN_COLORS), minimum=80)
+    if not pawn_parts:
+        raise ValueError("pawn evidence missing")
+    pawn = max(pawn_parts, key=lambda item: item["area"])
+    distances = [abs(pawn["cx"] - item["cx"]) for item in rooms]
+    order = sorted(range(4), key=lambda idx: distances[idx])
+    if distances[order[1]] - distances[order[0]] < 30:
+        raise ValueError("pawn room is ambiguous")
+    room = order[0] + 1
+
+    gate_parts = _components(_mask_for(arr, GATE_COLORS), minimum=80)
+    if len(gate_parts) != 6:
+        raise ValueError(f"expected six gate bars, found {len(gate_parts)}")
+    gate_parts.sort(key=lambda item: item["cx"])
+    gates = []
+    for index in range(0, 6, 2):
+        pair = gate_parts[index:index + 2]
+        orientations = []
+        for part in pair:
+            x0, y0, x1, y1 = part["box"]
+            orientations.append("open" if x1 - x0 > y1 - y0 else "closed")
+        if len(set(orientations)) != 1 or abs(pair[0]["cx"] - pair[1]["cx"]) > 35:
+            raise ValueError("gate bars do not form an unambiguous pair")
+        gates.append(orientations[0] == "open")
+
+    flip_mask = _mask_for(arr, FLIP_COLORS)
+    move_mask = _mask_for(arr, MOVE_COLORS)
+    commands = []
+    for card in cards:
+        x0, y0, x1, y1 = card["box"]
+        inner_flip = int(flip_mask[y0 + 8:y1 - 7, x0 + 8:x1 - 7].sum())
+        inner_move = move_mask[y0 + 8:y1 - 7, x0 + 8:x1 - 7]
+        move_area = int(inner_move.sum())
+        if inner_flip > 4000 and move_area < 50:
+            dots = _interior_components(black, card["box"])
+            # Border is excluded; arc/line join into one large glyph, dots are compact.
+            compact = [item for item in dots if item["area"] < 180 and (item["box"][2] - item["box"][0]) <= 15]
+            gate_number = len(compact)
+            if gate_number not in (1, 2, 3):
+                raise ValueError(f"flip card has ambiguous dot count {gate_number}")
+            commands.append(("flip", gate_number))
+        elif move_area > 300 and inner_flip < 100:
+            ys, xs = np.nonzero(inner_move)
+            center = (inner_move.shape[1] - 1) / 2
+            displacement = float(xs.mean() - center)
+            if abs(displacement) < 3:
+                raise ValueError("arrow direction is ambiguous")
+            commands.append(("move", "right" if displacement > 0 else "left"))
+        else:
+            raise ValueError("card type evidence is ambiguous")
+
+    for kind, value in commands:
+        if kind == "flip":
+            gates[int(value) - 1] = not gates[int(value) - 1]
+        else:
+            step = 1 if value == "right" else -1
+            destination = room + step
+            if 1 <= destination <= 4 and gates[min(room, destination) - 1]:
+                room = destination
+    return str(room)

@@ -1,0 +1,201 @@
+"""Independent pixel-only inverse arm for frontal_anamorph_reveal.
+
+Receives ONLY the final PNG. It locates the blue quadrilateral fiducial frame,
+recovers its four corner fiducials by convex hull, rectifies by viewing the
+marked quadrilateral front-on (planar homography from the four corners to the
+unit rectangle), resamples the glyph grid, and classifies the reconstructed
+letter against the two block candidates A and B declared by the public question
+contract. No scene data and no analytic gold.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "frontal_anamorph_reveal-oracle-0.1.0"
+
+W = 400
+H = 400
+G_ROWS = 15
+G_COLS = 12
+
+TEMPLATE_A = [
+    list("............"),
+    list("....##......"),
+    list("....##......"),
+    list("...#..#....."),
+    list("...#..#....."),
+    list("..#....#...."),
+    list("..#....#...."),
+    list(".#......#..."),
+    list(".#......#..."),
+    list(".########..."),
+    list("#........#.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("............"),
+    list("............"),
+]
+TEMPLATE_B = [
+    list("............"),
+    list("##########.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("##########.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("#........#.."),
+    list("##########.."),
+    list("............"),
+    list("............"),
+    list("............"),
+    list("............"),
+    list("............"),
+]
+TEMPLATES = {"A": TEMPLATE_A, "B": TEMPLATE_B}
+
+
+def _template_mask(glyph: str) -> np.ndarray:
+    return np.array([[c == "#" for c in row] for row in TEMPLATES[glyph]], dtype=bool)
+
+
+
+    def cross(o: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    pts = sorted(map(tuple, points))
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return [np.array(p) for p in (lower[:-1] + upper[:-1])]
+
+
+def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    ys, xs = np.nonzero(mask)
+    coords = set(zip(xs.tolist(), ys.tolist()))
+    components = []
+    height, width = mask.shape
+    while coords:
+        start = coords.pop()
+        stack = [start]
+        pixels = [start]
+        while stack:
+            x, y = stack.pop()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < width and 0 <= ny < height and (nx, ny) in coords:
+                    coords.remove((nx, ny))
+                    stack.append((nx, ny))
+                    pixels.append((nx, ny))
+        components.append(np.array(pixels, dtype=float))
+    return components
+
+
+def _corners(blue_mask: np.ndarray) -> list[list[int]] | None:
+    components = _connected_components(blue_mask)
+    if len(components) < 4:
+        return None
+    components.sort(key=lambda c: -len(c))
+    blobs = components[:4]
+    centroids = []
+    for blob in blobs:
+        centroids.append([int(round(float(blob[:, 0].mean()))),
+                          int(round(float(blob[:, 1].mean())))])
+    pts = np.array(centroids, dtype=float)
+    order = np.argsort(pts[:, 1])
+    top = pts[order[:2]]
+    bot = pts[order[2:]]
+    top = top[np.argsort(top[:, 0])]
+    bot = bot[np.argsort(bot[:, 0])]
+    return [
+        [int(round(top[0][0])), int(round(top[0][1]))],
+        [int(round(top[1][0])), int(round(top[1][1]))],
+        [int(round(bot[1][0])), int(round(bot[1][1]))],
+        [int(round(bot[0][0])), int(round(bot[0][1]))],
+    ]
+
+
+def _homography(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    rows = []
+    for p, q in zip(src, dst):
+        x, y = p[0], p[1]
+        u, v = q[0], q[1]
+        rows.append([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, -u])
+        rows.append([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, -v])
+    matrix = np.array(rows, dtype=float)
+    _, _, vt = np.linalg.svd(matrix)
+    h = vt[-1].reshape(3, 3)
+    return h / h[2, 2]
+
+
+def _apply(h: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=float)
+    if pts.ndim == 1:
+        pts = pts[None, :]
+    hom = np.column_stack([pts, np.ones(pts.shape[0])])
+    out = hom @ h.T
+    out = out / out[:, 2:3]
+    return out[:, :2]
+
+
+def _rectified_grid(image: Image.Image, corners: list[list[int]]) -> np.ndarray | None:
+    arr = np.asarray(image.convert("L"), dtype=float)
+    src = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    dst = np.array(corners, dtype=float)
+    h = _homography(src, dst)
+    grid = np.zeros((G_ROWS, G_COLS), dtype=bool)
+    for row in range(G_ROWS):
+        for col in range(G_COLS):
+            u = (col + 0.5) / G_COLS
+            v = (row + 0.5) / G_ROWS
+            x, y = _apply(h, np.array([u, v]))[0]
+            xi = int(round(x))
+            yi = int(round(y))
+            if 0 <= xi < arr.shape[1] and 0 <= yi < arr.shape[0]:
+                grid[row, col] = bool(arr[yi, xi] < 128.0)
+    return grid
+
+
+def _scores(grid: np.ndarray) -> dict[str, float]:
+    scores = {}
+    for glyph, tmpl in TEMPLATES.items():
+        t = _template_mask(glyph)
+        scores[glyph] = float((grid & t).sum()) / float(t.sum())
+    return scores
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=int)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    blue = (b > r + 40) & (b > g + 60) & (b > 120)
+    corners = _corners(blue)
+    if corners is None:
+        return "A"
+    grid = _rectified_grid(image, corners)
+    if grid is None:
+        return "A"
+    scores = _scores(grid)
+    return "A" if scores["A"] >= scores["B"] else "B"
+
+
+def reveal_margin(image: Image.Image) -> float:
+    arr = np.asarray(image.convert("RGB"), dtype=int)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    blue = (b > r + 40) & (b > g + 60) & (b > 120)
+    corners = _corners(blue)
+    if corners is None:
+        return 0.0
+    grid = _rectified_grid(image, corners)
+    if grid is None:
+        return 0.0
+    scores = _scores(grid)
+    return abs(scores["A"] - scores["B"])

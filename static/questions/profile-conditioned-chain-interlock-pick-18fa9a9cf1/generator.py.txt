@@ -1,0 +1,400 @@
+"""Chain-interlock world: four flat rings whose crossings show which ring passes in front.
+
+A scene holds one black ring and three coloured rings arranged so that every pair
+of rings crosses at exactly two points. At each crossing one ring is painted in
+front as an unbroken band and the other is interrupted by a white gap. Two rings
+are interlocked exactly when a different ring is in front at each of their two
+crossings; if the same ring is in front at both crossings the pair can be pulled
+apart. Exactly one coloured ring is interlocked with the black ring.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WORLD_VERSION = "chain_interlock_pick-renderer-0.1.0"
+
+CANVAS = 1024
+SUPERSAMPLE = 2
+BACKGROUND = (255, 255, 255)
+STROKE = 7.0
+HALO = 4.5
+BLACK_INK = (24, 24, 24)
+COLOUR_INKS = {
+    "red": (206, 38, 44),
+    "green": (26, 132, 58),
+    "blue": (36, 78, 200),
+}
+COLOUR_NAMES = ("red", "green", "blue")
+
+MIN_TRANSVERSALITY_DEG = 40.0
+QUARANTINE_PX = 38.0
+_NORMAL_CLEAR = 44.0
+_TIGHT_CLEAR = 34.0
+_NORMAL_THIRD = 30.0
+_TIGHT_THIRD = 24.0
+_EDGE_MARGIN = 16.0
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+def _circle_intersections(c0, r0, c1, r1):
+    """Return the two intersection points of two circles, or None."""
+    dx = c1[0] - c0[0]
+    dy = c1[1] - c0[1]
+    d = math.hypot(dx, dy)
+    if d <= 1e-9 or d >= r0 + r1 or d <= abs(r0 - r1):
+        return None
+    a = (r0 * r0 - r1 * r1 + d * d) / (2.0 * d)
+    h2 = r0 * r0 - a * a
+    if h2 <= 0.0:
+        return None
+    h = math.sqrt(h2)
+    xm = c0[0] + a * dx / d
+    ym = c0[1] + a * dy / d
+    ux = -dy / d
+    uy = dx / d
+    return [[xm + h * ux, ym + h * uy], [xm - h * ux, ym - h * uy]]
+
+
+def _transversality_deg(c0, c1, point):
+    """Angle between the two circles at a shared point, in degrees."""
+    u = (point[0] - c0[0], point[1] - c0[1])
+    v = (point[0] - c1[0], point[1] - c1[1])
+    nu = math.hypot(*u) or 1e-9
+    nv = math.hypot(*v) or 1e-9
+    cosine = max(-1.0, min(1.0, (u[0] * v[0] + u[1] * v[1]) / (nu * nv)))
+    angle = math.degrees(math.acos(cosine))
+    return min(angle, 180.0 - angle)
+
+
+def _distance_to_circle(point, centre, radius):
+    return abs(math.hypot(point[0] - centre[0], point[1] - centre[1]) - radius)
+
+
+def _ring_centre(ring):
+    return (ring["cx"], ring["cy"])
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _try_layout(rng, tight):
+    """Sample four ring geometries; return rings and pair crossings, or None."""
+    clear = _TIGHT_CLEAR if tight else _NORMAL_CLEAR
+    third = _TIGHT_THIRD if tight else _NORMAL_THIRD
+    centre = CANVAS / 2.0
+    black_r = rng.uniform(230.0, 254.0)
+    rings = [
+        {
+            "slot": 0,
+            "colour": "black",
+            "rgb": list(BLACK_INK),
+            "cx": centre + rng.uniform(-8.0, 8.0),
+            "cy": centre + rng.uniform(-8.0, 8.0),
+            "r": black_r,
+        }
+    ]
+    # A cluster of three mutually crossing coloured rings straddles the black band.
+    cluster_angle = rng.uniform(0.0, 2.0 * math.pi)
+    cluster_x = rings[0]["cx"] + black_r * math.cos(cluster_angle)
+    cluster_y = rings[0]["cy"] + black_r * math.sin(cluster_angle)
+    ring_r = rng.uniform(118.0, 138.0)
+    tangent = (-math.sin(cluster_angle), math.cos(cluster_angle))
+    normal = (math.cos(cluster_angle), math.sin(cluster_angle))
+    hues = list(COLOUR_NAMES)
+    rng.shuffle(hues)
+    for slot in range(3):
+        radius = ring_r * rng.uniform(0.90, 1.10)
+        along = ring_r * rng.uniform(-1.35, 1.35)
+        across = ring_r * rng.uniform(-0.62, 0.62)
+        rings.append(
+            {
+                "slot": slot + 1,
+                "colour": hues[slot],
+                "rgb": list(COLOUR_INKS[hues[slot]]),
+                "cx": cluster_x + along * tangent[0] + across * normal[0],
+                "cy": cluster_y + along * tangent[1] + across * normal[1],
+                "r": radius,
+            }
+        )
+
+    for ring in rings:
+        if (
+            ring["cx"] - ring["r"] < _EDGE_MARGIN
+            or ring["cy"] - ring["r"] < _EDGE_MARGIN
+            or ring["cx"] + ring["r"] > CANVAS - _EDGE_MARGIN
+            or ring["cy"] + ring["r"] > CANVAS - _EDGE_MARGIN
+        ):
+            return None
+
+    pairs = []
+    for i in range(4):
+        for j in range(i + 1, 4):
+            points = _circle_intersections(
+                _ring_centre(rings[i]), rings[i]["r"], _ring_centre(rings[j]), rings[j]["r"]
+            )
+            if points is None:
+                return None
+            for point in points:
+                if _transversality_deg(_ring_centre(rings[i]), _ring_centre(rings[j]), point) < (
+                    MIN_TRANSVERSALITY_DEG
+                ):
+                    return None
+                if not (
+                    _EDGE_MARGIN < point[0] < CANVAS - _EDGE_MARGIN
+                    and _EDGE_MARGIN < point[1] < CANVAS - _EDGE_MARGIN
+                ):
+                    return None
+            pairs.append({"a": i, "b": j, "points": points})
+
+    every_point = [(pair["a"], pair["b"], point) for pair in pairs for point in pair["points"]]
+    for index, (ai, bi, point) in enumerate(every_point):
+        for other_index in range(index + 1, len(every_point)):
+            other = every_point[other_index][2]
+            if math.hypot(point[0] - other[0], point[1] - other[1]) < clear:
+                return None
+        for k in range(4):
+            if k in (ai, bi):
+                continue
+            if _distance_to_circle(point, _ring_centre(rings[k]), rings[k]["r"]) < third:
+                return None
+    return rings, pairs
+
+
+def _assign_fronts(rng, rings, pairs):
+    """Choose the front ring at every crossing.
+
+    Exactly one coloured ring is interlocked with the black ring. One of the two
+    remaining coloured rings passes behind black at both of its crossings and the
+    other passes in front at both, and the coloured-coloured crossings are then
+    assigned so that all four rings show exactly three white gaps each.
+    """
+    linked = rng.randrange(1, 4)
+    others = [slot for slot in (1, 2, 3) if slot != linked]
+    rng.shuffle(others)
+    behind_black, over_black = others[0], others[1]
+
+    by_key = {(pair["a"], pair["b"]): pair for pair in pairs}
+    for pair in pairs:
+        pair["front"] = [None, None]
+
+    # black (index 0) against each coloured ring
+    pair = by_key[(0, linked)]
+    order = [0, linked]
+    rng.shuffle(order)
+    pair["front"] = list(order)
+    by_key[(0, behind_black)]["front"] = [0, 0]
+    by_key[(0, over_black)]["front"] = [over_black, over_black]
+
+    # coloured-coloured crossings: gaps go to (linked, behind_black, over_black)
+    # in the amounts (2, 1, 3), which equalises every ring's gap count at three.
+    plan = {
+        (linked, behind_black): [linked, behind_black],
+        (behind_black, over_black): [over_black, over_black],
+        (over_black, linked): [over_black, linked],
+    }
+    for (x, y), behind_list in plan.items():
+        key = (min(x, y), max(x, y))
+        pair = by_key[key]
+        behind = list(behind_list)
+        rng.shuffle(behind)
+        pair["front"] = [
+            (key[0] if behind[0] == key[1] else key[1]),
+            (key[0] if behind[1] == key[1] else key[1]),
+        ]
+    return linked
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one latent scene."""
+    rng = random.Random(int(seed) * 7919 + 13)
+    tight = (int(seed) % 4) == 0
+    layout = None
+    for _ in range(6000):
+        layout = _try_layout(rng, tight)
+        if layout is not None:
+            break
+    if layout is None:  # pragma: no cover - sampling is generous
+        raise RuntimeError("could not sample a valid chain layout")
+    rings, pairs = layout
+    linked = _assign_fronts(rng, rings, pairs)
+    return {
+        "canvas": CANVAS,
+        "supersample": SUPERSAMPLE,
+        "background": list(BACKGROUND),
+        "stroke": STROKE,
+        "halo": HALO,
+        "tight": bool(tight),
+        "rings": rings,
+        "pairs": pairs,
+        "draw_order": [0, 1, 2, 3],
+        "crossing_order": list(range(2 * len(pairs))),
+        "linked_slot": linked,
+    }
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _arc_band(draw, centre, radius, width, start_deg, end_deg, colour, scale):
+    """Paint an annular band of the given circle between two angles."""
+    outer = radius + width / 2.0
+    box = [
+        (centre[0] - outer) * scale,
+        (centre[1] - outer) * scale,
+        (centre[0] + outer) * scale,
+        (centre[1] + outer) * scale,
+    ]
+    draw.arc(box, start_deg, end_deg, fill=tuple(colour), width=int(round(width * scale)))
+
+
+def render(scene: dict):
+    """Render the scene to an RGB image."""
+    scale = int(scene["supersample"])
+    size = int(scene["canvas"]) * scale
+    image = Image.new("RGB", (size, size), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    stroke = float(scene["stroke"])
+    halo = float(scene["halo"])
+    rings = scene["rings"]
+
+    for index in scene["draw_order"]:
+        ring = rings[int(index)]
+        _arc_band(
+            draw,
+            (ring["cx"], ring["cy"]),
+            ring["r"],
+            stroke,
+            0.0,
+            360.0,
+            ring["rgb"],
+            scale,
+        )
+
+    crossings = []
+    for pair in scene["pairs"]:
+        for which in (0, 1):
+            crossings.append((pair, which))
+    for position in scene["crossing_order"]:
+        pair, which = crossings[int(position)]
+        point = pair["points"][which]
+        front = int(pair["front"][which])
+        back = pair["a"] if front == pair["b"] else pair["b"]
+        front_ring = rings[front]
+        back_ring = rings[back]
+        angle_between = _transversality_deg(
+            _ring_centre(front_ring), _ring_centre(back_ring), point
+        )
+        sine = max(math.sin(math.radians(angle_between)), 1e-3)
+        half_len = (stroke / 2.0 + halo) / sine + halo + 3.0
+        half_deg = math.degrees(half_len / front_ring["r"])
+        centre_deg = math.degrees(
+            math.atan2(point[1] - front_ring["cy"], point[0] - front_ring["cx"])
+        )
+        _arc_band(
+            draw,
+            _ring_centre(front_ring),
+            front_ring["r"],
+            stroke + 2.0 * halo,
+            centre_deg - half_deg,
+            centre_deg + half_deg,
+            scene["background"],
+            scale,
+        )
+        _arc_band(
+            draw,
+            _ring_centre(front_ring),
+            front_ring["r"],
+            stroke,
+            centre_deg - half_deg,
+            centre_deg + half_deg,
+            front_ring["rgb"],
+            scale,
+        )
+    if scale != 1:
+        image = image.resize((int(scene["canvas"]), int(scene["canvas"])), Image.LANCZOS)
+    return image.convert("RGB")
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine, symmetries
+# --------------------------------------------------------------------------
+def _interlocked_slots(scene: dict) -> list:
+    slots = []
+    for pair in scene["pairs"]:
+        if pair["a"] != 0:
+            continue
+        if int(pair["front"][0]) != int(pair["front"][1]):
+            slots.append(int(pair["b"]))
+    return sorted(slots)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour name of the coloured ring interlocked with the black ring."""
+    slots = _interlocked_slots(scene)
+    if len(slots) != 1:
+        raise ValueError(f"scene does not have exactly one interlocked ring: {slots}")
+    return str(scene["rings"][slots[0]]["colour"])
+
+
+def margin(scene: dict) -> float:
+    """Smallest visible clearance that keeps every crossing readable, in pixels.
+
+    The decision degenerates when the two crossings of a pair merge (tangency),
+    when two crossings of different pairs collide, or when a third ring's band
+    runs through a crossing; all three are distances in the raster.
+    """
+    rings = scene["rings"]
+    values = []
+    points = []
+    for pair in scene["pairs"]:
+        p0, p1 = pair["points"]
+        values.append(math.hypot(p0[0] - p1[0], p0[1] - p1[1]))
+        for point in pair["points"]:
+            points.append((pair["a"], pair["b"], point))
+    for index, (ai, bi, point) in enumerate(points):
+        for other_index in range(index + 1, len(points)):
+            other = points[other_index][2]
+            values.append(math.hypot(point[0] - other[0], point[1] - other[1]))
+        for k in range(len(rings)):
+            if k in (ai, bi):
+                continue
+            values.append(
+                _distance_to_circle(point, _ring_centre(rings[k]), rings[k]["r"])
+            )
+    return float(min(values))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """True when a clearance is too small to be read reliably from pixels."""
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def _copy_scene(scene: dict) -> dict:
+    import copy
+
+    return copy.deepcopy(scene)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Pixel-identical, gold-preserving relabelings of pure bookkeeping fields."""
+    reversed_draw = _copy_scene(scene)
+    reversed_draw["draw_order"] = list(reversed(scene["draw_order"]))
+
+    rotated_crossings = _copy_scene(scene)
+    order = list(scene["crossing_order"])
+    rotated_crossings["crossing_order"] = order[3:] + order[:3]
+
+    reversed_pairs = _copy_scene(scene)
+    reversed_pairs["pairs"] = list(reversed(scene["pairs"]))
+
+    return [
+        ("reversed_draw_order", reversed_draw),
+        ("rotated_crossing_order", rotated_crossings),
+        ("reversed_pair_order", reversed_pairs),
+    ]

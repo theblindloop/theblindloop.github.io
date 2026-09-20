@@ -1,0 +1,138 @@
+"""Scene-free pixel inverse arm for copy_wire_relay.
+
+Receives only the rendered RGB image. It re-discovers the lanes from the drawn
+starting discs, reads each lane's starting colour, re-discovers the bottom
+sockets, re-discovers the marked lane from the drawn red ring, re-discovers the
+black copy arrows as horizontal bands in drawn top-to-bottom order, decides each
+arrow's direction from the thickness asymmetry between its head end and its tail
+end, replays the copies onto the lanes, and returns the marked lane's final
+colour together with the number of copies that changed it.
+
+It imports no renderer, prompt, generator, verifier or gold code, and it never
+sees latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "copy_wire_relay-oracle-0.1.0"
+
+_VALUES: dict[str, tuple[int, int, int]] = {
+    "blue": (36, 84, 200),
+    "green": (26, 150, 72),
+    "orange": (232, 124, 20),
+    "purple": (128, 54, 168),
+    "yellow": (232, 200, 24),
+}
+_BLACK = (15, 15, 15)
+_RED = (214, 38, 38)
+_SOCKET = (232, 232, 232)
+
+_MIN_BLOB = 250          # pixels; a starting disc or a socket is far larger
+_MIN_ARROW_PIXELS = 200
+
+
+def _mask(arr: np.ndarray, ref, tol: int = 26) -> np.ndarray:
+    return (
+        (np.abs(arr[:, :, 0].astype(np.int16) - ref[0]) <= tol)
+        & (np.abs(arr[:, :, 1].astype(np.int16) - ref[1]) <= tol)
+        & (np.abs(arr[:, :, 2].astype(np.int16) - ref[2]) <= tol)
+    )
+
+
+def _runs(flags: np.ndarray, min_len: int = 1) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, v in enumerate(flags):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if i - start >= min_len:
+                out.append((start, i - 1))
+            start = None
+    if start is not None and len(flags) - start >= min_len:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def _centroid(mask: np.ndarray) -> tuple[float, float]:
+    ys, xs = np.nonzero(mask)
+    return float(xs.mean()), float(ys.mean())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    h, w, _ = arr.shape
+
+    # ---- lanes and their starting colours, from the drawn discs -------------
+    discs: list[tuple[float, str]] = []
+    for name, rgb in _VALUES.items():
+        m = _mask(arr, rgb)
+        if int(m.sum()) < _MIN_BLOB:
+            raise ValueError(f"starting colour {name} is not present in the image")
+        cx, _cy = _centroid(m)
+        discs.append((cx, name))
+    discs.sort()
+    lane_x = [cx for cx, _ in discs]
+    start = [name for _, name in discs]
+    n_lanes = len(lane_x)
+
+    # ---- bottom sockets: one per lane, all on a common row ------------------
+    sm = _mask(arr, _SOCKET, tol=10)
+    if int(sm.sum()) < _MIN_BLOB:
+        raise ValueError("no sockets found")
+    ys, _xs = np.nonzero(sm)
+    socket_y = float(ys.mean())
+
+    # ---- marked lane, from the drawn red ring ------------------------------
+    rm = _mask(arr, _RED)
+    if int(rm.sum()) < 100:
+        raise ValueError("no marker ring found")
+    rx, ry = _centroid(rm)
+    marked = min(
+        range(n_lanes),
+        key=lambda i: (rx - lane_x[i]) ** 2 + (ry - socket_y) ** 2,
+    )
+
+    # ---- copy arrows, in drawn top-to-bottom order -------------------------
+    bm = _mask(arr, _BLACK, tol=40)
+    if int(bm.sum()) < _MIN_ARROW_PIXELS:
+        raise ValueError("no copy arrows found")
+    rows = bm.any(axis=1)
+    ops: list[tuple[int, int]] = []
+    for y0, y1 in _runs(rows):
+        band = bm[y0 : y1 + 1, :]
+        if int(band.sum()) < _MIN_ARROW_PIXELS:
+            continue
+        cols = np.nonzero(band.any(axis=0))[0]
+        x_lo, x_hi = int(cols[0]), int(cols[-1])
+        thick = band.sum(axis=0)
+        win = 26
+        lo_thick = int(thick[x_lo : min(x_lo + win, w)].max())
+        hi_thick = int(thick[max(x_hi - win, 0) : x_hi + 1].max())
+        if lo_thick == hi_thick:
+            raise ValueError("copy arrow direction is not readable")
+        if lo_thick > hi_thick:
+            tgt_x, src_x = x_lo, x_hi
+        else:
+            tgt_x, src_x = x_hi, x_lo
+        src = min(range(n_lanes), key=lambda i: abs(src_x - lane_x[i]))
+        tgt = min(range(n_lanes), key=lambda i: abs(tgt_x - lane_x[i]))
+        if src == tgt:
+            raise ValueError("copy arrow does not join two different lanes")
+        ops.append((src, tgt))
+
+    if not ops:
+        raise ValueError("no copy arrows recovered")
+
+    # ---- replay ------------------------------------------------------------
+    values = list(start)
+    changes = 0
+    for src, tgt in ops:
+        new = values[src]
+        if tgt == marked and new != values[marked]:
+            changes += 1
+        values[tgt] = new
+    return f"{values[marked]}|{changes}"

@@ -1,0 +1,172 @@
+"""Independent pixel-only inverse for paired checkpoint-order agreement.
+
+The inverse segments visible palette classes, recovers the two disconnected
+navy stroke components, attaches one start and one marker of each color to each
+component, computes shortest-path distances on each raster stroke graph, and
+compares the two recovered red-versus-green order relations.  It receives only
+the final PIL image and imports no candidate implementation module.
+"""
+
+from __future__ import annotations
+
+import heapq
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    remaining = {tuple(map(int, point)) for point in np.argwhere(mask)}
+    output: list[np.ndarray] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        component = [start]
+        while stack:
+            y, x = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    neighbor = (y + dy, x + dx)
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+                        component.append(neighbor)
+        if len(component) >= minimum:
+            output.append(np.asarray(component, dtype=np.int32))
+    return output
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    y, x = component.mean(axis=0)
+    return float(y), float(x)
+
+
+def _closest(left: np.ndarray, right: np.ndarray) -> tuple[float, tuple[int, int]]:
+    """Return pixel distance and the closest coordinate belonging to right."""
+
+    best = float("inf")
+    anchor = (int(right[0, 0]), int(right[0, 1]))
+    for start in range(0, len(left), 64):
+        delta = left[start : start + 64, None, :] - right[None, :, :]
+        squared = np.sum(delta.astype(np.float64) ** 2, axis=2)
+        flat = int(np.argmin(squared))
+        value = float(squared.ravel()[flat])
+        if value < best:
+            best = value
+            _, right_index = np.unravel_index(flat, squared.shape)
+            anchor = tuple(map(int, right[int(right_index)]))
+    return math.sqrt(best), anchor
+
+
+def _attach(markers: list[np.ndarray], route: np.ndarray, label: str) -> tuple[np.ndarray, tuple[int, int], float]:
+    ranked = sorted((*_closest(marker, route), index) for index, marker in enumerate(markers))
+    if not ranked or ranked[0][0] > 8.0:
+        raise OracleAbstention(f"{label} marker is not visibly attached to a route")
+    if len(ranked) > 1 and ranked[1][0] - ranked[0][0] < 80.0:
+        raise OracleAbstention(f"{label} route association is ambiguous")
+    distance, anchor, index = ranked[0]
+    return markers[index], anchor, distance
+
+
+def _graph_distance(route: np.ndarray, start: tuple[int, int], targets: set[tuple[int, int]]) -> dict[tuple[int, int], float]:
+    pixels = {tuple(map(int, point)) for point in route}
+    if start not in pixels or not targets <= pixels:
+        raise OracleAbstention("route anchors are absent from the stroke graph")
+    queue: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
+    distances = {start: 0.0}
+    found: dict[tuple[int, int], float] = {}
+    while queue and len(found) < len(targets):
+        distance, point = heapq.heappop(queue)
+        if distance != distances.get(point):
+            continue
+        if point in targets:
+            found[point] = distance
+        y, x = point
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                neighbor = (y + dy, x + dx)
+                if neighbor not in pixels:
+                    continue
+                candidate = distance + (math.sqrt(2.0) if dy and dx else 1.0)
+                if candidate < distances.get(neighbor, float("inf")):
+                    distances[neighbor] = candidate
+                    heapq.heappush(queue, (candidate, neighbor))
+    if len(found) != len(targets):
+        raise OracleAbstention("checkpoint anchors are disconnected from the blue start")
+    return found
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = array[:, :, 0], array[:, :, 1], array[:, :, 2]
+
+    navy_mask = (red < 82) & (green < 98) & (blue < 122) & ((blue - red) > 12)
+    blue_mask = (red < 92) & (green > 82) & (green < 162) & (blue > 145) & ((blue - green) > 32)
+    orange_mask = (red > 185) & (green > 82) & (green < 178) & (blue < 98) & ((red - green) > 48)
+    red_mask = (red > 165) & (green < 116) & (blue < 116) & ((red - green) > 74)
+    green_mask = (red < 108) & (green > 116) & (blue < 145) & ((green - red) > 48)
+
+    routes = _components(navy_mask, 160)
+    starts = _components(blue_mask, 38)
+    finishes = _components(orange_mask, 55)
+    reds = _components(red_mask, 38)
+    greens = _components(green_mask, 38)
+    counts = (len(routes), len(starts), len(finishes), len(reds), len(greens))
+    if counts != (2, 2, 2, 2, 2):
+        raise OracleAbstention(
+            "expected two routes, starts, finishes, red checkpoints, and green checkpoints; "
+            f"found {counts}"
+        )
+
+    # Starts define the directed order.  Sorting only stabilizes iteration; it
+    # does not decide the answer because each is attached by pixel proximity.
+    starts.sort(key=_centroid)
+    unused_routes = set(range(2))
+    relations: list[str] = []
+    used_red: set[int] = set()
+    used_green: set[int] = set()
+    used_finish: set[int] = set()
+    for start_component in starts:
+        ranked_routes = sorted((*_closest(start_component, routes[index]), index) for index in unused_routes)
+        if ranked_routes[0][0] > 8.0:
+            raise OracleAbstention("a blue start is not attached to a navy route")
+        route_index = ranked_routes[0][2]
+        route = routes[route_index]
+        unused_routes.remove(route_index)
+        start_anchor = ranked_routes[0][1]
+
+        red_ranked = sorted((*_closest(marker, route), index) for index, marker in enumerate(reds) if index not in used_red)
+        green_ranked = sorted((*_closest(marker, route), index) for index, marker in enumerate(greens) if index not in used_green)
+        finish_ranked = sorted((*_closest(marker, route), index) for index, marker in enumerate(finishes) if index not in used_finish)
+        if not red_ranked or not green_ranked or not finish_ranked:
+            raise OracleAbstention("a route lacks a unique visible marker set")
+        if max(red_ranked[0][0], green_ranked[0][0], finish_ranked[0][0]) > 9.0:
+            raise OracleAbstention("a route marker is detached")
+        if len(red_ranked) > 1 and red_ranked[1][0] - red_ranked[0][0] < 80.0:
+            raise OracleAbstention("red checkpoint association is ambiguous")
+        if len(green_ranked) > 1 and green_ranked[1][0] - green_ranked[0][0] < 80.0:
+            raise OracleAbstention("green checkpoint association is ambiguous")
+        used_red.add(red_ranked[0][2])
+        used_green.add(green_ranked[0][2])
+        used_finish.add(finish_ranked[0][2])
+
+        red_anchor = red_ranked[0][1]
+        green_anchor = green_ranked[0][1]
+        distances = _graph_distance(route, start_anchor, {red_anchor, green_anchor})
+        gap = abs(distances[red_anchor] - distances[green_anchor])
+        if gap < 42.0:
+            raise OracleAbstention("checkpoint order has insufficient raster margin")
+        relations.append("red_green" if distances[red_anchor] < distances[green_anchor] else "green_red")
+
+    if len(relations) != 2:
+        raise OracleAbstention("could not recover both route relations")
+    return "same_order" if relations[0] == relations[1] else "opposite_order"

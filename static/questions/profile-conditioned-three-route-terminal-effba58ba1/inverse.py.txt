@@ -1,0 +1,162 @@
+"""Independent pixel inverse for the exact-simple-route-count world."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_PALETTE = {
+    "red": (224, 58, 62),
+    "blue": (55, 116, 224),
+    "orange": (238, 143, 47),
+    "green": (36, 166, 91),
+    "node": (207, 219, 231),
+    "ink": (25, 28, 33),
+}
+
+
+def _components(mask: np.ndarray, minimum: int = 70) -> list[np.ndarray]:
+    """Return 8-connected component coordinates as (y, x) arrays."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask), strict=True):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _centers(arr: np.ndarray, color: tuple[int, int, int]) -> list[tuple[float, float]]:
+    target = np.asarray(color, dtype=np.int16)
+    distance = np.linalg.norm(arr.astype(np.int16) - target, axis=2)
+    centers = []
+    for comp in _components(distance < 24):
+        span_y, span_x = np.ptp(comp, axis=0) + 1
+        if 12 <= span_x <= 30 and 12 <= span_y <= 30:
+            centers.append((float(comp[:, 1].mean()), float(comp[:, 0].mean())))
+    return centers
+
+
+def _point_segment_distance(
+    point: tuple[float, float], a: tuple[float, float], b: tuple[float, float]
+) -> tuple[float, float]:
+    px, py = point
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    denom = vx * vx + vy * vy
+    if denom == 0:
+        return math.inf, 0.0
+    t = ((px - ax) * vx + (py - ay) * vy) / denom
+    qx, qy = ax + t * vx, ay + t * vy
+    return math.hypot(px - qx, py - qy), t
+
+
+def _stroke_present(
+    dark: np.ndarray,
+    a: tuple[float, float],
+    b: tuple[float, float],
+    all_nodes: list[tuple[float, float]],
+) -> bool:
+    distance = math.dist(a, b)
+    if not 34.0 <= distance <= 132.0:
+        return False
+    for point in all_nodes:
+        if point == a or point == b:
+            continue
+        clearance, t = _point_segment_distance(point, a, b)
+        if 0.12 < t < 0.88 and clearance < 19.0:
+            return False
+    trim = 17.0 / distance
+    ts = np.linspace(trim, 1.0 - trim, max(20, int(distance)))
+    hits = 0
+    height, width = dark.shape
+    for t in ts:
+        x = int(round(a[0] + t * (b[0] - a[0])))
+        y = int(round(a[1] + t * (b[1] - a[1])))
+        y0, y1 = max(0, y - 2), min(height, y + 3)
+        x0, x1 = max(0, x - 2), min(width, x + 3)
+        hits += bool(dark[y0:y1, x0:x1].any())
+    return hits / len(ts) >= 0.84
+
+
+def _simple_path_count(adjacency: list[set[int]], start: int, terminal: int) -> int:
+    """Count simple paths using only the graph recovered from raster pixels."""
+    def visit(current: int, seen: frozenset[int]) -> int:
+        if current == terminal:
+            return 1
+        total = 0
+        for neighbor in adjacency[current]:
+            if neighbor not in seen:
+                total += visit(neighbor, seen | {neighbor})
+                if total > 32:
+                    raise ValueError("raster graph has implausibly many simple routes")
+        return total
+
+    return visit(start, frozenset({start}))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover all three graphs and return the three-route terminal color."""
+    arr = np.asarray(image.convert("RGB"))
+    starts = _centers(arr, _PALETTE["green"])
+    terminals = [
+        (color, center)
+        for color in ("red", "blue", "orange")
+        for center in _centers(arr, _PALETTE[color])
+    ]
+    ordinary = _centers(arr, _PALETTE["node"])
+    if len(starts) != 3 or len(terminals) != 3 or len(ordinary) != 21:
+        raise ValueError(
+            "expected 3 starts, 3 terminals, and 21 ordinary nodes; "
+            f"found {len(starts)}, {len(terminals)}, {len(ordinary)}"
+        )
+    starts.sort(key=lambda point: point[0])
+    terminals.sort(key=lambda item: item[1][0])
+    panel_centers = [(starts[i][0] + terminals[i][1][0]) / 2.0 for i in range(3)]
+    groups: list[list[tuple[float, float]]] = [[], [], []]
+    for point in ordinary:
+        slot = min(range(3), key=lambda index: abs(point[0] - panel_centers[index]))
+        groups[slot].append(point)
+    if [len(group) for group in groups] != [7, 7, 7]:
+        raise ValueError(f"ordinary-node panel split is ambiguous: {[len(group) for group in groups]}")
+
+    ink = np.asarray(_PALETTE["ink"], dtype=np.int16)
+    dark = np.linalg.norm(arr.astype(np.int16) - ink, axis=2) < 58
+    counts: list[int] = []
+    for slot in range(3):
+        nodes = [starts[slot], terminals[slot][1], *groups[slot]]
+        adjacency = [set() for _ in nodes]
+        for left in range(len(nodes)):
+            for right in range(left + 1, len(nodes)):
+                if _stroke_present(dark, nodes[left], nodes[right], nodes):
+                    adjacency[left].add(right)
+                    adjacency[right].add(left)
+        edge_count = sum(len(neighbors) for neighbors in adjacency) // 2
+        if edge_count != 10:
+            raise ValueError(f"panel {slot} should contain 10 links, recovered {edge_count}")
+        counts.append(_simple_path_count(adjacency, 0, 1))
+
+    if sorted(counts) != [2, 3, 4]:
+        raise ValueError(f"expected raster route counts [2, 3, 4], found {counts}")
+    winner = counts.index(3)
+    return terminals[winner][0]

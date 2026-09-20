@@ -1,0 +1,186 @@
+"""Pixel-only inverse arm for the bay-record climb world.
+
+Receives the final PNG and nothing else.  It segments the dark corridor, splits
+it into horizontal bays by row-run length, recovers the connector graph by
+walking narrow vertical strips found in the clear rows between bays, locates the
+green start frame, then walks the chain and counts walk-order thickness records.
+Returns "undetermined" whenever the corridor is not a clean unbranched chain.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+MIN_BAY_RUN = 70
+MAX_LINK_RUN = 40
+UNDETERMINED = "undetermined"
+
+
+def _masks(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    red, green, blue = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    ring = (green > red + 40) & (green > blue + 40)
+    dark = (arr.max(axis=2) < 130) & ~ring
+    return dark, ring
+
+
+def _runs(row: np.ndarray) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = -1
+    for x, on in enumerate(row):
+        if on and start < 0:
+            start = x
+        elif not on and start >= 0:
+            out.append((start, x - 1))
+            start = -1
+    if start >= 0:
+        out.append((start, len(row) - 1))
+    return out
+
+
+def _bands(mask: np.ndarray) -> list[dict] | None:
+    height = mask.shape[0]
+    long_rows = []
+    for y in range(height):
+        runs = _runs(mask[y])
+        if any(end - begin + 1 >= MIN_BAY_RUN for begin, end in runs):
+            long_rows.append(y)
+    if not long_rows:
+        return None
+
+    groups: list[list[int]] = []
+    for y in long_rows:
+        if groups and y == groups[-1][-1] + 1:
+            groups[-1].append(y)
+        else:
+            groups.append([y])
+
+    bands: list[dict] = []
+    for group in groups:
+        mid = group[len(group) // 2]
+        spans = [
+            (begin, end)
+            for begin, end in _runs(mask[mid])
+            if end - begin + 1 >= MIN_BAY_RUN
+        ]
+        if len(spans) != 1:
+            return None
+        begin, end = spans[0]
+        bands.append(
+            {
+                "y0": group[0],
+                "y1": group[-1],
+                "t": len(group),
+                "x0": begin,
+                "x1": end,
+                "yc": (group[0] + group[-1]) // 2,
+            }
+        )
+    return bands
+
+
+def _band_of(bands: list[dict], y: int) -> int | None:
+    for index, band in enumerate(bands):
+        if band["y0"] <= y <= band["y1"]:
+            return index
+    return None
+
+
+def _links(mask: np.ndarray, bands: list[dict]) -> list[tuple[int, int]] | None:
+    height = mask.shape[0]
+    seen: set[tuple[int, int, int]] = set()
+    edges: set[tuple[int, int]] = set()
+    for lower, upper in zip(bands, bands[1:]):
+        gap_rows = range(lower["y1"] + 1, upper["y0"])
+        if not len(gap_rows):
+            return None
+        probe = gap_rows[len(gap_rows) // 2]
+        for begin, end in _runs(mask[probe]):
+            if end - begin + 1 > MAX_LINK_RUN:
+                return None
+            column = (begin + end) // 2
+            top = probe
+            while top - 1 >= 0 and mask[top - 1, column]:
+                top -= 1
+            bottom = probe
+            while bottom + 1 < height and mask[bottom + 1, column]:
+                bottom += 1
+            key = (column, top, bottom)
+            if key in seen:
+                continue
+            seen.add(key)
+            first, second = _band_of(bands, top), _band_of(bands, bottom)
+            if first is None or second is None or first == second:
+                return None
+            edges.add((min(first, second), max(first, second)))
+    return sorted(edges)
+
+
+def _chain(count: int, edges: list[tuple[int, int]]) -> list[int] | None:
+    if len(edges) != count - 1:
+        return None
+    neighbours: dict[int, list[int]] = {index: [] for index in range(count)}
+    for first, second in edges:
+        neighbours[first].append(second)
+        neighbours[second].append(first)
+    ends = [index for index in range(count) if len(neighbours[index]) == 1]
+    if len(ends) != 2 or any(len(neighbours[i]) > 2 for i in range(count)):
+        return None
+    walk = [ends[0]]
+    previous = -1
+    while True:
+        current = walk[-1]
+        nexts = [n for n in neighbours[current] if n != previous]
+        if not nexts:
+            break
+        if len(nexts) > 1:
+            return None
+        previous = current
+        walk.append(nexts[0])
+    if len(walk) != count:
+        return None
+    return walk
+
+
+def decision_from_image(image: Image.Image) -> str:
+    dark, ring = _masks(image)
+    if not ring.any():
+        return UNDETERMINED
+
+    bands = _bands(dark)
+    if bands is None or len(bands) < 3:
+        return UNDETERMINED
+
+    edges = _links(dark, bands)
+    if edges is None:
+        return UNDETERMINED
+
+    walk = _chain(len(bands), edges)
+    if walk is None:
+        return UNDETERMINED
+
+    ys, xs = np.nonzero(ring)
+    ring_center = (float(xs.mean()), float(ys.mean()))
+    best_end, best_distance = None, None
+    for end in (walk[0], walk[-1]):
+        band = bands[end]
+        for x in (band["x0"], band["x1"]):
+            distance = (x - ring_center[0]) ** 2 + (band["yc"] - ring_center[1]) ** 2
+            if best_distance is None or distance < best_distance:
+                best_distance, best_end = distance, end
+    if best_end is None:
+        return UNDETERMINED
+    if best_end == walk[-1]:
+        walk = list(reversed(walk))
+
+    thicknesses = [bands[index]["t"] for index in walk]
+    best = thicknesses[0]
+    records = 0
+    for value in thicknesses[1:]:
+        if value > best:
+            records += 1
+            best = value
+    if records < 1 or records > 3:
+        return UNDETERMINED
+    return str(records)

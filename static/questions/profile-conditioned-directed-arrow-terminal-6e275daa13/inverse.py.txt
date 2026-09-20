@@ -1,0 +1,141 @@
+"""Independent raster-only inverse for arrow-directed reachability."""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict, deque
+
+import numpy as np
+from PIL import Image
+
+COLORS = {
+    "dark": np.array((40, 48, 60), dtype=np.int16),
+    "gray": np.array((155, 163, 175), dtype=np.int16),
+    "green": np.array((45, 168, 82), dtype=np.int16),
+    "cyan": np.array((15, 180, 205), dtype=np.int16),
+    "red": np.array((220, 65, 70), dtype=np.int16),
+    "orange": np.array((240, 145, 35), dtype=np.int16),
+    "purple": np.array((145, 75, 190), dtype=np.int16),
+}
+
+
+def _mask(array: np.ndarray, name: str, tolerance: int = 34) -> np.ndarray:
+    delta = array.astype(np.int16) - COLORS[name]
+    return np.max(np.abs(delta), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        pixels = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            output.append(np.asarray(pixels, dtype=float))
+    return output
+
+
+def _centers(array: np.ndarray) -> tuple[list[tuple[str, np.ndarray]], np.ndarray]:
+    nodes: list[tuple[str, np.ndarray]] = []
+    start_parts = _components(_mask(array, "green"), 120)
+    if len(start_parts) != 1:
+        raise ValueError("expected one green start node")
+    start = start_parts[0][:, ::-1].mean(axis=0)
+    nodes.append(("start", start))
+    gray_parts = _components(_mask(array, "gray"), 120)
+    if len(gray_parts) != 5:
+        raise ValueError("expected five gray junction nodes")
+    for index, part in enumerate(gray_parts):
+        nodes.append((f"junction_{index}", part[:, ::-1].mean(axis=0)))
+    for color in ("red", "orange", "purple"):
+        parts = _components(_mask(array, color), 180)
+        if len(parts) != 1:
+            raise ValueError(f"expected one {color} terminal")
+        nodes.append((color, parts[0][:, ::-1].mean(axis=0)))
+    return nodes, start
+
+
+def _line_support(mask: np.ndarray, one: np.ndarray, two: np.ndarray) -> float:
+    hits = 0
+    total = 0
+    height, width = mask.shape
+    for t in np.linspace(0.16, 0.84, 35):
+        if 0.39 <= t <= 0.61:
+            continue
+        x, y = one * (1 - t) + two * t
+        xi, yi = int(round(x)), int(round(y))
+        y0, y1 = max(0, yi - 4), min(height, yi + 5)
+        x0, x1 = max(0, xi - 4), min(width, xi + 5)
+        hits += bool(mask[y0:y1, x0:x1].any())
+        total += 1
+    return hits / max(total, 1)
+
+
+def _arrow_direction(points_yx: np.ndarray, one: np.ndarray, two: np.ndarray) -> int:
+    xy = points_yx[:, ::-1]
+    unit = two - one
+    unit = unit / np.linalg.norm(unit)
+    projections = xy @ unit
+    middle = (float(projections.min()) + float(projections.max())) / 2
+    offset = float(projections.mean()) - middle
+    if abs(offset) < 0.65:
+        raise ValueError("arrowhead direction is raster-ambiguous")
+    # A filled triangle's centroid lies toward its broad base, opposite its tip.
+    return 1 if offset < 0 else -1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+    nodes, start = _centers(array)
+    dark = _mask(array, "dark")
+    arrows = _components(_mask(array, "cyan"), 120)
+    if len(arrows) < 8:
+        raise ValueError("too few visible arrowheads")
+
+    edges: list[tuple[int, int]] = []
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            distance = float(np.linalg.norm(nodes[i][1] - nodes[j][1]))
+            if 70 < distance < 245 and _line_support(dark, nodes[i][1], nodes[j][1]) > 0.82:
+                edges.append((i, j))
+    if len(edges) != len(arrows):
+        raise ValueError(f"edge/arrow count mismatch: {len(edges)} versus {len(arrows)}")
+
+    directed: dict[int, list[int]] = defaultdict(list)
+    unused = set(range(len(arrows)))
+    for i, j in edges:
+        midpoint = (nodes[i][1] + nodes[j][1]) / 2
+        ranked = sorted((float(np.linalg.norm(part[:, ::-1].mean(axis=0) - midpoint)), k) for k, part in enumerate(arrows) if k in unused)
+        if not ranked or ranked[0][0] > 24:
+            raise ValueError("cannot associate arrowhead with link")
+        _, k = ranked[0]
+        unused.remove(k)
+        sign = _arrow_direction(arrows[k], nodes[i][1], nodes[j][1])
+        source, target = (i, j) if sign > 0 else (j, i)
+        directed[source].append(target)
+    if unused:
+        raise ValueError("unassigned arrowhead")
+
+    start_index = min(range(len(nodes)), key=lambda i: float(np.linalg.norm(nodes[i][1] - start)))
+    reached = {start_index}
+    queue = deque([start_index])
+    while queue:
+        for nxt in directed[queue.popleft()]:
+            if nxt not in reached:
+                reached.add(nxt)
+                queue.append(nxt)
+    answers = [nodes[i][0] for i in reached if nodes[i][0] in {"red", "orange", "purple"}]
+    if len(answers) != 1:
+        raise ValueError(f"expected one reachable colored terminal, found {answers}")
+    return answers[0]

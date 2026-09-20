@@ -1,0 +1,117 @@
+"""Independent inverse using final RGB pixels and the public transform only."""
+
+from __future__ import annotations
+
+import math
+import numpy as np
+from PIL import Image
+
+TEMPLATES = {
+    "M": (1.0, .55, .1, -.35, .25, -.35, .1, .55, 1.0),
+    "W": (-1.0, -.55, -.1, .35, -.25, .35, -.1, -.55, -1.0),
+    "U": (-1.0, -.45, .1, .65, 1.0, .65, .1, -.45, -1.0),
+    "Z": (-.85, -.85, -.55, -.25, .05, .35, .65, .85, .85),
+}
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, bool)
+    groups = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack, pts = [(y, x)], []
+        seen[y, x] = True
+        while stack:
+            cy, cx = stack.pop(); pts.append((cy, cx))
+            for ny, nx in ((cy-1,cx),(cy+1,cx),(cy,cx-1),(cy,cx+1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny,nx] and not seen[ny,nx]:
+                    seen[ny,nx] = True; stack.append((ny,nx))
+        groups.append(np.asarray(pts, dtype=np.int32))
+    return groups
+
+
+def _node_centers(arr: np.ndarray) -> list[tuple[float, float]]:
+    r, g, b = (arr[..., i].astype(np.int16) for i in range(3))
+    mask = (r > 125) & (r > g + 65) & (b > g + 30) & (g < 120)
+    groups = [p for p in _components(mask) if 40 <= len(p) <= 220]
+    if len(groups) != 18:
+        raise ValueError(f"expected 18 visible corner rings, found {len(groups)}")
+    return [(float(p[:,1].mean()), float(p[:,0].mean())) for p in groups]
+
+
+def _cap(arr: np.ndarray, which: str) -> tuple[float, float]:
+    r, g, b = (arr[..., i].astype(np.int16) for i in range(3))
+    if which == "amber":
+        mask = (r > 180) & (g > 105) & (g < 205) & (b < 100) & (r-g > 35)
+    else:
+        mask = (g > 115) & (b > 105) & (r < 105) & (np.abs(g-b) < 70)
+    groups = [p for p in _components(mask) if len(p) >= 45]
+    if len(groups) != 1:
+        raise ValueError(f"missing or ambiguous {which} cap")
+    p = groups[0]
+    return float(p[:,1].mean()), float(p[:,0].mean())
+
+
+def _validate_connected_trace(arr: np.ndarray, centers: list[tuple[float,float]]) -> None:
+    # Both allowed inks have all channels below 105. Node outlines touch the
+    # route, so a complete scene has one large, thin, distributed component.
+    dark = np.max(arr, axis=2) < 115
+    groups = [p for p in _components(dark) if len(p) >= 120]
+    if len(groups) != 1:
+        raise ValueError("route is erased, split, or not a single connected trace")
+    route = groups[0]
+    if route[:,1].max() - route[:,1].min() < 330 or route[:,0].max() - route[:,0].min() < 150:
+        raise ValueError("route does not span the declared corner sequence")
+    # Every detected ring must touch the same route component.
+    route_mask = np.zeros(dark.shape, bool); route_mask[route[:,0], route[:,1]] = True
+    for x, y in centers:
+        xi, yi = int(round(x)), int(round(y))
+        if not route_mask[max(0,yi-10):yi+11, max(0,xi-10):xi+11].any():
+            raise ValueError("a corner ring is detached from the route")
+
+
+def _shape_score(values: np.ndarray, template: tuple[float,...]) -> float:
+    t = np.asarray(template, float)
+    # Best positive affine fit y = a*t+b; translation and scale are nuisances.
+    tc = t - t.mean(); vc = values - values.mean()
+    denom = float(np.dot(tc, tc))
+    a = float(np.dot(vc, tc) / denom)
+    if a <= 20.0:
+        return 1e9
+    residual = vc - a*tc
+    return float(math.sqrt(np.mean(residual**2)))
+
+
+def measure_from_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    centers = _node_centers(arr)
+    _validate_connected_trace(arr, centers)
+    amber, teal = _cap(arr, "amber"), _cap(arr, "teal")
+
+    # Nine x-separated pairs are found entirely from raster geometry.  Traversal
+    # reversal changes only within-pair order, not any midpoint.
+    centers.sort(key=lambda p: (p[0], p[1]))
+    pairs = [centers[i:i+2] for i in range(0, 18, 2)]
+    gaps = [abs(pair[0][0]-pair[1][0]) for pair in pairs]
+    pair_x = [sum(p[0] for p in pair)/2 for pair in pairs]
+    if max(gaps) > 2.5 or min(np.diff(pair_x)) < 35:
+        raise ValueError("corner pairing is ambiguous")
+    if abs(amber[0]-teal[0]) < 300:
+        raise ValueError("route endpoint order is ambiguous")
+    mid_y = np.asarray([sum(p[1] for p in pair)/2 for pair in pairs], float)
+    scores = sorted((_shape_score(mid_y, tpl), name) for name, tpl in TEMPLATES.items())
+    if scores[0][0] > 2.2 or scores[1][0] - scores[0][0] < 5.0:
+        raise ValueError("midpoint centerline has insufficient runner-up margin")
+    return {
+        "decision": scores[0][1],
+        "runner_up_margin": round(scores[1][0] - scores[0][0], 6),
+        "best_residual": round(scores[0][0], 6),
+        "minimum_pair_separation": round(min(math.dist(*pair) for pair in pairs), 3),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure_from_image(image)["decision"])

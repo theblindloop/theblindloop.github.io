@@ -1,0 +1,159 @@
+"""Independent RGB-only inverse for the matched connector route world."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ROUTE_RGB = np.array((37, 53, 70), dtype=np.float32)
+MARKER_RGB = {
+    "green": np.array((39, 169, 104), dtype=np.float32),
+    "amber": np.array((226, 151, 34), dtype=np.float32),
+    "violet": np.array((132, 86, 190), dtype=np.float32),
+    "cyan": np.array((39, 157, 207), dtype=np.float32),
+    "magenta": np.array((215, 76, 147), dtype=np.float32),
+}
+
+
+class OracleFitError(ValueError):
+    """The raster does not expose an unambiguous connector-route structure."""
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and not seen[ny, nx]
+                        and mask[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= min_area:
+            found.append(np.asarray(pixels, dtype=np.float64))
+    return found
+
+
+def _centers(array: np.ndarray, rgb: np.ndarray) -> list[np.ndarray]:
+    distance = np.linalg.norm(array - rgb[None, None, :], axis=2)
+    # Marker hues are deliberately separated, but green/cyan are close enough
+    # that a broad antialias tolerance would merge their masks.  Solid marker
+    # interiors provide ample headroom at this tighter threshold.
+    mask = distance < 80.0
+    parts = _components(mask, min_area=45)
+    return [part.mean(axis=0) for part in parts]
+
+
+def _route_components(array: np.ndarray) -> list[np.ndarray]:
+    distance = np.linalg.norm(array - ROUTE_RGB[None, None, :], axis=2)
+    return _components(distance < 65.0, min_area=70)
+
+
+def _nearest_component(center: np.ndarray, components: list[np.ndarray]) -> tuple[int, float]:
+    distances = [float(np.linalg.norm(part - center[None, :], axis=1).min()) for part in components]
+    index = int(np.argmin(distances))
+    return index, distances[index]
+
+
+def _piece_length(component: np.ndarray) -> float:
+    """Estimate a thick monotone-x stroke's centerline length from its pixels."""
+
+    xs = np.unique(component[:, 1].astype(int))
+    if len(xs) < 8:
+        raise OracleFitError("route piece is too short to fit")
+    samples: list[tuple[float, float]] = []
+    for x in xs:
+        ys = component[component[:, 1].astype(int) == x, 0]
+        samples.append((float(x), float(np.median(ys))))
+    samples.sort()
+    return float(
+        sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(samples, samples[1:]))
+    )
+
+
+def _check_count(name: str, values: list[np.ndarray], count: int) -> None:
+    if len(values) != count:
+        raise OracleFitError(f"expected {count} {name} markers, found {len(values)}")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the longer terminal using only final RGB pixels."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    greens = _centers(array, MARKER_RGB["green"])
+    ambers = _centers(array, MARKER_RGB["amber"])
+    violets = _centers(array, MARKER_RGB["violet"])
+    cyan = _centers(array, MARKER_RGB["cyan"])
+    magenta = _centers(array, MARKER_RGB["magenta"])
+    _check_count("green", greens, 2)
+    _check_count("amber", ambers, 1)
+    _check_count("violet", violets, 1)
+    _check_count("cyan", cyan, 2)
+    _check_count("magenta", magenta, 2)
+
+    components = _route_components(array)
+    if len(components) != 4:
+        raise OracleFitError(f"expected four disconnected dark pieces, found {len(components)}")
+    lengths = [_piece_length(component) for component in components]
+
+    green_links = [_nearest_component(center, components) for center in greens]
+    if any(distance > 34.0 for _, distance in green_links):
+        raise OracleFitError("a green start is not bound to a dark piece")
+    green_component_ids = {index for index, _ in green_links}
+    if len(green_component_ids) != 2:
+        raise OracleFitError("green starts do not bind two distinct pieces")
+
+    terminal_centers = [("amber", ambers[0]), ("violet", violets[0])]
+    terminal_links = []
+    for color, center in terminal_centers:
+        index, distance = _nearest_component(center, components)
+        if distance > 34.0 or index in green_component_ids:
+            raise OracleFitError("a terminal is not bound to its own terminal piece")
+        terminal_links.append((color, index))
+    if len({index for _, index in terminal_links}) != 2:
+        raise OracleFitError("terminals bind to the same piece")
+
+    groups: dict[str, list[int]] = {}
+    for connector_name, centers in (("cyan", cyan), ("magenta", magenta)):
+        links = [_nearest_component(center, components) for center in centers]
+        if any(distance > 34.0 for _, distance in links):
+            raise OracleFitError(f"{connector_name} tabs are not bound to route pieces")
+        indexes = [index for index, _ in links]
+        if len(set(indexes)) != 2:
+            raise OracleFitError(f"{connector_name} tabs bind the same piece")
+        groups[connector_name] = indexes
+    all_group_indexes = groups["cyan"] + groups["magenta"]
+    if len(set(all_group_indexes)) != 4:
+        raise OracleFitError("connector bindings do not partition the four pieces")
+
+    terminal_by_component = {index: color for color, index in terminal_links}
+    totals: dict[str, float] = {}
+    output_color: dict[str, str] = {}
+    for connector_name, indexes in groups.items():
+        if not any(index in green_component_ids for index in indexes):
+            raise OracleFitError("a matched route has no green start")
+        terminal_indexes = [index for index in indexes if index in terminal_by_component]
+        if len(terminal_indexes) != 1:
+            raise OracleFitError("a matched route has no unique colored terminal")
+        totals[connector_name] = sum(lengths[index] for index in indexes)
+        output_color[connector_name] = terminal_by_component[terminal_indexes[0]]
+
+    winner = max(sorted(totals), key=lambda key: (totals[key], key))
+    return output_color[winner]

@@ -1,0 +1,338 @@
+"""Piece/hole signature world.
+
+Four flat drawings sit in the four cells of an invisible 2x2 grid: one black
+reference and three coloured candidates (red, green, blue).  Every drawing is a
+set of solid blobs of one colour, and some blobs have round white holes punched
+right through them.  A drawing's topological signature is the pair
+
+    (number of separate blobs, total number of enclosed white holes)
+
+which is exactly (b0, b1) of that colour's ink.  Sampling guarantees that
+exactly one coloured drawing repeats the black drawing's signature, that one
+distractor repeats only the blob count, and that the other distractor repeats
+only the hole count, so neither invariant alone selects the answer.
+
+Only Pillow is used; the LaTeX renderer is not needed because the decision
+depends on hard colour edges and on exact wall and gap clearances.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw
+
+WIDTH = 640
+HEIGHT = 480
+SUPERSAMPLE = 3
+BACKGROUND = (255, 255, 255)
+
+REFERENCE_RGB = (30, 30, 34)
+CANDIDATE_PALETTE: tuple[tuple[str, tuple[int, int, int]], ...] = (
+    ("red", (198, 42, 42)),
+    ("green", (28, 132, 58)),
+    ("blue", (44, 78, 196)),
+)
+COLOR_NAMES = tuple(name for name, _ in CANDIDATE_PALETTE)
+
+CELL_MARGIN = 24
+SLOT_GAP = 7  # half-gap inset applied on both sides of a blob slot
+NORMAL_WALL = 12.0  # ink between a hole edge and the blob boundary
+TIGHT_WALLS = (6.0, 7.0, 8.0)
+HOLE_SEPARATION = 11.0
+MIN_HALF_SIZE = 24.0
+MAX_HALF_SIZE = 46.0
+TWO_HOLE_HALF_SIZE = 36.0
+QUARANTINE_PX = 9.0
+TIGHT_EVERY = 6  # one scene in six is sampled against the resolution boundary
+
+
+# --------------------------------------------------------------------------- #
+# scene sampling
+# --------------------------------------------------------------------------- #
+def _cell_region(cell: int) -> tuple[float, float, float, float]:
+    col, row = cell % 2, cell // 2
+    x0 = col * (WIDTH / 2) + CELL_MARGIN
+    y0 = row * (HEIGHT / 2) + CELL_MARGIN
+    return x0, y0, x0 + WIDTH / 2 - 2 * CELL_MARGIN, y0 + HEIGHT / 2 - 2 * CELL_MARGIN
+
+
+def _slots(region: tuple[float, float, float, float], count: int, vertical: bool) -> list[tuple[float, float, float, float]]:
+    x0, y0, x1, y1 = region
+    out = []
+    for index in range(count):
+        if vertical:
+            step = (y1 - y0) / count
+            out.append((x0, y0 + index * step, x1, y0 + (index + 1) * step))
+        else:
+            step = (x1 - x0) / count
+            out.append((x0 + index * step, y0, x0 + (index + 1) * step, y1))
+    return out
+
+
+def _blob(rng: random.Random, slot: tuple[float, float, float, float]) -> dict[str, Any]:
+    x0, y0, x1, y1 = (slot[0] + SLOT_GAP, slot[1] + SLOT_GAP, slot[2] - SLOT_GAP, slot[3] - SLOT_GAP)
+    max_a = min((x1 - x0) / 2, MAX_HALF_SIZE)
+    max_b = min((y1 - y0) / 2, MAX_HALF_SIZE)
+    kind = "disk" if rng.random() < 0.55 else "rect"
+    if kind == "disk":
+        radius = round(rng.uniform(MIN_HALF_SIZE, min(max_a, max_b)), 2)
+        half_a = half_b = radius
+    else:
+        half_a = round(rng.uniform(MIN_HALF_SIZE, max_a), 2)
+        half_b = round(rng.uniform(MIN_HALF_SIZE, max_b), 2)
+    cx = round(rng.uniform(x0 + half_a, x1 - half_a), 2)
+    cy = round(rng.uniform(y0 + half_b, y1 - half_b), 2)
+    return {"kind": kind, "cx": cx, "cy": cy, "a": half_a, "b": half_b, "holes": []}
+
+
+def _capacity(blob: dict[str, Any]) -> int:
+    """How many holes this blob can host at the normal wall clearance."""
+    small = min(blob["a"], blob["b"])
+    large = max(blob["a"], blob["b"])
+    if small < 8.0 + NORMAL_WALL:
+        return 0
+    if large >= TWO_HOLE_HALF_SIZE:
+        return 2
+    return 1
+
+
+def _punch(rng: random.Random, blob: dict[str, Any], count: int, wall: float) -> None:
+    """Place `count` round holes inside one blob, keeping `wall` px of ink."""
+    small = min(blob["a"], blob["b"])
+    large = max(blob["a"], blob["b"])
+    if count == 1:
+        radius = round(rng.uniform(8.0, min(12.0, small - wall)), 2)
+        reach = small - radius - wall
+        distance = round(rng.uniform(0.0, max(0.0, reach)), 2)
+        angle = rng.uniform(0.0, 2.0 * math.pi)
+        offsets = [(distance * math.cos(angle), distance * math.sin(angle))]
+    else:
+        radius = round(rng.uniform(8.0, min(11.0, small - wall)), 2)
+        distance = round(radius + HOLE_SEPARATION / 2.0, 2)
+        distance = min(distance, large - radius - wall)
+        angle = 0.0 if blob["a"] >= blob["b"] else math.pi / 2
+        if blob["kind"] == "disk":
+            angle = rng.uniform(0.0, 2.0 * math.pi)
+        offsets = [
+            (distance * math.cos(angle), distance * math.sin(angle)),
+            (-distance * math.cos(angle), -distance * math.sin(angle)),
+        ]
+    for dx, dy in offsets:
+        blob["holes"].append(
+            {"x": round(blob["cx"] + dx, 2), "y": round(blob["cy"] + dy, 2), "r": radius}
+        )
+
+
+def _drawing(rng: random.Random, cell: int, blobs: int, holes: int, wall: float) -> list[dict[str, Any]]:
+    for _ in range(200):
+        region = _cell_region(cell)
+        vertical = rng.random() < 0.5 and blobs > 1
+        slots = _slots(region, blobs, vertical)
+        pieces = [_blob(rng, slot) for slot in slots]
+        order = list(range(blobs))
+        rng.shuffle(order)
+        remaining = holes
+        plan = [0] * blobs
+        for index in order:
+            take = min(_capacity(pieces[index]), remaining)
+            if take and remaining and rng.random() < 0.5 and remaining < 2 * blobs:
+                take = min(take, 1)
+            plan[index] = take
+            remaining -= take
+        if remaining:
+            continue
+        for index, count in enumerate(plan):
+            if count:
+                _punch(rng, pieces[index], count, wall)
+        return pieces
+    raise RuntimeError("could not place holes")
+
+
+def _signature_from_pieces(pieces: list[dict[str, Any]]) -> tuple[int, int]:
+    return len(pieces), sum(len(piece["holes"]) for piece in pieces)
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Sample one balanced scene; `seed` fully determines the result."""
+    rng = random.Random(int(seed) * 6151 + 907)
+    tight = (int(seed) % TIGHT_EVERY) == 3
+    for _ in range(400):
+        blobs = rng.choice((1, 2, 3))
+        holes = rng.randint(0, min(4, 2 * blobs))
+        other_holes = [value for value in range(0, 2 * blobs + 1) if value != holes and abs(value - holes) <= 2]
+        other_blobs = [value for value in (1, 2, 3) if value != blobs and 2 * value >= holes]
+        if not other_holes or not other_blobs:
+            continue
+        match_sig = (blobs, holes)
+        same_blobs_sig = (blobs, rng.choice(other_holes))
+        same_holes_sig = (rng.choice(other_blobs), holes)
+        signatures = [match_sig, same_blobs_sig, same_holes_sig]
+        rng.shuffle(signatures)
+        cells = [0, 1, 2, 3]
+        rng.shuffle(cells)
+        reference_cell = cells[0]
+        colors = list(CANDIDATE_PALETTE)
+        rng.shuffle(colors)
+        walls = [NORMAL_WALL] * 4
+        holed = [index for index, count in enumerate([holes, *(sig[1] for sig in signatures)]) if count]
+        if tight and holed:
+            walls[rng.choice(holed)] = rng.choice(TIGHT_WALLS)
+        try:
+            reference = {
+                "cell": reference_cell,
+                "color_name": "black",
+                "rgb": list(REFERENCE_RGB),
+                "pieces": _drawing(rng, reference_cell, blobs, holes, walls[0]),
+            }
+            candidates = []
+            for index, (signature, cell) in enumerate(zip(signatures, cells[1:])):
+                name, rgb = colors[index]
+                candidates.append(
+                    {
+                        "cell": cell,
+                        "color_name": name,
+                        "rgb": list(rgb),
+                        "pieces": _drawing(rng, cell, signature[0], signature[1], walls[index + 1]),
+                    }
+                )
+        except RuntimeError:
+            continue
+        scene = {
+            "canvas": [WIDTH, HEIGHT],
+            "background": list(BACKGROUND),
+            "reference": reference,
+            "candidates": candidates,
+            "tight": bool(tight),
+        }
+        if analytic_gold(scene) in COLOR_NAMES:
+            return scene
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def _draw_drawing(draw: ImageDraw.ImageDraw, drawing: dict[str, Any], scale: int) -> None:
+    rgb = tuple(int(value) for value in drawing["rgb"])
+    for piece in drawing["pieces"]:
+        cx, cy, half_a, half_b = piece["cx"], piece["cy"], piece["a"], piece["b"]
+        box = [
+            (cx - half_a) * scale,
+            (cy - half_b) * scale,
+            (cx + half_a) * scale,
+            (cy + half_b) * scale,
+        ]
+        if piece["kind"] == "disk":
+            draw.ellipse(box, fill=rgb)
+        else:
+            draw.rounded_rectangle(box, radius=8 * scale, fill=rgb)
+    for piece in drawing["pieces"]:
+        for hole in piece["holes"]:
+            box = [
+                (hole["x"] - hole["r"]) * scale,
+                (hole["y"] - hole["r"]) * scale,
+                (hole["x"] + hole["r"]) * scale,
+                (hole["y"] + hole["r"]) * scale,
+            ]
+            draw.ellipse(box, fill=BACKGROUND)
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    """Render a scene deterministically at 640x480 RGB."""
+    width, height = int(scene["canvas"][0]), int(scene["canvas"][1])
+    scale = SUPERSAMPLE
+    canvas = Image.new("RGB", (width * scale, height * scale), tuple(int(v) for v in scene["background"]))
+    draw = ImageDraw.Draw(canvas)
+    for drawing in [scene["reference"], *scene["candidates"]]:
+        _draw_drawing(draw, drawing, scale)
+    return canvas.resize((width, height), Image.Resampling.BOX)
+
+
+# --------------------------------------------------------------------------- #
+# analytic gold, margin, quarantine, symmetries
+# --------------------------------------------------------------------------- #
+def analytic_gold(scene: dict[str, Any]) -> str:
+    """Colour of the unique candidate whose (blobs, holes) equals the reference."""
+    target = _signature_from_pieces(scene["reference"]["pieces"])
+    hits = [
+        drawing["color_name"]
+        for drawing in scene["candidates"]
+        if _signature_from_pieces(drawing["pieces"]) == target
+    ]
+    if len(hits) == 1:
+        return hits[0]
+    return "none"
+
+
+def _piece_box(piece: dict[str, Any]) -> tuple[float, float, float, float]:
+    return (
+        piece["cx"] - piece["a"],
+        piece["cy"] - piece["b"],
+        piece["cx"] + piece["a"],
+        piece["cy"] + piece["b"],
+    )
+
+
+def _box_gap(first: dict[str, Any], second: dict[str, Any]) -> float:
+    ax0, ay0, ax1, ay1 = _piece_box(first)
+    bx0, by0, bx1, by1 = _piece_box(second)
+    dx = max(bx0 - ax1, ax0 - bx1)
+    dy = max(by0 - ay1, ay0 - by1)
+    return max(dx, dy)
+
+
+def margin(scene: dict[str, Any]) -> float:
+    """Smallest visible clearance whose collapse could change a signature."""
+    clearances: list[float] = []
+    pieces: list[dict[str, Any]] = []
+    for drawing in [scene["reference"], *scene["candidates"]]:
+        pieces.extend(drawing["pieces"])
+        for piece in drawing["pieces"]:
+            clearances.append(2.0 * min(piece["a"], piece["b"]))
+            for hole in piece["holes"]:
+                clearances.append(2.0 * hole["r"])
+                if piece["kind"] == "disk":
+                    reach = math.hypot(hole["x"] - piece["cx"], hole["y"] - piece["cy"])
+                    clearances.append(piece["a"] - reach - hole["r"])
+                else:
+                    clearances.append(piece["a"] - abs(hole["x"] - piece["cx"]) - hole["r"])
+                    clearances.append(piece["b"] - abs(hole["y"] - piece["cy"]) - hole["r"])
+    for index, piece in enumerate(pieces):
+        for other in pieces[index + 1 :]:
+            clearances.append(_box_gap(piece, other))
+        for first_index, hole in enumerate(piece["holes"]):
+            for other in piece["holes"][first_index + 1 :]:
+                gap = math.hypot(hole["x"] - other["x"], hole["y"] - other["y"]) - hole["r"] - other["r"]
+                clearances.append(gap)
+    return round(float(min(clearances)), 4)
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    """True when a clearance is close enough to the raster grid to be unsafe."""
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Pixel-identical, gold-preserving relabelings of the bookkeeping lists."""
+    import copy
+
+    out: list[tuple[str, dict[str, Any]]] = []
+
+    reversed_candidates = copy.deepcopy(scene)
+    reversed_candidates["candidates"] = list(reversed(reversed_candidates["candidates"]))
+    out.append(("candidate_slot_order_reversed", reversed_candidates))
+
+    reversed_pieces = copy.deepcopy(scene)
+    for drawing in [reversed_pieces["reference"], *reversed_pieces["candidates"]]:
+        drawing["pieces"] = list(reversed(drawing["pieces"]))
+    out.append(("blob_list_order_reversed", reversed_pieces))
+
+    reversed_holes = copy.deepcopy(scene)
+    for drawing in [reversed_holes["reference"], *reversed_holes["candidates"]]:
+        for piece in drawing["pieces"]:
+            piece["holes"] = list(reversed(piece["holes"]))
+    out.append(("hole_list_order_reversed", reversed_holes))
+    return out

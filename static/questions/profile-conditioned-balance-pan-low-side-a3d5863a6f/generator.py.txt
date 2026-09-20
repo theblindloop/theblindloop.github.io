@@ -1,0 +1,341 @@
+"""Forward arm for `balance_pan_low_side`.
+
+Latent scene z: a white page carrying one beam balance drawn in flat ink. A
+light grey stand holds a light grey beam that pivots at the top of the post; two
+identical dark slate pans hang from the two beam ends on light grey cords, and a
+row of coloured blocks sits on each pan. Gold is the purely geometric readout of
+which pan is drawn nearer the bottom of the page:
+
+    dy = pan_centre_y(right) - pan_centre_y(left) = 2 * L * sin(tilt)
+    right if dy > 0, left if dy < 0
+
+The margin is the visible vertical separation of the two pan centres,
+
+    m = |dy|,
+
+i.e. how far the low pan would have to rise before the beam is level and the
+answer is destroyed. The runner-up answer is always the other pan.
+
+The familiar prior -- the side carrying more objects hangs lower -- is recorded
+for analysis only and is never used as gold. Which side carries more blocks is
+sampled independently of the tilt, so half the pages are canonical (the loaded
+side really is down) and half are counterfactual (the loaded side is up), with
+identical wording, palette, stand, cords, pans and scale distribution. Block
+counts, block colours, block size, beam length, tilt magnitude and page position
+are all sampled independently of the answer.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "balance_pan_low_side-renderer-0.1.0"
+
+WIDTH, HEIGHT = 640, 420
+SUPERSAMPLE = 3
+
+QUARANTINE_PX = 12.0  # pan-centre separation below this is a boundary case
+
+DECISIONS = ("left", "right")
+
+PAN_INK = (48, 52, 58)  # dark and nearly colourless: the pans, and only the pans
+STAND_INK = (152, 152, 158)  # light grey: stand, beam, cords, page decoration
+PAGE_INK = (176, 176, 176)
+BLOCK_PALETTE = (
+    (206, 52, 62),
+    (46, 104, 208),
+    (232, 158, 30),
+    (36, 156, 128),
+    (150, 68, 196),
+    (214, 92, 168),
+)
+
+PIVOT_X_RANGE = (296.0, 344.0)
+PIVOT_Y_RANGE = (118.0, 140.0)
+BEAM_HALF_RANGE = (170.0, 205.0)
+TILT_DEG_RANGE = (4.5, 11.0)
+CORD_RANGE = (30.0, 44.0)
+PAN_W_RANGE = (82.0, 96.0)
+PAN_H = 12.0
+BLOCK_SIZE_RANGE = (14.0, 20.0)
+BASE_Y = 372.0
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene. Every field below is painted into the raster."""
+    rng = random.Random(seed)
+
+    # Balanced counterbalancing: the answer and the loaded side are taken from
+    # two different bits of the seed, so a dataset built from consecutive scene
+    # seeds carries each answer exactly half the time and each (answer, loaded
+    # side) cell exactly a quarter of the time. The loaded side is therefore
+    # independent of the tilt: it agrees with the tilt on half the pages
+    # (canonical) and contradicts it on the other half (counterfactual).
+    target = DECISIONS[seed % 2]
+    heavy_side = DECISIONS[(seed // 2) % 2]
+
+    tilt_mag = rng.uniform(*TILT_DEG_RANGE)
+    tilt_deg = tilt_mag if target == "right" else -tilt_mag
+
+    hi = rng.randint(4, 6)
+    lo = hi - rng.randint(2, 3)
+    left_count, right_count = (hi, lo) if heavy_side == "left" else (lo, hi)
+
+    colours = rng.sample(list(BLOCK_PALETTE), 2)
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "pivot_x": round(rng.uniform(*PIVOT_X_RANGE), 3),
+        "pivot_y": round(rng.uniform(*PIVOT_Y_RANGE), 3),
+        "beam_half": round(rng.uniform(*BEAM_HALF_RANGE), 3),
+        "tilt_deg": round(tilt_deg, 4),
+        "cord_len": round(rng.uniform(*CORD_RANGE), 3),
+        "pan_w": round(rng.uniform(*PAN_W_RANGE), 3),
+        "left_count": left_count,
+        "right_count": right_count,
+        "block_size": round(rng.uniform(*BLOCK_SIZE_RANGE), 3),
+        "left_color": list(colours[0]),
+        "right_color": list(colours[1]),
+        "base_y": BASE_Y,
+        "tick_len": rng.randint(12, 20),
+    }
+    return scene
+
+
+# --------------------------------------------------------------------------- #
+# geometry, gold and margin
+# --------------------------------------------------------------------------- #
+def _beam_ends(scene: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    t = math.radians(float(scene["tilt_deg"]))
+    px, py = float(scene["pivot_x"]), float(scene["pivot_y"])
+    half = float(scene["beam_half"])
+    dx, dy = half * math.cos(t), half * math.sin(t)
+    return (px - dx, py - dy), (px + dx, py + dy)
+
+
+def pan_centres(scene: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Centres of the two drawn pans, left pan first."""
+    left_end, right_end = _beam_ends(scene)
+    cord = float(scene["cord_len"])
+    return (
+        (left_end[0], left_end[1] + cord + PAN_H / 2.0),
+        (right_end[0], right_end[1] + cord + PAN_H / 2.0),
+    )
+
+
+def analytic_gold(scene: dict) -> str:
+    left_c, right_c = pan_centres(scene)
+    return "right" if right_c[1] > left_c[1] else "left"
+
+
+def margin(scene: dict) -> float:
+    left_c, right_c = pan_centres(scene)
+    return round(abs(right_c[1] - left_c[1]), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def runner_up(scene: dict) -> str:
+    return "left" if analytic_gold(scene) == "right" else "right"
+
+
+def prior_side(scene: dict) -> str:
+    """The side the canonical prior predicts: the one carrying more blocks."""
+    if int(scene["left_count"]) == int(scene["right_count"]):
+        return "none"
+    return "left" if int(scene["left_count"]) > int(scene["right_count"]) else "right"
+
+
+def variant(scene: dict) -> str:
+    return "canonical" if prior_side(scene) == analytic_gold(scene) else "counterfactual"
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent aliases are declared: see candidate.json latent_alias."""
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# declared edits
+# --------------------------------------------------------------------------- #
+def translate(scene: dict, dx: float, dy: float) -> dict:
+    alt = dict(scene)
+    alt["pivot_x"] = round(float(scene["pivot_x"]) + dx, 3)
+    alt["pivot_y"] = round(float(scene["pivot_y"]) + dy, 3)
+    alt["base_y"] = float(scene["base_y"]) + dy
+    return alt
+
+
+def recolor(scene: dict) -> dict:
+    """Repaint the blocks with two other palette inks; gold is untouched."""
+    alt = dict(scene)
+    left = tuple(scene["left_color"])
+    idx = BLOCK_PALETTE.index(left) if left in BLOCK_PALETTE else 0
+    alt["left_color"] = list(BLOCK_PALETTE[(idx + 2) % len(BLOCK_PALETTE)])
+    alt["right_color"] = list(BLOCK_PALETTE[(idx + 3) % len(BLOCK_PALETTE)])
+    return alt
+
+
+def restyle(scene: dict, seed: int) -> dict:
+    """Swap the block loads between the pans and resize the blocks.
+
+    This moves the canonical prior to the other side while leaving the drawn
+    beam alone, so a reader that answers from the load must change its answer
+    and a reader that answers from the picture must not.
+    """
+    rng = random.Random(seed ^ 0x5EE5)
+    alt = dict(scene)
+    alt["left_count"], alt["right_count"] = int(scene["right_count"]), int(scene["left_count"])
+    alt["block_size"] = round(rng.uniform(*BLOCK_SIZE_RANGE), 3)
+    return alt
+
+
+def rescale(scene: dict) -> dict:
+    """Lengthen the beam and the cords together; the tilt sign is preserved."""
+    alt = dict(scene)
+    alt["beam_half"] = round(min(205.0, float(scene["beam_half"]) * 1.08), 3)
+    alt["cord_len"] = round(float(scene["cord_len"]) * 1.15, 3)
+    alt["pan_w"] = round(float(scene["pan_w"]) * 0.94, 3)
+    return alt
+
+
+def mirror(scene: dict) -> dict:
+    """Mirror the page left-right: left and right swap, so gold swaps."""
+    alt = dict(scene)
+    alt["pivot_x"] = round(float(scene["width"]) - float(scene["pivot_x"]), 3)
+    alt["tilt_deg"] = round(-float(scene["tilt_deg"]), 4)
+    alt["left_count"], alt["right_count"] = int(scene["right_count"]), int(scene["left_count"])
+    alt["left_color"], alt["right_color"] = list(scene["right_color"]), list(scene["left_color"])
+    return alt
+
+
+def mirrored_decision(decision: str) -> str:
+    return "left" if decision == "right" else "right"
+
+
+def set_class(scene: dict, target: str) -> dict:
+    """Repaint the page so that the named pan is the low one."""
+    if target not in DECISIONS:
+        raise ValueError(f"unknown class: {target}")
+    alt = dict(scene)
+    mag = abs(float(scene["tilt_deg"]))
+    alt["tilt_deg"] = round(mag if target == "right" else -mag, 4)
+    return alt
+
+
+def collapse_margin(scene: dict) -> dict:
+    """Level the beam: the boundary itself, where no pan is lower."""
+    alt = dict(scene)
+    alt["tilt_deg"] = 0.0
+    return alt
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def render(scene: dict) -> Image.Image:
+    s = SUPERSAMPLE
+    w, h = int(scene["width"]), int(scene["height"])
+    img = Image.new("RGB", (w * s, h * s), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+
+    def px(v: float) -> float:
+        return v * s
+
+    px_x, px_y = float(scene["pivot_x"]), float(scene["pivot_y"])
+    base_y = float(scene["base_y"])
+    left_end, right_end = _beam_ends(scene)
+    left_c, right_c = pan_centres(scene)
+    pan_w = float(scene["pan_w"])
+
+    # page decoration: border and four corner ticks, fixed and answer-free
+    d.rectangle([px(8), px(8), px(w - 9), px(h - 9)], outline=PAGE_INK, width=max(1, s))
+    tl = int(scene["tick_len"])
+    for cx, cy, sx, sy in ((8, 8, 1, 1), (w - 9, 8, -1, 1), (8, h - 9, 1, -1), (w - 9, h - 9, -1, -1)):
+        d.line([px(cx), px(cy), px(cx + sx * tl), px(cy)], fill=PAGE_INK, width=max(1, s))
+        d.line([px(cx), px(cy), px(cx), px(cy + sy * tl)], fill=PAGE_INK, width=max(1, s))
+
+    # stand: foot, post, pivot cap
+    d.rectangle([px(px_x - 62), px(base_y), px(px_x + 62), px(base_y + 12)],
+                fill=STAND_INK)
+    d.polygon(
+        [
+            (px(px_x - 9), px(px_y + 4)),
+            (px(px_x + 9), px(px_y + 4)),
+            (px(px_x + 30), px(base_y)),
+            (px(px_x - 30), px(base_y)),
+        ],
+        fill=STAND_INK,
+    )
+    d.ellipse([px(px_x - 11), px(px_y - 11), px(px_x + 11), px(px_y + 11)], fill=STAND_INK)
+
+    # beam
+    d.line([px(left_end[0]), px(left_end[1]), px(right_end[0]), px(right_end[1])],
+           fill=STAND_INK, width=int(px(7)))
+
+    # cords and pans
+    for end, centre in ((left_end, left_c), (right_end, right_c)):
+        pan_top = centre[1] - PAN_H / 2.0
+        for sign in (-1.0, 1.0):
+            d.line(
+                [px(end[0]), px(end[1]), px(centre[0] + sign * pan_w * 0.38), px(pan_top)],
+                fill=STAND_INK,
+                width=max(1, int(px(2.4))),
+            )
+        d.polygon(
+            [
+                (px(centre[0] - pan_w / 2.0), px(pan_top)),
+                (px(centre[0] + pan_w / 2.0), px(pan_top)),
+                (px(centre[0] + pan_w / 2.0 - 7), px(pan_top + PAN_H)),
+                (px(centre[0] - pan_w / 2.0 + 7), px(pan_top + PAN_H)),
+            ],
+            fill=PAN_INK,
+        )
+
+    # blocks standing on each pan
+    for centre, count, colour in (
+        (left_c, int(scene["left_count"]), tuple(scene["left_color"])),
+        (right_c, int(scene["right_count"]), tuple(scene["right_color"])),
+    ):
+        _draw_blocks(d, px, centre, count, float(scene["block_size"]), colour, pan_w)
+
+    return img.resize((w, h), Image.LANCZOS)
+
+
+def _draw_blocks(d, px, centre, count: int, size: float, colour, pan_w: float) -> None:
+    """A single row of coloured blocks resting on the pan's top edge."""
+    if count <= 0:
+        return
+    gap = 4.0
+    per_row = max(1, min(count, int((pan_w - 6.0) // (size + gap))))
+    rows = []
+    left_over = count
+    while left_over > 0:
+        take = min(per_row, left_over)
+        rows.append(take)
+        left_over -= take
+    top_of_pan = centre[1] - PAN_H / 2.0
+    for r, n in enumerate(rows):
+        span = n * size + (n - 1) * gap
+        x0 = centre[0] - span / 2.0
+        y1 = top_of_pan - r * (size + 2.0)
+        y0 = y1 - size
+        for i in range(n):
+            bx = x0 + i * (size + gap)
+            d.rectangle([px(bx), px(y0), px(bx + size), px(y1)], fill=colour)
+
+
+def ink_pixels(image: Image.Image) -> int:
+    """Diagnostic: how much non-white ink the page carries."""
+    import numpy as np
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    return int((arr.min(axis=-1) < 235).sum())

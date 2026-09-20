@@ -1,0 +1,169 @@
+"""Independent pixel-only inverse arm for the shuffled compass dial.
+
+The inverse receives one RGB raster. It segments the four dark glyph components,
+recognizes each normalized glyph against independently produced font exemplars,
+finds the visible red hub by color and connectedness, and recomputes the angular
+ranking. No latent data, file name, metadata, or generating module is consulted.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+FONT_NAME = "DejaVuSans-Bold.ttf"
+GLYPHS = ("N", "E", "S", "W")
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[dict] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y0, x0)])
+        seen[y0, x0] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        ys = np.fromiter((p[0] for p in pixels), dtype=np.int32)
+        xs = np.fromiter((p[1] for p in pixels), dtype=np.int32)
+        found.append(
+            {
+                "area": len(pixels),
+                "x0": int(xs.min()),
+                "x1": int(xs.max()) + 1,
+                "y0": int(ys.min()),
+                "y1": int(ys.max()) + 1,
+                "cx": float((xs.min() + xs.max() + 1) / 2.0),
+                "cy": float((ys.min() + ys.max() + 1) / 2.0),
+            }
+        )
+    return found
+
+
+def _normalized(mask: np.ndarray, box: dict) -> np.ndarray:
+    crop = mask[box["y0"] : box["y1"], box["x0"] : box["x1"]]
+    image = Image.fromarray((crop.astype(np.uint8) * 255), mode="L")
+    return np.asarray(image.resize((64, 64), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+
+
+def _reference_glyph(label: str) -> np.ndarray:
+    canvas = Image.new("L", (140, 140), 0)
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.truetype(FONT_NAME, size=88)
+    draw.text((15, 8), label, fill=255, font=font)
+    arr = np.asarray(canvas) > 120
+    points = np.argwhere(arr)
+    box = {
+        "y0": int(points[:, 0].min()),
+        "y1": int(points[:, 0].max()) + 1,
+        "x0": int(points[:, 1].min()),
+        "x1": int(points[:, 1].max()) + 1,
+    }
+    return _normalized(arr, box)
+
+
+REFERENCES = {label: _reference_glyph(label) for label in GLYPHS}
+
+
+def _recognize(glyph: np.ndarray) -> tuple[str, float]:
+    errors = sorted(
+        ((float(np.mean(np.abs(glyph - reference))), label) for label, reference in REFERENCES.items()),
+        key=lambda item: (item[0], item[1]),
+    )
+    gap = errors[1][0] - errors[0][0]
+    if errors[0][0] > 0.24 or gap < 0.025:
+        raise ValueError(
+            f"glyph is not confidently recognized: best={errors[0][1]} "
+            f"error={errors[0][0]:.3f} gap={gap:.3f}"
+        )
+    return errors[0][1], gap
+
+
+def _angular_error(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def measure_from_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    # All label palettes are near-black; ring and background colors have at least
+    # one channel above this conservative threshold.
+    ink = np.max(arr, axis=2) < 95
+    candidates = []
+    for component in _components(ink):
+        width = component["x1"] - component["x0"]
+        height = component["y1"] - component["y0"]
+        if component["area"] >= 350 and 28 <= width <= 95 and 36 <= height <= 82:
+            candidates.append(component)
+    if len(candidates) != 4:
+        raise ValueError(f"expected four isolated printed glyphs, found {len(candidates)}")
+
+    recognized: dict[str, dict] = {}
+    recognition_gaps = []
+    for component in candidates:
+        label, class_gap = _recognize(_normalized(ink, component))
+        if label in recognized:
+            raise ValueError(f"duplicate recognized label {label}")
+        recognized[label] = component
+        recognition_gaps.append(class_gap)
+    if set(recognized) != set(GLYPHS):
+        raise ValueError(f"recognized labels are {sorted(recognized)}")
+
+    red = (
+        (arr[:, :, 0] > 165)
+        & (arr[:, :, 1] < 135)
+        & (arr[:, :, 2] < 125)
+        & ((arr[:, :, 0] - arr[:, :, 1]) > 55)
+    )
+    hubs = [component for component in _components(red) if 180 <= component["area"] <= 900]
+    if len(hubs) != 1:
+        raise ValueError(f"expected one visible red center, found {len(hubs)}")
+    hub = hubs[0]
+    center_x, center_y = hub["cx"], hub["cy"]
+
+    angles = {
+        label: math.degrees(
+            math.atan2(component["cy"] - center_y, component["cx"] - center_x)
+        )
+        % 360.0
+        for label, component in recognized.items()
+    }
+    antipode = (angles["N"] + 180.0) % 360.0
+    ranked = sorted(
+        ((_angular_error(angles[label], antipode), label) for label in ("E", "S", "W")),
+        key=lambda item: (item[0], item[1]),
+    )
+    runner_gap = float(ranked[1][0] - ranked[0][0])
+    if runner_gap < 12.0:
+        raise ValueError(f"ambiguous angular ranking: runner-up gap {runner_gap:.2f} degrees")
+    return {
+        "decision": ranked[0][1],
+        "margin": runner_gap,
+        "angles": angles,
+        "center": [center_x, center_y],
+        "recognition_gap": float(min(recognition_gaps)),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure_from_image(image)["decision"])

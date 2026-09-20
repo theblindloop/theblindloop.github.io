@@ -1,0 +1,110 @@
+"""Independent pixel-only inverse for the connected pulse trace.
+
+The oracle sees only the final RGB image. It finds the single navy connected
+component, estimates its local baseline from the component bounds, samples the
+four pulse apices in each of the three public lanes, applies the declared
+vertical flip to candidates, and compares complete sequences.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_NAVY = np.asarray((27, 84, 140), dtype=np.float32)
+_LANE_STEP = 39
+_PULSE_OFFSETS = (7, 14, 21, 28)
+_PULSE_HALF_SAMPLE = 2
+_MIN_COMPONENT_AREA = 500
+
+
+def _navy_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    distance = np.sqrt(np.sum((array - _NAVY) ** 2, axis=2))
+    return distance < 92.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= _MIN_COMPONENT_AREA:
+            component = np.zeros_like(mask, dtype=bool)
+            ys, xs = zip(*points, strict=True)
+            component[np.asarray(ys), np.asarray(xs)] = True
+            components.append(component)
+    return components
+
+
+def _pulse_bits(component: np.ndarray) -> list[int]:
+    ys, xs = np.nonzero(component)
+    if len(ys) == 0:
+        raise ValueError("navy trace is empty")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    if not 105 <= width <= 125:
+        raise ValueError("connected trace has an unexpected width")
+    if not 17 <= height <= 35:
+        raise ValueError("connected trace has an unexpected height")
+    baseline = (float(y0) + float(y1)) / 2.0
+    lanes: list[list[int]] = []
+    for lane in range(3):
+        lane_start = x0 + lane * _LANE_STEP
+        bits: list[int] = []
+        for offset in _PULSE_OFFSETS:
+            sample_x = int(round(lane_start + offset))
+            left = max(0, sample_x - _PULSE_HALF_SAMPLE)
+            right = min(component.shape[1], sample_x + _PULSE_HALF_SAMPLE + 1)
+            sample_points = np.argwhere(component[:, left:right])
+            if len(sample_points) < 3:
+                raise ValueError("pulse sample is missing")
+            median_y = float(np.median(sample_points[:, 0]))
+            if abs(median_y - baseline) < 3.0:
+                raise ValueError("pulse direction is ambiguous")
+            bits.append(1 if median_y < baseline else 0)
+        if sum(bits) != 2:
+            raise ValueError("lane does not contain the balanced two-up/two-down signature")
+        lanes.append(bits)
+    return [*lanes[0], *lanes[1], *lanes[2]]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return A or B from a complete raster, raising on an incomplete cue."""
+
+    mask = _navy_mask(image)
+    components = _components(mask)
+    if len(components) != 1:
+        raise ValueError("image must contain exactly one complete navy trace")
+    values = _pulse_bits(components[0])
+    reference = values[0:4]
+    candidate_a = values[4:8]
+    candidate_b = values[8:12]
+    transformed_a = [1 - value for value in candidate_a]
+    transformed_b = [1 - value for value in candidate_b]
+    score_a = sum(int(left == right) for left, right in zip(reference, transformed_a, strict=True))
+    score_b = sum(int(left == right) for left, right in zip(reference, transformed_b, strict=True))
+    if score_a == score_b:
+        raise ValueError("candidate pulse sequences are tied")
+    return "A" if score_a > score_b else "B"

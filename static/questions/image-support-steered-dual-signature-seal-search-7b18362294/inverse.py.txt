@@ -1,0 +1,178 @@
+"""Independent RGB-only inverse for local hole-and-notch conjunctions."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+SECTORS = ("NW", "NE", "SW", "SE")
+MIN_COMPONENT_AREA = 4000
+MIN_HOLE_AREA = 300
+NOTCH_PENETRATION = 14
+
+
+def _background_color(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:3].reshape(-1, 3),
+            array[-3:].reshape(-1, 3),
+            array[:, :3].reshape(-1, 3),
+            array[:, -3:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    values, counts = np.unique(border, axis=0, return_counts=True)
+    return values[int(np.argmax(counts))]
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in (
+                (cy - 1, cx),
+                (cy + 1, cx),
+                (cy, cx - 1),
+                (cy, cx + 1),
+                (cy - 1, cx - 1),
+                (cy - 1, cx + 1),
+                (cy + 1, cx - 1),
+                (cy + 1, cx + 1),
+            ):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            found.append(np.asarray(points, dtype=np.int32))
+    return found
+
+
+def _edge_reachable(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    queue: deque[tuple[int, int]] = deque()
+    for x in range(width):
+        for y in (0, height - 1):
+            if mask[y, x] and not seen[y, x]:
+                seen[y, x] = True
+                queue.append((y, x))
+    for y in range(height):
+        for x in (0, width - 1):
+            if mask[y, x] and not seen[y, x]:
+                seen[y, x] = True
+                queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                seen[ny, nx] = True
+                queue.append((ny, nx))
+    return seen
+
+
+def _component_box(points: np.ndarray) -> tuple[int, int, int, int]:
+    ys = points[:, 0]
+    xs = points[:, 1]
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _local_reachable(background: np.ndarray, box: tuple[int, int, int, int]) -> tuple[np.ndarray, tuple[int, int]]:
+    """Flood-fill only a padded crop around one candidate component."""
+
+    x0, y0, x1, y1 = box
+    pad = 10
+    left, top = max(0, x0 - pad), max(0, y0 - pad)
+    right = min(background.shape[1] - 1, x1 + pad)
+    bottom = min(background.shape[0] - 1, y1 + pad)
+    local = background[top : bottom + 1, left : right + 1]
+    return _edge_reachable(local), (left, top)
+
+
+def _has_hole(component: np.ndarray, background: np.ndarray) -> tuple[bool, np.ndarray, tuple[int, int]]:
+    x0, y0, x1, y1 = _component_box(component)
+    reachable, origin = _local_reachable(background, (x0, y0, x1, y1))
+    left, top = origin
+    local_background = background[top : top + reachable.shape[0], left : left + reachable.shape[1]]
+    enclosed = local_background & ~reachable
+    inner = enclosed[max(0, y0 - top) : y1 - top + 1, max(0, x0 - left) : x1 - left + 1]
+    return any(len(part) >= MIN_HOLE_AREA for part in _components(inner, MIN_HOLE_AREA)), reachable, origin
+
+
+def _has_notch(component: np.ndarray, reachable_background: np.ndarray, origin: tuple[int, int]) -> bool:
+    """Detect an exterior background channel penetrating a local side."""
+
+    x0, y0, x1, y1 = _component_box(component)
+    left, top = origin
+    x0, x1 = x0 - left, x1 - left
+    y0, y1 = y0 - top, y1 - top
+    cx = int(round(float(component[:, 1].mean())))
+    cy = int(round(float(component[:, 0].mean())))
+    half_band = max(3, min(8, (x1 - x0) // 12))
+    probes: list[int] = []
+
+    def longest_run(values: np.ndarray) -> int:
+        best = current = 0
+        for value in values.tolist():
+            if bool(value):
+                current += 1
+                best = max(best, current)
+            else:
+                current = 0
+        return best
+
+    # A valid notch is a channel from one of the four exterior sides into the
+    # component's interior. An enclosed hole is excluded by reachable_background.
+    cy -= top
+    cx -= left
+    for y in range(max(0, cy - half_band), min(reachable_background.shape[0], cy + half_band + 1)):
+        row = reachable_background[y]
+        inside = row[max(0, x0) : min(reachable_background.shape[1], x1 + 1)]
+        probes.append(longest_run(inside))
+    for x in range(max(0, cx - half_band), min(reachable_background.shape[1], cx + half_band + 1)):
+        column = reachable_background[:, x]
+        inside = column[max(0, y0) : min(reachable_background.shape[0], y1 + 1)]
+        probes.append(longest_run(inside))
+    # Only the component bounding box is inspected, so exterior background
+    # outside the medallion cannot masquerade as an inward channel.
+    return bool(probes and max(probes) >= NOTCH_PENETRATION + 12)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the quadrant of the unique component with both visible attributes."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 32:
+        raise ValueError("expected a sufficiently large RGB image")
+    background_color = _background_color(array)
+    background = np.all(array == background_color, axis=2)
+    ink = ~background
+    components = _components(ink, MIN_COMPONENT_AREA)
+    if not components:
+        raise ValueError("no complete medallion component found")
+    height, width = ink.shape
+    dual: list[str] = []
+    for component in components:
+        has_hole, reachable, origin = _has_hole(component, background)
+        has_notch = _has_notch(component, reachable, origin)
+        if not (has_hole and has_notch):
+            continue
+        mean_x = float(component[:, 1].mean())
+        mean_y = float(component[:, 0].mean())
+        sector = ("N" if mean_y < height / 2 else "S") + ("W" if mean_x < width / 2 else "E")
+        if sector in SECTORS:
+            dual.append(sector)
+    if len(dual) != 1:
+        raise ValueError(f"expected one dual-signature medallion, found {dual}")
+    return dual[0]

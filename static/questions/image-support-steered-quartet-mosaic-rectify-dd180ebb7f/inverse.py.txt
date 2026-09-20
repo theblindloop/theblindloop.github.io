@@ -1,0 +1,207 @@
+"""Independent pixel-only inverse for four rectified mosaic cards."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+MOSAIC_SIZE = 16
+QUADRANT_SIZE = 8
+INK_U0 = 0.18
+INK_U1 = 0.82
+
+
+def _diamond() -> tuple[tuple[int, ...], ...]:
+    rows = (
+        "................",
+        ".......##.......",
+        "......####......",
+        ".....##..##.....",
+        "....##....##....",
+        "...##......##...",
+        "..##........##..",
+        ".##..........##.",
+        ".##..........##.",
+        "..##........##..",
+        "...##......##...",
+        "....##....##....",
+        ".....##..##.....",
+        "......####......",
+        ".......##.......",
+        "................",
+    )
+    return tuple(tuple(int(char == "#") for char in row) for row in rows)
+
+
+def _cross() -> tuple[tuple[int, ...], ...]:
+    cells: set[tuple[int, int]] = set()
+    for row in range(2, 14):
+        cells.update({(row, 7), (row, 8)})
+    for column in range(2, 14):
+        cells.update({(7, column), (8, column)})
+    cells.update({(2, 2), (2, 13), (13, 2), (13, 13)})
+    cells.update({(1, 7), (1, 8), (14, 7), (14, 8)})
+    return tuple(
+        tuple(int((row, column) in cells) for column in range(MOSAIC_SIZE))
+        for row in range(MOSAIC_SIZE)
+    )
+
+
+DIAMOND = _diamond()
+CROSS = _cross()
+TEMPLATES = {"diamond": DIAMOND, "cross": CROSS}
+
+
+def _gold_mask(array: np.ndarray) -> np.ndarray:
+    red, green, blue = [array[:, :, index].astype(np.int16) for index in range(3)]
+    return (red > 155) & (green > 105) & (blue < 125) & (red - green > 32) & (green - blue > 28)
+
+
+def _components(mask: np.ndarray, minimum: int = 25) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if visited[y, x]:
+            continue
+        stack = [(y, x)]
+        visited[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            output.append(np.asarray(pixels, dtype=np.float64))
+    return output
+
+
+def _fiducials(array: np.ndarray) -> list[np.ndarray]:
+    components = _components(_gold_mask(array))
+    if len(components) != 16:
+        raise ValueError(f"expected sixteen corner fiducials, found {len(components)}")
+    return [component.mean(axis=0)[::-1] for component in components]
+
+
+def _group_cards(points: list[np.ndarray]) -> dict[tuple[int, int], list[np.ndarray]]:
+    values = np.asarray(points, dtype=float)
+    x_mid = float(np.median(values[:, 0]))
+    y_mid = float(np.median(values[:, 1]))
+    groups: dict[tuple[int, int], list[np.ndarray]] = {(0, 0): [], (0, 1): [], (1, 0): [], (1, 1): []}
+    for point in points:
+        column = int(float(point[0]) >= x_mid)
+        row = int(float(point[1]) >= y_mid)
+        groups[(row, column)].append(point)
+    if any(len(group) != 4 for group in groups.values()):
+        raise ValueError("corner fiducials do not form four compass cards")
+    return groups
+
+
+def _ordered_corners(points: list[np.ndarray]) -> list[tuple[float, float]]:
+    def xy(point: np.ndarray) -> tuple[float, float]:
+        return float(point[0]), float(point[1])
+
+    top_left = min(points, key=lambda point: float(point[0] + point[1]))
+    bottom_right = max(points, key=lambda point: float(point[0] + point[1]))
+    top_right = max(points, key=lambda point: float(point[0] - point[1]))
+    bottom_left = min(points, key=lambda point: float(point[0] - point[1]))
+    ordered = [xy(top_left), xy(top_right), xy(bottom_right), xy(bottom_left)]
+    if len({(round(x, 3), round(y, 3)) for x, y in ordered}) != 4:
+        raise ValueError("card corner ordering is ambiguous")
+    return ordered
+
+
+def _homography(corners: list[tuple[float, float]]) -> np.ndarray:
+    source = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+    matrix: list[list[float]] = []
+    target: list[float] = []
+    for (u, v), (x, y) in zip(source, corners):
+        matrix.append([u, v, 1.0, 0.0, 0.0, 0.0, -x * u, -x * v])
+        target.append(x)
+        matrix.append([0.0, 0.0, 0.0, u, v, 1.0, -y * u, -y * v])
+        target.append(y)
+    values = np.linalg.solve(np.asarray(matrix, dtype=float), np.asarray(target, dtype=float))
+    return np.asarray(
+        [[values[0], values[1], values[2]], [values[3], values[4], values[5]], [values[6], values[7], 1.0]],
+        dtype=float,
+    )
+
+
+def _map_point(h: np.ndarray, u: float, v: float) -> tuple[float, float]:
+    value = h @ np.asarray([u, v, 1.0], dtype=float)
+    return float(value[0] / value[2]), float(value[1] / value[2])
+
+
+def _ink_mask(array: np.ndarray) -> np.ndarray:
+    red, green, blue = [array[:, :, index].astype(np.int16) for index in range(3)]
+    return (red > 145) & (red - green > 42) & (red - blue > 35)
+
+
+def _sample(mask: np.ndarray, x: float, y: float) -> float:
+    height, width = mask.shape
+    ix, iy = int(round(x)), int(round(y))
+    x0, x1 = max(0, ix - 1), min(width, ix + 2)
+    y0, y1 = max(0, iy - 1), min(height, iy + 2)
+    if x0 >= x1 or y0 >= y1:
+        return 0.0
+    return float(mask[y0:y1, x0:x1].mean())
+
+
+def _read_card(mask: np.ndarray, corners: list[tuple[float, float]]) -> tuple[tuple[int, ...], ...]:
+    h = _homography(corners)
+    bits: list[tuple[int, ...]] = []
+    for row in range(QUADRANT_SIZE):
+        values: list[int] = []
+        for column in range(QUADRANT_SIZE):
+            u = INK_U0 + (INK_U1 - INK_U0) * (column + 0.5) / QUADRANT_SIZE
+            v = INK_U0 + (INK_U1 - INK_U0) * (row + 0.5) / QUADRANT_SIZE
+            x, y = _map_point(h, u, v)
+            confidence = _sample(mask, x, y)
+            if 0.25 < confidence < 0.75:
+                raise ValueError("rectified raster cell is unclear")
+            values.append(int(confidence >= 0.5))
+        bits.append(tuple(values))
+    return tuple(bits)
+
+
+def _assemble(cards: dict[tuple[int, int], tuple[tuple[int, ...], ...]]) -> tuple[tuple[int, ...], ...]:
+    rows: list[tuple[int, ...]] = []
+    for card_row in (0, 1):
+        for local_row in range(QUADRANT_SIZE):
+            rows.append(cards[(card_row, 0)][local_row] + cards[(card_row, 1)][local_row])
+    return tuple(rows)
+
+
+def _score(observed: tuple[tuple[int, ...], ...], template: tuple[tuple[int, ...], ...]) -> int:
+    return sum(a != b for row_a, row_b in zip(observed, template) for a, b in zip(row_a, row_b))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the symbol using only visible pixels and the declared geometry."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or array.shape[1] < 128:
+        raise ValueError("invalid raster")
+    points = _fiducials(array)
+    groups = _group_cards(points)
+    mask = _ink_mask(array)
+    cards = {
+        key: _read_card(mask, _ordered_corners(value))
+        for key, value in groups.items()
+    }
+    mosaic = _assemble(cards)
+    scores = {name: _score(mosaic, template) for name, template in TEMPLATES.items()}
+    ranked = sorted(scores.items(), key=lambda item: item[1])
+    best, runner = ranked[0], ranked[1]
+    if best[1] > 28 or runner[1] - best[1] < 8:
+        raise ValueError("mosaic template margin is ambiguous")
+    return best[0]

@@ -1,0 +1,156 @@
+"""Independent pixel-only inverse for two shape-marked seven-slot rulers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+N = 7
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _bbox(points: np.ndarray) -> tuple[int, int, int, int]:
+    return (
+        int(points[:, 1].min()), int(points[:, 0].min()),
+        int(points[:, 1].max()), int(points[:, 0].max()),
+    )
+
+
+def _grid(rows: list[int], cols: list[int]) -> np.ndarray:
+    result = np.zeros((N, N), dtype=np.uint8)
+    result[rows, :] = 1
+    result[:, cols] = 1
+    return result
+
+
+def _template_scores(rows: list[int], cols: list[int]) -> dict[str, int]:
+    observed = _grid(rows, cols)
+    variants = {
+        "plus": [_grid([3], [3])],
+        "tee": [_grid([0], [3]), _grid([6], [3]), _grid([3], [0]), _grid([3], [6])],
+        "corner": [_grid([r], [c]) for r in (0, 6) for c in (0, 6)],
+    }
+    return {name: min(int(np.count_nonzero(observed != item)) for item in items)
+            for name, items in variants.items()}
+
+
+@dataclass(frozen=True)
+class PixelMeasurement:
+    row_slots: tuple[int, ...]
+    column_slots: tuple[int, ...]
+    scores: dict[str, int]
+    decision: str
+    runner_up_margin: float
+
+
+def _parse_card(array: np.ndarray, bounds: tuple[int, int, int, int]) -> tuple[str, int]:
+    x0, y0, x1, y1 = bounds
+    crop = array[y0:y1 + 1, x0:x1 + 1]
+    h, w = crop.shape[:2]
+    long_horizontal = w > h
+    long_side, short_side = (w, h) if long_horizontal else (h, w)
+    if not (92 <= long_side <= 118 and 46 <= short_side <= 62):
+        raise OracleError(f"malformed ruler extent {(w, h)}")
+
+    high = crop.max(axis=2).astype(np.int16)
+    low = crop.min(axis=2).astype(np.int16)
+    chroma = high - low
+    saturated = (chroma > 55) & (high > 105)
+    colored = [part for part in _components(saturated) if len(part) >= 18]
+    if len(colored) != 2:
+        raise OracleError(f"ruler must expose one marker and one tab, found {len(colored)}")
+    shapes = []
+    for part in colored:
+        bx0, by0, bx1, by1 = _bbox(part)
+        bw, bh = bx1 - bx0 + 1, by1 - by0 + 1
+        shapes.append((max(bw, bh) / max(1, min(bw, bh)), part, (bx0, by0, bx1, by1)))
+    shapes.sort(key=lambda item: item[0])
+    marker, tab = shapes[0], shapes[1]
+    if marker[0] > 1.55 or tab[0] < 1.55:
+        raise OracleError("cannot distinguish marker from active tab")
+    mb = marker[2]
+    mcx, mcy = (mb[0] + mb[2]) // 2, (mb[1] + mb[3]) // 2
+    role = "column" if saturated[mcy, mcx] else "row"
+
+    rgb = crop.astype(np.int16)
+    dark = ((rgb.max(axis=2) - rgb.min(axis=2)) < 30) & (rgb.mean(axis=2) < 125)
+    slots = []
+    for part in _components(dark):
+        bx0, by0, bx1, by1 = _bbox(part)
+        bw, bh = bx1 - bx0 + 1, by1 - by0 + 1
+        short, long = min(bw, bh), max(bw, bh)
+        if 6 <= short <= 12 and 19 <= long <= 29 and len(part) >= 35:
+            slots.append(((bx0 + bx1) / 2.0, (by0 + by1) / 2.0))
+    if len(slots) != N:
+        raise OracleError(f"expected seven visible slot outlines, found {len(slots)}")
+    slots.sort(key=(lambda p: p[0]) if long_horizontal else (lambda p: p[1]))
+    tab_part = tab[1]
+    tab_center = (float(tab_part[:, 1].mean()), float(tab_part[:, 0].mean()))
+    distances = [float(np.hypot(tab_center[0] - sx, tab_center[1] - sy)) for sx, sy in slots]
+    index = int(np.argmin(distances))
+    if distances[index] > 3.0:
+        raise OracleError("active tab is not centered in a visible slot")
+    # Slot order can reverse after image rotation; all public hypotheses treat the
+    # two edges symmetrically, so canonicalize that visible reversal.
+    index = min(index, N - 1 - index)
+    return role, index
+
+
+def measure_from_image(image: Image.Image) -> PixelMeasurement:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    border = np.concatenate((array[:3].reshape(-1, 3), array[-3:].reshape(-1, 3),
+                             array[:, :3].reshape(-1, 3), array[:, -3:].reshape(-1, 3)))
+    background = np.median(border, axis=0)
+    foreground = np.max(np.abs(array.astype(np.int16) - background.astype(np.int16)), axis=2) > 12
+    cards = []
+    for part in _components(foreground):
+        if len(part) < 1500:
+            continue
+        bounds = _bbox(part)
+        w, h = bounds[2] - bounds[0] + 1, bounds[3] - bounds[1] + 1
+        if max(w, h) >= 88 and min(w, h) >= 40:
+            cards.append(bounds)
+    if len(cards) != 2:
+        raise OracleError(f"expected two detached ruler cards, found {len(cards)}")
+    decoded = [_parse_card(array, bounds) for bounds in cards]
+    roles = {role: index for role, index in decoded}
+    if set(roles) != {"row", "column"}:
+        raise OracleError("circle and triangle ruler roles are not both visible")
+    scores = _template_scores([roles["row"]], [roles["column"]])
+    ordered = sorted((value, name) for name, value in scores.items())
+    decision = "ambiguous" if ordered[0][0] == ordered[1][0] else ordered[0][1]
+    return PixelMeasurement(
+        row_slots=(roles["row"],), column_slots=(roles["column"],), scores=scores,
+        decision=decision, runner_up_margin=float(ordered[1][0] - ordered[0][0]),
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure_from_image(image).decision

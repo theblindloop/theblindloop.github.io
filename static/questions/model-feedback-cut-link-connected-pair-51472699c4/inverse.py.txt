@@ -1,0 +1,157 @@
+"""Independent image-only inverse for the cut-link connectivity task."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "background": (250, 248, 244),
+    "ink": (43, 48, 56),
+    "joint": (218, 230, 241),
+    "cut": (205, 47, 63),
+    "amber": (232, 156, 37),
+    "cyan": (31, 163, 190),
+    "violet": (132, 79, 188),
+}
+COLOR_NAMES = ("amber", "cyan", "violet")
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _mask(arr: np.ndarray, color: tuple[int, int, int], tolerance: int = 14) -> np.ndarray:
+    target = np.asarray(color, dtype=np.int16)
+    return np.max(np.abs(arr.astype(np.int16) - target), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    remaining = set(map(tuple, np.argwhere(mask)))
+    found: list[np.ndarray] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        points = [start]
+        while stack:
+            y, x = stack.pop()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                ny, nx = neighbor
+                if 0 <= ny < height and 0 <= nx < width and neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+                    points.append(neighbor)
+        if len(points) >= minimum:
+            found.append(np.asarray(points, dtype=np.float64))
+    return found
+
+
+def _centers(arr: np.ndarray) -> tuple[list[dict], tuple[float, float]]:
+    nodes: list[dict] = []
+    for color in COLOR_NAMES:
+        parts = _components(_mask(arr, PALETTE[color]), 180)
+        if len(parts) != 2:
+            raise OracleError(f"expected two {color} terminals, found {len(parts)}")
+        for part in parts:
+            y, x = part.mean(axis=0)
+            nodes.append({"point": (float(x), float(y)), "color": color})
+    joints = _components(_mask(arr, PALETTE["joint"]), 90)
+    if len(joints) != 19:
+        raise OracleError(f"expected nineteen pale junctions, found {len(joints)}")
+    for part in joints:
+        y, x = part.mean(axis=0)
+        nodes.append({"point": (float(x), float(y)), "color": None})
+    cut_parts = _components(_mask(arr, PALETTE["cut"], 18), 130)
+    if len(cut_parts) != 1:
+        raise OracleError(f"expected one red X, found {len(cut_parts)}")
+    y, x = cut_parts[0].mean(axis=0)
+    return nodes, (float(x), float(y))
+
+
+def _coverage(mask: np.ndarray, a: tuple[float, float], b: tuple[float, float]) -> float:
+    ax, ay = a
+    bx, by = b
+    ts = np.linspace(0.19, 0.81, 64)
+    xs = ax + ts * (bx - ax)
+    ys = ay + ts * (by - ay)
+    hits = 0
+    height, width = mask.shape
+    for x, y in zip(xs, ys):
+        ix, iy = int(round(x)), int(round(y))
+        x0, x1 = max(0, ix - 3), min(width, ix + 4)
+        y0, y1 = max(0, iy - 3), min(height, iy + 4)
+        hits += bool(mask[y0:y1, x0:x1].any())
+    return hits / len(ts)
+
+
+def _recover_edges(arr: np.ndarray, nodes: list[dict]) -> list[tuple[int, int]]:
+    line_mask = _mask(arr, PALETTE["ink"], 24) | _mask(arr, PALETTE["cut"], 24)
+    edges: list[tuple[int, int]] = []
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            ax, ay = nodes[i]["point"]
+            bx, by = nodes[j]["point"]
+            dx, dy = abs(bx - ax), abs(by - ay)
+            distance = float(np.hypot(dx, dy))
+            if 96.0 < distance < 124.0 and (dx < 6.0 or dy < 6.0):
+                if _coverage(line_mask, (ax, ay), (bx, by)) >= 0.78:
+                    edges.append((i, j))
+    if len(edges) != 30:
+        raise OracleError(f"expected thirty links, recovered {len(edges)}")
+    return edges
+
+
+def _parts(node_count: int, edges: list[tuple[int, int]], omitted: tuple[int, int] | None = None) -> list[set[int]]:
+    adjacency = {i: [] for i in range(node_count)}
+    for edge in edges:
+        if omitted is not None and edge == omitted:
+            continue
+        a, b = edge
+        adjacency[a].append(b)
+        adjacency[b].append(a)
+    remaining = set(range(node_count))
+    parts: list[set[int]] = []
+    while remaining:
+        start = min(remaining)
+        reached = {start}
+        queue = deque([start])
+        while queue:
+            here = queue.popleft()
+            for neighbor in adjacency[here]:
+                if neighbor not in reached:
+                    reached.add(neighbor)
+                    queue.append(neighbor)
+        parts.append(reached)
+        remaining -= reached
+    return parts
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape[:2] != (640, 640):
+        raise OracleError(f"unexpected image size {image.size}")
+    nodes, cut_center = _centers(arr)
+    edges = _recover_edges(arr, nodes)
+    if len(_parts(len(nodes), edges)) != 1:
+        raise OracleError("uncut network is not connected")
+    ranked = sorted(
+        (float(np.hypot((nodes[a]["point"][0] + nodes[b]["point"][0]) / 2 - cut_center[0],
+                        (nodes[a]["point"][1] + nodes[b]["point"][1]) / 2 - cut_center[1])), (a, b))
+        for a, b in edges
+    )
+    if ranked[0][0] > 8.0 or ranked[1][0] < 35.0:
+        raise OracleError("red X does not identify exactly one link")
+    parts = _parts(len(nodes), edges, ranked[0][1])
+    if len(parts) != 2 or min(map(len, parts)) < 8:
+        raise OracleError("marked link does not yield two substantial components")
+    answers: list[str] = []
+    for color in COLOR_NAMES:
+        pair = [i for i, node in enumerate(nodes) if node["color"] == color]
+        if any(pair[0] in part and pair[1] in part for part in parts):
+            answers.append(color)
+    if len(answers) != 1:
+        raise OracleError(f"expected one connected color pair, found {answers}")
+    return answers[0]

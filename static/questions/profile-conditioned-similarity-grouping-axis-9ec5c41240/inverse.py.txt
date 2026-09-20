@@ -1,0 +1,132 @@
+"""Pixel-only inverse arm for `similarity_grouping_axis`.
+
+Receives a rendered PNG and the public question contract, nothing else. It
+segments ink, labels marks, recovers the lattice, classifies each mark as filled
+or hollow from its own pixels, and compares the average row purity with the
+average column purity. Ambiguous rasters abstain.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "similarity_grouping_axis-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+_CLASSES = ("rows", "columns")
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    threshold = 0.5 * (float(lum.min()) + float(lum.max()))
+    return lum < threshold
+
+
+def _label(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    lab = np.where(mask, np.arange(height * width).reshape(height, width), -1)
+    while True:
+        prev = lab
+        grown = lab.copy()
+        grown[:-1, :] = np.maximum(grown[:-1, :], lab[1:, :])
+        grown[1:, :] = np.maximum(grown[1:, :], lab[:-1, :])
+        grown[:, :-1] = np.maximum(grown[:, :-1], lab[:, 1:])
+        grown[:, 1:] = np.maximum(grown[:, 1:], lab[:, :-1])
+        lab = np.where(mask, grown, -1)
+        if np.array_equal(lab, prev):
+            return lab
+
+
+def _cluster(values: list[float]) -> list[list[int]] | None:
+    """Group indices whose coordinate agrees, using the gap structure itself."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    diffs = [values[order[i + 1]] - values[order[i]] for i in range(len(order) - 1)]
+    big = sorted(d for d in diffs if d > 5.0)
+    if not big:
+        return None
+    threshold = 0.5 * big[len(big) // 2]
+    if threshold < 4.0:
+        return None
+    groups: list[list[int]] = [[order[0]]]
+    for position, index in enumerate(order[1:]):
+        if diffs[position] > threshold:
+            groups.append([])
+        groups[-1].append(index)
+    return groups
+
+
+def measure(image: Image.Image) -> dict:
+    """Full pixel reading: decision, margin and the recovered scores."""
+    mask = _ink_mask(image)
+    if not mask.any():
+        return {"decision": ABSTAIN, "margin": 0.0, "reason": "no ink"}
+    labels = _label(mask)
+    flat = labels.ravel()
+    values, counts = np.unique(flat[flat >= 0], return_counts=True)
+    keep = values[counts >= 40]
+    if len(keep) < 4:
+        return {"decision": ABSTAIN, "margin": 0.0, "reason": "too few marks"}
+
+    height, width = mask.shape
+    ys, xs = np.mgrid[0:height, 0:width]
+    marks = []
+    for value in keep:
+        sel = labels == value
+        area = int(sel.sum())
+        cy = float(ys[sel].mean())
+        cx = float(xs[sel].mean())
+        y0, y1 = int(ys[sel].min()), int(ys[sel].max())
+        x0, x1 = int(xs[sel].min()), int(xs[sel].max())
+        box = max(1, (y1 - y0 + 1) * (x1 - x0 + 1))
+        fill = area / box
+        centre_ink = bool(mask[int(round(cy)), int(round(cx))])
+        # a filled disk covers about 0.79 of its box, a hollow ring about 0.52
+        solid = fill > 0.65
+        if solid != centre_ink:
+            return {"decision": ABSTAIN, "margin": 0.0, "reason": "ambiguous mark"}
+        if 0.60 < fill < 0.71:
+            return {"decision": ABSTAIN, "margin": 0.0, "reason": "ambiguous fill"}
+        marks.append({"cx": cx, "cy": cy, "kind": 1 if solid else 0})
+
+    rows = _cluster([m["cy"] for m in marks])
+    cols = _cluster([m["cx"] for m in marks])
+    if rows is None or cols is None:
+        return {"decision": ABSTAIN, "margin": 0.0, "reason": "no lattice"}
+    size = len(rows)
+    if size != len(cols) or size < 3 or len(marks) != size * size:
+        return {"decision": ABSTAIN, "margin": 0.0, "reason": "lattice mismatch"}
+
+    grid = [[None] * size for _ in range(size)]
+    row_of = {i: r for r, group in enumerate(rows) for i in group}
+    col_of = {i: c for c, group in enumerate(cols) for i in group}
+    for index, mark in enumerate(marks):
+        r, c = row_of[index], col_of[index]
+        if grid[r][c] is not None:
+            return {"decision": ABSTAIN, "margin": 0.0, "reason": "duplicate cell"}
+        grid[r][c] = mark["kind"]
+    if any(cell is None for row in grid for cell in row):
+        return {"decision": ABSTAIN, "margin": 0.0, "reason": "empty cell"}
+
+    row_score = sum(abs(2 * sum(row) - size) / size for row in grid) / size
+    col_score = (
+        sum(abs(2 * sum(grid[r][c] for r in range(size)) - size) / size for c in range(size))
+        / size
+    )
+    if row_score == col_score:
+        return {"decision": ABSTAIN, "margin": 0.0, "reason": "tied scores"}
+    decision = "rows" if row_score > col_score else "columns"
+    return {
+        "decision": decision,
+        "margin": round(abs(row_score - col_score) * 100.0, 6),
+        "row_score": round(row_score, 6),
+        "column_score": round(col_score, 6),
+        "marks": len(marks),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    reading = measure(image)
+    decision = reading["decision"]
+    return decision if decision in _CLASSES else ABSTAIN

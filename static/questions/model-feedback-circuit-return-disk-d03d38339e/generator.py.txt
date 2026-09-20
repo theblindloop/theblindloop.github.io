@@ -1,0 +1,434 @@
+"""Deterministic latent scene, raster, analytic gold and margin.
+
+The black walls carve a square field of cells, but they never seal it: the white
+floor is one single connected room, so every mark can be walked to from every
+other. What differs between the marks is the *cycle structure* of the corridor
+network. A disk is the answer when two routes from the star reach it without
+sharing a single stretch of corridor, i.e. when its cell lies in the same
+two-edge-connected component as the star's cell. Reachability, which decides the
+parent world, is true of all three disks here and therefore decides nothing.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+GRID = 8
+CELL = 80
+ORIGIN = 40
+WALL = 14
+WIDTH = HEIGHT = ORIGIN * 2 + GRID * CELL
+
+DISK_RADIUS = 18
+STAR_RADIUS = 18
+JITTER = 3
+MIN_MARGIN = 11.0
+MIN_ROUTE_STEPS = 5
+EXTRA_PASSAGES = 4
+
+DISK_COLORS = ("red", "gold", "magenta")
+
+PALETTE = {
+    "background": (255, 255, 255),
+    "wall": (0, 0, 0),
+    "start": (0, 90, 220),
+    "red": (220, 30, 30),
+    "gold": (235, 170, 0),
+    "magenta": (190, 0, 150),
+}
+
+
+# --------------------------------------------------------------------------
+# cell helpers
+# --------------------------------------------------------------------------
+def _neighbours(r: int, c: int):
+    if r > 0:
+        yield r - 1, c
+    if r < GRID - 1:
+        yield r + 1, c
+    if c > 0:
+        yield r, c - 1
+    if c < GRID - 1:
+        yield r, c + 1
+
+
+def _edge_key(a, b):
+    return tuple(sorted((tuple(a), tuple(b))))
+
+
+def _cell_centre(cell, jitter=(0, 0)):
+    r, c = cell
+    x = ORIGIN + c * CELL + CELL / 2 + jitter[0]
+    y = ORIGIN + r * CELL + CELL / 2 + jitter[1]
+    return x, y
+
+
+def _passage_set(scene) -> set:
+    return {_edge_key(p[:2], p[2:]) for p in scene["passages"]}
+
+
+def _adjacency(passages) -> dict:
+    graph = {(r, c): [] for r in range(GRID) for c in range(GRID)}
+    for a, b in passages:
+        graph[a].append(b)
+        graph[b].append(a)
+    return graph
+
+
+def _walk_steps(passages, start) -> dict:
+    """Corridor-graph hop count from ``start`` to every reachable cell."""
+    graph = _adjacency(passages)
+    dist = {tuple(start): 0}
+    queue = deque([tuple(start)])
+    while queue:
+        cur = queue.popleft()
+        for nb in graph[cur]:
+            if nb not in dist:
+                dist[nb] = dist[cur] + 1
+                queue.append(nb)
+    return dist
+
+
+# --------------------------------------------------------------------------
+# two-edge-connected structure
+# --------------------------------------------------------------------------
+def _bridges(passages) -> set:
+    """Edges of the corridor graph that lie on no cycle (low-link search).
+
+    The corridor graph is simple, so the tree edge back to a node's parent is
+    the only edge that must be ignored when relaxing low-links.
+    """
+    graph = _adjacency(passages)
+    order: dict = {}
+    low: dict = {}
+    bridges = set()
+    counter = [0]
+
+    def visit(cur, parent):
+        order[cur] = low[cur] = counter[0]
+        counter[0] += 1
+        for nb in graph[cur]:
+            if nb == parent:
+                continue
+            if nb in order:
+                low[cur] = min(low[cur], order[nb])
+                continue
+            visit(nb, cur)
+            low[cur] = min(low[cur], low[nb])
+            if low[nb] > order[cur]:
+                bridges.add(_edge_key(cur, nb))
+
+    for root in sorted(graph):
+        if root not in order:
+            visit(root, None)
+    return bridges
+
+
+def _two_edge_components(passages) -> dict:
+    """Map every cell to the identifier of its two-edge-connected component."""
+    bridges = _bridges(passages)
+    graph = _adjacency(passages)
+    comp: dict = {}
+    for cell in graph:
+        if cell in comp:
+            continue
+        comp[cell] = cell
+        queue = deque([cell])
+        while queue:
+            cur = queue.popleft()
+            for nb in graph[cur]:
+                if nb in comp or _edge_key(cur, nb) in bridges:
+                    continue
+                comp[nb] = cell
+                queue.append(nb)
+    return comp
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _spanning_tree(rng):
+    cells = [(r, c) for r in range(GRID) for c in range(GRID)]
+    root = cells[rng.randrange(len(cells))]
+    tree = []
+    seen = {root}
+    stack = [root]
+    while stack:
+        cur = stack[-1]
+        options = [nb for nb in _neighbours(*cur) if nb not in seen]
+        if not options:
+            stack.pop()
+            continue
+        nxt = options[rng.randrange(len(options))]
+        seen.add(nxt)
+        tree.append(_edge_key(cur, nxt))
+        stack.append(nxt)
+    return tree, seen
+
+
+def _walled_pairs(passage_set):
+    pairs = []
+    for r in range(GRID):
+        for c in range(GRID):
+            for nb in ((r + 1, c), (r, c + 1)):
+                if nb[0] >= GRID or nb[1] >= GRID:
+                    continue
+                if _edge_key((r, c), nb) not in passage_set:
+                    pairs.append(((r, c), nb))
+    return pairs
+
+
+def _attempt(rng, answer_colour):
+    tree, seen = _spanning_tree(rng)
+    if len(seen) != GRID * GRID:
+        return None
+    passage_set = set(tree)
+    for _ in range(EXTRA_PASSAGES):
+        pairs = _walled_pairs(passage_set)
+        if not pairs:
+            return None
+        a, b = pairs[rng.randrange(len(pairs))]
+        passage_set.add(_edge_key(a, b))
+
+    comp = _two_edge_components(passage_set)
+    members: dict = {}
+    for cell, cid in comp.items():
+        members.setdefault(cid, []).append(cell)
+    loops = sorted((cid for cid, cells in members.items() if len(cells) >= 4), key=str)
+    if len(loops) < 2:
+        return None
+
+    rng.shuffle(loops)
+    home, other_loop = loops[0], loops[1]
+    home_cells = sorted(members[home])
+    start_cell = home_cells[rng.randrange(len(home_cells))]
+    steps = _walk_steps(passage_set, start_cell)
+
+    far = [
+        cell
+        for cell in home_cells
+        if cell != start_cell and steps.get(cell, -1) >= MIN_ROUTE_STEPS
+    ]
+    if not far:
+        return None
+    answer_cell = far[rng.randrange(len(far))]
+    sx, sy = _cell_centre(start_cell)
+    ax, ay = _cell_centre(answer_cell)
+    answer_gap = (ax - sx) ** 2 + (ay - sy) ** 2
+
+    # Decoy one: a disk that does lie on a loop of its own, but whose loop hangs
+    # off the star's component across at least one bridge.
+    loop_pool = [
+        cell
+        for cell in sorted(members[other_loop])
+        if (_cell_centre(cell)[0] - sx) ** 2 + (_cell_centre(cell)[1] - sy) ** 2
+        < answer_gap
+    ]
+    if not loop_pool:
+        return None
+    loop_cell = loop_pool[rng.randrange(len(loop_pool))]
+
+    # Decoy two: a disk on a stretch of corridor that lies on no loop at all,
+    # drawn nearer to the star than the answer.
+    degree = {cell: 0 for cell in comp}
+    for a, b in passage_set:
+        degree[a] += 1
+        degree[b] += 1
+    stub_pool = [
+        cell
+        for cid, cells in members.items()
+        for cell in cells
+        if len(cells) == 1
+        and degree[cell] >= 2
+        and (_cell_centre(cell)[0] - sx) ** 2 + (_cell_centre(cell)[1] - sy) ** 2
+        < answer_gap
+    ]
+    if not stub_pool:
+        return None
+    stub_cell = sorted(stub_pool)[rng.randrange(len(stub_pool))]
+
+    used = {start_cell, answer_cell, loop_cell, stub_cell}
+    if len(used) != 4:
+        return None
+
+    # The decision boundary must be a single drawn wall segment: opening it has
+    # to merge the loop decoy's component into the star's own.
+    if not _merging_wall(passage_set, comp, home, other_loop):
+        return None
+
+    others = [colour for colour in DISK_COLORS if colour != answer_colour]
+    rng.shuffle(others)
+    disks = [
+        {"colour": answer_colour, "cell": list(answer_cell)},
+        {"colour": others[0], "cell": list(loop_cell)},
+        {"colour": others[1], "cell": list(stub_cell)},
+    ]
+    for disk in disks:
+        disk["jitter"] = [rng.randint(-JITTER, JITTER), rng.randint(-JITTER, JITTER)]
+    rng.shuffle(disks)
+    return {
+        "grid": GRID,
+        "passages": sorted([list(a) + list(b) for a, b in sorted(passage_set)]),
+        "start": {
+            "cell": list(start_cell),
+            "jitter": [rng.randint(-JITTER, JITTER), rng.randint(-JITTER, JITTER)],
+        },
+        "disks": disks,
+    }
+
+
+def _merging_wall(passage_set, comp, home, other_loop):
+    for a, b in _walled_pairs(passage_set):
+        if {comp[a], comp[b]} == {home, other_loop}:
+            return (a, b)
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    answer_colour = DISK_COLORS[seed % len(DISK_COLORS)]
+    for attempt in range(4000):
+        rng = random.Random((seed + 1) * 1_000_003 + attempt)
+        scene = _attempt(rng, answer_colour)
+        if scene is None:
+            continue
+        if _gold_or_none(scene) != answer_colour:
+            continue
+        if margin(scene) < MIN_MARGIN:
+            continue
+        return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# gold and margin
+# --------------------------------------------------------------------------
+def _gold_or_none(scene):
+    passage_set = _passage_set(scene)
+    steps = _walk_steps(passage_set, scene["start"]["cell"])
+    if any(tuple(d["cell"]) not in steps for d in scene["disks"]):
+        return None  # the floor must be one room: every disk is walkable to
+    comp = _two_edge_components(passage_set)
+    home = comp[tuple(scene["start"]["cell"])]
+    hits = [d["colour"] for d in scene["disks"] if comp[tuple(d["cell"])] == home]
+    return hits[0] if len(hits) == 1 else None
+
+
+def analytic_gold(scene: dict) -> str:
+    decision = _gold_or_none(scene)
+    if decision is None:
+        raise ValueError("scene does not expose exactly one round-trip disk")
+    return decision
+
+
+def _marker_clearance(cell, jitter, radius) -> float:
+    half = (CELL - WALL) / 2.0
+    return min(half - abs(jitter[0]), half - abs(jitter[1])) - radius
+
+
+def margin(scene: dict) -> float:
+    values = [float(WALL), float(CELL - WALL)]
+    values.append(
+        _marker_clearance(scene["start"]["cell"], scene["start"]["jitter"], STAR_RADIUS)
+    )
+    for disk in scene["disks"]:
+        values.append(_marker_clearance(disk["cell"], disk["jitter"], DISK_RADIUS))
+    return float(min(values))
+
+
+def is_quarantined(scene: dict) -> bool:
+    if _gold_or_none(scene) is None:
+        return True
+    return margin(scene) < MIN_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    reversed_passages = {
+        **scene,
+        "passages": [p[2:] + p[:2] for p in reversed(scene["passages"])],
+    }
+    rotated_disks = {**scene, "disks": scene["disks"][1:] + scene["disks"][:1]}
+    return [
+        ("passage_record_order_and_endpoint_order", reversed_passages),
+        ("disk_record_order", rotated_disks),
+    ]
+
+
+def open_boundary(scene: dict) -> dict:
+    """Knock out the one wall segment that puts a second disk on the star's loop."""
+    passage_set = _passage_set(scene)
+    comp = _two_edge_components(passage_set)
+    home = comp[tuple(scene["start"]["cell"])]
+    others = sorted(
+        {comp[tuple(d["cell"])] for d in scene["disks"]} - {home}, key=str
+    )
+    for target in others:
+        found = _merging_wall(passage_set, comp, home, target)
+        if found:
+            (a, b) = found
+            return {
+                **scene,
+                "passages": sorted(scene["passages"] + [list(a) + list(b)]),
+            }
+    raise RuntimeError("no boundary wall found")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _star_points(cx, cy, radius):
+    pts = []
+    for i in range(10):
+        rad = radius if i % 2 == 0 else radius * 0.42
+        angle = -math.pi / 2 + i * math.pi / 5
+        pts.append((cx + rad * math.cos(angle), cy + rad * math.sin(angle)))
+    return pts
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), PALETTE["background"])
+    draw = ImageDraw.Draw(image)
+    half = WALL // 2
+    passages = _passage_set(scene)
+
+    right = ORIGIN + GRID * CELL
+    draw.rectangle([ORIGIN - half, ORIGIN - half, right + half, ORIGIN + half], fill=PALETTE["wall"])
+    draw.rectangle([ORIGIN - half, right - half, right + half, right + half], fill=PALETTE["wall"])
+    draw.rectangle([ORIGIN - half, ORIGIN - half, ORIGIN + half, right + half], fill=PALETTE["wall"])
+    draw.rectangle([right - half, ORIGIN - half, right + half, right + half], fill=PALETTE["wall"])
+
+    for r in range(GRID):
+        for c in range(GRID):
+            for nb in ((r + 1, c), (r, c + 1)):
+                if nb[0] >= GRID or nb[1] >= GRID:
+                    continue
+                if _edge_key((r, c), nb) in passages:
+                    continue
+                if nb[0] == r + 1:
+                    y = ORIGIN + (r + 1) * CELL
+                    x0 = ORIGIN + c * CELL
+                    draw.rectangle(
+                        [x0 - half, y - half, x0 + CELL + half, y + half],
+                        fill=PALETTE["wall"],
+                    )
+                else:
+                    x = ORIGIN + (c + 1) * CELL
+                    y0 = ORIGIN + r * CELL
+                    draw.rectangle(
+                        [x - half, y0 - half, x + half, y0 + CELL + half],
+                        fill=PALETTE["wall"],
+                    )
+
+    for disk in scene["disks"]:
+        cx, cy = _cell_centre(disk["cell"], disk["jitter"])
+        draw.ellipse(
+            [cx - DISK_RADIUS, cy - DISK_RADIUS, cx + DISK_RADIUS, cy + DISK_RADIUS],
+            fill=PALETTE[disk["colour"]],
+        )
+
+    sx, sy = _cell_centre(scene["start"]["cell"], scene["start"]["jitter"])
+    draw.polygon(_star_points(sx, sy, STAR_RADIUS), fill=PALETTE["start"])
+    return image

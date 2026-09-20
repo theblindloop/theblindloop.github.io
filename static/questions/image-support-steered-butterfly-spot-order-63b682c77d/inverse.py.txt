@@ -1,0 +1,122 @@
+"""Independent pixel-only inverse for bilateral butterfly spot order.
+
+The implementation receives only the final raster. It discovers saturated spot
+components, splits them at the largest horizontal gap, orders each side by its
+observed centroid, and compares visible mean colors position by position.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+MIN_COMPONENT_AREA = 470
+MAX_COMPONENT_AREA = 1800
+PAIR_COLOR_THRESHOLD = 45.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for start_y, start_x in np.argwhere(mask):
+        sy, sx = int(start_y), int(start_x)
+        if seen[sy, sx]:
+            continue
+        seen[sy, sx] = True
+        queue = deque([(sy, sx)])
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if MIN_COMPONENT_AREA <= len(points) <= MAX_COMPONENT_AREA:
+            output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _distance(left: np.ndarray, right: np.ndarray) -> float:
+    return float(np.linalg.norm(left.astype(np.float64) - right.astype(np.float64)))
+
+
+def analyze_image(image: Image.Image) -> dict[str, object]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 100:
+        raise ValueError("invalid raster")
+    high = array.max(axis=2).astype(np.int16)
+    low = array.min(axis=2).astype(np.int16)
+    saturated = (high - low >= 72) & (high >= 125) & (low <= 190)
+    components = _components(saturated)
+    if len(components) != 8:
+        raise ValueError(f"expected eight visible colored spots, found {len(components)}")
+
+    records = []
+    for points in components:
+        ys = points[:, 0]
+        xs = points[:, 1]
+        height = int(ys.max() - ys.min() + 1)
+        width = int(xs.max() - xs.min() + 1)
+        if not (0.72 <= width / height <= 1.38):
+            raise ValueError("a colored component is not a resolvable spot")
+        pixels = array[ys, xs].astype(np.float64)
+        # The darkest saturated rim blends are excluded so the mean represents
+        # the flat visible interior rather than antialiasing phase.
+        brightness = pixels.max(axis=1)
+        core = pixels[brightness >= np.percentile(brightness, 45)]
+        records.append(
+            {
+                "x": float(xs.mean()),
+                "y": float(ys.mean()),
+                "color": core.mean(axis=0),
+                "area": int(len(points)),
+            }
+        )
+
+    records.sort(key=lambda item: float(item["x"]))
+    x_gaps = [float(records[i + 1]["x"]) - float(records[i]["x"]) for i in range(7)]
+    split = int(np.argmax(np.asarray(x_gaps))) + 1
+    if split != 4 or x_gaps[3] < array.shape[1] * 0.35:
+        raise ValueError("could not recover two separated four-spot wings")
+    left = sorted(records[:4], key=lambda item: float(item["y"]))
+    right = sorted(records[4:], key=lambda item: float(item["y"]))
+    for side in (left, right):
+        gaps = [float(side[i + 1]["y"]) - float(side[i]["y"]) for i in range(3)]
+        if min(gaps) < 38.0:
+            raise ValueError("spot rows are not visibly ordered")
+
+    # Both sides must visibly contain the same color multiset. This validation
+    # makes erasure or recoloring of any one evidence component an abstention.
+    assignment_costs = []
+    for permutation in itertools.permutations(range(4)):
+        distances = [
+            _distance(left[index]["color"], right[permutation[index]]["color"])
+            for index in range(4)
+        ]
+        assignment_costs.append((max(distances), sum(distances), permutation))
+    assignment_costs.sort(key=lambda item: (item[0], item[1], item[2]))
+    if assignment_costs[0][0] > PAIR_COLOR_THRESHOLD:
+        raise ValueError("the two wings do not contain a common visible color multiset")
+
+    paired_distances = [
+        _distance(left[index]["color"], right[index]["color"]) for index in range(4)
+    ]
+    score = max(paired_distances)
+    decision = "yes" if score <= PAIR_COLOR_THRESHOLD else "no"
+    return {
+        "decision": decision,
+        "runner_up_margin": round(abs(score - PAIR_COLOR_THRESHOLD), 6),
+        "paired_color_distances": [round(value, 6) for value in paired_distances],
+        "component_areas": [int(item["area"]) for item in left + right],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])
+

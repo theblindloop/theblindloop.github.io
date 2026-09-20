@@ -1,0 +1,138 @@
+"""Latent sampler, analytic arm, and raster renderer."""
+
+from __future__ import annotations
+
+import copy
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+SIZE = 512
+BACKGROUND = (248, 246, 239)
+INK = (39, 45, 61)
+OUTER_PALETTES = (((22, 137, 160), (190, 229, 230)), ((45, 104, 177), (199, 218, 242)))
+INNER_PALETTES = (((226, 91, 76), (248, 205, 190)), ((184, 72, 146), (237, 198, 224)))
+
+DIAG = [1, 0, 0, 1]
+ANTI = [0, 1, 1, 0]
+
+TEMPLATES = {
+    "one falling diagonal": np.kron(np.asarray(DIAG).reshape(2, 2), np.asarray(DIAG).reshape(2, 2)),
+    "two rising dashes": np.kron(np.asarray(DIAG).reshape(2, 2), np.asarray(ANTI).reshape(2, 2)),
+    "two falling dashes": np.kron(np.asarray(ANTI).reshape(2, 2), np.asarray(DIAG).reshape(2, 2)),
+    "one rising diagonal": np.kron(np.asarray(ANTI).reshape(2, 2), np.asarray(ANTI).reshape(2, 2)),
+}
+
+
+def sample_scene(seed: int) -> dict:
+    """Cycle labels exactly while randomizing all nuisance fields."""
+
+    rng = random.Random(int(seed))
+    label_index = int(seed) % 4
+    outer = DIAG if label_index in (0, 1) else ANTI
+    inner = DIAG if label_index in (0, 2) else ANTI
+    # Grid-cell centers make the two small decisive chips stable under the
+    # public 8x8 ablation probe while their absolute position still varies.
+    first_x = rng.choice((96, 160, 224, 288))
+    y = rng.choice((96, 160, 224, 288, 352, 416))
+    return {
+        "outer": list(outer),
+        "inner": list(inner),
+        "alias_turns": rng.choice((0, 4)),
+        "origin": [first_x, y],
+        "order": rng.randrange(2),
+        "palette": rng.randrange(2),
+        "decoy_variant": rng.randrange(16),
+    }
+
+
+def _decision(scene: dict) -> str:
+    outer = np.asarray(scene["outer"], dtype=np.uint8).reshape(2, 2)
+    inner = np.asarray(scene["inner"], dtype=np.uint8).reshape(2, 2)
+    product = np.kron(outer, inner)
+    scores = {name: 16 - int(np.count_nonzero(product != template)) for name, template in TEMPLATES.items()}
+    return max(scores, key=scores.get)
+
+
+def analytic_gold(scene: dict) -> str:
+    return _decision(scene)
+
+
+def margin(scene: dict) -> float:
+    outer = np.asarray(scene["outer"], dtype=np.uint8).reshape(2, 2)
+    inner = np.asarray(scene["inner"], dtype=np.uint8).reshape(2, 2)
+    product = np.kron(outer, inner)
+    scores = sorted((16 - int(np.count_nonzero(product != t)) for t in TEMPLATES.values()), reverse=True)
+    return float(scores[0] - scores[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    # Sampling admits only exact, four-cell motifs with a positive template gap.
+    return margin(scene) < 2.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    # Four full quarter-turns are a genuine latent encoding alias.  The renderer
+    # executes it, yet it is pixel-identical and label-preserving.
+    twin = copy.deepcopy(scene)
+    twin["alias_turns"] = 4 if int(scene["alias_turns"]) == 0 else 0
+    return [("four_full_turn_alias", twin)]
+
+
+def _draw_chip(draw: ImageDraw.ImageDraw, center: tuple[int, int], factor: np.ndarray, palette) -> None:
+    dark, pale = palette
+    cx, cy = center
+    cell, gap = 10, 3
+    total = cell * 2 + gap
+    left, top = cx - total // 2, cy - total // 2
+    draw.rounded_rectangle((left - 4, top - 4, left + total + 3, top + total + 3), radius=4, fill=BACKGROUND, outline=dark, width=2)
+    for row in range(2):
+        for col in range(2):
+            x0 = left + col * (cell + gap)
+            y0 = top + row * (cell + gap)
+            fill = dark if int(factor[row, col]) else pale
+            draw.rectangle((x0, y0, x0 + cell - 1, y0 + cell - 1), fill=fill)
+
+
+def _dashed_badge(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int]) -> None:
+    x0, y0, x1, y1 = box
+    color = (190, 184, 199)
+    for x in range(x0, x1, 12):
+        draw.line((x, y0, min(x + 6, x1), y0), fill=color, width=1)
+        draw.line((x, y1, min(x + 6, x1), y1), fill=color, width=1)
+    for y in range(y0, y1, 12):
+        draw.line((x0, y, x0, min(y + 6, y1)), fill=color, width=1)
+        draw.line((x1, y, x1, min(y + 6, y1)), fill=color, width=1)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (SIZE, SIZE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    outer = np.asarray(scene["outer"], dtype=np.uint8).reshape(2, 2)
+    inner = np.asarray(scene["inner"], dtype=np.uint8).reshape(2, 2)
+    turns = int(scene["alias_turns"])
+    outer = np.rot90(outer, turns)
+    inner = np.rot90(inner, turns)
+    first_x, y = map(int, scene["origin"])
+    centers = ((first_x, y), (first_x + 128, y))
+    if int(scene["order"]) == 0:
+        outer_center, inner_center = centers
+    else:
+        inner_center, outer_center = centers
+    palette_index = int(scene["palette"])
+
+    _dashed_badge(draw, (first_x - 30, y - 34, first_x + 158, y + 34))
+    _draw_chip(draw, outer_center, outer, OUTER_PALETTES[palette_index])
+    _draw_chip(draw, inner_center, inner, INNER_PALETTES[palette_index])
+
+    # Remote neutral marks vary independently and are deliberately ignored by
+    # both analytic and inverse arms.
+    variant = int(scene["decoy_variant"])
+    for index, (dx, dy) in enumerate(((42, 452), (466, 62), (458, 454))):
+        radius = 3 + ((variant >> (index * 2)) & 3)
+        draw.ellipse((dx - radius, dy - radius, dx + radius, dy + radius), fill=(205, 201, 194))
+
+    font = ImageFont.load_default()
+    draw.text((18, 18), "BLOCK-SUBSTITUTE", font=font, fill=(119, 113, 128))
+    return image

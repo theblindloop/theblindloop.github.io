@@ -1,0 +1,183 @@
+"""Independent pixel-only inverse for paired checkpoint change counts.
+
+Only raster colors and connectivity are used.  The oracle segments two distant
+route components and their visible markers, directs each route from its blue
+ring, orders markers by raster geodesic distance, counts adjacent color changes,
+and compares the two counts.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    remaining = {tuple(map(int, point)) for point in np.argwhere(mask)}
+    output: list[np.ndarray] = []
+    while remaining:
+        origin = remaining.pop()
+        stack = [origin]
+        component = [origin]
+        while stack:
+            y, x = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    neighbor = (y + dy, x + dx)
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+                        component.append(neighbor)
+        if len(component) >= minimum:
+            output.append(np.asarray(component, dtype=np.int32))
+    return output
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    y, x = component.mean(axis=0)
+    return float(x), float(y)
+
+
+def _as_mask(component: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    mask[component[:, 0], component[:, 1]] = True
+    return mask
+
+
+def _closest_local(left: np.ndarray, route_mask: np.ndarray, radius: int = 8) -> tuple[float, tuple[int, int]]:
+    """Find a nearby route pixel without consulting any latent coordinates."""
+
+    y0 = max(0, int(left[:, 0].min()) - radius)
+    y1 = min(route_mask.shape[0], int(left[:, 0].max()) + radius + 1)
+    x0 = max(0, int(left[:, 1].min()) - radius)
+    x1 = min(route_mask.shape[1], int(left[:, 1].max()) + radius + 1)
+    nearby = np.argwhere(route_mask[y0:y1, x0:x1])
+    if not len(nearby):
+        return float("inf"), (0, 0)
+    nearby[:, 0] += y0
+    nearby[:, 1] += x0
+    delta = left[:, None, :].astype(np.float64) - nearby[None, :, :]
+    squared = np.sum(delta * delta, axis=2)
+    flat = int(np.argmin(squared))
+    left_index, route_index = np.unravel_index(flat, squared.shape)
+    del left_index
+    return math.sqrt(float(squared.ravel()[flat])), tuple(map(int, nearby[int(route_index)]))
+
+
+def _distance_map(route_mask: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    shape = route_mask.shape
+    if not route_mask[start]:
+        raise OracleAbstention("start anchor is absent from route component")
+    distances = np.full(shape, -1, dtype=np.int32)
+    distances[start] = 0
+    queue: deque[tuple[int, int]] = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distances[y, x]) + 1
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < shape[0] and 0 <= nx < shape[1] and route_mask[ny, nx] and distances[ny, nx] < 0:
+                    distances[ny, nx] = next_distance
+                    queue.append((ny, nx))
+    return distances
+
+
+def _changes(word: list[str]) -> int:
+    return sum(left != right for left, right in zip(word, word[1:]))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.ndim != 3 or array.shape[0] < 360 or array.shape[1] < 640:
+        raise OracleAbstention("unexpected raster size")
+    red, green, blue = array[:, :, 0], array[:, :, 1], array[:, :, 2]
+
+    route_mask = (red < 85) & (green < 100) & (blue < 125) & ((blue - red) > 15)
+    start_mask = (red < 95) & (green > 78) & (green < 165) & (blue > 155) & ((blue - green) > 35)
+    finish_mask = (red > 180) & (green > 70) & (green < 165) & (blue < 100) & ((red - green) > 60)
+    red_mask = (red > 165) & (green < 90) & (blue < 120) & ((red - green) > 70)
+    green_mask = (red < 110) & (green > 118) & (blue < 145) & ((green - red) > 45)
+
+    routes = _components(route_mask, 1200)
+    starts = _components(start_mask, 80)
+    finishes = _components(finish_mask, 100)
+    red_marks = _components(red_mask, 100)
+    green_marks = _components(green_mask, 100)
+    counts = (len(routes), len(starts), len(finishes), len(red_marks), len(green_marks))
+    if counts != (2, 2, 2, 6, 6):
+        raise OracleAbstention(
+            "expected two routes, two ports of each role, and six checkpoints of each color; "
+            f"found {counts}"
+        )
+
+    routes.sort(key=lambda component: _centroid(component)[0])
+    route_masks = [_as_mask(component, route_mask.shape) for component in routes]
+    all_markers = [("red", component) for component in red_marks] + [
+        ("green", component) for component in green_marks
+    ]
+    route_words: list[list[str]] = []
+    used_starts: set[int] = set()
+    used_finishes: set[int] = set()
+    used_markers: set[int] = set()
+
+    for route_index, route in enumerate(routes):
+        start_rank = sorted((*_closest_local(component, route_masks[route_index]), index) for index, component in enumerate(starts) if index not in used_starts)
+        finish_rank = sorted((*_closest_local(component, route_masks[route_index]), index) for index, component in enumerate(finishes) if index not in used_finishes)
+        if not start_rank or not finish_rank or start_rank[0][0] > 4.0 or finish_rank[0][0] > 4.0:
+            raise OracleAbstention("a colored endpoint is detached from its route")
+        if len(start_rank) > 1 and start_rank[1][0] - start_rank[0][0] < 120.0:
+            raise OracleAbstention("blue start ownership is ambiguous")
+        used_starts.add(start_rank[0][2])
+        used_finishes.add(finish_rank[0][2])
+        start_anchor = start_rank[0][1]
+        finish_anchor = finish_rank[0][1]
+
+        attached: list[tuple[str, np.ndarray, tuple[int, int], int]] = []
+        for marker_index, (name, component) in enumerate(all_markers):
+            if marker_index in used_markers:
+                continue
+            distance, anchor = _closest_local(component, route_masks[route_index])
+            other_distance, _ = _closest_local(component, route_masks[1 - route_index])
+            if distance <= 3.0 and other_distance > 8.0:
+                attached.append((name, component, anchor, marker_index))
+        if len(attached) != 6:
+            raise OracleAbstention(f"route has {len(attached)} uniquely attached checkpoints instead of six")
+        if sum(name == "red" for name, *_ in attached) != 3:
+            raise OracleAbstention("a route does not contain three checkpoints of each color")
+
+        distances = _distance_map(route_masks[route_index], start_anchor)
+        finish_distance = int(distances[finish_anchor])
+        if finish_distance < 850:
+            raise OracleAbstention("route is broken, looped, or too short")
+        ordered: list[tuple[int, str, int]] = []
+        for name, _component, anchor, marker_index in attached:
+            along = int(distances[anchor])
+            if along < 0:
+                raise OracleAbstention("checkpoint stem is disconnected from its route")
+            ordered.append((along, name, marker_index))
+        ordered.sort()
+        if any(right[0] - left[0] < 85 for left, right in zip(ordered, ordered[1:])):
+            raise OracleAbstention("checkpoint order lacks a stable raster margin")
+        if ordered[0][0] < 70 or finish_distance - ordered[-1][0] < 45:
+            raise OracleAbstention("endpoint checkpoint clearance is insufficient")
+        route_words.append([name for _, name, _ in ordered])
+        used_markers.update(marker_index for _, _, marker_index in ordered)
+
+    if len(used_markers) != 12 or len(route_words) != 2:
+        raise OracleAbstention("not all visible checkpoint evidence was consumed")
+    transition_counts = [_changes(word) for word in route_words]
+    if transition_counts[0] == transition_counts[1]:
+        raise OracleAbstention("visible transition counts tie")
+    return "left_more" if transition_counts[0] > transition_counts[1] else "right_more"

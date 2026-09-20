@@ -1,0 +1,118 @@
+"""Independent pixel-only inverse arm for rotational_orbit_completion.
+
+Only the final RGB raster is accepted. The arm segments the visible center ring,
+17 dark components, and four candidate colors; it then adds each candidate in
+turn and evaluates the augmented centroid set under 120- and 240-degree turns.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+_DARK = np.array((38.0, 46.0, 57.0), dtype=np.float64)
+_CENTER_GRAY = np.array((118.0, 126.0, 138.0), dtype=np.float64)
+_PALETTE = {
+    "red": np.array((205.0, 67.0, 85.0), dtype=np.float64),
+    "blue": np.array((45.0, 103.0, 210.0), dtype=np.float64),
+    "green": np.array((38.0, 151.0, 105.0), dtype=np.float64),
+    "orange": np.array((232.0, 132.0, 39.0), dtype=np.float64),
+}
+_TURN = 2.0 * math.pi / 3.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    remaining = set(zip(*np.nonzero(mask), strict=True))
+    groups: list[np.ndarray] = []
+    while remaining:
+        start = remaining.pop()
+        queue: deque[tuple[int, int]] = deque([start])
+        group = [start]
+        while queue:
+            y, x = queue.popleft()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    neighbor = (y + dy, x + dx)
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        queue.append(neighbor)
+                        group.append(neighbor)
+        groups.append(np.asarray(group, dtype=np.float64))
+    return groups
+
+
+def _orbit_score(points: np.ndarray, center: np.ndarray) -> float:
+    shifted = points - center
+    residuals: list[float] = []
+    for angle in (_TURN, 2.0 * _TURN):
+        cosine, sine = math.cos(angle), math.sin(angle)
+        rotated = np.column_stack(
+            (
+                center[0] + cosine * shifted[:, 0] - sine * shifted[:, 1],
+                center[1] + sine * shifted[:, 0] + cosine * shifted[:, 1],
+            )
+        )
+        distances = np.linalg.norm(rotated[:, None, :] - points[None, :, :], axis=2)
+        residuals.extend(distances.min(axis=1).tolist())
+    return float(np.mean(sorted(residuals, reverse=True)[:4]))
+
+
+def measure_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError("abstain: expected an RGB raster")
+
+    dark_mask = np.linalg.norm(arr - _DARK, axis=2) < 48.0
+    components = [group for group in _components(dark_mask) if len(group) >= 45]
+    if len(components) != 17 or any(not 70 <= len(group) <= 180 for group in components):
+        raise ValueError("abstain: expected exactly 17 intact dark-dot components")
+    dark_points = np.asarray(
+        [[float(group[:, 1].mean() + 0.5), float(group[:, 0].mean() + 0.5)] for group in components],
+        dtype=np.float64,
+    )
+
+    center_mask = np.linalg.norm(arr - _CENTER_GRAY, axis=2) < 52.0
+    center_groups = sorted(_components(center_mask), key=len, reverse=True)
+    if not center_groups or not 180 <= len(center_groups[0]) <= 500:
+        raise ValueError("abstain: the hollow center ring is absent or malformed")
+    ring = center_groups[0]
+    cy, cx = ring[:, 0], ring[:, 1]
+    center = np.array([float(cx.mean() + 0.5), float(cy.mean() + 0.5)], dtype=np.float64)
+
+    names = tuple(_PALETTE)
+    palette = np.stack([_PALETTE[name] for name in names], axis=0)
+    distances = np.linalg.norm(arr[:, :, None, :] - palette[None, None, :, :], axis=3)
+    nearest = distances.argmin(axis=2)
+    nearest_distance = distances.min(axis=2)
+    candidates: dict[str, np.ndarray] = {}
+    for index, name in enumerate(names):
+        mask = (nearest == index) & (nearest_distance < 58.0)
+        my, mx = np.nonzero(mask)
+        if not 220 <= len(mx) <= 470:
+            raise ValueError(f"abstain: {name} candidate is absent or malformed")
+        candidates[name] = np.array([float(mx.mean() + 0.5), float(my.mean() + 0.5)])
+
+    ranked = sorted(
+        (_orbit_score(np.vstack((dark_points, point)), center), name)
+        for name, point in candidates.items()
+    )
+    runner_up_gap = float(ranked[1][0] - ranked[0][0])
+    if ranked[0][0] > 2.5 or runner_up_gap < 9.0:
+        raise ValueError("abstain: rotational completion is raster-ambiguous")
+    return {
+        "decision": ranked[0][1],
+        "best_score": float(ranked[0][0]),
+        "runner_up_gap": runner_up_gap,
+        "center": center.tolist(),
+        "dark_component_count": len(components),
+        "scores": {name: float(score) for score, name in ranked},
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure_image(image)["decision"])

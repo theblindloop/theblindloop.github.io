@@ -1,0 +1,112 @@
+"""Independent final-PNG inverse arm for trapezoidal-area selection."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+# Public visual encodings are duplicated deliberately; no rendering code or latent
+# values are imported by this inverse arm.
+_PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (214, 54, 64),
+    "blue": (40, 112, 184),
+    "green": (35, 142, 82),
+    "orange": (226, 126, 34),
+}
+_AXIS_RGB = (103, 112, 126)
+_COLOR_DISTANCE = 24.0
+_AXIS_DISTANCE = 8.0
+_MIN_CURVE_INK = 500
+
+
+def _near_color(arr: np.ndarray, rgb: tuple[int, int, int], limit: float) -> np.ndarray:
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    squared = np.sum(delta * delta, axis=2, dtype=np.int32)
+    return squared <= limit * limit
+
+
+def _components(mask: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return 4-connected component coordinates as (ys, xs) arrays."""
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[tuple[np.ndarray, np.ndarray]] = []
+    for start_y, start_x in np.argwhere(mask):
+        sy, sx = int(start_y), int(start_x)
+        if visited[sy, sx]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(sy, sx)])
+        visited[sy, sx] = True
+        ys: list[int] = []
+        xs: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            ys.append(y)
+            xs.append(x)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        components.append((np.asarray(ys), np.asarray(xs)))
+    return components
+
+
+def _marker_centers(mask: np.ndarray) -> list[tuple[float, float]]:
+    centers: list[tuple[float, float]] = []
+    for ys, xs in _components(mask):
+        count = len(xs)
+        box_width = int(xs.max() - xs.min() + 1)
+        box_height = int(ys.max() - ys.min() + 1)
+        if 55 <= count <= 120 and 9 <= box_width <= 13 and 9 <= box_height <= 13:
+            centers.append((float(xs.mean()), float(ys.mean())))
+    centers.sort()
+    if len(centers) != 6:
+        raise ValueError(f"expected six isolated checkpoint markers, found {len(centers)}")
+    spacings = np.diff([center[0] for center in centers])
+    if np.any(spacings < 30) or float(spacings.max() - spacings.min()) > 3.0:
+        raise ValueError("checkpoint spacing is missing or inconsistent")
+    return centers
+
+
+def _visible_zero_row(axis_mask: np.ndarray, centers: list[tuple[float, float]]) -> float:
+    x0 = max(0, int(round(centers[0][0])) - 4)
+    x1 = min(axis_mask.shape[1], int(round(centers[-1][0])) + 5)
+    lower_marker = max(center[1] for center in centers)
+    y0 = max(0, int(round(lower_marker)) + 12)
+    y1 = min(axis_mask.shape[0], int(round(lower_marker)) + 55)
+    if y1 <= y0:
+        raise ValueError("visible zero-axis search window is empty")
+    counts = axis_mask[y0:y1, x0:x1].sum(axis=1)
+    index = int(np.argmax(counts))
+    if int(counts[index]) < 150:
+        raise ValueError("visible horizontal zero line is missing")
+    return float(y0 + index)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 3 or arr.shape[0] < 400 or arr.shape[1] < 500:
+        raise ValueError("unsupported raster")
+    axis_mask = _near_color(arr, _AXIS_RGB, _AXIS_DISTANCE)
+
+    scores: dict[str, float] = {}
+    for name, rgb in _PALETTE.items():
+        mask = _near_color(arr, rgb, _COLOR_DISTANCE)
+        if int(mask.sum()) < _MIN_CURVE_INK:
+            raise ValueError(f"missing or materially erased {name} curve")
+        centers = _marker_centers(mask)
+        zero_y = _visible_zero_row(axis_mask, centers)
+        heights = [zero_y - center_y for _center_x, center_y in centers]
+        if min(heights) <= 8 or max(heights) >= 118:
+            raise ValueError(f"{name} curve is outside the visible measurement scale")
+        if abs(heights[0] - heights[-1]) > 1.0:
+            raise ValueError(f"{name} endpoints do not share the declared height")
+        scores[name] = sum(
+            (heights[index] + heights[index + 1]) / 2.0 for index in range(5)
+        )
+
+    ranked = sorted(((score, name) for name, score in scores.items()), reverse=True)
+    if ranked[0][0] - ranked[1][0] < 2.0:
+        raise ValueError("pixel AUC measurement is tied or ambiguous")
+    return ranked[0][1]

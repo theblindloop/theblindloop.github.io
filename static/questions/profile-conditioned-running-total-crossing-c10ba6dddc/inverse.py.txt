@@ -1,0 +1,155 @@
+"""Pixel-only inverse arm for running_total_crossing.
+
+Input: the final RGB raster. Nothing else. This module imports no renderer,
+prompt, generator, verifier or gold code and never receives latent scene data.
+
+Steps: find the saturated bar pixels, split them into left-to-right columns of
+contiguous colored x-ranges, recover the gridline pitch from the long gray
+rows, convert each bar's pixel height into gridline units, then walk the bars
+left to right until the running total reaches half of the grand total.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "running_total_crossing-oracle-1.0.0"
+ABSTAIN = "abstain"
+
+_EXPECTED_BARS = 5
+_HUE_ANCHORS = (
+    ("red", 0.0),
+    ("orange", 33.0),
+    ("green", 135.0),
+    ("blue", 222.0),
+    ("purple", 285.0),
+)
+
+
+def _hue(rgb: tuple[float, float, float]) -> float:
+    r, g, b = (value / 255.0 for value in rgb)
+    high, low = max(r, g, b), min(r, g, b)
+    span = high - low
+    if span <= 0:
+        return -1.0
+    if high == r:
+        hue = 60.0 * (((g - b) / span) % 6.0)
+    elif high == g:
+        hue = 60.0 * (((b - r) / span) + 2.0)
+    else:
+        hue = 60.0 * (((r - g) / span) + 4.0)
+    return hue % 360.0
+
+
+def _name(rgb: tuple[float, float, float]) -> str | None:
+    hue = _hue(rgb)
+    if hue < 0:
+        return None
+    best, best_gap = None, 1e9
+    for name, anchor in _HUE_ANCHORS:
+        gap = abs((hue - anchor + 180.0) % 360.0 - 180.0)
+        if gap < best_gap:
+            best, best_gap = name, gap
+    return best if best_gap <= 22.0 else None
+
+
+def _runs(flags: np.ndarray, min_gap: int = 3) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start = None
+    gap = 0
+    for index, flag in enumerate(flags):
+        if flag:
+            if start is None:
+                start = index
+            elif gap:
+                gap = 0
+            end = index
+        elif start is not None:
+            gap += 1
+            if gap >= min_gap:
+                runs.append((start, end))
+                start, gap = None, 0
+    if start is not None:
+        runs.append((start, end))
+    return runs
+
+
+def _grid_pitch(array: np.ndarray, colored: np.ndarray) -> float | None:
+    red, green, blue = (array[:, :, channel].astype(int) for channel in range(3))
+    grayish = (
+        (abs(red - green) <= 12)
+        & (abs(green - blue) <= 12)
+        & (abs(red - blue) <= 12)
+        & (red >= 140)
+        & (red <= 205)
+    )
+    grayish &= ~colored
+    counts = grayish.sum(axis=1)
+    rows = [int(y) for y in np.flatnonzero(counts >= 60)]
+    if len(rows) < 3:
+        return None
+    merged: list[int] = []
+    for row in rows:
+        if merged and row - merged[-1] <= 2:
+            continue
+        merged.append(row)
+    if len(merged) < 3:
+        return None
+    diffs = np.diff(np.array(merged, dtype=float))
+    pitch = float(np.median(diffs))
+    if pitch < 6.0 or float(np.max(np.abs(diffs - pitch))) > 1.5:
+        return None
+    return pitch
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+    channels = array.astype(int)
+    span = channels.max(axis=2) - channels.min(axis=2)
+    colored = span > 60
+
+    if not colored.any():
+        return ABSTAIN
+    pitch = _grid_pitch(array, colored)
+    if pitch is None:
+        return ABSTAIN
+
+    columns = _runs(colored.any(axis=0))
+    if len(columns) != _EXPECTED_BARS:
+        return ABSTAIN
+
+    names: list[str] = []
+    heights: list[int] = []
+    bottoms: list[int] = []
+    for left, right in columns:
+        block = colored[:, left : right + 1]
+        rows = np.flatnonzero(block.any(axis=1))
+        if rows.size == 0:
+            return ABSTAIN
+        top, bottom = int(rows[0]), int(rows[-1])
+        if bottom - top + 1 != rows.size:          # a hole means damaged ink
+            return ABSTAIN
+        patch = array[top : bottom + 1, left : right + 1].reshape(-1, 3)
+        name = _name(tuple(float(v) for v in np.median(patch, axis=0)))
+        if name is None:
+            return ABSTAIN
+        units = (bottom - top + 1) / pitch
+        if abs(units - round(units)) > 0.22 or round(units) < 1:
+            return ABSTAIN
+        names.append(name)
+        heights.append(int(round(units)))
+        bottoms.append(bottom)
+
+    if len(set(names)) != _EXPECTED_BARS:
+        return ABSTAIN
+    if max(bottoms) - min(bottoms) > 1:            # bars must share a baseline
+        return ABSTAIN
+
+    total = sum(heights)
+    running = 0
+    for index, value in enumerate(heights):
+        running += value
+        if 2 * running >= total:
+            return names[index]
+    return ABSTAIN

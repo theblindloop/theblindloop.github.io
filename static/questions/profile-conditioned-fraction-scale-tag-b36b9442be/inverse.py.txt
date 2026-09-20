@@ -1,0 +1,139 @@
+"""Independent image-only inverse for Scaled-Fraction Tag Transfer."""
+from __future__ import annotations
+
+from collections import deque
+from math import gcd
+import numpy as np
+from PIL import Image
+
+CARD = np.array((244, 247, 252), dtype=np.int16)
+INK = np.array((35, 43, 54), dtype=np.int16)
+TAG_RGB = {
+    "red": np.array((218, 62, 67), dtype=np.int16),
+    "blue": np.array((52, 108, 196), dtype=np.int16),
+    "gold": np.array((224, 166, 45), dtype=np.int16),
+}
+PATTERNS = {
+    frozenset("bc"): 1, frozenset("abdeg"): 2, frozenset("abcdg"): 3,
+    frozenset("bcfg"): 4, frozenset("acdfg"): 5, frozenset("acdefg"): 6,
+    frozenset("abc"): 7, frozenset("abcdefg"): 8, frozenset("abcdfg"): 9,
+}
+
+
+def _runs(values: np.ndarray, minimum: int) -> list[tuple[int, int]]:
+    idx = np.flatnonzero(values)
+    if not len(idx):
+        return []
+    cuts = np.flatnonzero(np.diff(idx) > 1)
+    starts = np.r_[0, cuts + 1]
+    ends = np.r_[cuts, len(idx) - 1]
+    return [(int(idx[a]), int(idx[b])) for a, b in zip(starts, ends) if idx[b] - idx[a] + 1 >= minimum]
+
+
+def _find_cards(arr: np.ndarray) -> tuple[tuple[int, int, int, int], list[tuple[int, int, int, int]]]:
+    pale = np.linalg.norm(arr.astype(np.int16) - CARD, axis=2) < 4
+    ybands = _runs(pale.sum(axis=1) > 120, 150)
+    if len(ybands) != 2:
+        raise ValueError("could not detect reference and candidate rows")
+    rows = []
+    for ya, yb in ybands:
+        xruns = _runs(pale[ya:yb + 1].sum(axis=0) > 100, 180)
+        rows.append([(xa, ya, xb, yb) for xa, xb in xruns])
+    if len(rows[0]) != 1 or len(rows[1]) != 3:
+        raise ValueError("could not detect four fraction cards")
+    return rows[0][0], rows[1]
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    out = []
+    height, width = mask.shape
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        xs, ys = [], []
+        while queue:
+            cy, cx = queue.popleft()
+            xs.append(cx); ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(xs) >= 20:
+            out.append((min(xs), min(ys), max(xs), max(ys), len(xs)))
+    return out
+
+
+def _decode_fraction(arr: np.ndarray, box: tuple[int, int, int, int]) -> tuple[int, int]:
+    x0, y0, x1, y1 = box
+    crop = arr[y0:y1 + 1, x0:x1 + 1].astype(np.int16)
+    ink = np.linalg.norm(crop - INK, axis=2) < 5
+    comps = _components(ink)
+    bars = [c for c in comps if c[2] - c[0] > 80 and c[3] - c[1] < 18]
+    if len(bars) != 1:
+        raise ValueError("fraction bar not uniquely detected")
+    bar = bars[0]
+    bar_x = (bar[0] + bar[2]) / 2.0
+    bar_y = (bar[1] + bar[3]) / 2.0
+
+    def decode(above: bool) -> int:
+        pieces = []
+        for comp in comps:
+            if comp == bar:
+                continue
+            width = comp[2] - comp[0] + 1
+            height = comp[3] - comp[1] + 1
+            if width > 60 or height > 35:
+                continue
+            cx = (comp[0] + comp[2]) / 2.0
+            cy = (comp[1] + comp[3]) / 2.0
+            top = bar_y - 96 if above else bar_y + 20
+            if (cy < bar_y) != above or abs(cx - bar_x) > 45 or not top - 2 <= cy <= top + 74:
+                continue
+            pieces.append(comp)
+        labels = set()
+        top = bar_y - 96 if above else bar_y + 20
+        for xa, ya, xb, yb, _area in pieces:
+            cx, cy = (xa + xb) / 2.0, (ya + yb) / 2.0
+            width, height = xb - xa + 1, yb - ya + 1
+            if width > height:
+                relative = cy - top
+                labels.add("a" if relative < 20 else "g" if relative < 52 else "d")
+            else:
+                side = "l" if cx < bar_x else "r"
+                half = "u" if cy - top < 36 else "d"
+                labels.add({("r", "u"): "b", ("r", "d"): "c", ("l", "d"): "e", ("l", "u"): "f"}[(side, half)])
+        if frozenset(labels) not in PATTERNS:
+            raise ValueError(f"unknown seven-segment pattern {sorted(labels)}")
+        return PATTERNS[frozenset(labels)]
+
+    return decode(True), decode(False)
+
+
+def _read_tag(arr: np.ndarray, box: tuple[int, int, int, int]) -> str:
+    x0, y0, x1, y1 = box
+    crop = arr[y0:y1 + 1, x0:x1 + 1].astype(np.int16)
+    counts = {name: int((np.linalg.norm(crop - rgb, axis=2) < 5).sum()) for name, rgb in TAG_RGB.items()}
+    tag = max(counts, key=counts.get)
+    if counts[tag] < 500:
+        raise ValueError("candidate tag is missing")
+    return tag
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    reference_box, candidate_boxes = _find_cards(arr)
+    reference = _decode_fraction(arr, reference_box)
+    candidates = [_decode_fraction(arr, box) for box in candidate_boxes]
+    common = gcd(*reference)
+    target = (reference[0] // common, reference[1] // common)
+    matches = []
+    for index, pair in enumerate(candidates):
+        divisor = gcd(*pair)
+        if (pair[0] // divisor, pair[1] // divisor) == target:
+            matches.append(index)
+    if len(matches) != 1:
+        return "abstain"
+    return _read_tag(arr, candidate_boxes[matches[0]])

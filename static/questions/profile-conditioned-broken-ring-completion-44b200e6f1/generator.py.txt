@@ -1,0 +1,256 @@
+"""Scene sampling and rasterisation for the broken-ring completion world.
+
+A single invisible circle is evidenced only by a few disjoint dark arcs cut out
+of it.  Four coloured dots are placed so that exactly one of them lies on the
+completed circle; the others sit clearly inside or outside it.  The answer is
+the colour of the on-circle dot, which can only be found by integrating all arc
+fragments into one global contour and continuing it through the empty gaps.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 640
+HEIGHT = 640
+SUPERSAMPLE = 3
+
+# The four marker colours are part of the public question contract.
+MARKER_COLORS: dict[str, tuple[int, int, int]] = {
+    "red": (214, 45, 40),
+    "blue": (35, 85, 205),
+    "green": (25, 145, 65),
+    "orange": (240, 150, 25),
+}
+COLOR_NAMES = ("red", "blue", "green", "orange")
+
+QUARANTINE_MARGIN = 18.0
+
+
+# --------------------------------------------------------------------------- #
+# geometry helpers
+# --------------------------------------------------------------------------- #
+def _angdiff(a: float, b: float) -> float:
+    """Smallest absolute difference between two angles in degrees."""
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def _in_arc(angle: float, start: float, span: float) -> bool:
+    return ((angle - start) % 360.0) <= span
+
+
+def _dist_to_arcs(scene: dict, x: float, y: float) -> float:
+    """Euclidean distance from a point to the painted arc band."""
+    cx, cy, radius = scene["cx"], scene["cy"], scene["radius"]
+    half = scene["stroke"] / 2.0
+    dx, dy = x - cx, y - cy
+    dist = math.hypot(dx, dy)
+    angle = math.degrees(math.atan2(dy, dx)) % 360.0
+    best = float("inf")
+    for start, span in scene["arcs"]:
+        if _in_arc(angle, start, span):
+            best = min(best, abs(dist - radius) - half)
+            continue
+        for end_angle in (start, (start + span) % 360.0):
+            rad = math.radians(end_angle)
+            ex, ey = cx + radius * math.cos(rad), cy + radius * math.sin(rad)
+            best = min(best, math.hypot(x - ex, y - ey) - half)
+    return max(best, 0.0)
+
+
+def _radial_deviation(scene: dict, marker: dict) -> float:
+    dx = marker["x"] - scene["cx"]
+    dy = marker["y"] - scene["cy"]
+    return abs(math.hypot(dx, dy) - scene["radius"])
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def _sample_arcs(rng: random.Random) -> list[list[float]]:
+    """Disjoint arcs of one circle: coverage and gaps carry no information."""
+    for _ in range(200):
+        count = rng.choice((3, 3, 4, 4, 5))
+        coverage = rng.uniform(0.40, 0.60) * 360.0
+        weights = [rng.uniform(0.7, 1.4) for _ in range(count)]
+        total = sum(weights)
+        spans = [coverage * w / total for w in weights]
+        gap_total = 360.0 - coverage
+        gap_weights = [rng.uniform(0.7, 1.4) for _ in range(count)]
+        gap_sum = sum(gap_weights)
+        gaps = [gap_total * w / gap_sum for w in gap_weights]
+        if min(spans) < 30.0 or min(gaps) < 34.0 or max(gaps) > 150.0:
+            continue
+        arcs: list[list[float]] = []
+        cursor = rng.uniform(0.0, 360.0)
+        for span, gap in zip(spans, gaps):
+            arcs.append([round(cursor % 360.0, 4), round(span, 4)])
+            cursor += span + gap
+        return arcs
+    raise RuntimeError("arc sampling failed")
+
+
+def _gap_angles(arcs: list[list[float]]) -> list[tuple[float, float]]:
+    """Angular gaps as (start, span) pairs, in the order the arcs were drawn."""
+    ordered = sorted(arcs, key=lambda a: a[0])
+    gaps: list[tuple[float, float]] = []
+    for index, (start, span) in enumerate(ordered):
+        end = (start + span) % 360.0
+        next_start = ordered[(index + 1) % len(ordered)][0]
+        gaps.append((end, (next_start - end) % 360.0))
+    return gaps
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic scene sample; the answer colour is drawn uniformly first."""
+    rng = random.Random(seed * 7919 + 13)
+
+    answer = rng.choice(COLOR_NAMES)
+    boundary_case = rng.random() < 0.22
+    target_rank = rng.randrange(4)
+
+    bg_level = rng.randint(232, 246)
+    bg = (bg_level, bg_level - rng.randint(0, 6), bg_level - rng.randint(0, 10))
+    dark = rng.randint(28, 64)
+    arc_color = (dark, dark + rng.randint(0, 8), dark + rng.randint(0, 12))
+
+    cx = rng.uniform(WIDTH / 2 - 32, WIDTH / 2 + 32)
+    cy = rng.uniform(HEIGHT / 2 - 32, HEIGHT / 2 + 32)
+    bound = min(cx, cy, WIDTH - cx, HEIGHT - cy) - 58.0
+    radius = rng.uniform(150.0, min(236.0, bound))
+    stroke = rng.randint(5, 8)
+    marker_radius = rng.randint(9, 12)
+
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "bg_color": list(bg),
+        "arc_color": list(arc_color),
+        "cx": round(cx, 4),
+        "cy": round(cy, 4),
+        "radius": round(radius, 4),
+        "stroke": stroke,
+        "marker_radius": marker_radius,
+        "arcs": _sample_arcs(rng),
+        "markers": [],
+    }
+
+    clearance = marker_radius + 13.0
+    gaps = _gap_angles(scene["arcs"])
+
+    def place_true() -> dict:
+        for _ in range(300):
+            start, span = gaps[rng.randrange(len(gaps))]
+            angle = (start + rng.uniform(0.12, 0.88) * span) % 360.0
+            rad = math.radians(angle)
+            x = scene["cx"] + scene["radius"] * math.cos(rad)
+            y = scene["cy"] + scene["radius"] * math.sin(rad)
+            if _dist_to_arcs(scene, x, y) >= clearance:
+                return {"color": answer, "x": round(x, 4), "y": round(y, 4)}
+        raise RuntimeError("true marker placement failed")
+
+    others = [name for name in COLOR_NAMES if name != answer]
+    for _ in range(400):
+        true_marker = place_true()
+        markers = [true_marker]
+        ok = True
+        for name in others:
+            for attempt in range(300):
+                angle = rng.uniform(0.0, 360.0)
+                low, high = (10.0, 17.0) if boundary_case else (19.0, 52.0)
+                offset = rng.uniform(low, high) * rng.choice((-1.0, 1.0))
+                rad = math.radians(angle)
+                x = scene["cx"] + (scene["radius"] + offset) * math.cos(rad)
+                y = scene["cy"] + (scene["radius"] + offset) * math.sin(rad)
+                if not (28 < x < WIDTH - 28 and 28 < y < HEIGHT - 28):
+                    continue
+                if _dist_to_arcs(scene, x, y) < clearance:
+                    continue
+                if any(math.hypot(x - m["x"], y - m["y"]) < 3.4 * marker_radius for m in markers):
+                    continue
+                markers.append({"color": name, "x": round(x, 4), "y": round(y, 4)})
+                break
+            else:
+                ok = False
+                break
+        if not ok:
+            continue
+        # Counterbalance the cheap "closest to the ink" cue: the answer marker's
+        # rank in distance-to-nearest-arc is forced onto an independent draw.
+        ink = sorted(markers, key=lambda m: _dist_to_arcs(scene, m["x"], m["y"]))
+        if ink.index(true_marker) != target_rank:
+            continue
+        rng.shuffle(markers)
+        scene["markers"] = markers
+        return scene
+    raise RuntimeError("marker layout failed")
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def render(scene: dict) -> Image.Image:
+    scale = SUPERSAMPLE
+    image = Image.new(
+        "RGB",
+        (scene["width"] * scale, scene["height"] * scale),
+        tuple(scene["bg_color"]),
+    )
+    draw = ImageDraw.Draw(image)
+    cx, cy, radius = scene["cx"] * scale, scene["cy"] * scale, scene["radius"] * scale
+    # Pillow paints the stroke inwards from the bounding ellipse, so the box is
+    # grown by half a stroke to centre the painted band on the true radius.
+    outer = radius + scene["stroke"] * scale / 2.0
+    box = (cx - outer, cy - outer, cx + outer, cy + outer)
+    for start, span in scene["arcs"]:
+        draw.arc(box, start, start + span, fill=tuple(scene["arc_color"]),
+                 width=scene["stroke"] * scale)
+    for marker in scene["markers"]:
+        mx, my = marker["x"] * scale, marker["y"] * scale
+        rad = scene["marker_radius"] * scale
+        draw.ellipse((mx - rad, my - rad, mx + rad, my + rad),
+                     fill=MARKER_COLORS[marker["color"]])
+    return image.resize((scene["width"], scene["height"]), Image.BOX)
+
+
+# --------------------------------------------------------------------------- #
+# analytic consequences of the scene
+# --------------------------------------------------------------------------- #
+def analytic_gold(scene: dict) -> str:
+    ranked = sorted(scene["markers"], key=lambda m: _radial_deviation(scene, m))
+    return str(ranked[0]["color"])
+
+
+def margin(scene: dict) -> float:
+    """Runner-up radial deviation minus the winner's, in pixels."""
+    deviations = sorted(_radial_deviation(scene, m) for m in scene["markers"])
+    return round(deviations[1] - deviations[0], 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabelings of the two unordered latent lists."""
+    out: list[tuple[str, dict]] = []
+    arcs = scene["arcs"]
+    if len(arcs) > 1:
+        rotated = dict(scene)
+        rotated["arcs"] = arcs[1:] + arcs[:1]
+        out.append(("rotate_arc_list", rotated))
+        reversed_arcs = dict(scene)
+        reversed_arcs["arcs"] = list(reversed(arcs))
+        out.append(("reverse_arc_list", reversed_arcs))
+    markers = scene["markers"]
+    if len(markers) > 1:
+        rotated_markers = dict(scene)
+        rotated_markers["markers"] = markers[1:] + markers[:1]
+        out.append(("rotate_marker_list", rotated_markers))
+        reversed_markers = dict(scene)
+        reversed_markers["markers"] = list(reversed(markers))
+        out.append(("reverse_marker_list", reversed_markers))
+    return out

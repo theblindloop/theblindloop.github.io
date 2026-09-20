@@ -1,0 +1,114 @@
+"""Independent image-only inverse for the junction arm-count question."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "junction_arm_count_selection-oracle-0.1.0"
+INK = np.array((28, 47, 78), dtype=np.float32)
+GREEN = np.array((38, 160, 91), dtype=np.float32)
+RED = np.array((211, 66, 61), dtype=np.float32)
+BACKGROUND = np.array((248, 248, 244), dtype=np.float32)
+MARKER = np.array((143, 72, 180), dtype=np.float32)
+
+
+def _nearest_labels(array: np.ndarray) -> np.ndarray:
+    palette = np.stack([INK, GREEN, RED, MARKER, BACKGROUND], axis=0)
+    distances = ((array[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=3)
+    return distances.argmin(axis=2)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(points) >= 20:
+            components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _shape_and_center(component: np.ndarray) -> tuple[str, tuple[float, float]]:
+    y0, x0 = component.min(axis=0)
+    y1, x1 = component.max(axis=0)
+    center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+    dx = component[:, 1] - center[0]
+    dy = component[:, 0] - center[1]
+    radial = np.hypot(dx, dy)
+    manhattan = np.abs(dx) + np.abs(dy)
+    circle_error = float(np.mean(np.abs(radial - np.median(radial))))
+    diamond_error = float(np.mean(np.abs(manhattan - np.median(manhattan))))
+    square_distance = np.maximum(np.abs(dx), np.abs(dy))
+    square_error = float(np.mean(np.abs(square_distance - np.median(square_distance))))
+    shape = "circle" if circle_error <= square_error else "square"
+    return shape, center
+
+
+def _arm_count(mask: np.ndarray, center: tuple[float, float]) -> int:
+    """Count separated dark radial supports outside the colored marker."""
+
+    y, x = np.nonzero(mask)
+    dx = x.astype(np.float64) - center[0]
+    dy = y.astype(np.float64) - center[1]
+    radius = np.hypot(dx, dy)
+    keep = (radius >= 30.0) & (radius <= 92.0)
+    if int(keep.sum()) < 80:
+        raise ValueError("insufficient network pixels around marker")
+    angles = (np.arctan2(dy[keep], dx[keep]) + math.tau) % math.tau
+    bins = 720
+    histogram, _ = np.histogram(angles, bins=bins, range=(0.0, math.tau))
+    kernel = np.ones(9, dtype=np.float64)
+    padded = np.concatenate([histogram[-4:], histogram, histogram[:4]])
+    smooth = np.convolve(padded, kernel, mode="same")[4:-4]
+    threshold = max(8.0, float(smooth.max()) * 0.24)
+    candidates = [index for index, value in enumerate(smooth) if value >= threshold]
+    selected: list[int] = []
+    # Greedy non-maximum suppression is stable because all arms are deliberately
+    # separated by more than thirty degrees in the generated layouts.
+    for index in sorted(candidates, key=lambda item: (-smooth[item], item)):
+        distances = [min((index - other) % bins, (other - index) % bins) for other in selected]
+        if all(distance >= 42 for distance in distances):
+            selected.append(index)
+    if not 2 <= len(selected) <= 6:
+        raise ValueError(f"ambiguous arm count {len(selected)}")
+    return len(selected)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the larger-degree marker label using only the supplied raster."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _nearest_labels(array)
+    red, green, blue = array[:, :, 0], array[:, :, 1], array[:, :, 2]
+    # The marker color is fixed and deliberately separated from the dark ink,
+    # endpoint disks, and background. A hue/brightness mask avoids mistaking
+    # antialiasing mixtures of those other colors for marker components.
+    marker_mask = (red > 90.0) & (blue > red + 10.0) & (red > green + 30.0) & (blue > 110.0)
+    marker_components = _components(marker_mask)
+    if len(marker_components) != 2:
+        raise ValueError(f"expected two isolated marker components, found {len(marker_components)}")
+    marker_info = [_shape_and_center(component) for component in marker_components]
+    dark_mask = labels == 0
+    counts = [_arm_count(dark_mask, center) for _, center in marker_info]
+    if counts[0] == counts[1]:
+        raise ValueError("image-only arm-count tie")
+    return marker_info[0][0] if counts[0] > counts[1] else marker_info[1][0]

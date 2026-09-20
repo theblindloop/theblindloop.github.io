@@ -1,0 +1,286 @@
+"""Scene sampler, raster renderer, analytic gold and latent aliases.
+
+World: a reference rail carrying one marker is drawn above a full-width rule;
+five candidate rails, each of a different length and each starting at its own
+horizontal position, are drawn below it.  Every rail carries exactly one
+marker.  Exactly one candidate rail places its marker at the same fraction of
+its own length, measured from its own left end, as the reference rail does.
+The decision is that rail's row.  Absolute pixel offsets and absolute rail
+lengths are deliberately decoupled from the answer: one distractor repeats the
+reference's marker offset in pixels (and its screen column), and another
+repeats the reference's rail length.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+N_RAILS = 5
+
+CANVAS_W = 820
+CANVAS_H = 430
+
+RULE_Y = 118
+RULE_H = 3
+RULE_INSET = 16
+
+REF_RAIL_Y = 74
+FIRST_RAIL_Y = 174
+ROW_PITCH = 58
+
+RAIL_H = 12
+MARKER_SIZE = 13
+MARKER_GAP = 6
+
+MIN_LEN = 220
+MAX_LEN = 620
+MIN_REF_LEN = 260
+MAX_REF_LEN = 560
+SIDE_MARGIN = 30
+
+MIN_FRACTION = 0.28
+MAX_FRACTION = 0.72
+MIN_DELTA = 0.12
+MIN_LEN_SEPARATION = 70
+MIN_SCREEN_SEPARATION = 20
+
+QUARANTINE_MARGIN = 5.0
+AMBIGUOUS = "ambiguous"
+
+PALETTES = (
+    {"bg": (247, 246, 242), "rail": (46, 50, 58), "marker": (28, 32, 40),
+     "rule": (96, 100, 110)},
+    {"bg": (243, 247, 247), "rail": (36, 58, 60), "marker": (22, 40, 42),
+     "rule": (84, 108, 110)},
+    {"bg": (248, 245, 247), "rail": (56, 44, 58), "marker": (34, 26, 38),
+     "rule": (104, 92, 108)},
+)
+
+
+# --------------------------------------------------------------------------
+# geometry helpers shared by the renderer and the analytic gold
+# --------------------------------------------------------------------------
+
+
+def _fraction(offset: int, length: int) -> float:
+    """Marker position as a fraction of the rail's own drawn length."""
+    return offset / (length - 1)
+
+
+def _ordered(rails: list) -> list:
+    """Candidate rails read by row.  The stored list order is irrelevant."""
+    return sorted(rails, key=lambda rail: rail["row"])
+
+
+def _rail_y(row: int) -> int:
+    return FIRST_RAIL_Y + row * ROW_PITCH
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+
+
+def _even(rng: random.Random, low: int, high: int) -> int:
+    return rng.randrange(low, high + 1, 2)
+
+
+def _left_for(rng: random.Random, length: int) -> int:
+    return _even(rng, SIDE_MARGIN, CANVAS_W - SIDE_MARGIN - length)
+
+
+def _free_distractor(rng: random.Random, ref_length: int, ref_offset: int,
+                     ref_fraction: float) -> dict:
+    """A rail matching neither the reference fraction, offset nor length."""
+    while True:
+        length = _even(rng, MIN_LEN, MAX_LEN)
+        fraction = rng.uniform(0.14, 0.86)
+        offset = int(round(fraction * (length - 1)))
+        if abs(offset / (length - 1) - ref_fraction) < MIN_DELTA:
+            continue
+        if offset == ref_offset or length == ref_length:
+            continue
+        return {"length": length, "offset": offset}
+
+
+def _offset_trap(rng: random.Random, ref_length: int, ref_offset: int,
+                 ref_fraction: float) -> dict:
+    """Rail repeating the reference's marker offset in pixels, not its ratio."""
+    options = []
+    for length in range(MIN_LEN, MAX_LEN + 1, 2):
+        if abs(length - ref_length) < MIN_LEN_SEPARATION:
+            continue
+        fraction = ref_offset / (length - 1)
+        if not 0.12 <= fraction <= 0.88:
+            continue
+        if abs(fraction - ref_fraction) < MIN_DELTA:
+            continue
+        options.append(length)
+    if not options:
+        return None
+    length = rng.choice(options)
+    return {"length": length, "offset": ref_offset}
+
+
+def _length_trap(rng: random.Random, ref_length: int, ref_fraction: float) -> dict:
+    """Rail repeating the reference's length but not its marker ratio."""
+    while True:
+        fraction = rng.uniform(0.14, 0.86)
+        offset = int(round(fraction * (ref_length - 1)))
+        if abs(offset / (ref_length - 1) - ref_fraction) >= MIN_DELTA:
+            return {"length": ref_length, "offset": offset}
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    for _attempt in range(400):
+        scene = _attempt_scene(rng)
+        if scene is not None and not is_quarantined(scene):
+            return scene
+    raise RuntimeError(f"could not sample a clean scene for seed {seed}")
+
+
+def _attempt_scene(rng: random.Random) -> dict:
+    ref_length = _even(rng, MIN_REF_LEN, MAX_REF_LEN)
+    ref_offset = int(round(rng.uniform(MIN_FRACTION, MAX_FRACTION)
+                           * (ref_length - 1)))
+    ref_fraction = ref_offset / (ref_length - 1)
+    ref_left = _left_for(rng, ref_length)
+
+    target_length = _even(rng, MIN_LEN, MAX_LEN)
+    if abs(target_length - ref_length) < MIN_LEN_SEPARATION:
+        return None
+    target_offset = int(round(ref_fraction * (target_length - 1)))
+    if target_offset == ref_offset:
+        return None
+
+    offset_trap = _offset_trap(rng, ref_length, ref_offset, ref_fraction)
+    if offset_trap is None:
+        return None
+    length_trap = _length_trap(rng, ref_length, ref_fraction)
+    free = [_free_distractor(rng, ref_length, ref_offset, ref_fraction)
+            for _ in range(2)]
+
+    target_row = rng.randrange(N_RAILS)
+    others = [offset_trap, length_trap, free[0], free[1]]
+    rng.shuffle(others)
+
+    rails = []
+    slot = iter(others)
+    for row in range(N_RAILS):
+        spec = {"length": target_length, "offset": target_offset} \
+            if row == target_row else next(slot)
+        if spec is offset_trap:
+            # the offset trap also repeats the reference's screen column
+            left = ref_left
+        else:
+            left = _left_for(rng, spec["length"])
+        rails.append({"row": row, "length": spec["length"],
+                      "offset": spec["offset"], "left": left})
+
+    target = rails[target_row]
+    target_screen = target["left"] + target["offset"]
+    if abs(target_screen - (ref_left + ref_offset)) < MIN_SCREEN_SEPARATION:
+        return None
+
+    return {
+        "width": CANVAS_W,
+        "height": CANVAS_H,
+        "palette": rng.randrange(len(PALETTES)),
+        "reference": {"length": ref_length, "offset": ref_offset,
+                      "left": ref_left},
+        "rails": rails,
+    }
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+
+def _draw_unit(draw: ImageDraw.ImageDraw, rail: dict, top: int,
+               colors: dict) -> None:
+    left = rail["left"]
+    right = left + rail["length"] - 1
+    draw.rectangle([left, top, right, top + RAIL_H - 1], fill=colors["rail"])
+    centre = left + rail["offset"]
+    half = MARKER_SIZE // 2
+    marker_bottom = top - MARKER_GAP - 1
+    draw.rectangle(
+        [centre - half, marker_bottom - MARKER_SIZE + 1, centre + half,
+         marker_bottom],
+        fill=colors["marker"],
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    colors = PALETTES[scene["palette"] % len(PALETTES)]
+    image = Image.new("RGB", (scene["width"], scene["height"]), colors["bg"])
+    draw = ImageDraw.Draw(image)
+
+    _draw_unit(draw, scene["reference"], REF_RAIL_Y, colors)
+    draw.rectangle(
+        [RULE_INSET, RULE_Y, scene["width"] - 1 - RULE_INSET,
+         RULE_Y + RULE_H - 1],
+        fill=colors["rule"],
+    )
+    for rail in _ordered(scene["rails"]):
+        _draw_unit(draw, rail, _rail_y(rail["row"]), colors)
+    return image
+
+
+# --------------------------------------------------------------------------
+# analytic gold
+# --------------------------------------------------------------------------
+
+
+def _deltas(scene: dict) -> list:
+    reference = scene["reference"]
+    ref = _fraction(reference["offset"], reference["length"])
+    return [
+        abs(_fraction(rail["offset"], rail["length"]) - ref)
+        for rail in _ordered(scene["rails"])
+    ]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin in percentage points of rail length."""
+    deltas = sorted(_deltas(scene))
+    return 100.0 * (deltas[1] - deltas[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def analytic_gold(scene: dict) -> str:
+    if is_quarantined(scene):
+        return AMBIGUOUS
+    deltas = _deltas(scene)
+    best = min(range(N_RAILS), key=lambda index: deltas[index])
+    return f"rail-{best + 1}"
+
+
+# --------------------------------------------------------------------------
+# latent aliases
+# --------------------------------------------------------------------------
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Declared latent aliases: pixel-identical and label-preserving."""
+    palette_period = dict(scene)
+    palette_period["palette"] = scene["palette"] + len(PALETTES)
+
+    reversed_rails = dict(scene)
+    reversed_rails["rails"] = list(reversed(scene["rails"]))
+
+    rotated_rails = dict(scene)
+    rotated_rails["rails"] = scene["rails"][2:] + scene["rails"][:2]
+
+    return [
+        ("palette_index_period", palette_period),
+        ("rail_list_reversal", reversed_rails),
+        ("rail_list_rotation", rotated_rails),
+    ]

@@ -1,0 +1,155 @@
+"""Independent PNG-only inverse for the blurred halftone panel."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+MICRO_GRID = 24
+BLOCK = 3
+SUPPORTED_OUTER_SIZES = (216, 240, 264)
+
+TEMPLATES: dict[str, tuple[str, ...]] = {
+    "ORBIT": (
+        "01111110",
+        "11000011",
+        "10000001",
+        "10000001",
+        "10000001",
+        "10000001",
+        "11000011",
+        "01111110",
+    ),
+    "PRISM": (
+        "00011000",
+        "00111100",
+        "01100110",
+        "11000011",
+        "11000011",
+        "01100110",
+        "00111100",
+        "00011000",
+    ),
+}
+
+
+def _background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:4].reshape(-1, 3),
+            array[-4:].reshape(-1, 3),
+            array[:, :4].reshape(-1, 3),
+            array[:, -4:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    return np.median(border, axis=0).astype(np.uint8)
+
+
+def _longest_run(values: np.ndarray) -> tuple[int, int] | None:
+    best: tuple[int, int] | None = None
+    start: int | None = None
+    for index, value in enumerate(values.tolist() + [False]):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            candidate = (start, index - 1)
+            if best is None or (candidate[1] - candidate[0]) > (best[1] - best[0]):
+                best = candidate
+            start = None
+    return best
+
+
+def _locate_panel(mask: np.ndarray) -> tuple[int, int, int]:
+    height, width = mask.shape
+    row_run = _longest_run(mask.sum(axis=1) > 100)
+    col_run = _longest_run(mask.sum(axis=0) > 100)
+    if row_run is None or col_run is None:
+        raise ValueError("no framed panel-sized region found")
+    y0, y1 = row_run
+    x0, x1 = col_run
+    outer_width = x1 - x0 + 1
+    outer_height = y1 - y0 + 1
+    if not (200 <= outer_width <= 290 and 200 <= outer_height <= 290):
+        raise ValueError("panel bounding box has an unsupported size")
+    if abs(outer_width - outer_height) > 3:
+        raise ValueError("panel bounding box is not square")
+    outer = int(round((outer_width + outer_height) / 2.0))
+    expected = min(SUPPORTED_OUTER_SIZES, key=lambda value: abs(value - outer))
+    if abs(expected - outer) > 4:
+        raise ValueError("panel scale is ambiguous")
+    panel_mask = mask[y0 : y0 + expected, x0 : x0 + expected]
+    if panel_mask.shape != (expected, expected) or float(panel_mask.mean()) < 0.90:
+        raise ValueError("panel coverage is incomplete")
+    return x0, y0, expected
+
+
+def _template_distance(code: tuple[str, ...], template: tuple[str, ...]) -> int:
+    return sum(
+        bit != expected
+        for code_row, template_row in zip(code, template)
+        for bit, expected in zip(code_row, template_row)
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the symbol from the final raster and the public question only."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    background = _background(array)
+    distance = np.linalg.norm(
+        array.astype(np.float32) - background.astype(np.float32), axis=2
+    )
+    mask = distance > 18.0
+    x0, y0, outer = _locate_panel(mask)
+    margin = 24
+    inner = outer - 2 * margin
+    if inner % MICRO_GRID != 0:
+        raise ValueError("panel interior is not a 24-by-24 raster")
+    microcell = inner // MICRO_GRID
+    interior = array[
+        y0 + margin : y0 + margin + inner,
+        x0 + margin : x0 + margin + inner,
+    ]
+    if interior.shape[:2] != (inner, inner):
+        raise ValueError("panel interior is clipped")
+
+    # Estimate the two visible microcell tones from the cell centers. A
+    # declared block blur is then the average of each 3-by-3 group of cells.
+    cell_luminance = np.zeros((MICRO_GRID, MICRO_GRID), dtype=np.float32)
+    for row in range(MICRO_GRID):
+        for col in range(MICRO_GRID):
+            block = interior[
+                row * microcell : (row + 1) * microcell,
+                col * microcell : (col + 1) * microcell,
+            ]
+            cell_luminance[row, col] = float(block.astype(np.float32).mean())
+    low = float(np.min(cell_luminance))
+    high = float(np.max(cell_luminance))
+    if high - low < 20.0:
+        raise ValueError("two microcell tones are not separated")
+    midpoint = (low + high) / 2.0
+    blurred = np.zeros((8, 8), dtype=np.float32)
+    for row in range(8):
+        for col in range(8):
+            blurred[row, col] = float(
+                cell_luminance[
+                    row * BLOCK : (row + 1) * BLOCK,
+                    col * BLOCK : (col + 1) * BLOCK,
+                ].mean()
+            )
+    code = tuple(
+        "".join("1" if blurred[row, col] < midpoint else "0" for col in range(8))
+        for row in range(8)
+    )
+    distances = {
+        name: _template_distance(code, template)
+        for name, template in TEMPLATES.items()
+    }
+    ordered = sorted(distances.items(), key=lambda item: (item[1], item[0]))
+    if ordered[0][1] == ordered[1][1]:
+        raise ValueError("blurred template scores tie")
+    if ordered[1][1] - ordered[0][1] < 8:
+        raise ValueError("blurred template margin is quarantined")
+    return ordered[0][0]

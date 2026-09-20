@@ -1,0 +1,215 @@
+"""Deterministic renderer and analytic closure oracle for one panel search."""
+
+from __future__ import annotations
+
+import random
+from copy import deepcopy
+
+from PIL import Image, ImageDraw, ImageFont
+
+CANVAS_SIZE = (1040, 760)
+PANEL_BOXES = (
+    (24, 24, 504, 354),
+    (536, 24, 1016, 354),
+    (24, 406, 504, 736),
+    (536, 406, 1016, 736),
+)
+LABELS = ("A", "B", "C", "D")
+BACKGROUND = (255, 255, 255)
+PANEL_FILL = (248, 249, 251)
+PANEL_EDGE = (194, 199, 207)
+LABEL_INK = (70, 74, 82)
+SHAPE_INK = (24, 27, 32)
+MASK_SIZE = 160
+MASK_ANCHOR_Y = 78
+
+
+def _mask(rows: list[str]) -> list[list[bool]]:
+    if len(rows) != MASK_SIZE or any(len(row) != MASK_SIZE for row in rows):
+        raise ValueError("mask must be 160 by 160")
+    if any(cell not in "01" for row in rows for cell in row):
+        raise ValueError("mask contains a non-binary cell")
+    return [[cell == "1" for cell in row] for row in rows]
+
+
+def _rows(mask: list[list[bool]]) -> list[str]:
+    return ["".join("1" if cell else "0" for cell in row) for row in mask]
+
+
+def _base_loop() -> list[list[bool]]:
+    image = Image.new("1", (MASK_SIZE, MASK_SIZE), 0)
+    draw = ImageDraw.Draw(image)
+    points = ((24, 24), (135, 24), (135, 135), (24, 135), (24, 24))
+    draw.line(points, fill=1, width=9, joint="curve")
+    return [[bool(image.getpixel((x, y))) for x in range(MASK_SIZE)] for y in range(MASK_SIZE)]
+
+
+def _gap_box(gap_side: str) -> tuple[int, int, int, int]:
+    if gap_side == "top":
+        return (52, 17, 108, 32)
+    if gap_side == "right":
+        return (128, 52, 143, 108)
+    if gap_side == "bottom":
+        return (52, 128, 108, 143)
+    if gap_side == "left":
+        return (17, 52, 32, 108)
+    raise ValueError(f"unknown gap side {gap_side!r}")
+
+
+def _open_loop(gap_side: str) -> list[list[bool]]:
+    mask = _base_loop()
+    x0, y0, x1, y1 = _gap_box(gap_side)
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            mask[y][x] = False
+    return mask
+
+
+def _balance_open_mask(mask: list[list[bool]], gap_side: str, target_count: int) -> None:
+    """Add equal-ink pixels on the side opposite the gap without closing it."""
+
+    reservoir: list[tuple[int, int]] = []
+    if gap_side == "top":
+        reservoir.extend((y, x) for y in (130, 129) for x in range(35, 125))
+        reservoir.extend((y, x) for y in range(35, 125) for x in (29, 30, 130, 129))
+    elif gap_side == "bottom":
+        reservoir.extend((y, x) for y in (29, 30) for x in range(35, 125))
+        reservoir.extend((y, x) for y in range(35, 125) for x in (29, 30, 130, 129))
+    elif gap_side == "left":
+        reservoir.extend((y, x) for y in (29, 30, 130, 129) for x in range(35, 125))
+        reservoir.extend((y, x) for y in range(35, 125) for x in (130, 129))
+    elif gap_side == "right":
+        reservoir.extend((y, x) for y in (29, 30, 130, 129) for x in range(35, 125))
+        reservoir.extend((y, x) for y in range(35, 125) for x in (29, 30))
+    else:
+        raise ValueError(f"unknown gap side {gap_side!r}")
+    needed = target_count - sum(sum(row) for row in mask)
+    if needed < 0:
+        raise AssertionError("open mask unexpectedly contains more ink than closed mask")
+    for y, x in reservoir:
+        if needed == 0:
+            break
+        if not mask[y][x]:
+            mask[y][x] = True
+            needed -= 1
+    if needed:
+        raise AssertionError(f"not enough safe equalization ink for {gap_side}: {needed}")
+
+
+def _side_coverages(mask: list[list[bool]]) -> tuple[float, float, float, float]:
+    ys = [y for y, row in enumerate(mask) for value in row if value]
+    xs = [x for y, row in enumerate(mask) for x, value in enumerate(row) if value]
+    if not ys or not xs:
+        raise ValueError("empty contour mask")
+    left, right = min(xs), max(xs)
+    top, bottom = min(ys), max(ys)
+    crop = [row[left : right + 1] for row in mask[top : bottom + 1]]
+    band = 12
+    width = len(crop[0])
+    height = len(crop)
+    top_fraction = sum(any(crop[y][x] for y in range(band)) for x in range(width)) / width
+    bottom_fraction = sum(any(crop[y][x] for y in range(height - band, height)) for x in range(width)) / width
+    left_fraction = sum(any(crop[y][x] for x in range(band)) for y in range(height)) / height
+    right_fraction = sum(any(crop[y][x] for x in range(width - band, width)) for y in range(height)) / height
+    return (top_fraction, right_fraction, bottom_fraction, left_fraction)
+
+
+def _closed_score(mask: list[list[bool]]) -> int:
+    coverages = _side_coverages(mask)
+    return int(min(coverages) >= 0.90)
+
+
+def _closure_scores(scene: dict) -> list[int]:
+    panels = scene["panels"]
+    if not isinstance(panels, list) or len(panels) != 4:
+        raise ValueError("scene must contain four panels")
+    return [_closed_score(_mask(panel["mask"])) for panel in panels]
+
+
+def sample_scene(seed: int) -> dict:
+    """Create one balanced scene with exactly one continuous contour."""
+
+    rng = random.Random(int(seed) * 7919 + 29)
+    target_slot = int(seed) % 4
+    gap_sides = ["top", "right", "bottom", "left"]
+    rng.shuffle(gap_sides)
+    closed = _base_loop()
+    closed_count = sum(sum(row) for row in closed)
+    panels: list[dict] = []
+    distractor_index = 0
+    for panel_index, label in enumerate(LABELS):
+        if panel_index == target_slot:
+            mask = deepcopy(closed)
+        else:
+            gap_side = gap_sides[distractor_index]
+            distractor_index += 1
+            mask = _open_loop(gap_side)
+            _balance_open_mask(mask, gap_side, closed_count)
+        offset = [rng.choice((-18, -9, 0, 9, 18)), rng.choice((-12, -6, 0, 6, 12))]
+        panels.append({"label": label, "offset": offset, "mask": _rows(mask)})
+    scene = {"panels": panels}
+    scores = _closure_scores(scene)
+    if scores.count(1) != 1 or scores.count(0) != 3:
+        raise AssertionError(f"invalid closure classes: {scores}")
+    counts = [sum(row.count("1") for row in panel["mask"]) for panel in panels]
+    if len(set(counts)) != 1:
+        raise AssertionError("stroke ink was not equalized")
+    return scene
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only the visible scene fields into a hard RGB raster."""
+
+    image = Image.new("RGB", CANVAS_SIZE, BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    panels = scene["panels"]
+    if len(panels) != 4:
+        raise ValueError("scene must contain four panels")
+    for panel, (x0, y0, x1, y1) in zip(panels, PANEL_BOXES, strict=True):
+        draw.rounded_rectangle(
+            (x0, y0, x1 - 1, y1 - 1),
+            radius=14,
+            fill=PANEL_FILL,
+            outline=PANEL_EDGE,
+            width=2,
+        )
+        draw.text((x0 + 16, y0 + 14), str(panel["label"]), font=font, fill=LABEL_INK)
+        local = Image.new("1", (MASK_SIZE, MASK_SIZE), 0)
+        rows = _mask(panel["mask"])
+        for y, row in enumerate(rows):
+            for x, value in enumerate(row):
+                if value:
+                    local.putpixel((x, y), 1)
+        dx, dy = (int(value) for value in panel["offset"])
+        gx = x0 + (x1 - x0 - MASK_SIZE) // 2 + dx
+        gy = y0 + MASK_ANCHOR_Y + dy
+        image.paste(SHAPE_INK, (gx, gy), local)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return the label of the unique panel with a closed contour."""
+
+    scores = _closure_scores(scene)
+    if scores.count(max(scores)) != 1 or max(scores) != 1:
+        raise ValueError(f"scene has no unique closed contour: {scores}")
+    return str(scene["panels"][scores.index(1)]["label"])
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_closure_scores(scene), reverse=True)
+    if len(scores) != 4:
+        raise ValueError("need four closure scores")
+    return float(scores[0] - scores[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = _closure_scores(scene)
+    return scores.count(1) != 1 or margin(scene) <= 0.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """All fields that determine gold are rendered; no latent aliases apply."""
+
+    return []

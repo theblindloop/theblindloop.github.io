@@ -1,0 +1,351 @@
+"""Barb-handedness reveal: scene sampler, raster renderer and analytic gold.
+
+One teal wire runs as a single unbranching zigzag of ten equal straight runs
+through a medium window of the canvas.  Twenty-five short barbs stick out of the
+wire, each on one of the two sides of the wire.  The declared raster operation is
+a handedness read-out transported along the wire: walk the wire from the end
+sitting in the crimson pad, and record for each barb, in the order the barbs are
+met, whether it points to the walker's left.  The twenty-five verdicts, written
+row by row into a five by five grid, spell one abstract symbol.
+
+Nothing in the picture states which absolute direction is "left": the wire turns
+at every node, so a barb pointing up is a left barb on one run and a right barb
+on the next.  The bit of a barb therefore exists only relative to the direction
+in which the wire is being travelled at that barb, and the position of a barb in
+the grid exists only in the order the wire imposes on its own interior.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "barb_handedness_reveal-renderer-0.1.0"
+
+CANVAS = 640
+PITCH = 74
+LATTICE = 5                      # 5x5 lattice of nodes -> 296 px window
+WINDOW = PITCH * (LATTICE - 1)
+EDGE_MARGIN = 58
+ROUTE_EDGES = 10                 # eleven nodes, every interior node is a turn
+STATION_COUNT = 25
+GRID = 5
+
+WIRE_HALF = 3                    # wire is 7 px wide
+BARB_HALF = 2                    # barb is 5 px wide
+BARB_LEN = 18                    # barb reaches 18 px out of the wire centre line
+NODE_HALF = 5                    # node stud is 11 px square
+PAD_HALF = 11                    # start pad is 23 px square
+PROBE = 11                       # side probe offset used by the pixel oracle
+
+BG = (238, 238, 231)
+WIRE = (0, 138, 148)
+NODE = (24, 32, 84)
+PAD = (188, 32, 48)
+DECOY = (206, 201, 222)
+DECOY_NODE = (176, 172, 198)
+
+QUARANTINE_MARGIN = 4.0
+
+# Every declared symbol marks exactly nine of the twenty-five grid positions and
+# differs from every other declared symbol in at least eight positions.
+SYMBOLS: dict[str, tuple[tuple[int, int], ...]] = {
+    "ell": tuple((r, 0) for r in range(5)) + tuple((4, c) for c in range(1, 5)),
+    "ex": tuple((i, i) for i in range(5)) + tuple((i, 4 - i) for i in (0, 1, 3, 4)),
+    "plus": tuple((2, c) for c in range(5)) + tuple((r, 2) for r in (0, 1, 3, 4)),
+    "tack": tuple((4, c) for c in range(5)) + tuple((r, 2) for r in range(4)),
+    "tee": tuple((0, c) for c in range(5)) + tuple((r, 2) for r in range(1, 5)),
+}
+SYMBOL_NAMES = tuple(sorted(SYMBOLS))
+CENTRE_COLUMN_SYMBOLS = frozenset({"plus", "tack", "tee"})
+
+DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+def _pattern(name: str) -> tuple[int, ...]:
+    cells = set(SYMBOLS[name])
+    return tuple(1 if (r, c) in cells else 0 for r in range(GRID) for c in range(GRID))
+
+
+PATTERNS: dict[str, tuple[int, ...]] = {name: _pattern(name) for name in SYMBOL_NAMES}
+
+
+def _hamming(bits: Iterable[int], pattern: Iterable[int]) -> int:
+    return sum(1 for a, b in zip(bits, pattern) if a != b)
+
+
+def nearest_symbol(bits: Iterable[int]) -> tuple[str, int, int]:
+    """Nearest declared symbol, its distance and the runner-up distance."""
+    bits = tuple(int(b) for b in bits)
+    scored = sorted((_hamming(bits, PATTERNS[name]), name) for name in SYMBOL_NAMES)
+    return scored[0][1], scored[0][0], scored[1][0]
+
+
+def left_of(direction: tuple[int, int]) -> tuple[int, int]:
+    """Unit vector pointing to the left of a walker facing `direction`.
+
+    Image coordinates: x grows right, y grows down.  Facing east (1, 0) the
+    walker's left hand points north, i.e. (0, -1).
+    """
+    dx, dy = direction
+    return (dy, -dx)
+
+
+# ---------------------------------------------------------------------------
+# route sampling
+# ---------------------------------------------------------------------------
+
+
+def _sample_route(rng: random.Random) -> list[tuple[int, int]] | None:
+    """A self-avoiding lattice walk of ROUTE_EDGES steps that turns at every node."""
+    start = (rng.randrange(LATTICE), rng.randrange(LATTICE))
+    route = [start]
+    visited = {start}
+
+    def extend(last_dir: tuple[int, int] | None) -> bool:
+        if len(route) == ROUTE_EDGES + 1:
+            return True
+        node = route[-1]
+        options = [d for d in DIRS if last_dir is None or d[0] * last_dir[0] + d[1] * last_dir[1] == 0]
+        rng.shuffle(options)
+        for d in options:
+            nxt = (node[0] + d[0], node[1] + d[1])
+            if not (0 <= nxt[0] < LATTICE and 0 <= nxt[1] < LATTICE):
+                continue
+            if nxt in visited:
+                continue
+            route.append(nxt)
+            visited.add(nxt)
+            if extend(d):
+                return True
+            route.pop()
+            visited.discard(nxt)
+        return False
+
+    if not extend(None):
+        return None
+    return route
+
+
+def _station_offsets(count: int) -> list[int]:
+    return [int(round(PITCH * (i + 1) / (count + 1))) for i in range(count)]
+
+
+def _allocate_stations(rng: random.Random) -> list[int]:
+    """Barbs per straight run: every run carries two, five runs carry a third."""
+    counts = [2] * ROUTE_EDGES
+    for index in sorted(rng.sample(range(ROUTE_EDGES), STATION_COUNT - 2 * ROUTE_EDGES)):
+        counts[index] += 1
+    return counts
+
+
+def _node_px(node: tuple[int, int], origin: tuple[int, int]) -> tuple[int, int]:
+    return (origin[0] + node[1] * PITCH, origin[1] + node[0] * PITCH)
+
+
+def _stations(route: list[tuple[int, int]], counts: list[int], origin: tuple[int, int]):
+    """Barb stations in walking order: (x, y, travel direction)."""
+    out = []
+    for edge in range(ROUTE_EDGES):
+        ax, ay = _node_px(route[edge], origin)
+        bx, by = _node_px(route[edge + 1], origin)
+        length = abs(bx - ax) + abs(by - ay)
+        dx, dy = ((bx - ax) // length, (by - ay) // length)
+        for offset in _station_offsets(counts[edge]):
+            out.append((ax + dx * offset, ay + dy * offset, (dx, dy)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# shortcut audits used at sampling time
+# ---------------------------------------------------------------------------
+
+
+def _absolute_bit(barb_dir: tuple[int, int]) -> int:
+    """A handedness-free read-out: does the barb point up or left on the page?"""
+    return 1 if barb_dir in ((0, -1), (-1, 0)) else 0
+
+
+def shortcut_readings(scene: dict) -> dict[str, tuple[int, ...]]:
+    """Cheap read-outs a solver might try instead of the declared operation."""
+    stations = _stations(scene["route"], scene["station_counts"], tuple(scene["origin"]))
+    bits = tuple(int(b) for b in scene["bits"])
+    barbs = []
+    for (x, y, direction), bit in zip(stations, bits):
+        lx, ly = left_of(direction)
+        barb_dir = (lx, ly) if bit else (-lx, -ly)
+        barbs.append((x, y, barb_dir))
+    by_row = sorted(barbs, key=lambda b: (b[1], b[0]))
+    by_col = sorted(barbs, key=lambda b: (b[0], b[1]))
+    return {
+        "page_row_major": tuple(_absolute_bit(b[2]) for b in by_row),
+        "page_col_major": tuple(_absolute_bit(b[2]) for b in by_col),
+        "walk_without_handedness": tuple(_absolute_bit(b[2]) for b in barbs),
+        "walk_from_other_end": tuple(1 - b for b in reversed(bits)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# decoy placement
+# ---------------------------------------------------------------------------
+
+
+def _decoys(rng: random.Random, origin: tuple[int, int]) -> list[dict]:
+    keep_out = (origin[0] - 26, origin[1] - 26, origin[0] + WINDOW + 26, origin[1] + WINDOW + 26)
+    spots = []
+    for gx in range(14, CANVAS - 108, 26):
+        for gy in range(14, CANVAS - 108, 26):
+            if gx + 94 < keep_out[0] or gx > keep_out[2] or gy + 94 < keep_out[1] or gy > keep_out[3]:
+                spots.append((gx, gy))
+    rng.shuffle(spots)
+    chosen: list[dict] = []
+    for gx, gy in spots:
+        if len(chosen) == rng.choice((2, 3)):
+            break
+        if any(abs(gx - d["x"]) < 110 and abs(gy - d["y"]) < 110 for d in chosen):
+            continue
+        chosen.append(
+            {
+                "x": gx,
+                "y": gy,
+                "step": rng.choice((30, 36, 42)),
+                "runs": rng.choice((3, 4)),
+                "flip": rng.choice((0, 1)),
+                "sides": [rng.choice((0, 1)) for _ in range(8)],
+            }
+        )
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# public interface
+# ---------------------------------------------------------------------------
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one scene; rejects layouts that a cheap read-out would solve."""
+    rng = random.Random(0x5EED ^ (int(seed) * 2654435761 & 0xFFFFFFFF))
+    for _ in range(4000):
+        route = _sample_route(rng)
+        if route is None:
+            continue
+        # The wire must reach every side of its own lattice window, so the
+        # decisive support always spans one medium region of the canvas rather
+        # than a small local patch.
+        rows = {node[0] for node in route}
+        cols = {node[1] for node in route}
+        if min(rows) != 0 or max(rows) != LATTICE - 1 or min(cols) != 0 or max(cols) != LATTICE - 1:
+            continue
+        if rng.random() < 0.5:
+            route = list(reversed(route))
+        origin = (
+            rng.randrange(EDGE_MARGIN, CANVAS - WINDOW - EDGE_MARGIN + 1),
+            rng.randrange(EDGE_MARGIN, CANVAS - WINDOW - EDGE_MARGIN + 1),
+        )
+        counts = _allocate_stations(rng)
+        target = rng.choice(SYMBOL_NAMES)
+        flips = rng.choices((0, 1, 2, 3), weights=(4, 4, 3, 2), k=1)[0]
+        bits = list(PATTERNS[target])
+        for position in rng.sample(range(STATION_COUNT), flips):
+            bits[position] ^= 1
+        scene = {
+            "canvas": CANVAS,
+            "pitch": PITCH,
+            "lattice": LATTICE,
+            "grid": GRID,
+            "origin": list(origin),
+            "route": [list(node) for node in route],
+            "station_counts": counts,
+            "bits": bits,
+            "flip_count": flips,
+            "decoys": _decoys(rng, origin),
+        }
+        gold, best, runner_up = nearest_symbol(bits)
+        if best >= runner_up:
+            continue
+        shortcuts = shortcut_readings(scene)
+        if any(nearest_symbol(reading)[0] == gold for reading in shortcuts.values()):
+            continue
+        scene["route"] = [list(node) for node in route]
+        return scene
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+def _fill(arr: np.ndarray, x0: int, y0: int, x1: int, y1: int, color: tuple[int, int, int]) -> None:
+    arr[max(0, y0) : y1 + 1, max(0, x0) : x1 + 1] = color
+
+
+def _segment(arr: np.ndarray, x0: int, y0: int, x1: int, y1: int, half: int, color) -> None:
+    lo_x, hi_x = sorted((x0, x1))
+    lo_y, hi_y = sorted((y0, y1))
+    _fill(arr, lo_x - half, lo_y - half, hi_x + half, hi_y + half, color)
+
+
+def render(scene: dict) -> Image.Image:
+    """Flat, non-antialiased raster of one scene."""
+    arr = np.zeros((CANVAS, CANVAS, 3), dtype=np.uint8)
+    arr[:, :] = BG
+    origin = tuple(scene["origin"])
+    route = [tuple(node) for node in scene["route"]]
+
+    for decoy in scene["decoys"]:
+        x, y, step = decoy["x"], decoy["y"], decoy["step"]
+        direction = (1, 0) if decoy["flip"] == 0 else (0, 1)
+        px, py = x, y
+        for run in range(decoy["runs"]):
+            nx, ny = px + direction[0] * step, py + direction[1] * step
+            _segment(arr, px, py, nx, ny, 2, DECOY)
+            mx, my = (px + nx) // 2, (py + ny) // 2
+            lx, ly = left_of(direction)
+            side = 1 if decoy["sides"][run % len(decoy["sides"])] else -1
+            _segment(arr, mx, my, mx + lx * 11 * side, my + ly * 11 * side, 1, DECOY)
+            _fill(arr, px - 3, py - 3, px + 3, py + 3, DECOY_NODE)
+            px, py = nx, ny
+            direction = (direction[1], direction[0])
+        _fill(arr, px - 3, py - 3, px + 3, py + 3, DECOY_NODE)
+
+    sx, sy = _node_px(route[0], origin)
+    _fill(arr, sx - PAD_HALF, sy - PAD_HALF, sx + PAD_HALF, sy + PAD_HALF, PAD)
+
+    for index in range(ROUTE_EDGES):
+        ax, ay = _node_px(route[index], origin)
+        bx, by = _node_px(route[index + 1], origin)
+        _segment(arr, ax, ay, bx, by, WIRE_HALF, WIRE)
+
+    stations = _stations(route, scene["station_counts"], origin)
+    for (x, y, direction), bit in zip(stations, scene["bits"]):
+        lx, ly = left_of(direction)
+        if not bit:
+            lx, ly = -lx, -ly
+        _segment(arr, x, y, x + lx * BARB_LEN, y + ly * BARB_LEN, BARB_HALF, WIRE)
+
+    for node in route:
+        nx, ny = _node_px(node, origin)
+        _fill(arr, nx - NODE_HALF, ny - NODE_HALF, nx + NODE_HALF, ny + NODE_HALF, NODE)
+
+    return Image.fromarray(arr, mode="RGB")
+
+
+def analytic_gold(scene: dict) -> str:
+    return nearest_symbol(scene["bits"])[0]
+
+
+def hamming_margin(scene: dict) -> int:
+    _, best, runner_up = nearest_symbol(scene["bits"])
+    return int(runner_up - best)
+
+
+def margin(scene: dict) -> float:
+    return float(hamming_margin(scene))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: every sampled field is rendered (see candidate.json)."""
+    return []

@@ -1,0 +1,147 @@
+"""Independent image-only inverse for the affine lattice vacancy task."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+INK = np.array([34.0, 37.0, 44.0])
+PALETTE = {
+    "red": np.array([214.0, 55.0, 62.0]),
+    "blue": np.array([48.0, 104.0, 201.0]),
+    "green": np.array([42.0, 151.0, 88.0]),
+    "orange": np.array([230.0, 132.0, 34.0]),
+}
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    remaining = set(int(value) for value in np.flatnonzero(mask))
+    groups: list[np.ndarray] = []
+    while remaining:
+        start = remaining.pop()
+        queue = deque([start])
+        pixels = [start]
+        while queue:
+            value = queue.popleft()
+            y, x = divmod(value, width)
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    neighbor = ny * width + nx
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        queue.append(neighbor)
+                        pixels.append(neighbor)
+        if len(pixels) >= minimum:
+            yy = np.array(pixels, dtype=np.int64) // width
+            xx = np.array(pixels, dtype=np.int64) % width
+            groups.append(np.column_stack([xx, yy]).astype(np.float64))
+    return groups
+
+
+def _centroids(image: Image.Image) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.float64)
+    black_mask = np.linalg.norm(array - INK, axis=2) < 62.0
+    black_groups = _components(black_mask, 35)
+    if len(black_groups) != 24:
+        raise ValueError(f"expected 24 dark disks, recovered {len(black_groups)}")
+    dark = np.array([group.mean(axis=0) for group in black_groups])
+    colored: dict[str, np.ndarray] = {}
+    for name, rgb in PALETTE.items():
+        groups = _components(np.linalg.norm(array - rgb, axis=2) < 58.0, 24)
+        if len(groups) != 1:
+            raise ValueError(f"expected one {name} ring, recovered {len(groups)}")
+        colored[name] = groups[0].mean(axis=0)
+    return dark, colored
+
+
+def _canonical(vector: np.ndarray) -> np.ndarray:
+    if vector[0] < 0.0 or (abs(vector[0]) < 1e-9 and vector[1] < 0.0):
+        return -vector
+    return vector
+
+
+def _basis_modes(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    vectors = []
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            vector = _canonical(points[j] - points[i])
+            length = float(np.linalg.norm(vector))
+            if 45.0 <= length <= 73.0:
+                vectors.append(vector)
+    values = np.array(vectors)
+    if len(values) < 20:
+        raise ValueError("too few repeated displacement candidates")
+    ranked = []
+    for vector in values:
+        distances = np.linalg.norm(values - vector, axis=1)
+        neighbors = values[distances < 1.8]
+        ranked.append((len(neighbors), float(np.linalg.norm(vector)), neighbors.mean(axis=0)))
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2][0], item[2][1]))
+    selected: list[tuple[int, np.ndarray]] = []
+    for count, _length, mode in ranked:
+        if count < 14:
+            continue
+        if any(np.linalg.norm(mode - prior) < 3.0 for _, prior in selected):
+            continue
+        if selected:
+            prior = selected[0][1]
+            cross = prior[0] * mode[1] - prior[1] * mode[0]
+            sine = abs(float(cross)) / (np.linalg.norm(prior) * np.linalg.norm(mode))
+            if sine < 0.65:
+                continue
+        selected.append((count, mode))
+        if len(selected) == 2:
+            return selected[0][1], selected[1][1]
+    raise ValueError("could not recover two nonparallel repeated spacings")
+
+
+def _vacancy(points: np.ndarray, u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, int]:
+    basis = np.column_stack([u, v])
+    if abs(float(np.linalg.det(basis))) < 1000.0:
+        raise ValueError("recovered lattice basis is degenerate")
+    inverse = np.linalg.inv(basis)
+    best = None
+    for anchor in points:
+        coordinates = (inverse @ (points - anchor).T).T
+        rounded = np.rint(coordinates).astype(int)
+        rebuilt = anchor + (basis @ rounded.T).T
+        residuals = np.linalg.norm(points - rebuilt, axis=1)
+        valid = residuals < 2.2
+        coord_set = {tuple(value) for value in rounded[valid]}
+        if len(coord_set) < 23:
+            continue
+        xs = [value[0] for value in coord_set]
+        ys = [value[1] for value in coord_set]
+        for x0 in range(min(xs) - 1, max(xs) + 1):
+            for y0 in range(min(ys) - 1, max(ys) + 1):
+                window = {(x, y) for x in range(x0, x0 + 5) for y in range(y0, y0 + 5)}
+                occupied = coord_set & window
+                score = len(occupied)
+                error = float(residuals[valid].sum())
+                key = (score, -error)
+                if best is None or key > best[0]:
+                    best = (key, anchor.copy(), window, occupied, basis.copy())
+    if best is None or best[0][0] != 24:
+        raise ValueError("dark disks do not support a 24-of-25 lattice")
+    _key, anchor, window, occupied, fitted_basis = best
+    missing = list(window - occupied)
+    if len(missing) != 1:
+        raise ValueError(f"expected one lattice vacancy, recovered {len(missing)}")
+    target = anchor + fitted_basis @ np.array(missing[0], dtype=np.float64)
+    return target, best[0][0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    dark, colored = _centroids(image)
+    u, v = _basis_modes(dark)
+    target, _support = _vacancy(dark, u, v)
+    ranked = sorted((float(np.linalg.norm(center - target)), name) for name, center in colored.items())
+    if ranked[0][0] > 4.0:
+        raise ValueError(f"no colored ring at inferred vacancy (distance {ranked[0][0]:.2f})")
+    if ranked[1][0] - ranked[0][0] < 10.0:
+        raise ValueError("candidate decision margin is too small")
+    return ranked[0][1]

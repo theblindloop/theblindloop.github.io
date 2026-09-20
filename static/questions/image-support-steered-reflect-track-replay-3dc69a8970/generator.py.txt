@@ -1,0 +1,183 @@
+"""Reflecting-track replay world: sampling, rendering, and analytic gold.
+
+The board is one connected 5-row by 6-column tiled panel. Column 0 marks the
+token's starting row with a black disk. Columns 1-4 are ordered move stages:
+the stage's coloured cells give both the direction (teal = up, amber = down)
+and the magnitude (number of coloured cells in that stage). A move that would
+leave the track bounces off the edge and spends its remaining steps in the
+opposite direction. Column 5 is the outcome legend: one distinctly coloured cap
+per row. The answer is the cap colour of the row the token occupies after all
+four stages have been replayed.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "reflect_track_replay-renderer-0.1.0"
+
+ROWS = 5
+STAGES = 4
+COLS = 2 + STAGES  # start column, four stage columns, outcome legend column
+CELL = 84
+SEAM = 6
+BORDER = 20
+BOARD_W = (COLS + 1) * SEAM + COLS * CELL
+BOARD_H = (ROWS + 1) * SEAM + ROWS * CELL
+WIDTH = BOARD_W + 2 * BORDER
+HEIGHT = BOARD_H + 2 * BORDER
+
+CAP_NAMES = ("red", "blue", "green", "purple", "pink")
+
+# Canonical palette. Jitter is applied per scene; the pixel oracle classifies
+# against these canonical anchors, so jitter never crosses a decision boundary.
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "page": (255, 255, 255),
+    "seam": (95, 100, 110),
+    "inert": (170, 174, 182),
+    "marker": (20, 20, 24),
+    "up": (0, 150, 150),
+    "down": (235, 165, 20),
+    "red": (214, 40, 40),
+    "blue": (40, 80, 210),
+    "green": (40, 150, 60),
+    "purple": (140, 50, 190),
+    "pink": (245, 120, 180),
+}
+JITTER_ROLES = ("seam", "inert", "marker", "up", "down", *CAP_NAMES)
+JITTER_MAX = 8
+# Below this smallest pairwise colour separation (RGB units) a scene is treated
+# as a finite-resolution legibility boundary case and quarantined.
+QUARANTINE_MARGIN = 78.0
+MARKER_RADIUS_FRAC = 0.40
+
+
+def _rgb_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    return sum((int(x) - int(y)) ** 2 for x, y in zip(a, b, strict=True)) ** 0.5
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced latent scene. Every field below is rendered."""
+    rng = random.Random(seed)
+    start_row = rng.randrange(ROWS)
+    stage_dirs: list[str] = []
+    stage_cells: list[list[int]] = []
+    for _ in range(STAGES):
+        stage_dirs.append(rng.choice(("up", "down")))
+        count = rng.randint(1, ROWS - 1)
+        stage_cells.append(sorted(rng.sample(range(ROWS), count)))
+    cap_order = list(CAP_NAMES)
+    rng.shuffle(cap_order)
+    jitter = {
+        role: [rng.randint(-JITTER_MAX, JITTER_MAX) for _ in range(3)] for role in JITTER_ROLES
+    }
+    return {
+        "start_row": start_row,
+        "stage_dirs": stage_dirs,
+        "stage_cells": stage_cells,
+        "cap_order": cap_order,
+        "jitter": jitter,
+    }
+
+
+def scene_colors(scene: dict) -> dict[str, tuple[int, int, int]]:
+    """Jittered colour actually painted for each palette role."""
+    colors = {"page": PALETTE["page"]}
+    for role in JITTER_ROLES:
+        base = PALETTE[role]
+        offset = scene["jitter"][role]
+        colors[role] = tuple(max(0, min(255, base[i] + int(offset[i]))) for i in range(3))
+    return colors
+
+
+def replay(start_row: int, stage_dirs: list[str], stage_cells: list[list[int]]) -> int:
+    """Reflecting replay: the declared rule, applied one unit step at a time."""
+    position = start_row
+    for direction, cells in zip(stage_dirs, stage_cells, strict=True):
+        step = -1 if direction == "up" else 1
+        for _ in range(len(cells)):
+            nxt = position + step
+            if nxt < 0 or nxt > ROWS - 1:
+                step = -step
+                nxt = position + step
+            position = nxt
+    return position
+
+
+def final_row(scene: dict) -> int:
+    return replay(scene["start_row"], scene["stage_dirs"], scene["stage_cells"])
+
+
+def analytic_gold(scene: dict) -> str:
+    """Cap colour name of the row the token occupies after all four stages."""
+    return scene["cap_order"][final_row(scene)]
+
+
+def margin(scene: dict) -> float:
+    """Smallest pairwise separation between painted role colours, RGB units.
+
+    This is the runner-up margin of the pixel reading: the smallest colour
+    perturbation that could make any cell read as a different role, which is
+    the only route by which a replay step - and hence the answer - can flip.
+    """
+    colors = scene_colors(scene)
+    roles = ["page", "seam", "inert", "marker", "up", "down", *scene["cap_order"]]
+    worst = float("inf")
+    for i, a in enumerate(roles):
+        for b in roles[i + 1 :]:
+            worst = min(worst, _rgb_distance(colors[a], colors[b]))
+    return round(float(worst), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: the render is injective in every scene field."""
+    return []
+
+
+def cell_box(row: int, col: int) -> tuple[int, int, int, int]:
+    x0 = BORDER + SEAM + col * (CELL + SEAM)
+    y0 = BORDER + SEAM + row * (CELL + SEAM)
+    return x0, y0, x0 + CELL, y0 + CELL
+
+
+def cell_roles(scene: dict) -> list[list[str]]:
+    """Role of every board cell; this is exactly what the renderer paints."""
+    grid = [["inert"] * COLS for _ in range(ROWS)]
+    for row in range(ROWS):
+        grid[row][0] = "marker" if row == scene["start_row"] else "inert"
+    for stage, (direction, cells) in enumerate(
+        zip(scene["stage_dirs"], scene["stage_cells"], strict=True)
+    ):
+        for row in cells:
+            grid[row][1 + stage] = direction
+    for row in range(ROWS):
+        grid[row][COLS - 1] = scene["cap_order"][row]
+    return grid
+
+
+def render(scene: dict) -> Image.Image:
+    colors = scene_colors(scene)
+    image = Image.new("RGB", (WIDTH, HEIGHT), colors["page"])
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(
+        (BORDER, BORDER, BORDER + BOARD_W - 1, BORDER + BOARD_H - 1), fill=colors["seam"]
+    )
+    grid = cell_roles(scene)
+    for row in range(ROWS):
+        for col in range(COLS):
+            x0, y0, x1, y1 = cell_box(row, col)
+            role = grid[row][col]
+            if role == "marker":
+                draw.rectangle((x0, y0, x1 - 1, y1 - 1), fill=colors["inert"])
+                cx, cy = (x0 + x1 - 1) / 2.0, (y0 + y1 - 1) / 2.0
+                rad = CELL * MARKER_RADIUS_FRAC
+                draw.ellipse((cx - rad, cy - rad, cx + rad, cy + rad), fill=colors["marker"])
+            else:
+                draw.rectangle((x0, y0, x1 - 1, y1 - 1), fill=colors[role])
+    return image

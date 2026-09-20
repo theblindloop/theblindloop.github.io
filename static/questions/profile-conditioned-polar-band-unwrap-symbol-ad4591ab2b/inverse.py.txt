@@ -1,0 +1,214 @@
+"""Independent image-only inverse for the polar band symbol world."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+ORACLE_VERSION = "polar-band-unwrap-oracle-0.1.0"
+SYMBOLS = ("wave", "ladder", "bowtie", "key")
+
+
+def _segment_band(x, y, x1, y1, x2, y2, width):
+    dx, dy = x2 - x1, y2 - y1
+    t = ((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy)
+    t = np.clip(t, 0.0, 1.0)
+    px, py = x1 + t * dx, y1 + t * dy
+    return (x - px) ** 2 + (y - py) ** 2 <= width * width
+
+
+def _disk(x, y, cx, cy, radius):
+    return (x - cx) ** 2 + (y - cy) ** 2 <= radius * radius
+
+
+def _template_mask(u, v, symbol, dx, dy, scale):
+    """Independent copy of the public symbol templates, with no scene access."""
+
+    x = (u - 0.5 - dx) / scale + 0.5
+    y = (v - 0.5 - dy) / scale + 0.5
+    if symbol == "wave":
+        curve = 0.5 + 0.21 * np.sin(2.0 * math.pi * 1.35 * (x - 0.12))
+        return (x >= 0.12) & (x <= 0.88) & (np.abs(y - curve) <= 0.055)
+    if symbol == "ladder":
+        parts = [
+            _segment_band(x, y, 0.27, 0.19, 0.27, 0.81, 0.045),
+            _segment_band(x, y, 0.73, 0.19, 0.73, 0.81, 0.045),
+            _segment_band(x, y, 0.27, 0.28, 0.73, 0.28, 0.045),
+            _segment_band(x, y, 0.27, 0.50, 0.73, 0.50, 0.045),
+            _segment_band(x, y, 0.27, 0.72, 0.73, 0.72, 0.045),
+        ]
+        return np.logical_or.reduce(parts)
+    if symbol == "bowtie":
+        parts = [
+            _segment_band(x, y, 0.20, 0.22, 0.80, 0.50, 0.050),
+            _segment_band(x, y, 0.80, 0.50, 0.20, 0.78, 0.050),
+            _segment_band(x, y, 0.20, 0.78, 0.80, 0.22, 0.050),
+            _segment_band(x, y, 0.80, 0.22, 0.20, 0.50, 0.050),
+        ]
+        return np.logical_or.reduce(parts)
+    if symbol == "key":
+        parts = [
+            _disk(x, y, 0.50, 0.27, 0.135),
+            _segment_band(x, y, 0.50, 0.34, 0.50, 0.78, 0.055),
+            _segment_band(x, y, 0.50, 0.68, 0.68, 0.68, 0.055),
+            _segment_band(x, y, 0.50, 0.78, 0.65, 0.78, 0.055),
+        ]
+        return np.logical_or.reduce(parts)
+    raise ValueError(f"unknown template {symbol!r}")
+
+
+def _components(mask: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    visited = np.zeros(mask.shape, dtype=bool)
+    components = []
+    height, width = mask.shape
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if visited[y0, x0]:
+            continue
+        queue = deque([(y0, x0)])
+        visited[y0, x0] = True
+        ys, xs = [], []
+        while queue:
+            y, x = queue.popleft()
+            ys.append(y)
+            xs.append(x)
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(xs) >= 100:
+            components.append((np.asarray(ys, dtype=int), np.asarray(xs, dtype=int)))
+    return components
+
+
+def _marker_data(arr: np.ndarray):
+    spread = arr.max(axis=2) - arr.min(axis=2)
+    components = _components(spread > 58.0)
+    if len(components) != 4:
+        raise ValueError(f"expected four colored fiducials, found {len(components)}")
+    data = []
+    for ys, xs in components:
+        pixels = arr[ys, xs].astype(float)
+        data.append(
+            {
+                "point": np.array([float(xs.mean()) + 0.5, float(ys.mean()) + 0.5]),
+                "color": pixels.mean(axis=0),
+            }
+        )
+    return data
+
+
+def _pairings():
+    return [((0, 1), (2, 3)), ((0, 2), (1, 3)), ((0, 3), (1, 2))]
+
+
+def _cross(a, b):
+    return float(a[0] * b[1] - a[1] * b[0])
+
+
+def _frame_from_markers(data):
+    best = None
+    for left, right in _pairings():
+        color_cost = float(np.linalg.norm(data[left[0]]["color"] - data[left[1]]["color"]))
+        color_cost += float(np.linalg.norm(data[right[0]]["color"] - data[right[1]]["color"]))
+        if best is None or color_cost < best[0]:
+            best = (color_cost, left, right)
+    _, left, right = best
+    p, q = data[left[0]]["point"], data[left[1]]["point"]
+    r, s = data[right[0]]["point"], data[right[1]]["point"]
+    direction_a, direction_b = q - p, s - r
+    denominator = _cross(direction_a, direction_b)
+    if abs(denominator) < 1e-5:
+        raise ValueError("fiducial rays are parallel")
+    t = _cross(r - p, direction_b) / denominator
+    center = p + t * direction_a
+    if not np.all(np.isfinite(center)):
+        raise ValueError("invalid frame center")
+    ordered = []
+    for pair in (left, right):
+        points = [data[pair[0]]["point"], data[pair[1]]["point"]]
+        points.sort(key=lambda point: float(np.linalg.norm(point - center)))
+        ordered.append(points)
+    inner = float(np.mean([np.linalg.norm(points[0] - center) for points in ordered]))
+    outer = float(np.mean([np.linalg.norm(points[1] - center) for points in ordered]))
+    if not (55.0 < inner < outer < 340.0 and outer - inner > 60.0):
+        raise ValueError("invalid annular radii")
+    angles = [math.degrees(math.atan2(points[1][1] - center[1], points[1][0] - center[0])) % 360.0 for points in ordered]
+    delta = (angles[1] - angles[0]) % 360.0
+    if not 60.0 <= delta <= 170.0:
+        ordered.reverse()
+        angles = [angles[1], angles[0]]
+        delta = (angles[1] - angles[0]) % 360.0
+    if not 60.0 <= delta <= 170.0:
+        raise ValueError(f"invalid angular span {delta}")
+    return center, inner, outer, angles[0], delta
+
+
+def _bilinear(gray: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    x = np.clip(xs, 0.0, gray.shape[1] - 1.001)
+    y = np.clip(ys, 0.0, gray.shape[0] - 1.001)
+    x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
+    x1, y1 = x0 + 1, y0 + 1
+    wx, wy = x - x0, y - y0
+    return (
+        gray[y0, x0] * (1.0 - wx) * (1.0 - wy)
+        + gray[y0, x1] * wx * (1.0 - wy)
+        + gray[y1, x0] * (1.0 - wx) * wy
+        + gray[y1, x1] * wx * wy
+    )
+
+
+def _unwrap(arr: np.ndarray, frame) -> np.ndarray:
+    center, inner, outer, start, span = frame
+    # Crop away the colored corner marks and boundary pixels before the flat view.
+    us = np.linspace(0.08, 0.92, 192, dtype=float)
+    vs = np.linspace(0.12, 0.88, 64, dtype=float)
+    u, v = np.meshgrid(us, vs)
+    radii = inner + v * (outer - inner)
+    angles = np.radians(start + u * span)
+    xs = center[0] + radii * np.cos(angles)
+    ys = center[1] + radii * np.sin(angles)
+    gray = arr[:, :, 0].astype(float)
+    sampled = _bilinear(gray, xs, ys)
+    image = Image.fromarray(np.clip(sampled, 0.0, 255.0).astype(np.uint8), mode="L")
+    return np.asarray(image.resize((96, 32), Image.Resampling.BOX), dtype=float)
+
+
+def _score_view(low: np.ndarray) -> dict[str, float]:
+    us = np.linspace(0.08, 0.92, 96, dtype=float)
+    vs = np.linspace(0.12, 0.88, 32, dtype=float)
+    u, v = np.meshgrid(us, vs)
+    observed = np.median(low) - low
+    observed = observed - observed.mean()
+    observed /= observed.std() + 1e-6
+    scores = {symbol: -1e9 for symbol in SYMBOLS}
+    for symbol in SYMBOLS:
+        for dx in (-0.04, -0.02, 0.0, 0.02, 0.04):
+            for dy in (-0.04, -0.02, 0.0, 0.02, 0.04):
+                for scale in (0.88, 0.94, 1.00, 1.06, 1.12):
+                    mask = _template_mask(u, v, symbol, dx, dy, scale).astype(float)
+                    mask -= mask.mean()
+                    norm = float(np.linalg.norm(mask))
+                    if norm > 1.0:
+                        value = float(np.sum(observed * mask) / norm)
+                        if value > scores[symbol]:
+                            scores[symbol] = value
+    return scores
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the symbol from pixels only; no latent scene or renderer import."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=float)
+    data = _marker_data(arr)
+    frame = _frame_from_markers(data)
+    low = _unwrap(arr, frame)
+    forward = _score_view(low)
+    reverse = _score_view(low[:, ::-1])
+    scores = {symbol: max(forward[symbol], reverse[symbol]) for symbol in SYMBOLS}
+    return max(SYMBOLS, key=lambda symbol: (scores[symbol], -SYMBOLS.index(symbol)))

@@ -1,0 +1,244 @@
+"""compare_swap_network: conditional comparator-exchange network.
+
+Four lanes each hold one coloured bar of its own height.  Below the lanes a
+top-to-bottom ordered stack of rungs is drawn; every rung joins exactly two
+lanes and carries a small orange square just outside one of its two ends.
+Applying a rung puts the TALLER of the two bars it joins into the marked (orange)
+end and the shorter one into the other end; if they already sit that way nothing
+moves.  The bars keep their colour and their height while they travel.  A teal
+triangle under one lane marks the lane that is queried.
+
+Everything the answer depends on is drawn: the bar colours and heights, the lane
+each bar starts in, the two lanes each rung joins, which end of each rung is
+marked, the top-to-bottom order of the rungs, and the queried lane.
+
+Public interface (protocol v0.4):
+    sample_scene(seed) -> dict
+    render(scene) -> PIL.Image.Image
+    analytic_gold(scene) -> str
+    margin(scene) -> float
+    is_quarantined(scene) -> bool
+    latent_symmetries(scene) -> list[tuple[str, dict]]
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "compare_swap_network@1.0.0"
+
+# ---------------------------------------------------------------- geometry --
+W, H = 480, 420
+LANE_X = (90, 190, 290, 390)
+BASELINE = 150            # bars stand on this line
+BAR_W = 44
+RUNG_Y0 = 195             # first rung
+RUNG_DY = 50
+RUNG_T = 5                # rung thickness
+CAP_W, CAP_H = 5, 20      # end caps
+SQ = 16                   # orange marker square
+SQ_GAP = 10               # gap from lane centre to the near edge of the square
+TRI_Y = 366               # teal triangle top
+QUARANTINE_MARGIN = 6.0
+
+# ------------------------------------------------------------------ palette --
+BG = (255, 255, 255)
+BLACK = (0, 0, 0)
+ORANGE = (255, 150, 0)
+TEAL = (0, 150, 150)
+LANE_GREY = (170, 170, 170)
+RACK_GREY = (225, 225, 225)
+ARROW_GREY = (120, 120, 120)
+
+BAR_COLORS = {
+    "red": (220, 40, 40),
+    "blue": (40, 70, 200),
+    "green": (30, 140, 60),
+    "purple": (140, 50, 170),
+}
+COLOR_ORDER = ("red", "blue", "green", "purple")
+
+
+# -------------------------------------------------------------- sampling ----
+def _candidate_scene(rng: random.Random) -> dict:
+    """One unconstrained draw of the latent scene."""
+    # Heights are drawn through their sorted gaps so that the least pairwise gap
+    # - the margin - is controlled directly and near-boundary scenes are sampled
+    # on purpose rather than by accident.
+    least = rng.randint(2, 5) if rng.random() < 0.18 else rng.randint(8, 17)
+    gaps = [least + rng.randint(0, 11) for _ in range(3)]
+    gaps[rng.randrange(3)] = least
+    base = rng.randint(34, 116 - sum(gaps))
+    heights = [base]
+    for g in gaps:
+        heights.append(heights[-1] + g)
+    rng.shuffle(heights)
+    lanes = list(range(4))
+    rng.shuffle(lanes)
+    # bars is an unordered bag: each bar records its own start lane.
+    bars = [
+        {"color": c, "height": h, "lane": ln}
+        for c, h, ln in zip(COLOR_ORDER, heights, lanes)
+    ]
+    rng.shuffle(bars)
+
+    n_rungs = rng.choice((3, 4))
+    rungs = []
+    for i in range(n_rungs):
+        a, b = rng.sample(range(4), 2)
+        rungs.append({"row": i, "lane_a": a, "lane_b": b, "marked": rng.choice((a, b))})
+    rng.shuffle(rungs)  # stored order is irrelevant; `row` is what is drawn
+
+    return {
+        "bars": bars,
+        "rungs": rungs,
+        "query_lane": rng.randrange(4),
+        "canvas": [W, H],
+    }
+
+
+def _ordered_rungs(scene: dict) -> list[dict]:
+    return sorted(scene["rungs"], key=lambda r: r["row"])
+
+
+def _start_lanes(scene: dict) -> list[str]:
+    """Colour standing in each lane before any rung is applied."""
+    lane = [None, None, None, None]
+    for bar in scene["bars"]:
+        lane[bar["lane"]] = bar["color"]
+    return lane
+
+
+def _heights(scene: dict) -> dict:
+    return {bar["color"]: bar["height"] for bar in scene["bars"]}
+
+
+def _replay(scene: dict) -> list[str]:
+    lane = _start_lanes(scene)
+    hh = _heights(scene)
+    for rung in _ordered_rungs(scene):
+        a, b = rung["lane_a"], rung["lane_b"]
+        marked = rung["marked"]
+        other = b if marked == a else a
+        if hh[lane[marked]] < hh[lane[other]]:
+            lane[marked], lane[other] = lane[other], lane[marked]
+    return lane
+
+
+def analytic_gold(scene: dict) -> str:
+    """`<colour>|start<n>`: the colour that ends in the queried lane and the
+    1-based lane that colour started in."""
+    final = _replay(scene)
+    color = final[scene["query_lane"]]
+    start = _start_lanes(scene).index(color)
+    return f"{color}|start{start + 1}"
+
+
+def margin(scene: dict) -> float:
+    """Smallest height difference between any two bars, in pixels.
+
+    Every decision the rungs make is a comparison of two bar heights, so the
+    least pairwise height gap bounds how much the raster may move before some
+    comparison, and hence the answer, is no longer certifiable."""
+    hs = sorted(bar["height"] for bar in scene["bars"])
+    return float(min(b - a for a, b in zip(hs, hs[1:])))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def sample_scene(seed: int) -> dict:
+    """Balanced draw: the answering colour is pinned to a seed-cycled target so
+    answer identity is counterbalanced against colour, and cheap heuristics are
+    forced off systematic correctness."""
+    rng = random.Random((seed * 2654435761) % (2**63))
+    target = COLOR_ORDER[seed % 4]
+    want_tallest = (seed // 4) % 4 == 0      # answer is the tallest bar 1/4 of the time
+    want_stayer = (seed // 16) % 4 == 0      # answer already sits in the query lane 1/4
+    fallback = None
+    for _ in range(4000):
+        scene = _candidate_scene(rng)
+        color = analytic_gold(scene).split("|")[0]
+        if color != target:
+            continue
+        hh = _heights(scene)
+        tallest = max(hh, key=lambda c: hh[c]) == color
+        stayer = _start_lanes(scene)[scene["query_lane"]] == color
+        if fallback is None:
+            fallback = scene
+        if tallest == want_tallest and stayer == want_stayer:
+            return scene
+    if fallback is None:  # pragma: no cover - the target colour is always reachable
+        raise RuntimeError("sampling failed")
+    return fallback
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Storage permutations that must redraw the identical raster and keep gold.
+
+    The bars are a bag and the rungs are an unordered list carrying their own
+    drawn row; a rung's two lanes are an unordered pair plus a marked member.
+    Gold that keyed off Python list position instead of what is drawn would
+    break on all three."""
+    out: list[tuple[str, dict]] = []
+    out.append(("reverse_bar_bag", {**scene, "bars": list(reversed(scene["bars"]))}))
+    out.append(("reverse_rung_storage", {**scene, "rungs": list(reversed(scene["rungs"]))}))
+    out.append(
+        (
+            "swap_rung_endpoint_storage",
+            {
+                **scene,
+                "rungs": [
+                    {**r, "lane_a": r["lane_b"], "lane_b": r["lane_a"]} for r in scene["rungs"]
+                ],
+            },
+        )
+    )
+    return out
+
+
+# ------------------------------------------------------------------ render --
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+
+    # lane racks (decoration) and lane guide lines
+    for x in LANE_X:
+        d.rectangle([x - BAR_W // 2 - 8, 22, x + BAR_W // 2 + 8, BASELINE + 4], fill=RACK_GREY)
+        d.rectangle([x - 1, 162, x + 1, 356], fill=LANE_GREY)
+
+    # bars, drawn from the shared baseline upwards
+    for bar in sorted(scene["bars"], key=lambda b: b["lane"]):
+        x = LANE_X[bar["lane"]]
+        top = BASELINE - bar["height"]
+        d.rectangle(
+            [x - BAR_W // 2, top, x + BAR_W // 2, BASELINE],
+            fill=BAR_COLORS[bar["color"]],
+        )
+
+    # order arrow on the left margin: top to bottom
+    d.rectangle([38, 186, 42, 336], fill=ARROW_GREY)
+    d.polygon([(30, 336), (50, 336), (40, 352)], fill=ARROW_GREY)
+
+    # rungs
+    for rung in _ordered_rungs(scene):
+        y = RUNG_Y0 + RUNG_DY * rung["row"]
+        xa, xb = LANE_X[rung["lane_a"]], LANE_X[rung["lane_b"]]
+        lo, hi = min(xa, xb), max(xa, xb)
+        d.rectangle([lo, y - RUNG_T // 2, hi, y + RUNG_T // 2], fill=BLACK)
+        for x in (lo, hi):
+            d.rectangle(
+                [x - CAP_W // 2, y - CAP_H // 2, x + CAP_W // 2, y + CAP_H // 2], fill=BLACK
+            )
+        mx = LANE_X[rung["marked"]]
+        outward = 1 if mx == hi else -1      # square sits outside the joined span
+        cx = mx + outward * (SQ_GAP + SQ // 2)
+        d.rectangle([cx - SQ // 2, y - SQ // 2, cx + SQ // 2, y + SQ // 2], fill=ORANGE)
+
+    # teal query triangle under the queried lane
+    qx = LANE_X[scene["query_lane"]]
+    d.polygon([(qx, TRI_Y), (qx - 14, TRI_Y + 24), (qx + 14, TRI_Y + 24)], fill=TEAL)
+    return img

@@ -1,0 +1,138 @@
+"""Image-only inverse arm for graph reconstruction and weakest-link capacity."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+PALETTE = np.array(
+    [
+        (247, 249, 252),
+        (31, 36, 44),
+        (32, 170, 92),
+        (132, 141, 153),
+        (242, 139, 38),
+        (142, 68, 173),
+        (45, 117, 220),
+    ],
+    dtype=np.int16,
+)
+COLOR_NAMES = {4: "orange", 5: "purple", 6: "blue"}
+
+
+def _components(mask: np.ndarray, minimum: int = 8) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        pixels = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            result.append(np.asarray(pixels, dtype=np.float64))
+    return result
+
+
+def _center(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _stroke_width(component: np.ndarray) -> float:
+    """Estimate width as component area divided by its PCA centerline span."""
+    xy = component[:, ::-1]
+    centered = xy - xy.mean(axis=0)
+    covariance = centered.T @ centered
+    values, vectors = np.linalg.eigh(covariance)
+    axis = vectors[:, int(np.argmax(values))]
+    projection = centered @ axis
+    span = float(projection.max() - projection.min() + 1.0)
+    if span < 25.0:
+        raise ValueError("dark link is too short")
+    return float(len(component) / span)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int32)
+
+    def mask_for(index: int, tolerance: int = 24) -> np.ndarray:
+        color = PALETTE[index].astype(np.int32)
+        return ((arr - color) ** 2).sum(axis=2) <= tolerance**2
+
+    nodes: list[tuple[str, tuple[float, float]]] = []
+    starts = _components(mask_for(2), 80)
+    if len(starts) != 3:
+        raise ValueError(f"expected three green starts, found {len(starts)}")
+    start_ids = []
+    for index, component in enumerate(starts):
+        node = f"start_{index}"
+        start_ids.append(node)
+        nodes.append((node, _center(component)))
+
+    waypoints = _components(mask_for(3), 80)
+    if len(waypoints) != 9:
+        raise ValueError(f"expected nine gray waypoints, found {len(waypoints)}")
+    for index, component in enumerate(waypoints):
+        nodes.append((f"waypoint_{index}", _center(component)))
+
+    terminal_color: dict[str, str] = {}
+    for palette_index, color in COLOR_NAMES.items():
+        components = _components(mask_for(palette_index), 80)
+        if len(components) != 1:
+            raise ValueError(f"expected one {color} terminal")
+        node = f"terminal_{color}"
+        terminal_color[node] = color
+        nodes.append((node, _center(components[0])))
+
+    graph: dict[str, list[tuple[str, float]]] = {name: [] for name, _ in nodes}
+    dark_components = _components(mask_for(1, 18), 40)
+    if len(dark_components) != 12:
+        raise ValueError(f"expected twelve separated dark links, found {len(dark_components)}")
+    for component in dark_components:
+        xy = component[:, ::-1]
+        ranked = []
+        for name, (cx, cy) in nodes:
+            distance2 = ((xy[:, 0] - cx) ** 2 + (xy[:, 1] - cy) ** 2).min()
+            ranked.append((float(distance2), name))
+        ranked.sort()
+        (distance_a, a), (distance_b, b) = ranked[:2]
+        if distance_b > 20.0**2 or a == b:
+            raise ValueError("dark link endpoints cannot be assigned")
+        estimate = _stroke_width(component)
+        graph[a].append((b, estimate))
+        graph[b].append((a, estimate))
+
+    capacities: dict[str, float] = {}
+    for start in start_ids:
+        stack = [(start, None, float("inf"))]
+        reached = []
+        seen = set()
+        while stack:
+            node, parent, bottleneck = stack.pop()
+            if node in seen:
+                raise ValueError("route graph contains a cycle")
+            seen.add(node)
+            if node in terminal_color:
+                reached.append((terminal_color[node], bottleneck))
+                continue
+            for nxt, width in graph[node]:
+                if nxt != parent:
+                    stack.append((nxt, node, min(bottleneck, width)))
+        if len(reached) != 1:
+            raise ValueError("each start must reach exactly one colored terminal")
+        color, capacity = reached[0]
+        capacities[color] = capacity
+    if len(capacities) != 3:
+        raise ValueError("recovered routes do not bind three distinct terminals")
+    ranked = sorted(capacities.items(), key=lambda item: item[1], reverse=True)
+    if ranked[0][1] - ranked[1][1] < 1.2:
+        raise ValueError("pixel bottleneck margin is ambiguous")
+    return ranked[0][0]

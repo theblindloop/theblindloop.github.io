@@ -1,0 +1,159 @@
+"""Pixel-only inverse arm for the socket-notch / plug-fit world.
+
+Input: one rasterized RGB image plus the public question contract. No latent
+scene, no renderer, no gold. Pipeline:
+
+1. locate the single cream panel by colour and take its extent;
+2. inside the panel, label tile-sized colour blobs and drop anything that is not
+   a contract-coloured tile (decorative or damaged pixels are ignored, not
+   guessed at);
+3. recover the tile pitch from the gray socket's own adjacent columns and read
+   every glyph onto its own cell lattice;
+4. rebuild the socket's 5 x 5 outline, subtract its tiles, and obtain the hole;
+5. require exactly two distinct plug colours, each with as many tiles as the
+   hole, and exactly one whose translated cell set equals the hole;
+6. report that plug's colour.
+
+Every failure of that structure is an abstention (exception), never a guess.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+CREAM = (240, 232, 208)
+CREAM_TOL = 26
+
+# The contract names one gray socket and four plug colours.
+GLYPH_COLORS = {
+    "gray": (96, 104, 118),
+    "red": (196, 52, 52),
+    "blue": (44, 92, 196),
+    "green": (36, 140, 80),
+    "purple": (132, 60, 168),
+}
+COLOR_TOL = 44.0
+
+MIN_TILE_AREA = 24
+MAX_TILE_AREA = 110
+SOCKET_N = 5
+MIN_HOLE = 3
+MAX_HOLE = 5
+
+
+def _label(mask: np.ndarray) -> list[np.ndarray]:
+    """4-connected components of a boolean mask, as index arrays."""
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    blobs: list[np.ndarray] = []
+    for sy in range(height):
+        for sx in range(width):
+            if not mask[sy, sx] or seen[sy, sx]:
+                continue
+            stack = [(sy, sx)]
+            seen[sy, sx] = True
+            pixels = []
+            while stack:
+                y, x = stack.pop()
+                pixels.append((y, x))
+                for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+            blobs.append(np.asarray(pixels, dtype=int))
+            if len(blobs) > 400:
+                raise ValueError("panel contents are too fragmented to read")
+    return blobs
+
+
+def _normalise(cells):
+    rows = [r for r, _ in cells]
+    cols = [c for _, c in cells]
+    r0, c0 = min(rows), min(cols)
+    return tuple(sorted((r - r0, c - c0) for r, c in cells))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+
+    cream = np.all(np.abs(array - np.asarray(CREAM, dtype=np.int16)) <= CREAM_TOL, axis=2)
+    if int(cream.sum()) < 3000:
+        raise ValueError("no cream panel is visible")
+    ys, xs = np.nonzero(cream)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    if (y1 - y0) < 40 or (x1 - x0) < 40:
+        raise ValueError("the cream panel is too small to hold the glyphs")
+    panel = array[y0:y1, x0:x1]
+    if int(cream[y0:y1, x0:x1].sum()) < 0.25 * (y1 - y0) * (x1 - x0):
+        raise ValueError("the cream region is not a filled panel")
+
+    ink = ~np.all(np.abs(panel - np.asarray(CREAM, dtype=np.int16)) <= CREAM_TOL, axis=2)
+    tiles: list[dict] = []
+    for pixels in _label(ink):
+        if not (MIN_TILE_AREA <= len(pixels) <= MAX_TILE_AREA):
+            continue  # decoration, damage, or a merged smear: not a contract tile
+        mean = panel[pixels[:, 0], pixels[:, 1]].mean(axis=0)
+        best, dist = None, None
+        for name, rgb in GLYPH_COLORS.items():
+            d = float(np.linalg.norm(mean - np.asarray(rgb, dtype=float)))
+            if dist is None or d < dist:
+                best, dist = name, d
+        if dist is None or dist > COLOR_TOL:
+            continue
+        tiles.append({"color": best, "cy": float(pixels[:, 0].mean()), "cx": float(pixels[:, 1].mean())})
+
+    socket = [t for t in tiles if t["color"] == "gray"]
+    if not (SOCKET_N * SOCKET_N - MAX_HOLE <= len(socket) <= SOCKET_N * SOCKET_N - MIN_HOLE):
+        raise ValueError(f"socket tile count {len(socket)} is outside the contract range")
+
+    xs_sorted = sorted(t["cx"] for t in socket)
+    diffs = [b - a for a, b in zip(xs_sorted, xs_sorted[1:]) if b - a > 2.0]
+    if not diffs:
+        raise ValueError("the socket exposes no adjacent columns to measure the tile pitch")
+    pitch = min(diffs)
+    if not 5.0 <= pitch <= 40.0:
+        raise ValueError(f"implausible tile pitch {pitch:.2f}")
+
+    def lattice(group):
+        oy = min(t["cy"] for t in group)
+        ox = min(t["cx"] for t in group)
+        cells = []
+        for t in group:
+            fr, fc = (t["cy"] - oy) / pitch, (t["cx"] - ox) / pitch
+            r, c = round(fr), round(fc)
+            if abs(fr - r) > 0.28 or abs(fc - c) > 0.28:
+                raise ValueError("a glyph's tiles are off its own lattice")
+            cells.append((int(r), int(c)))
+        if len(set(cells)) != len(cells):
+            raise ValueError("two tiles collided on one lattice cell")
+        return set(cells)
+
+    socket_cells = lattice(socket)
+    rows = {r for r, _ in socket_cells}
+    cols = {c for _, c in socket_cells}
+    if max(rows) - min(rows) != SOCKET_N - 1 or max(cols) - min(cols) != SOCKET_N - 1:
+        raise ValueError("the socket outline is not the contract 5 x 5 block")
+    full = {(r, c) for r in range(SOCKET_N) for c in range(SOCKET_N)}
+    hole = full - socket_cells
+    if not MIN_HOLE <= len(hole) <= MAX_HOLE:
+        raise ValueError(f"hole size {len(hole)} is outside the contract range")
+    if any(r in (0, SOCKET_N - 1) or c in (0, SOCKET_N - 1) for r, c in hole):
+        raise ValueError("the hole breaks the socket's outer border")
+    norm_hole = _normalise(hole)
+
+    plug_colors = sorted({t["color"] for t in tiles if t["color"] != "gray"})
+    if len(plug_colors) != 2:
+        raise ValueError(f"expected exactly two plug colours, saw {plug_colors}")
+
+    fits = []
+    for name in plug_colors:
+        group = [t for t in tiles if t["color"] == name]
+        if len(group) != len(hole):
+            raise ValueError(f"plug {name} has {len(group)} tiles but the hole needs {len(hole)}")
+        if _normalise(lattice(group)) == norm_hole:
+            fits.append(name)
+    if len(fits) != 1:
+        raise ValueError(f"the fitting plug is not unique: {fits}")
+    return fits[0]

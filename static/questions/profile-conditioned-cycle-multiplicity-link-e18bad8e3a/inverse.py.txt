@@ -1,0 +1,131 @@
+"""Independent pixel-only inverse arm for the rendered graph."""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from math import hypot
+
+import numpy as np
+from PIL import Image
+
+BLACK = np.array((24, 28, 34), dtype=float)
+WHITE = np.array((250, 250, 247), dtype=float)
+COLORS = {
+    "red": np.array((218, 55, 67), dtype=float),
+    "green": np.array((24, 151, 96), dtype=float),
+    "blue": np.array((47, 101, 211), dtype=float),
+}
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue = [(int(y), int(x))]
+        seen[y, x] = True
+        pixels = []
+        while queue:
+            cy, cx = queue.pop()
+            pixels.append((cy, cx))
+            for ny in range(max(0, cy - 1), min(h, cy + 2)):
+                for nx in range(max(0, cx - 1), min(w, cx + 2)):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= 120:
+            result.append(pixels)
+    return result
+
+
+def _point_segment_distance(px, py, ax, ay, bx, by) -> tuple[float, float]:
+    vx, vy = bx - ax, by - ay
+    denom = vx * vx + vy * vy
+    if denom == 0:
+        return hypot(px - ax, py - ay), 0.0
+    t = ((px - ax) * vx + (py - ay) * vy) / denom
+    t_clip = max(0.0, min(1.0, t))
+    qx, qy = ax + t_clip * vx, ay + t_clip * vy
+    return hypot(px - qx, py - qy), t
+
+
+def _sample_segment(arr: np.ndarray, a, b) -> list[np.ndarray]:
+    ax, ay = a
+    bx, by = b
+    distance = hypot(bx - ax, by - ay)
+    count = max(2, int(distance - 28))
+    samples = []
+    for i in range(count):
+        t = (14.0 + (distance - 28.0) * (i + 0.5) / count) / distance
+        x = int(round(ax + t * (bx - ax)))
+        y = int(round(ay + t * (by - ay)))
+        samples.append(arr[y, x])
+    return samples
+
+
+def _simple_path_count(graph: dict[int, set[int]], start: int, end: int) -> int:
+    def visit(node: int, seen: set[int]) -> int:
+        if node == end:
+            return 1
+        return sum(visit(nxt, seen | {nxt}) for nxt in graph[node] if nxt not in seen)
+    return visit(start, {start})
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=float)
+    black_mask = np.linalg.norm(arr - BLACK, axis=2) < 35.0
+    blobs = _components(black_mask)
+    if len(blobs) < 6:
+        raise ValueError("insufficient visible junctions")
+    nodes = []
+    for pixels in blobs:
+        ys = np.array([p[0] for p in pixels], dtype=float)
+        xs = np.array([p[1] for p in pixels], dtype=float)
+        nodes.append((float(xs.mean()), float(ys.mean())))
+
+    graph: dict[int, set[int]] = defaultdict(set)
+    candidate_edges: dict[str, tuple[int, int]] = {}
+    for i, a in enumerate(nodes):
+        for j in range(i + 1, len(nodes)):
+            b = nodes[j]
+            distance = hypot(b[0] - a[0], b[1] - a[1])
+            if distance < 28 or distance > 190:
+                continue
+            blocked = False
+            for k, point in enumerate(nodes):
+                if k in (i, j):
+                    continue
+                gap, t = _point_segment_distance(point[0], point[1], a[0], a[1], b[0], b[1])
+                if 0.08 < t < 0.92 and gap < 15.0:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            samples = _sample_segment(arr, a, b)
+            ink = sum(np.linalg.norm(pixel - WHITE) > 70.0 for pixel in samples) / len(samples)
+            if ink < 0.84:
+                continue
+            graph[i].add(j)
+            graph[j].add(i)
+            for name, rgb in COLORS.items():
+                share = sum(np.linalg.norm(pixel - rgb) < 45.0 for pixel in samples) / len(samples)
+                if share > 0.72:
+                    if name in candidate_edges:
+                        raise ValueError(f"multiple {name} candidate links")
+                    candidate_edges[name] = (i, j)
+
+    if set(candidate_edges) != set(COLORS):
+        raise ValueError(f"candidate links not recovered: {sorted(candidate_edges)}")
+    matches = []
+    for color, (a, b) in candidate_edges.items():
+        reduced = {node: set(neighbors) for node, neighbors in graph.items()}
+        reduced[a].discard(b)
+        reduced[b].discard(a)
+        if _simple_path_count(reduced, a, b) == 2:
+            matches.append(color)
+    if len(matches) != 1:
+        raise ValueError(f"ambiguous two-loop link: {matches}")
+    return matches[0]
+

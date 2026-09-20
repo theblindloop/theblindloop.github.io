@@ -1,0 +1,135 @@
+"""Independent image-only inverse for the route checkpoint world."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_PALETTE = np.asarray(
+    [
+        (250, 247, 240),  # background
+        (30, 67, 102),  # route
+        (222, 126, 24),  # gate
+        (25, 132, 82),  # start
+        (125, 78, 158),  # finish
+        (155, 164, 172),  # distractor
+    ],
+    dtype=np.float32,
+)
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    distances = ((array[:, :, None, :] - _PALETTE[None, None, :, :]) ** 2).sum(axis=3)
+    return distances.argmin(axis=2)
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(points) >= minimum:
+            components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _centroid(component: np.ndarray) -> tuple[int, int]:
+    y, x = np.rint(component.mean(axis=0)).astype(int)
+    return int(y), int(x)
+
+
+def _distance_map(mask: np.ndarray, seeds: np.ndarray) -> np.ndarray:
+    distances = np.full(mask.shape, -1, dtype=np.int32)
+    queue: deque[tuple[int, int]] = deque()
+    for y, x in seeds:
+        y, x = int(y), int(x)
+        if mask[y, x] and distances[y, x] < 0:
+            distances[y, x] = 0
+            queue.append((y, x))
+    height, width = mask.shape
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and distances[ny, nx] < 0:
+                    distances[ny, nx] = distances[y, x] + 1
+                    queue.append((ny, nx))
+    return distances
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover gate order and replay the visible state from pixels alone."""
+    labels = _labels(image)
+    route = labels == 1
+    gates = labels == 2
+    start = labels == 3
+    finish = labels == 4
+
+    start_parts = _components(start, minimum=20)
+    finish_parts = _components(finish, minimum=20)
+    gate_parts = _components(gates, minimum=80)
+    if len(start_parts) != 1 or len(finish_parts) != 1 or len(gate_parts) != 6:
+        raise ValueError("incomplete route endpoints or checkpoint set")
+
+    # The endpoint and gate ink is part of the traversable visible route.  A
+    # destructive crop that removes an interior route section therefore breaks
+    # connectivity and is quarantined instead of guessed through.
+    traversable = route | gates | start | finish
+    route_parts = _components(traversable, minimum=20)
+    if len(route_parts) != 1:
+        raise ValueError("route is disconnected")
+
+    start_component = start_parts[0]
+    finish_component = finish_parts[0]
+    distance = _distance_map(traversable, start_component)
+    finish_distances = distance[finish_component[:, 0], finish_component[:, 1]]
+    if np.any(finish_distances < 0):
+        raise ValueError("finish cannot be reached from the start")
+
+    ordered: list[tuple[int, int, np.ndarray]] = []
+    for component in gate_parts:
+        distances = distance[component[:, 0], component[:, 1]]
+        if np.any(distances < 0):
+            raise ValueError("checkpoint is not on the connected route")
+        row, col = _centroid(component)
+        ordered.append((int(distances.min()), len(component), component))
+    ordered.sort(key=lambda item: item[0])
+    if any(left[0] >= right[0] for left, right in zip(ordered, ordered[1:])):
+        raise ValueError("checkpoint order is unresolved")
+
+    # A filled diamond occupies materially fewer pixels than a filled circle
+    # at the same radius.  The shared gate color prevents answer-coded color
+    # shortcuts; only this local silhouette distinguishes toggle from hold.
+    state = 0
+    for _, area, _ in ordered:
+        if area < 205:
+            state ^= 1
+        elif area <= 310:
+            pass
+        else:
+            raise ValueError("checkpoint silhouette is ambiguous")
+    return "yes" if state else "no"

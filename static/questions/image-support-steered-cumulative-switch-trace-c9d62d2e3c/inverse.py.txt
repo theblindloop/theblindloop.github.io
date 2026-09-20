@@ -1,0 +1,147 @@
+"""Independent pixel-only inverse arm for cumulative switch-trace correspondence."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+TAG_RGB = {
+    "gold": np.array((226, 174, 38), dtype=np.int16),
+    "red": np.array((214, 60, 60), dtype=np.int16),
+    "green": np.array((45, 157, 91), dtype=np.int16),
+    "blue": np.array((53, 105, 210), dtype=np.int16),
+}
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    results: list[np.ndarray] = []
+    height, width = mask.shape
+    for sy, sx in np.argwhere(mask):
+        if seen[sy, sx]:
+            continue
+        stack = [(int(sy), int(sx))]
+        seen[sy, sx] = True
+        points = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        results.append(np.asarray(points, dtype=np.int32))
+    return results
+
+
+def _tag_centroid(array: np.ndarray, name: str) -> tuple[float, float]:
+    delta = np.linalg.norm(array.astype(np.int16) - TAG_RGB[name], axis=2)
+    comps = [points for points in _components(delta < 18.0) if len(points) >= 20]
+    if len(comps) != 1:
+        raise OracleAbstention(f"expected one intact {name} bead")
+    y, x = comps[0].mean(axis=0)
+    return float(x), float(y)
+
+
+def _groups(indices: np.ndarray) -> list[np.ndarray]:
+    if not len(indices):
+        return []
+    cuts = np.where(np.diff(indices) > 1)[0] + 1
+    return [part for part in np.split(indices, cuts) if len(part)]
+
+
+def _attachment_groups(dark: np.ndarray, y: int, x_min: int, x_max: int) -> list[np.ndarray]:
+    candidates = []
+    for x in range(x_min + 14, x_max - 13):
+        above = int(dark[max(0, y - 5) : max(0, y - 2), x].sum())
+        below = int(dark[min(dark.shape[0], y + 3) : min(dark.shape[0], y + 6), x].sum())
+        if max(above, below) >= 2:
+            candidates.append(x)
+    groups = _groups(np.asarray(candidates, dtype=np.int32))
+    if len(groups) != 4:
+        raise OracleAbstention(f"expected four intact attachments, saw {len(groups)}")
+    return groups
+
+
+def _read_gates(dark: np.ndarray, bead: tuple[float, float], extent: tuple[int, int]) -> list[int]:
+    bx, by = bead
+    y = int(round(by))
+    x_min, x_max = extent
+    direction = 1 if bx < (x_min + x_max) / 2.0 else -1
+    groups = _attachment_groups(dark, y, x_min, x_max)
+    observed: list[tuple[int, int]] = []
+    for group in groups:
+        x = int(round(float(group.mean())))
+        # Reference gates have equal reach and encode hold/toggle by visible
+        # horizontal thickness. The grouped attachment columns recover width.
+        width_score = len(group)
+        if width_score <= 4:
+            gate = 0
+        elif width_score >= 6:
+            gate = 1
+        else:
+            raise OracleAbstention("gate width is ambiguous")
+        observed.append((x, gate))
+    observed.sort(key=lambda item: direction * (item[0] - bx))
+    return [gate for _, gate in observed]
+
+
+def _read_states(dark: np.ndarray, bead: tuple[float, float], extent: tuple[int, int]) -> list[int]:
+    bx, by = bead
+    y = int(round(by))
+    x_min, x_max = extent
+    direction = 1 if bx < (x_min + x_max) / 2.0 else -1
+    groups = _attachment_groups(dark, y, x_min, x_max)
+    observed: list[tuple[int, int]] = []
+    for group in groups:
+        x = int(round(float(group.mean())))
+        above = int(dark[max(0, y - 9) : max(0, y - 2), group].sum())
+        below = int(dark[min(dark.shape[0], y + 3) : min(dark.shape[0], y + 10), group].sum())
+        if above == below:
+            raise OracleAbstention("state spur side is ambiguous")
+        page_sign = -1 if above > below else 1
+        state = 0 if page_sign == -direction else 1
+        observed.append((x, state))
+    observed.sort(key=lambda item: direction * (item[0] - bx))
+    return [state for _, state in observed]
+
+
+def _execute(gates: list[int]) -> list[int]:
+    state = 0
+    output = []
+    for gate in gates:
+        if gate == 1:
+            state = 1 - state
+        output.append(state)
+    return output
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tags = {name: _tag_centroid(array, name) for name in TAG_RGB}
+    ys = sorted(round(point[1]) for point in tags.values())
+    if len(ys) != 4 or any(b - a < 8 for a, b in zip(ys, ys[1:])):
+        raise OracleAbstention("beads do not define four separated strand runs")
+
+    dark = np.all(array < 100, axis=2)
+    points = np.argwhere(dark)
+    if len(points) < 1000:
+        raise OracleAbstention("connected strand ink is missing")
+    x_min = int(points[:, 1].min())
+    x_max = int(points[:, 1].max())
+    if x_max - x_min < 140:
+        raise OracleAbstention("strand run is truncated")
+
+    target = _execute(_read_gates(dark, tags["gold"], (x_min, x_max)))
+    distances: dict[str, int] = {}
+    for name in ("red", "green", "blue"):
+        states = _read_states(dark, tags[name], (x_min, x_max))
+        distances[name] = sum(int(a != b) for a, b in zip(target, states, strict=True))
+    winners = [name for name, distance in distances.items() if distance == min(distances.values())]
+    if len(winners) != 1 or distances[winners[0]] != 0:
+        raise OracleAbstention("pixels do not yield one exact cumulative state-trace match")
+    return winners[0]

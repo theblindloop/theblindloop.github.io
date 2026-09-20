@@ -1,0 +1,133 @@
+"""Independent image-only inverse for a single concave filled silhouette."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+SECTORS = ("NW", "NE", "SW", "SE")
+# A complete tile has roughly 3,400--5,000 saturated pixels.  Requiring most
+# of that area makes the inverse quarantine partially erased distractors rather
+# than mistaking their straight ablation edge for a new concavity.
+MIN_COMPONENT = 3000
+MIN_SCORE = 0.028
+MIN_WINNER_GAP = 0.009
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int16)
+    spread = pixels.max(axis=2) - pixels.min(axis=2)
+    return (spread > 38) & (pixels.min(axis=2) < 220)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y0, x0)])
+        seen[y0, x0] = True
+        points = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= MIN_COMPONENT:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _cross(origin: np.ndarray, first: np.ndarray, second: np.ndarray) -> float:
+    return float((first[0] - origin[0]) * (second[1] - origin[1]) - (first[1] - origin[1]) * (second[0] - origin[0]))
+
+
+def _hull(points_xy: np.ndarray) -> list[np.ndarray]:
+    unique = sorted({(float(x), float(y)) for x, y in points_xy})
+    if len(unique) <= 1:
+        return [np.asarray(point, dtype=np.float64) for point in unique]
+    lower: list[np.ndarray] = []
+    for x, y in unique:
+        point = np.asarray([x, y], dtype=np.float64)
+        while len(lower) >= 2 and _cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    upper: list[np.ndarray] = []
+    for x, y in reversed(unique):
+        point = np.asarray([x, y], dtype=np.float64)
+        while len(upper) >= 2 and _cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _polygon_area(points: list[np.ndarray]) -> float:
+    if len(points) < 3:
+        return 0.0
+    return 0.5 * abs(sum(
+        points[index][0] * points[(index + 1) % len(points)][1]
+        - points[(index + 1) % len(points)][0] * points[index][1]
+        for index in range(len(points))
+    ))
+
+
+def _concavity_score(component_yx: np.ndarray) -> float:
+    points_xy = component_yx[:, ::-1]
+    hull = _hull(points_xy)
+    hull_area = _polygon_area(hull)
+    if hull_area <= 1.0:
+        return 0.0
+    # Pixel count approximates filled area; the hull deficit is the visible
+    # local border bite.  Convex rasterization contributes only a small edge
+    # discretization deficit, below the target threshold.
+    return max(0.0, (hull_area - float(len(component_yx))) / hull_area)
+
+
+def _sector(component: np.ndarray, width: int, height: int) -> str:
+    center_x = float(component[:, 1].mean())
+    center_y = float(component[:, 0].mean())
+    return ("S" if center_y >= height / 2 else "N") + ("E" if center_x >= width / 2 else "W")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the unique sector with the largest connected-silhouette hull deficit."""
+
+    rgb = image.convert("RGB")
+    mask = _ink_mask(rgb)
+    components = _components(mask)
+    by_sector: dict[str, list[np.ndarray]] = {sector: [] for sector in SECTORS}
+    for component in components:
+        sector = _sector(component, rgb.width, rgb.height)
+        by_sector[sector].append(component)
+    if any(len(by_sector[sector]) > 1 for sector in SECTORS):
+        raise ValueError(f"a sector contains fragmented silhouettes: { {key: len(value) for key, value in by_sector.items()} }")
+    # Missing sectors are tolerated deliberately.  A destructive ablation of
+    # an ordinary distractor must not alter the answer; the local bitten tile
+    # remains sufficient.  Ablating that tile removes the only score above the
+    # concavity threshold and therefore produces abstention.
+    scores = {
+        sector: _concavity_score(by_sector[sector][0])
+        for sector in SECTORS
+        if len(by_sector[sector]) == 1
+    }
+    if not scores:
+        raise ValueError("no complete silhouette remains")
+    ranked = sorted((score, sector) for sector, score in scores.items())
+    if ranked[-1][0] < MIN_SCORE:
+        raise ValueError(f"no visible inward bite: {ranked}")
+    if ranked[-1][0] - ranked[-2][0] < MIN_WINNER_GAP:
+        raise ValueError(f"inward-bite decision is ambiguous: {ranked}")
+    return ranked[-1][1]

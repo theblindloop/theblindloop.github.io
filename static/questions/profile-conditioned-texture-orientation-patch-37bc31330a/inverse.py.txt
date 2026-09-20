@@ -1,0 +1,195 @@
+"""Image-only inverse arm: rebuild the texture-orientation field and segment it.
+
+This module never sees the latent scene. From the PNG alone it
+
+1. splits pixels by colour statistics only: chromatic pixels are marker ink,
+   dark achromatic pixels are texture strokes, the rest is background;
+2. segments the stroke ink into connected components, keeps whole strokes by an
+   adaptive area window, and estimates each stroke's orientation from the
+   principal axis of its pixel cloud;
+3. builds the global orientation field: the dominant tilt is the doubled-angle
+   circular mean, and every stroke more than 45 degrees away from it is a
+   minority stroke;
+4. fits the orientation-defined region to the minority strokes - centroid for
+   the centre, second radial moment (r = sqrt(2 * mean d^2) for a uniform disk)
+   for the radius - and returns the colour of the marker whose signed distance
+   to that fitted rim is smallest.
+
+Nothing local decides the answer: every marker looks identical apart from hue,
+and the region carries no luminance, density or ink cue. If the orientation
+field has no minority population (evidence erased), the arm abstains.
+"""
+
+from __future__ import annotations
+
+import colorsys
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "texture_orientation_patch-oracle-0.1.0"
+
+CHROMA_MIN = 60  # channel spread above this => coloured marker ink
+DARK_MAX = 190  # achromatic and this dark => stroke ink
+MIN_MARKER_PIXELS = 120
+MIN_STROKE_PIXELS = 12
+AREA_LO, AREA_HI = 0.55, 1.9  # adaptive whole-stroke area window (x median)
+MINORITY_LO, MINORITY_HI = 0.02, 0.45  # plausible minority share of strokes
+
+HUE_ANCHORS = {"red": 0.0, "orange": 32.0, "green": 135.0, "blue": 225.0}
+
+
+class OracleError(ValueError):
+    """The image does not contain the structure the question declares."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Connected components (4-connectivity) via row runs and union-find."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    runs: list[tuple[int, int, int, int]] = []
+    previous: list[tuple[int, int, int, int]] = []
+    for row in range(height):
+        line = mask[row]
+        if not line.any():
+            previous = []
+            continue
+        padded = np.concatenate(([False], line, [False]))
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        current: list[tuple[int, int, int, int]] = []
+        for start, end in zip(edges[0::2], edges[1::2]):
+            index = len(parent)
+            parent.append(index)
+            entry = (row, int(start), int(end), index)
+            current.append(entry)
+            runs.append(entry)
+            for _, p_start, p_end, p_index in previous:
+                if p_start < end and start < p_end:
+                    ri, rj = find(index), find(p_index)
+                    if ri != rj:
+                        parent[ri] = rj
+        previous = current
+
+    groups: dict[int, list[tuple[int, int, int]]] = {}
+    for row, start, end, index in runs:
+        groups.setdefault(find(index), []).append((row, start, end))
+
+    out: list[np.ndarray] = []
+    for pixel_runs in groups.values():
+        coordinates = []
+        for row, start, end in pixel_runs:
+            for column in range(start, end):
+                coordinates.append((column, row))
+        out.append(np.asarray(coordinates, dtype=np.float64))
+    return out
+
+
+def _principal_angle(points: np.ndarray) -> float:
+    """Orientation of the pixel cloud's major axis, in degrees mod 180."""
+    centred = points - points.mean(axis=0)
+    cov = centred.T @ centred
+    values, vectors = np.linalg.eigh(cov)
+    major = vectors[:, int(np.argmax(values))]
+    return math.degrees(math.atan2(float(major[1]), float(major[0]))) % 180.0
+
+
+def _hue_name(rgb: np.ndarray) -> str:
+    red, green, blue = (float(channel) / 255.0 for channel in rgb)
+    hue = colorsys.rgb_to_hsv(red, green, blue)[0] * 360.0
+    best, best_gap = "red", 1e9
+    for name, anchor in HUE_ANCHORS.items():
+        gap = abs((hue - anchor + 180.0) % 360.0 - 180.0)
+        if gap < best_gap:
+            best, best_gap = name, gap
+    return best
+
+
+def measure(image: Image.Image) -> dict:
+    """Recover markers, the orientation field and the fitted region from pixels."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    chroma = arr.max(axis=-1) - arr.min(axis=-1)
+    marker_mask = chroma >= CHROMA_MIN
+    stroke_mask = (arr.max(axis=-1) <= DARK_MAX) & ~marker_mask
+
+    markers: list[tuple[float, float, str]] = []
+    for component in _components(marker_mask):
+        if len(component) < MIN_MARKER_PIXELS:
+            continue
+        columns = component[:, 0].astype(int)
+        rows = component[:, 1].astype(int)
+        core = arr[rows, columns]
+        keep = (core.max(axis=-1) - core.min(axis=-1)) >= CHROMA_MIN + 40
+        sample = core[keep] if keep.any() else core
+        markers.append(
+            (
+                float(component[:, 0].mean()) + 0.5,
+                float(component[:, 1].mean()) + 0.5,
+                _hue_name(sample.mean(axis=0)),
+            )
+        )
+    if len(markers) != 4:
+        raise OracleError(f"expected four coloured markers, found {len(markers)}")
+
+    raw = [component for component in _components(stroke_mask) if len(component) >= MIN_STROKE_PIXELS]
+    if len(raw) < 60:
+        raise OracleError(f"texture field too sparse: {len(raw)} stroke components")
+    median_area = float(np.median([len(component) for component in raw]))
+    strokes = [
+        component
+        for component in raw
+        if AREA_LO * median_area <= len(component) <= AREA_HI * median_area
+    ]
+    if len(strokes) < 60:
+        raise OracleError(f"only {len(strokes)} whole strokes survive the area window")
+
+    angles = np.array([_principal_angle(component) for component in strokes])
+    centres = np.array(
+        [[component[:, 0].mean() + 0.5, component[:, 1].mean() + 0.5] for component in strokes]
+    )
+    doubled = np.radians(2.0 * angles)
+    dominant = math.degrees(math.atan2(float(np.sin(doubled).mean()), float(np.cos(doubled).mean()))) / 2.0
+    deviation = np.abs((angles - dominant + 90.0) % 180.0 - 90.0)
+    minority = deviation > 45.0
+    share = float(minority.mean())
+    if not MINORITY_LO <= share <= MINORITY_HI:
+        raise OracleError(f"no orientation-defined region: minority share {share:.3f}")
+
+    patch_points = centres[minority]
+    centre = patch_points.mean(axis=0)
+    radial = np.hypot(patch_points[:, 0] - centre[0], patch_points[:, 1] - centre[1])
+    radius = float(math.sqrt(2.0 * float((radial ** 2).mean())))
+    return {
+        "markers": markers,
+        "centre": (float(centre[0]), float(centre[1])),
+        "radius": radius,
+        "stroke_count": len(strokes),
+        "minority_share": share,
+    }
+
+
+def _scored(image: Image.Image) -> list[tuple[float, str]]:
+    field = measure(image)
+    cx, cy = field["centre"]
+    radius = field["radius"]
+    return sorted(
+        (math.hypot(mx - cx, my - cy) - radius, name) for mx, my, name in field["markers"]
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Colour of the marker inside the orientation-defined patch, from pixels."""
+    return _scored(image)[0][1]
+
+
+def decision_margin_from_image(image: Image.Image) -> float:
+    """Runner-up margin in pixels: how much deeper the winner sits inside the rim."""
+    scores = _scored(image)
+    return round(float(scores[1][0] - scores[0][0]), 4)

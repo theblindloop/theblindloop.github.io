@@ -1,0 +1,138 @@
+"""Independent pixel-only inverse for the glyph-controlled switching network."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "green": (45, 170, 92),
+    "purple": (139, 83, 190),
+    "red": (220, 62, 64),
+    "blue": (55, 105, 205),
+    "orange": (235, 142, 38),
+    "cyan": (35, 169, 173),
+}
+TERMINALS = ("red", "blue", "orange", "cyan")
+
+
+@dataclass(frozen=True)
+class Mark:
+    x: float
+    y: float
+    color: str
+    shape: str
+
+
+def _color_mask(arr: np.ndarray, rgb: tuple[int, int, int], radius: float = 55.0) -> np.ndarray:
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2) <= radius * radius
+
+
+def _components(mask: np.ndarray, minimum: int = 120) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for sy, sx in np.argwhere(mask):
+        if seen[sy, sx]:
+            continue
+        seen[sy, sx] = True
+        stack = [(int(sy), int(sx))]
+        points: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= minimum:
+            result.append(np.asarray(points, dtype=np.int32))
+    return result
+
+
+def _mark(component: np.ndarray, color: str, classify_shape: bool = False) -> Mark:
+    ys, xs = component[:, 0], component[:, 1]
+    bw = int(xs.max() - xs.min() + 1)
+    bh = int(ys.max() - ys.min() + 1)
+    fill_ratio = len(component) / float(bw * bh)
+    shape = "square" if classify_shape and fill_ratio > 0.87 else "circle"
+    return Mark(float(xs.mean()), float(ys.mean()), color, shape)
+
+
+def _line_occupancy(dark: np.ndarray, a: Mark, b: Mark) -> float:
+    values = []
+    for t in np.linspace(0.20, 0.80, 91):
+        x = int(round(a.x + t * (b.x - a.x)))
+        y = int(round(a.y + t * (b.y - a.y)))
+        y0, y1 = max(0, y - 3), min(dark.shape[0], y + 4)
+        x0, x1 = max(0, x - 3), min(dark.shape[1], x + 4)
+        values.append(bool(dark[y0:y1, x0:x1].any()))
+    return float(np.mean(values))
+
+
+def _read_marks(arr: np.ndarray) -> tuple[list[list[Mark]], dict[tuple[int, int], tuple[str, float]]]:
+    green_parts = _components(_color_mask(arr, PALETTE["green"]))
+    purple_parts = _components(_color_mask(arr, PALETTE["purple"]))
+    if len(green_parts) != 1 or len(purple_parts) != 5:
+        raise ValueError(f"expected one green start and five purple junctions, found {len(green_parts)} and {len(purple_parts)}")
+    start = _mark(green_parts[0], "green")
+    purple = sorted((_mark(part, "purple", True) for part in purple_parts), key=lambda mark: mark.y)
+    if purple[2].y - purple[1].y < 70:
+        raise ValueError("purple junction rows are not separable")
+
+    terminals = []
+    for color in TERMINALS:
+        parts = _components(_color_mask(arr, PALETTE[color]))
+        if len(parts) != 1:
+            raise ValueError(f"expected one {color} terminal, found {len(parts)}")
+        terminals.append(_mark(parts[0], color))
+    terminals.sort(key=lambda mark: mark.x)
+    layers = [[start], sorted(purple[:2], key=lambda mark: mark.x), sorted(purple[2:], key=lambda mark: mark.x), terminals]
+
+    dark = np.max(arr, axis=2) < 105
+    edges: dict[tuple[int, int], tuple[str, float]] = {}
+    for layer_index in range(3):
+        sources, destinations = layers[layer_index], layers[layer_index + 1]
+        for source_index, source in enumerate(sources):
+            scored = sorted(
+                ((float(_line_occupancy(dark, source, target)), target_index) for target_index, target in enumerate(destinations)),
+                reverse=True,
+            )
+            if len(scored) < 2 or scored[1][0] < 0.48:
+                raise ValueError("a junction has fewer than two visible outgoing links")
+            if len(scored) > 2 and scored[2][0] > scored[1][0] - 0.16:
+                raise ValueError("outgoing link ownership is ambiguous")
+            for score, target_index in scored[:2]:
+                style = "solid" if score > 0.95 else "dashed"
+                edges[(layer_index * 10 + source_index, (layer_index + 1) * 10 + target_index)] = (style, score)
+            styles = [style for (u, _), (style, _) in edges.items() if u == layer_index * 10 + source_index]
+            if sorted(styles) != ["dashed", "solid"]:
+                raise ValueError("outgoing styles are not one solid and one dashed")
+    return layers, edges
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the terminal using only RGB pixels and the public transition rule."""
+    arr = np.asarray(image.convert("RGB"))
+    layers, edges = _read_marks(arr)
+    current = 0
+    incoming: str | None = None
+    for layer_index in range(3):
+        node = layers[layer_index][current]
+        if layer_index == 0:
+            required = "solid"
+        else:
+            required = incoming if node.shape == "circle" else ("dashed" if incoming == "solid" else "solid")
+        source_key = layer_index * 10 + current
+        choices = [
+            (target % 10, style)
+            for (source, target), (style, _) in edges.items()
+            if source == source_key and style == required
+        ]
+        if len(choices) != 1:
+            raise ValueError("pixel trace is not unique")
+        current, incoming = choices[0]
+    return layers[3][current].color

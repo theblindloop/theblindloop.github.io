@@ -1,0 +1,115 @@
+"""Independent image-only aperture-side oracle.
+
+The implementation deliberately knows no renderer geometry or latent scene. It
+finds the largest saturated connected region, estimates the ring center from
+its vertical extrema, uses the ink mass on both sides as the two decisions, and
+requires broad angular coverage before returning either label.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for yy, xx in np.argwhere(mask):
+        y, x = int(yy), int(xx)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        q = deque([(y, x)])
+        points: list[tuple[int, int]] = []
+        while q:
+            cy, cx = q.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    q.append((ny, nx))
+        if len(points) > len(best):
+            best = points
+    if len(best) < 5000:
+        raise OracleAbstention("no substantial saturated region")
+    result = np.zeros_like(mask, dtype=bool)
+    ys, xs = zip(*best)
+    result[np.asarray(ys), np.asarray(xs)] = True
+    return result
+
+
+def _has_ink_near(mask: np.ndarray, x: float, y: float, radius: int = 3) -> bool:
+    xi, yi = int(round(x)), int(round(y))
+    y0, y1 = max(0, yi - radius), min(mask.shape[0], yi + radius + 1)
+    x0, x1 = max(0, xi - radius), min(mask.shape[1], xi + radius + 1)
+    return bool(mask[y0:y1, x0:x1].any())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    chroma = arr.max(axis=2) - arr.min(axis=2)
+    dark_enough = arr.mean(axis=2) < 225
+    component = _largest_component((chroma > 65) & dark_enough)
+    ys, xs = np.nonzero(component)
+    ymin, ymax = int(ys.min()), int(ys.max())
+    xmin, xmax = int(xs.min()), int(xs.max())
+    height = ymax - ymin + 1
+    width = xmax - xmin + 1
+    if not (200 <= height <= 255 and 155 <= width <= 255):
+        raise OracleAbstention("region scale or extent is outside the supported band")
+
+    # The intact top and bottom caps are symmetric about the true ring center.
+    cap = max(4, height // 18)
+    cap_pixels = component[ymin : ymin + cap + 1] | component[ymax - cap : ymax + 1]
+    cap_y, cap_x = np.nonzero(cap_pixels)
+    if len(cap_x) < 100:
+        raise OracleAbstention("ring caps are incomplete")
+    cx = float(np.median(cap_x))
+    cy = (ymin + ymax) / 2.0
+    outer = height / 2.0
+
+    left_mass = int(np.count_nonzero(component[:, : int(math.floor(cx))]))
+    right_mass = int(np.count_nonzero(component[:, int(math.ceil(cx)) + 1 :]))
+    total = left_mass + right_mass
+    if total < 9000:
+        raise OracleAbstention("insufficient annular ink")
+    signed = (left_mass - right_mass) / total
+    if abs(signed) < 0.055:
+        raise OracleAbstention("no decisive horizontal aperture")
+    side = "right" if signed > 0 else "left"
+
+    # Recover a representative annular radius from visible ink distances.
+    distances = np.hypot(xs.astype(float) - cx, ys.astype(float) - cy)
+    mid_radius = float((np.percentile(distances, 8) + np.percentile(distances, 96)) / 2.0)
+    if not (64.0 <= mid_radius <= 112.0):
+        raise OracleAbstention("annular radius could not be recovered")
+
+    # Broad coverage of the connected 270-degree body is mandatory. This makes
+    # destructive regional erasures abstain instead of silently relying on tips.
+    gap_center = 0.0 if side == "right" else 180.0
+    missing_body = 0
+    present_gap = 0
+    for angle in range(0, 360, 10):
+        delta = abs(((angle - gap_center + 180) % 360) - 180)
+        x = cx + mid_radius * math.cos(math.radians(angle))
+        y = cy + mid_radius * math.sin(math.radians(angle))
+        present = _has_ink_near(component, x, y)
+        if delta >= 38 and not present:
+            missing_body += 1
+        if delta <= 15 and present:
+            present_gap += 1
+    if missing_body > 1 or present_gap > 0:
+        raise OracleAbstention("annular body is erased, broken, or not C-shaped")
+
+    area_ratio = len(xs) / float(height * width)
+    if not (0.24 <= area_ratio <= 0.52):
+        raise OracleAbstention("connected region has incompatible occupancy")
+    return side

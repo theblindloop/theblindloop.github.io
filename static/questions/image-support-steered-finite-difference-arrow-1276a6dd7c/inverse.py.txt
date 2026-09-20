@@ -1,0 +1,94 @@
+"""Independent image-only inverse for the declared finite-difference transform."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+ROWS = 28
+RAW_COLS = 29
+OUT_COLS = 28
+FRAME_RGB = np.array([111, 48, 151], dtype=np.int16)
+SYMBOLS = ("up", "down", "left", "right")
+
+
+class OracleError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class Measurement:
+    decision: str
+    margin: float
+    scores: dict[str, int]
+    reconstructed_ink: int
+
+
+def _template(symbol: str) -> np.ndarray:
+    image = Image.new("1", (28, 28), 0)
+    draw = ImageDraw.Draw(image)
+    draw.polygon([(1, 8), (14, 8), (14, 2), (26, 14), (14, 26), (14, 20), (1, 20)], fill=1)
+    base = np.asarray(image, dtype=np.uint8)
+    rotations = {"right": 0, "up": 1, "left": 2, "down": 3}
+    return np.rot90(base, rotations[symbol]).copy()
+
+
+def _locate_field(array: np.ndarray) -> tuple[int, int, int]:
+    delta = np.linalg.norm(array.astype(np.int16) - FRAME_RGB, axis=2)
+    ys, xs = np.nonzero(delta <= 4.0)
+    if len(xs) < 3000:
+        raise OracleError("purple fiducial frame is missing or materially damaged")
+    left, right = int(xs.min()), int(xs.max())
+    top, bottom = int(ys.min()), int(ys.max())
+    outer_w, outer_h = right - left + 1, bottom - top + 1
+    candidates = []
+    for cell in (11, 12, 13):
+        if abs(outer_w - (RAW_COLS * cell + 12)) <= 1 and abs(outer_h - (ROWS * cell + 12)) <= 1:
+            candidates.append(cell)
+    if len(candidates) != 1:
+        raise OracleError("fiducial frame does not define one legal grid scale")
+    cell = candidates[0]
+    ox, oy = left + 6, top + 6
+    # The frame must occupy almost all of its expected ring, ensuring all four corner fiducials exist.
+    expected = outer_w * outer_h - (RAW_COLS * cell) * (ROWS * cell)
+    in_box = delta[top : bottom + 1, left : right + 1] <= 4.0
+    if int(in_box.sum()) < int(expected * 0.97):
+        raise OracleError("purple frame continuity check failed")
+    return ox, oy, cell
+
+
+def measure(image: Image.Image) -> Measurement:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape != (512, 512, 3):
+        raise OracleError("expected a 512 by 512 RGB raster")
+    ox, oy, cell = _locate_field(array)
+    samples = np.empty((ROWS, RAW_COLS, 3), dtype=np.uint8)
+    for y in range(ROWS):
+        for x in range(RAW_COLS):
+            cx = ox + x * cell + cell // 2
+            cy = oy + y * cell + cell // 2
+            patch = array[cy - 2 : cy + 3, cx - 2 : cx + 3]
+            if patch.shape != (5, 5, 3) or np.max(np.ptp(patch.astype(np.int16), axis=(0, 1))) > 3:
+                raise OracleError("a tile interior is missing or corrupted")
+            samples[y, x] = np.median(patch.reshape(-1, 3), axis=0).astype(np.uint8)
+    colors, inverse, counts = np.unique(samples.reshape(-1, 3), axis=0, return_inverse=True, return_counts=True)
+    if len(colors) != 2 or int(counts.min()) < 100:
+        raise OracleError("field must contain exactly two well-supported tile colors")
+    # Assign binary values by luminance; global polarity cancels under XOR.
+    luminance = colors @ np.array([0.299, 0.587, 0.114])
+    dark_index = int(np.argmin(luminance))
+    raw = (inverse.reshape(ROWS, RAW_COLS) == dark_index).astype(np.uint8)
+    revealed = np.bitwise_xor(raw[:, :-1], raw[:, 1:])
+    scores = {name: int(np.count_nonzero(revealed != _template(name))) for name in SYMBOLS}
+    ranked = sorted(scores, key=lambda name: (scores[name], name))
+    decision = ranked[0]
+    margin = float(scores[ranked[1]] - scores[ranked[0]])
+    if scores[decision] != 0 or margin < 24.0:
+        raise OracleError("reconstruction is not an unambiguous declared arrow template")
+    return Measurement(decision, margin, scores, int(revealed.sum()))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure(image).decision

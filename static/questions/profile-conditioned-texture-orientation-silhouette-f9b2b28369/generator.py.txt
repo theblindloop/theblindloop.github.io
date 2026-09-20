@@ -1,0 +1,153 @@
+"""Deterministic renderer for a shape carried by distributed dash orientation."""
+
+from __future__ import annotations
+
+import math
+import random
+from copy import deepcopy
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 420
+HEIGHT = 420
+BACKGROUND = [246, 244, 238]
+INK = [25, 29, 33]
+QUARANTINE_GAP = 0.10
+
+
+def _vertices(shape: str, cx: float, cy: float, radius: float, rotation: float) -> list[tuple[float, float]]:
+    count = 3 if shape == "triangle" else 6
+    return [
+        (
+            cx + radius * math.cos(rotation + 2.0 * math.pi * k / count),
+            cy + radius * math.sin(rotation + 2.0 * math.pi * k / count),
+        )
+        for k in range(count)
+    ]
+
+
+def _inside_convex(x: float, y: float, vertices: list[tuple[float, float]]) -> bool:
+    signs = []
+    for index, (ax, ay) in enumerate(vertices):
+        bx, by = vertices[(index + 1) % len(vertices)]
+        signs.append((bx - ax) * (y - ay) - (by - ay) * (x - ax))
+    return min(signs) >= -1e-7 or max(signs) <= 1e-7
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    shape = "triangle" if int(seed) % 2 else "hexagon"
+    cx = 210 + rng.randint(-13, 13)
+    cy = 210 + rng.randint(-13, 13)
+    rotation = math.radians(rng.randrange(0, 180, 15))
+    radius = rng.uniform(126.0, 137.0) if shape == "triangle" else rng.uniform(89.0, 97.0)
+    polygon = _vertices(shape, cx, cy, radius, rotation)
+    inside_positive = bool(rng.getrandbits(1))
+
+    marks = []
+    for row in range(17):
+        for col in range(17):
+            x = 50 + 20 * col + rng.uniform(-1.7, 1.7)
+            y = 50 + 20 * row + rng.uniform(-1.7, 1.7)
+            inside = _inside_convex(x, y, polygon)
+            positive = inside if inside_positive else not inside
+            angle = (37.0 if positive else -37.0) + rng.uniform(-3.5, 3.5)
+            marks.append({"x": round(x, 3), "y": round(y, 3), "angle": round(angle, 3)})
+
+    # Four counterbalanced local disruptions prevent perfect local texture purity.
+    for index in rng.sample(range(len(marks)), 4):
+        marks[index]["angle"] = round(-marks[index]["angle"], 3)
+
+    return {
+        "shape": shape,
+        "marks": marks,
+        "canvas": [WIDTH, HEIGHT],
+        "background": BACKGROUND,
+        "ink": INK,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    # Accessing shape is intentional: it is a declared visible label input, while
+    # the stored marks are the actual raster instructions.
+    shape = scene["shape"]
+    if shape not in {"triangle", "hexagon"}:
+        raise ValueError("unsupported shape")
+    width, height = map(int, scene["canvas"])
+    image = Image.new("RGB", (width, height), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    ink = tuple(scene["ink"])
+    half = 7.0
+    for mark in scene["marks"]:
+        angle = math.radians(float(mark["angle"]))
+        dx = half * math.cos(angle)
+        dy = half * math.sin(angle)
+        draw.line(
+            (mark["x"] - dx, mark["y"] - dy, mark["x"] + dx, mark["y"] + dy),
+            fill=ink,
+            width=3,
+        )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["shape"])
+
+
+def _inside_many(points: np.ndarray, vertices: np.ndarray) -> np.ndarray:
+    crosses = []
+    for index in range(len(vertices)):
+        a = vertices[index]
+        b = vertices[(index + 1) % len(vertices)]
+        crosses.append((b[0] - a[0]) * (points[:, 1] - a[1]) - (b[1] - a[1]) * (points[:, 0] - a[0]))
+    values = np.stack(crosses, axis=1)
+    return (values.min(axis=1) >= -1e-7) | (values.max(axis=1) <= 1e-7)
+
+
+def _best_template(points: np.ndarray, target: np.ndarray, sides: int) -> float:
+    focus = points[target]
+    center = focus.mean(axis=0)
+    distances = np.sqrt(((points[:, None, :] - points[None, :, :]) ** 2).sum(axis=2))
+    distances[distances == 0] = np.inf
+    spacing = float(np.median(distances.min(axis=1)))
+    sampled_area = float(target.sum()) * spacing * spacing
+    base_radius = math.sqrt(2.0 * sampled_area / (sides * math.sin(2.0 * math.pi / sides)))
+    best = 0.0
+    for ox in (-0.45 * spacing, 0.0, 0.45 * spacing):
+        for oy in (-0.45 * spacing, 0.0, 0.45 * spacing):
+            for factor in (0.90, 0.97, 1.04, 1.11):
+                radius = base_radius * factor
+                for degrees in range(0, 180, 5):
+                    angles = math.radians(degrees) + np.arange(sides) * (2.0 * math.pi / sides)
+                    vertices = np.column_stack((center[0] + ox + radius * np.cos(angles), center[1] + oy + radius * np.sin(angles)))
+                    predicted = _inside_many(points, vertices)
+                    intersection = int(np.count_nonzero(predicted & target))
+                    union = int(np.count_nonzero(predicted | target))
+                    best = max(best, intersection / max(union, 1))
+    return best
+
+
+def _model_scores(scene: dict) -> dict[str, float]:
+    points = np.array([[float(mark["x"]), float(mark["y"])] for mark in scene["marks"]], dtype=float)
+    signs = np.array([float(mark["angle"]) > 0.0 for mark in scene["marks"]], dtype=bool)
+    target = signs if signs.sum() < len(signs) / 2 else ~signs
+    return {
+        "triangle": _best_template(points, target, 3),
+        "hexagon": _best_template(points, target, 6),
+    }
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_model_scores(scene).values(), reverse=True)
+    return round(float(scores[0] - scores[1]), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_GAP
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = deepcopy(scene)
+    twin["marks"] = list(reversed(twin["marks"]))
+    return [("reverse_nonoverlapping_painter_order", twin)]

@@ -1,0 +1,216 @@
+"""Renderer and analytic arm for the collinear dot-lane search world.
+
+Six framed panels each hold a lane of five identical dots.  In exactly one
+panel the five dot centres lie on a single straight line; in every other panel
+one interior dot of the lane is pushed off that line.  The decision is the
+number of the perfectly straight panel, in reading order.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS_WIDTH = 840
+CANVAS_HEIGHT = 452
+
+PANEL_COLUMNS = 3
+PANEL_ROWS = 2
+N_PANELS = PANEL_COLUMNS * PANEL_ROWS
+
+PANEL_WIDTH = 256
+PANEL_HEIGHT = 200
+PANEL_GAP_X = 16
+PANEL_GAP_Y = 16
+MARGIN_TOP = 16
+
+FRAME = 3
+INNER_PAD = 20  # keeps every dot clear of its panel frame
+DOT_RADIUS = 7
+DOTS_PER_LANE = 5
+
+MIN_SEPARATION = 36.0  # centre-to-centre, guarantees separable blobs
+LANE_HALF_LENGTH = (82, 96)
+MAX_TILT_DEG = 24.0
+OFFSET_RANGE = (11.0, 19.0)
+
+STRAIGHT_CEILING = 0.75  # sub-pixel rounding slack on the answer lane
+DISTRACTOR_FLOOR = 7.0  # every other lane bends at least this far
+MARGIN_FLOOR_PX = 6.0
+QUARANTINE_MARGIN_PX = 4.0
+
+ANSWERS = tuple(f"panel-{index + 1}" for index in range(N_PANELS))
+
+# (background, structure, ink); ink is far from background, frames are mid-tone.
+PALETTES = (
+    ((246, 244, 238), (154, 152, 160), (34, 38, 54)),
+    ((240, 246, 248), (144, 160, 168), (20, 54, 70)),
+    ((248, 242, 242), (168, 148, 148), (68, 24, 32)),
+    ((242, 246, 240), (148, 164, 144), (30, 56, 30)),
+    ((244, 242, 250), (156, 152, 172), (42, 32, 74)),
+)
+
+
+def json_clone(scene: dict) -> dict:
+    """Round-trip copy of a scene, matching what the manifest stores."""
+    return json.loads(json.dumps(scene, sort_keys=True))
+
+
+def panel_box(index: int) -> tuple:
+    """Pixel box (left, top, right, bottom) of panel ``index`` in reading order."""
+    row, column = divmod(index, PANEL_COLUMNS)
+    row_width = PANEL_COLUMNS * PANEL_WIDTH + (PANEL_COLUMNS - 1) * PANEL_GAP_X
+    start_x = (CANVAS_WIDTH - row_width) // 2
+    left = start_x + column * (PANEL_WIDTH + PANEL_GAP_X)
+    top = MARGIN_TOP + row * (PANEL_HEIGHT + PANEL_GAP_Y)
+    return (left, top, left + PANEL_WIDTH - 1, top + PANEL_HEIGHT - 1)
+
+
+def _lane_points(rng: random.Random, straight: bool) -> list:
+    """Five integer dot centres inside a panel, straight or bent by one dot."""
+    left, top, right, bottom = panel_box(0)
+    inner_left = INNER_PAD + DOT_RADIUS
+    inner_top = INNER_PAD + DOT_RADIUS
+    inner_right = PANEL_WIDTH - 1 - INNER_PAD - DOT_RADIUS
+    inner_bottom = PANEL_HEIGHT - 1 - INNER_PAD - DOT_RADIUS
+
+    for _ in range(600):
+        tilt = math.radians(rng.uniform(-MAX_TILT_DEG, MAX_TILT_DEG))
+        half = rng.uniform(*LANE_HALF_LENGTH)
+        ux, uy = math.cos(tilt), math.sin(tilt)
+        nx, ny = -uy, ux
+        span_x = abs(ux) * half + DOT_RADIUS
+        span_y = abs(uy) * half + OFFSET_RANGE[1]
+        if inner_right - span_x <= inner_left + span_x:
+            continue
+        if inner_bottom - span_y <= inner_top + span_y:
+            continue
+        cx = rng.uniform(inner_left + span_x, inner_right - span_x)
+        cy = rng.uniform(inner_top + span_y, inner_bottom - span_y)
+
+        # ordered lane parameters with irregular, non-repeating spacing
+        shares = [1.0 + rng.uniform(0.0, 0.30) for _ in range(DOTS_PER_LANE - 1)]
+        total = sum(shares)
+        gaps = [2.0 * half * share / total for share in shares]
+        if min(gaps) < MIN_SEPARATION:
+            continue
+        taus = [-half]
+        for gap in gaps:
+            taus.append(taus[-1] + gap)
+
+        points = [(cx + ux * t, cy + uy * t) for t in taus]
+        if not straight:
+            which = rng.randrange(1, DOTS_PER_LANE - 1)
+            push = rng.uniform(*OFFSET_RANGE) * rng.choice((-1.0, 1.0))
+            px, py = points[which]
+            points[which] = (px + nx * push, py + ny * push)
+
+        pixels = [(int(round(x)), int(round(y))) for x, y in points]
+        if any(
+            not (inner_left <= x <= inner_right and inner_top <= y <= inner_bottom)
+            for x, y in pixels
+        ):
+            continue
+        if _min_separation(pixels) < MIN_SEPARATION:
+            continue
+        deviation = lane_deviation(pixels)
+        if straight and deviation > STRAIGHT_CEILING:
+            continue
+        if not straight and deviation < DISTRACTOR_FLOOR:
+            continue
+        return [[x, y] for x, y in pixels]
+    raise RuntimeError("could not sample a valid dot lane")
+
+
+def _min_separation(points) -> float:
+    best = float("inf")
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            dx = points[i][0] - points[j][0]
+            dy = points[i][1] - points[j][1]
+            best = min(best, math.hypot(dx, dy))
+    return best
+
+
+def lane_deviation(points) -> float:
+    """Largest perpendicular distance of a lane's dots from its best-fit line."""
+    count = len(points)
+    mx = sum(float(p[0]) for p in points) / count
+    my = sum(float(p[1]) for p in points) / count
+    sxx = sum((float(p[0]) - mx) ** 2 for p in points)
+    syy = sum((float(p[1]) - my) ** 2 for p in points)
+    sxy = sum((float(p[0]) - mx) * (float(p[1]) - my) for p in points)
+    # principal axis of the centred scatter matrix
+    theta = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+    nx, ny = -math.sin(theta), math.cos(theta)
+    return max(
+        abs((float(p[0]) - mx) * nx + (float(p[1]) - my) * ny) for p in points
+    )
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    palette = rng.randrange(len(PALETTES))
+    answer_index = rng.randrange(N_PANELS)
+    panels = [
+        _lane_points(rng, straight=(index == answer_index))
+        for index in range(N_PANELS)
+    ]
+    scene = {
+        "width": CANVAS_WIDTH,
+        "height": CANVAS_HEIGHT,
+        "palette": palette,
+        "panels": panels,
+    }
+    if margin(scene) < MARGIN_FLOOR_PX:  # pragma: no cover - floors keep this unreachable
+        return sample_scene(seed + 7_919)
+    return scene
+
+
+def _deviations(scene: dict) -> list:
+    return [lane_deviation(points) for points in scene["panels"]]
+
+
+def analytic_gold(scene: dict) -> str:
+    deviations = _deviations(scene)
+    best = min(range(N_PANELS), key=lambda index: deviations[index])
+    return ANSWERS[best]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up straightness gap, in pixels of perpendicular deviation."""
+    ordered = sorted(_deviations(scene))
+    return round(ordered[1] - ordered[0], 9)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return float(margin(scene)) < QUARANTINE_MARGIN_PX
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Declared pixel-identical latent aliases that must preserve the answer."""
+    period = json_clone(scene)
+    period["palette"] = scene["palette"] + len(PALETTES)
+
+    reversed_order = json_clone(scene)
+    reversed_order["panels"] = [list(reversed(points)) for points in scene["panels"]]
+    return [("palette_period", period), ("lane_dot_order", reversed_order)]
+
+
+def render(scene: dict) -> Image.Image:
+    background, structure, ink = PALETTES[scene["palette"] % len(PALETTES)]
+    image = Image.new("RGB", (scene["width"], scene["height"]), background)
+    draw = ImageDraw.Draw(image)
+    for index, points in enumerate(scene["panels"]):
+        left, top, right, bottom = panel_box(index)
+        draw.rectangle([left, top, right, bottom], outline=structure, width=FRAME)
+        for x, y in points:
+            cx, cy = left + int(x), top + int(y)
+            draw.ellipse(
+                [cx - DOT_RADIUS, cy - DOT_RADIUS, cx + DOT_RADIUS, cy + DOT_RADIUS],
+                fill=ink,
+            )
+    return image

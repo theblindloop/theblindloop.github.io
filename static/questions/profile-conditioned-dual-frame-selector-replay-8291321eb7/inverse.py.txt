@@ -1,0 +1,114 @@
+"""Independent image-only inverse arm for Dual-Frame Selector Replay.
+
+No renderer-side module or latent scene is imported. All state is recovered from
+large color regions and their relative centroids in the final PNG.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+TOKEN_RGB = {
+    "red": (220, 55, 55),
+    "green": (45, 165, 85),
+    "blue": (65, 105, 225),
+    "yellow": (235, 195, 45),
+}
+CARD_RGB = {"pointer": (52, 145, 220), "tray": (238, 143, 50)}
+MAGENTA = (210, 45, 150)
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int], tolerance: float = 25.0) -> np.ndarray:
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int32) <= tolerance * tolerance
+
+
+def _centroid(mask: np.ndarray, label: str, minimum: int) -> tuple[float, float]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < minimum:
+        raise ValueError(f"missing or damaged {label}")
+    return float(xs.mean()), float(ys.mean())
+
+
+def _runs(columns: np.ndarray, minimum_width: int = 30) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(columns)
+    if len(indices) == 0:
+        return []
+    starts = [int(indices[0])]
+    ends: list[int] = []
+    for left, right in zip(indices[:-1], indices[1:], strict=True):
+        if right > left + 1:
+            ends.append(int(left))
+            starts.append(int(right))
+    ends.append(int(indices[-1]))
+    return [(a, b) for a, b in zip(starts, ends, strict=True) if b - a + 1 >= minimum_width]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3 or min(arr.shape[:2]) < 200:
+        raise ValueError("image is too small")
+
+    token_centers: dict[str, tuple[float, float]] = {}
+    for color, rgb in TOKEN_RGB.items():
+        token_centers[color] = _centroid(_mask(arr, rgb), f"{color} token", 900)
+    center_x = sum(value[0] for value in token_centers.values()) / 4.0
+    center_y = sum(value[1] for value in token_centers.values()) / 4.0
+
+    tray: list[str | None] = [None, None, None, None]
+    for color, (x, y) in token_centers.items():
+        dx, dy = x - center_x, y - center_y
+        if abs(dx) > abs(dy):
+            slot = 1 if dx > 0 else 3
+        else:
+            slot = 2 if dy > 0 else 0
+        if tray[slot] is not None:
+            raise ValueError("two tokens occupy one inferred tray slot")
+        tray[slot] = color
+    if any(value is None for value in tray):
+        raise ValueError("incomplete tray")
+
+    black = np.max(arr, axis=2) < 65
+    pointer_x, pointer_y = _centroid(black, "pointer", 500)
+    pdx, pdy = pointer_x - center_x, pointer_y - center_y
+    if abs(pdx) > abs(pdy):
+        pointer = 1 if pdx > 0 else 3
+    else:
+        pointer = 2 if pdy > 0 else 0
+
+    pointer_cards = _mask(arr, CARD_RGB["pointer"])
+    tray_cards = _mask(arr, CARD_RGB["tray"])
+    all_cards = pointer_cards | tray_cards
+    card_runs = _runs(np.sum(all_cards, axis=0) > 20)
+    if len(card_runs) != 6:
+        raise ValueError(f"expected six operation cards, found {len(card_runs)}")
+    magenta = _mask(arr, MAGENTA)
+
+    operations: list[tuple[str, int]] = []
+    for x0, x1 in card_runs:
+        p_count = int(pointer_cards[:, x0 : x1 + 1].sum())
+        t_count = int(tray_cards[:, x0 : x1 + 1].sum())
+        if max(p_count, t_count) < 2500 or abs(p_count - t_count) < 1500:
+            raise ValueError("ambiguous operation-card type")
+        frame = "pointer" if p_count > t_count else "tray"
+        ys, xs_local = np.nonzero(magenta[:, x0 : x1 + 1])
+        if len(xs_local) < 150:
+            raise ValueError("operation card lacks a direction dot")
+        dot_x = x0 + float(xs_local.mean())
+        card_mid = (x0 + x1) / 2.0
+        if abs(dot_x - card_mid) < 10:
+            raise ValueError("ambiguous direction dot")
+        operations.append((frame, 1 if dot_x > card_mid else -1))
+
+    current = [str(value) for value in tray]
+    aimed = pointer
+    for frame, step in operations:
+        if frame == "pointer":
+            aimed = (aimed + step) % 4
+        else:
+            moved = [""] * 4
+            for old_index, color in enumerate(current):
+                moved[(old_index + step) % 4] = color
+            current = moved
+    return current[aimed]

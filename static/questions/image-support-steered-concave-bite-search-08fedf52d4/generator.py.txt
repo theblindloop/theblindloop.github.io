@@ -1,0 +1,236 @@
+"""Renderer and analytic label for the single-bite visual-search world."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+
+RENDERER_VERSION = "concave-bite-search-0.1.0"
+SECTORS = ("NW", "NE", "SW", "SE")
+WIDTH = 512
+HEIGHT = 512
+SUPERSAMPLE = 4
+MIN_CONCAVITY = 0.032
+MIN_MARGIN = 0.012
+
+BACKGROUND = (250, 250, 250)
+GUIDE = (205, 205, 205)
+INK_PALETTE = (
+    (30, 96, 184),
+    (170, 54, 66),
+    (25, 132, 91),
+    (126, 62, 168),
+    (192, 91, 27),
+)
+
+_CENTERS = {
+    "NW": (128.0, 128.0),
+    "NE": (384.0, 128.0),
+    "SW": (128.0, 384.0),
+    "SE": (384.0, 384.0),
+}
+
+# These are convex, similarly sized local silhouettes.  They are deliberately
+# not all the same orientation or vertex count, so the search cannot use a
+# single polygon template as a label shortcut.
+_CONVEX_TEMPLATES = (
+    (
+        (-34.0, -23.0), (-24.0, -33.0), (24.0, -33.0), (34.0, -23.0),
+        (34.0, 23.0), (24.0, 33.0), (-24.0, 33.0), (-34.0, 23.0),
+    ),
+    (
+        (-35.0, -16.0), (-19.0, -31.0), (21.0, -29.0), (35.0, -12.0),
+        (29.0, 25.0), (10.0, 34.0), (-27.0, 29.0), (-35.0, 8.0),
+    ),
+    (
+        (-31.0, -27.0), (2.0, -35.0), (31.0, -25.0), (35.0, 8.0),
+        (19.0, 32.0), (-13.0, 35.0), (-34.0, 17.0), (-35.0, -12.0),
+    ),
+    (
+        (-34.0, -19.0), (-10.0, -34.0), (25.0, -29.0), (35.0, -3.0),
+        (27.0, 29.0), (-4.0, 34.0), (-30.0, 24.0), (-35.0, -4.0),
+    ),
+    (
+        (-30.0, -30.0), (18.0, -33.0), (34.0, -12.0), (31.0, 23.0),
+        (8.0, 35.0), (-28.0, 29.0), (-35.0, -4.0),
+    ),
+)
+
+
+def _area(points: Iterable[tuple[float, float]]) -> float:
+    values = list(points)
+    return 0.5 * abs(
+        sum(
+            values[index][0] * values[(index + 1) % len(values)][1]
+            - values[(index + 1) % len(values)][0] * values[index][1]
+            for index in range(len(values))
+        )
+    )
+
+
+def _cross(origin: tuple[float, float], first: tuple[float, float], second: tuple[float, float]) -> float:
+    return (first[0] - origin[0]) * (second[1] - origin[1]) - (first[1] - origin[1]) * (second[0] - origin[0])
+
+
+def _convex_hull(points: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+    ordered = sorted(set((float(x), float(y)) for x, y in points))
+    if len(ordered) <= 1:
+        return ordered
+    lower: list[tuple[float, float]] = []
+    for point in ordered:
+        while len(lower) >= 2 and _cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[float, float]] = []
+    for point in reversed(ordered):
+        while len(upper) >= 2 and _cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _concavity_score(points: Iterable[tuple[float, float]]) -> float:
+    values = list(points)
+    hull = _convex_hull(values)
+    polygon_area = _area(values)
+    hull_area = _area(hull)
+    if hull_area <= 1e-9:
+        return 0.0
+    return max(0.0, (hull_area - polygon_area) / hull_area)
+
+
+def _transform(
+    local_points: Iterable[tuple[float, float]],
+    cx: float,
+    cy: float,
+    scale: float,
+    angle_degrees: float,
+) -> list[list[float]]:
+    angle = math.radians(angle_degrees)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    transformed = []
+    for x, y in local_points:
+        tx = scale * (x * cosine - y * sine) + cx
+        ty = scale * (x * sine + y * cosine) + cy
+        transformed.append([round(tx, 4), round(ty, 4)])
+    return transformed
+
+
+def _target_template(depth: float) -> tuple[tuple[float, float], ...]:
+    # A single V-shaped inward bite interrupts the right border.  The outline
+    # remains one connected filled region and has no detached cue.
+    return (
+        (-34.0, -23.0), (-24.0, -33.0), (24.0, -33.0), (34.0, -23.0),
+        (34.0, -15.0), (15.0, -15.0), (34.0 - depth, 0.0), (15.0, 15.0),
+        (34.0, 15.0), (34.0, 23.0), (24.0, 33.0), (-24.0, 33.0),
+        (-34.0, 23.0), (-34.0, -23.0),
+    )
+
+
+def _panel_points(
+    local_points: Iterable[tuple[float, float]],
+    cx: float,
+    cy: float,
+    rotation: float,
+    scale: float,
+) -> list[list[float]]:
+    return _transform(local_points, cx, cy, scale, rotation)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a balanced scene without storing a hidden target-sector field."""
+
+    rng = random.Random(int(seed))
+    target_index = rng.randrange(len(SECTORS))
+    ink = rng.choice(INK_PALETTE)
+    panels = []
+    for index, sector in enumerate(SECTORS):
+        base_x, base_y = _CENTERS[sector]
+        cx = base_x + rng.uniform(-34.0, 34.0)
+        cy = base_y + rng.uniform(-34.0, 34.0)
+        rotation = rng.uniform(0.0, 360.0)
+        if index == target_index:
+            depth = rng.uniform(38.0, 46.0)
+            local = _target_template(depth)
+            # Compensate the bite's missing area with a modest scale increase;
+            # target identity is therefore not encoded by ink quantity alone.
+            scale = rng.uniform(1.01, 1.08)
+            kind = "bitten"
+        else:
+            local = _CONVEX_TEMPLATES[rng.randrange(len(_CONVEX_TEMPLATES))]
+            scale = rng.uniform(0.94, 1.08)
+            kind = "convex"
+        panels.append(
+            {
+                "sector": sector,
+                "points": _panel_points(local, cx, cy, rotation, scale),
+                "kind": kind,
+            }
+        )
+    return {
+        "panels": panels,
+        "width": WIDTH,
+        "height": HEIGHT,
+        "background": list(BACKGROUND),
+        "ink": list(ink),
+        "guide": list(GUIDE),
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    width, height = int(scene["width"]), int(scene["height"])
+    ss = SUPERSAMPLE
+    image = Image.new("RGB", (width * ss, height * ss), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    for x0, y0, x1, y1 in (
+        (10, 10, 246, 246), (266, 10, 502, 246),
+        (10, 266, 246, 502), (266, 266, 502, 502),
+    ):
+        draw.rounded_rectangle(
+            (x0 * ss, y0 * ss, x1 * ss, y1 * ss),
+            radius=13 * ss,
+            outline=tuple(scene["guide"]),
+            width=2 * ss,
+        )
+    ink = tuple(scene["ink"])
+    for panel in scene["panels"]:
+        polygon = [(round(float(x) * ss), round(float(y) * ss)) for x, y in panel["points"]]
+        draw.polygon(polygon, fill=ink)
+    if ss > 1:
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    scored = sorted(
+        (_concavity_score([(float(x), float(y)) for x, y in panel["points"]]), str(panel["sector"]))
+        for panel in scene["panels"]
+    )
+    if len(scored) != 4 or scored[-1][0] < MIN_CONCAVITY:
+        raise ValueError(f"no reliable inward bite: {scored}")
+    if scored[-1][0] - scored[-2][0] < MIN_MARGIN:
+        raise ValueError(f"inward-bite winner is ambiguous: {scored}")
+    return scored[-1][1]
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_concavity_score([(float(x), float(y)) for x, y in panel["points"]]) for panel in scene["panels"])
+    if len(scores) < 2:
+        return 0.0
+    return float(scores[-1] - scores[-2])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = sorted(_concavity_score([(float(x), float(y)) for x, y in panel["points"]]) for panel in scene["panels"])
+    return len(scores) != 4 or scores[-1] < MIN_CONCAVITY or scores[-1] - scores[-2] < MIN_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["panels"] = list(reversed(twin["panels"]))
+    return [("reverse_unordered_panel_records", twin)]

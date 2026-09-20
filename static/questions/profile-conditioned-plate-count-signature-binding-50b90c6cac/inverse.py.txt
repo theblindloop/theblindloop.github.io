@@ -1,0 +1,157 @@
+"""Pixel-only oracle for plate_count_signature_binding.
+
+Receives a rendered image and nothing else. It segments the two rows of plates
+from generic color anchors, counts the black dot blobs carried by each plate,
+locates the framed lower plate, solves the count-signature assignment, and only
+then reads the bound color. It imports no renderer, prompt, generator, verifier
+or analytic-gold code and never sees latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "plate_count_signature_binding-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+_REFERENCE_COLORS = {
+    "red": (214, 45, 45),
+    "blue": (40, 80, 210),
+    "green": (35, 150, 60),
+    "orange": (240, 150, 20),
+}
+
+_WHITE_LEVEL = 245
+_BLACK_LEVEL = 70
+_MIN_BLOB_AREA = 10
+_RING_PAD = 14
+_RING_MIN_PIXELS = 60
+
+
+def _runs(flags: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    """Contiguous True runs of a 1-D boolean profile."""
+    out: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            if index - start >= min_len:
+                out.append((start, index - 1))
+            start = None
+    if start is not None and len(flags) - start >= min_len:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def _count_blobs(mask: np.ndarray) -> int:
+    """Four-connected components of a small boolean mask, area-filtered."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    blobs = 0
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x] or seen[y, x]:
+                continue
+            area = 0
+            queue = deque([(y, x)])
+            seen[y, x] = True
+            while queue:
+                cy, cx = queue.popleft()
+                area += 1
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+            if area >= _MIN_BLOB_AREA:
+                blobs += 1
+    return blobs
+
+
+def _nearest_color(rgb: tuple[float, float, float]) -> str | None:
+    best, best_dist = None, None
+    for name, ref in _REFERENCE_COLORS.items():
+        dist = sum((float(rgb[i]) - ref[i]) ** 2 for i in range(3))
+        if best_dist is None or dist < best_dist:
+            best, best_dist = name, dist
+    if best_dist is None or best_dist > 12_000:
+        return None
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the color bound to the framed plate, or 'abstain'."""
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    white = np.all(arr >= _WHITE_LEVEL, axis=2)
+    black = np.all(arr <= _BLACK_LEVEL, axis=2)
+    plate = ~white & ~black
+
+    bands = _runs(plate.any(axis=1), min_len=40)
+    if len(bands) != 2:
+        return ABSTAIN
+
+    rows: list[list[dict]] = []
+    for top, bottom in bands:
+        columns = _runs(plate[top : bottom + 1].any(axis=0), min_len=40)
+        if len(columns) != 4:
+            return ABSTAIN
+        entries: list[dict] = []
+        for left, right in columns:
+            sub_plate = plate[top : bottom + 1, left : right + 1]
+            ys, xs = np.nonzero(sub_plate)
+            if ys.size == 0:
+                return ABSTAIN
+            y0, y1 = top + int(ys.min()), top + int(ys.max())
+            x0, x1 = left + int(xs.min()), left + int(xs.max())
+            patch = arr[y0 : y1 + 1, x0 : x1 + 1]
+            body = plate[y0 : y1 + 1, x0 : x1 + 1]
+            mean_rgb = tuple(float(patch[:, :, c][body].mean()) for c in range(3))
+            saturation = max(mean_rgb) - min(mean_rgb)
+            count = _count_blobs(black[y0 : y1 + 1, x0 : x1 + 1])
+            entries.append(
+                {
+                    "box": (x0, y0, x1, y1),
+                    "rgb": mean_rgb,
+                    "colored": saturation > 40.0,
+                    "count": count,
+                }
+            )
+        rows.append(entries)
+
+    upper = [e for e in rows[0] + rows[1] if e["colored"]]
+    lower = [e for e in rows[0] + rows[1] if not e["colored"]]
+    if len(upper) != 4 or len(lower) != 4:
+        return ABSTAIN
+
+    named: dict[str, int] = {}
+    for entry in upper:
+        name = _nearest_color(entry["rgb"])
+        if name is None or name in named:
+            return ABSTAIN
+        named[name] = entry["count"]
+    if len(set(named.values())) != 4:
+        return ABSTAIN
+
+    height, width = black.shape
+    framed = None
+    for entry in lower:
+        x0, y0, x1, y1 = entry["box"]
+        ex0, ey0 = max(0, x0 - _RING_PAD), max(0, y0 - _RING_PAD)
+        ex1, ey1 = min(width - 1, x1 + _RING_PAD), min(height - 1, y1 + _RING_PAD)
+        ring = int(black[ey0 : ey1 + 1, ex0 : ex1 + 1].sum()) - int(
+            black[y0 : y1 + 1, x0 : x1 + 1].sum()
+        )
+        if ring >= _RING_MIN_PIXELS:
+            if framed is not None:
+                return ABSTAIN
+            framed = entry
+    if framed is None:
+        return ABSTAIN
+
+    matches = [name for name, count in named.items() if count == framed["count"]]
+    if len(matches) != 1:
+        return ABSTAIN
+    return matches[0]

@@ -1,0 +1,144 @@
+"""Independent image-only inverse for punched-tape registration.
+
+The detector locates tape-colored raster regions, infers their grid bounds,
+decodes local punch occupancy, locates the magenta marker, registers the short
+sequence in the long sequence, and only then reads the aligned color tag.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+TAPE_RGB = np.array((244, 235, 201), dtype=np.int16)
+INK_RGB = np.array((28, 32, 40), dtype=np.int16)
+MAGENTA_RGB = np.array((207, 34, 132), dtype=np.int16)
+TAG_RGB = {
+    "red": np.array((218, 57, 58), dtype=np.int16),
+    "green": np.array((43, 151, 82), dtype=np.int16),
+    "blue": np.array((48, 101, 211), dtype=np.int16),
+}
+REFERENCE_COLUMNS = 5
+TARGET_COLUMNS = 12
+PUNCH_ROWS = 4
+
+
+def _near(array: np.ndarray, rgb: np.ndarray, tolerance: int = 12) -> np.ndarray:
+    return np.max(np.abs(array.astype(np.int16) - rgb), axis=2) <= tolerance
+
+
+def _runs(values: np.ndarray, max_gap: int) -> list[tuple[int, int]]:
+    if len(values) == 0:
+        return []
+    groups: list[tuple[int, int]] = []
+    start = previous = int(values[0])
+    for raw in values[1:]:
+        value = int(raw)
+        if value - previous > max_gap:
+            groups.append((start, previous))
+            start = value
+        previous = value
+    groups.append((start, previous))
+    return groups
+
+
+def _tape_boxes(array: np.ndarray) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    mask = _near(array, TAPE_RGB)
+    y_values = np.flatnonzero(mask.any(axis=1))
+    bands = _runs(y_values, max_gap=14)
+    if len(bands) != 2:
+        raise ValueError(f"expected two detected tape bands, found {len(bands)}")
+    boxes = []
+    for y0, y1 in bands:
+        yy, xx = np.nonzero(mask[y0 : y1 + 1])
+        if len(xx) < 500:
+            raise ValueError("detected tape region has too little visible material")
+        boxes.append((int(xx.min()), y0 + int(yy.min()), int(xx.max()), y0 + int(yy.max())))
+    boxes.sort(key=lambda box: box[1])
+    if boxes[0][2] - boxes[0][0] >= boxes[1][2] - boxes[1][0]:
+        raise ValueError("reference tape is not shorter than target tape")
+    return boxes[0], boxes[1]
+
+
+def _centers(box: tuple[int, int, int, int], columns: int) -> tuple[list[float], list[float]]:
+    x0, y0, x1, y1 = box
+    # Tape-color extrema sit just inside the dark outline. Expanding by four
+    # pixels recovers the visible border; no absolute canvas coordinate is used.
+    left, right = x0 - 4.0, x1 + 4.0
+    top, bottom = y0 - 4.0, y1 + 4.0
+    xs = [left + (i + 0.5) * (right - left) / columns for i in range(columns)]
+    ys = [top + (i + 0.5) * (bottom - top) / PUNCH_ROWS for i in range(PUNCH_ROWS)]
+    return xs, ys
+
+
+def _decode_codes(array: np.ndarray, box: tuple[int, int, int, int], columns: int) -> tuple[list[int], list[float]]:
+    xs, ys = _centers(box, columns)
+    ink = _near(array, INK_RGB, tolerance=20)
+    codes = []
+    for x in xs:
+        code = 0
+        for row, y in enumerate(ys):
+            ix, iy = int(round(x)), int(round(y))
+            patch = ink[max(0, iy - 7) : iy + 8, max(0, ix - 7) : ix + 8]
+            if patch.size == 0:
+                raise ValueError("punch sample falls outside image")
+            if float(patch.mean()) > 0.28:
+                code |= 1 << row
+        codes.append(code)
+    return codes, xs
+
+
+def _marked_column(array: np.ndarray, reference_xs: list[float]) -> int:
+    mask = _near(array, MAGENTA_RGB, tolerance=20)
+    yy, xx = np.nonzero(mask)
+    if len(xx) < 40:
+        raise ValueError("magenta reference marker is absent")
+    marker_x = float(np.median(xx))
+    distances = [abs(x - marker_x) for x in reference_xs]
+    best = int(np.argmin(distances))
+    if sorted(distances)[1] - distances[best] < 8:
+        raise ValueError("magenta marker does not identify one column")
+    return best
+
+
+def _read_tags(array: np.ndarray, target_xs: list[float], target_box: tuple[int, int, int, int]) -> list[str]:
+    masks = {name: _near(array, rgb, tolerance=20) for name, rgb in TAG_RGB.items()}
+    combined = np.logical_or.reduce(list(masks.values()))
+    yy, xx = np.nonzero(combined)
+    if len(xx) < 1200 or int(yy.min()) <= target_box[3]:
+        raise ValueError("target color tags are absent or misplaced")
+    tag_y = float(np.median(yy))
+    tags = []
+    for x in target_xs:
+        ix, iy = int(round(x)), int(round(tag_y))
+        scores = {
+            name: int(mask[max(0, iy - 12) : iy + 13, max(0, ix - 12) : ix + 13].sum())
+            for name, mask in masks.items()
+        }
+        ranking = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        if ranking[0][1] < 250 or ranking[0][1] - ranking[1][1] < 200:
+            raise ValueError("a target tag has no unambiguous palette color")
+        tags.append(ranking[0][0])
+    if sorted(tags.count(name) for name in TAG_RGB) != [4, 4, 4]:
+        raise ValueError("tag palette is not visibly counterbalanced")
+    return tags
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the answer from RGB pixels and the fixed public grid contract."""
+    array = np.asarray(image.convert("RGB"))
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected an RGB raster")
+    reference_box, target_box = _tape_boxes(array)
+    reference, reference_xs = _decode_codes(array, reference_box, REFERENCE_COLUMNS)
+    target, target_xs = _decode_codes(array, target_box, TARGET_COLUMNS)
+    marker = _marked_column(array, reference_xs)
+    matches = [
+        start
+        for start in range(TARGET_COLUMNS - REFERENCE_COLUMNS + 1)
+        if target[start : start + REFERENCE_COLUMNS] == reference
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"punch evidence gives {len(matches)} exact registrations")
+    tags = _read_tags(array, target_xs, target_box)
+    return tags[matches[0] + marker]

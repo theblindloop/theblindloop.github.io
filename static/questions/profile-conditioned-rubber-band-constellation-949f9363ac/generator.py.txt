@@ -1,0 +1,224 @@
+"""Procedural renderer and analytic arm for the rubber-band constellation."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+
+PALETTE = {
+    "red": (216, 67, 58),
+    "blue": (45, 111, 195),
+    "green": (42, 148, 91),
+    "orange": (232, 137, 38),
+}
+COLOR_NAMES = ("red", "blue", "green", "orange")
+QUARANTINE_MARGIN = 20.0
+
+
+def _cross(a: tuple[float, float], b: tuple[float, float], p: tuple[float, float]) -> float:
+    return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+
+
+def _convex_hull(points: list[list[float]] | list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Andrew monotone chain, returned counterclockwise without a repeated end."""
+    pts = sorted({(float(p[0]), float(p[1])) for p in points})
+    if len(pts) < 3:
+        raise ValueError("at least three distinct points are required")
+
+    def build(sequence: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        for point in sequence:
+            while len(out) >= 2 and _cross(out[-2], out[-1], point) <= 0:
+                out.pop()
+            out.append(point)
+        return out
+
+    return build(pts)[:-1] + build(list(reversed(pts)))[:-1]
+
+
+def _signed_hull_score(hull: list[tuple[float, float]], point: list[float] | tuple[float, float]) -> float:
+    """Minimum inward perpendicular distance; positive exactly when strictly inside."""
+    values = []
+    for index, a in enumerate(hull):
+        b = hull[(index + 1) % len(hull)]
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        values.append(_cross(a, b, (float(point[0]), float(point[1]))) / length)
+    return min(values)
+
+
+def _scores(scene: dict) -> dict[str, float]:
+    hull = _convex_hull(scene["ink_points"])
+    return {
+        str(color): _signed_hull_score(hull, point)
+        for color, point in zip(scene["candidate_colors"], scene["candidate_points"])
+    }
+
+
+def _far_enough(point: tuple[float, float], others: list[list[float]], clearance: float) -> bool:
+    return all(math.hypot(point[0] - q[0], point[1] - q[1]) >= clearance for q in others)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a balanced, variable-size constellation with one inside candidate."""
+    rng = random.Random(int(seed))
+    width = height = 512
+    center = (256.0 + rng.uniform(-26.0, 26.0), 256.0 + rng.uniform(-26.0, 26.0))
+    rotation = rng.uniform(0.0, 2.0 * math.pi)
+    group = int(seed) // 4
+    outer_count = 8 + (group % 3)
+    inner_count = 6 + ((group // 3) % 4)
+    rx = rng.uniform(112.0, 132.0)
+    ry = rng.uniform(92.0, 118.0)
+
+    ink_points: list[list[float]] = []
+    for index in range(outer_count):
+        angle = rotation + 2.0 * math.pi * index / outer_count + rng.uniform(-0.045, 0.045)
+        radial = rng.uniform(0.96, 1.04)
+        ink_points.append(
+            [
+                round(center[0] + rx * radial * math.cos(angle), 3),
+                round(center[1] + ry * radial * math.sin(angle), 3),
+            ]
+        )
+
+    for _ in range(inner_count):
+        for _attempt in range(1000):
+            angle = rng.uniform(0.0, 2.0 * math.pi)
+            radial = math.sqrt(rng.uniform(0.04, 0.52))
+            point = (
+                center[0] + rx * radial * math.cos(angle),
+                center[1] + ry * radial * math.sin(angle),
+            )
+            if _far_enough(point, ink_points, 20.0):
+                ink_points.append([round(point[0], 3), round(point[1], 3)])
+                break
+        else:
+            raise RuntimeError("could not place separated interior ink dots")
+
+    hull = _convex_hull(ink_points)
+    # Whole four-seed blocks become near-boundary together, so quarantine
+    # status is counterbalanced across all four answer colors.
+    near_boundary = (int(seed) // 4) % 6 == 0
+    edge_index = rng.randrange(len(hull))
+
+    def edge_point(index: int, signed_offset: float, along: float = 0.0) -> list[float]:
+        a = hull[index % len(hull)]
+        b = hull[(index + 1) % len(hull)]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        tx, ty = dx / length, dy / length
+        nx, ny = -ty, tx
+        return [
+            round((a[0] + b[0]) / 2.0 + tx * along + nx * signed_offset, 3),
+            round((a[1] + b[1]) / 2.0 + ty * along + ny * signed_offset, 3),
+        ]
+
+    if near_boundary:
+        inside_point = edge_point(edge_index, 7.0, -16.0)
+        outside_points = [edge_point(edge_index, -7.0, 16.0)]
+    else:
+        for _attempt in range(1000):
+            point = [
+                center[0] + rng.uniform(-24.0, 24.0),
+                center[1] + rng.uniform(-24.0, 24.0),
+            ]
+            if _signed_hull_score(hull, point) > 48.0 and _far_enough((point[0], point[1]), ink_points, 22.0):
+                inside_point = [round(point[0], 3), round(point[1], 3)]
+                break
+        else:
+            inside_point = [round(center[0], 3), round(center[1], 3)]
+        outside_points = []
+
+    step = max(1, len(hull) // 3)
+    used_edges = {edge_index}
+    candidate_clearance = [inside_point, *outside_points]
+    offset_cursor = 0
+    while len(outside_points) < 3:
+        candidate_edge = (edge_index + step * (len(outside_points) + 1) + offset_cursor) % len(hull)
+        offset_cursor += 1
+        if candidate_edge in used_edges:
+            continue
+        used_edges.add(candidate_edge)
+        point = edge_point(candidate_edge, -rng.uniform(30.0, 43.0), rng.uniform(-8.0, 8.0))
+        if (
+            22.0 <= point[0] <= width - 22.0
+            and 22.0 <= point[1] <= height - 22.0
+            and _far_enough((point[0], point[1]), ink_points, 21.0)
+            and _far_enough((point[0], point[1]), candidate_clearance, 27.0)
+            and _signed_hull_score(hull, point) < -24.0
+        ):
+            outside_points.append(point)
+            candidate_clearance.append(point)
+
+    answer_index = int(seed) % len(COLOR_NAMES)
+    shuffled_outside = outside_points[:]
+    rng.shuffle(shuffled_outside)
+    candidate_points: list[list[float]] = []
+    cursor = 0
+    for index in range(len(COLOR_NAMES)):
+        if index == answer_index:
+            candidate_points.append(inside_point)
+        else:
+            candidate_points.append(shuffled_outside[cursor])
+            cursor += 1
+
+    scene = {
+        "width": width,
+        "height": height,
+        "background": [248, 247, 242],
+        "ink_color": [39, 45, 51],
+        "candidate_colors": list(COLOR_NAMES),
+        "ink_points": ink_points,
+        "candidate_points": candidate_points,
+        "ink_radius": 6,
+        "candidate_radius": 10,
+    }
+    scores = _scores(scene)
+    positives = [name for name, value in scores.items() if value > 0.0]
+    if positives != [COLOR_NAMES[answer_index]]:
+        raise RuntimeError(f"invalid sampled membership: {scores}")
+    return scene
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only visible scene fields; no label or metadata is embedded."""
+    scale = 4
+    width, height = int(scene["width"]), int(scene["height"])
+    background = tuple(int(v) for v in scene["background"])
+    ink = tuple(int(v) for v in scene["ink_color"])
+    ink_radius = int(scene["ink_radius"])
+    candidate_radius = int(scene["candidate_radius"])
+    image = Image.new("RGB", (width * scale, height * scale), background)
+    draw = ImageDraw.Draw(image)
+    for point in scene["ink_points"]:
+        x, y = float(point[0]) * scale, float(point[1]) * scale
+        radius = ink_radius * scale
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=ink)
+    for name, point in zip(scene["candidate_colors"], scene["candidate_points"]):
+        x, y = float(point[0]) * scale, float(point[1]) * scale
+        radius = candidate_radius * scale
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=PALETTE[str(name)])
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    return max(_scores(scene).items(), key=lambda item: item[1])[0]
+
+
+def margin(scene: dict) -> float:
+    ordered = sorted(_scores(scene).values(), reverse=True)
+    return float(ordered[0] - ordered[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["ink_points"] = list(reversed(twin["ink_points"]))
+    return [("reverse_unordered_ink_serialization", twin)]

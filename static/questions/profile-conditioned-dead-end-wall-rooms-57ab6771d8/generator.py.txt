@@ -1,0 +1,272 @@
+"""Scene sampler, rasteriser and analytic gold for the dead-end wall world.
+
+A white rectangular plate with a black border always carries exactly five
+straight black interior walls.  A wall only divides a room when it runs the
+whole way across that room and meets ink at both ends; a wall with a loose end,
+or a wall floating free of everything, adds ink but divides nothing.  The latent
+decision is the number of rooms, i.e. the number of faces of the drawn wall
+arrangement inside the plate.
+
+The wall count is held fixed at five in every scene, so neither wall count nor
+gross ink answers the question: only the incidence structure does.  Analytic
+gold is computed from wall geometry alone by a coordinate-compressed cell
+decomposition and union-find over cells - never from the construction
+bookkeeping - so the recorded answer is an independent consequence of the
+rendered geometry.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "dead_end_wall_rooms-renderer-0.1.0"
+
+CANVAS = [720, 460]
+BACKGROUND = [255, 255, 255]
+INK_COLOR = [20, 20, 20]
+PLATE = [30, 30, 690, 430]
+HALF_STROKE = 2
+WALL_TOTAL = 5
+MIN_ROOM_DIM = 92
+MIN_END_GAP = 7
+MAX_END_GAP = 45
+CORNER_KEEPOUT = 28
+MIN_SPUR_LENGTH = 30
+QUARANTINE_PX = 14.0
+
+
+# --------------------------------------------------------------------------
+# analytic gold: faces of the wall arrangement, from geometry only
+# --------------------------------------------------------------------------
+def _barriers(scene):
+    """Split walls into (x, y_lo, y_hi) verticals and (y, x_lo, x_hi) horizontals."""
+    verticals, horizontals = [], []
+    plate = scene["plate"]
+    verticals.append((plate[0], plate[1], plate[3]))
+    verticals.append((plate[2], plate[1], plate[3]))
+    horizontals.append((plate[1], plate[0], plate[2]))
+    horizontals.append((plate[3], plate[0], plate[2]))
+    for ax, ay, bx, by in scene["walls"]:
+        if ax == bx:
+            verticals.append((ax, min(ay, by), max(ay, by)))
+        else:
+            horizontals.append((ay, min(ax, bx), max(ax, bx)))
+    return verticals, horizontals
+
+
+def _room_count(scene) -> int:
+    """Number of connected faces strictly inside the plate.
+
+    Coordinates are compressed to a small grid whose lines carry every barrier
+    and every barrier endpoint, so a cell edge is either fully blocked by ink or
+    fully open.  Cells are then merged with union-find.
+    """
+    verticals, horizontals = _barriers(scene)
+    plate = scene["plate"]
+    xs = sorted({plate[0], plate[2]} | {v[0] for v in verticals} | {h[1] for h in horizontals} | {h[2] for h in horizontals})
+    ys = sorted({plate[1], plate[3]} | {h[0] for h in horizontals} | {v[1] for v in verticals} | {v[2] for v in verticals})
+    xs = [x for x in xs if plate[0] <= x <= plate[2]]
+    ys = [y for y in ys if plate[1] <= y <= plate[3]]
+    columns, rows = len(xs) - 1, len(ys) - 1
+    parent = list(range(columns * rows))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> None:
+        left, right = find(left), find(right)
+        if left != right:
+            parent[max(left, right)] = min(left, right)
+
+    def blocked_vertical(x: int, y_lo: int, y_hi: int) -> bool:
+        return any(v[0] == x and v[1] <= y_lo and v[2] >= y_hi for v in verticals)
+
+    def blocked_horizontal(y: int, x_lo: int, x_hi: int) -> bool:
+        return any(h[0] == y and h[1] <= x_lo and h[2] >= x_hi for h in horizontals)
+
+    for j in range(rows):
+        for i in range(columns):
+            cell = j * columns + i
+            if i + 1 < columns and not blocked_vertical(xs[i + 1], ys[j], ys[j + 1]):
+                union(cell, cell + 1)
+            if j + 1 < rows and not blocked_horizontal(ys[j + 1], xs[i], xs[i + 1]):
+                union(cell, cell + columns)
+    return len({find(cell) for cell in range(columns * rows)})
+
+
+def analytic_gold(scene) -> str:
+    """Decimal count of separate rooms inside the plate."""
+    return str(_room_count(scene))
+
+
+def margin(scene) -> float:
+    """Smallest visible white gap in pixels that keeps the answer where it is.
+
+    Every loose wall end contributes the raster gap between its ink and the
+    ink it stops short of; every room contributes its free interior extents.
+    The answer changes exactly when a loose end closes onto the far wall.
+    """
+    values = [float(gap) for gap in scene["end_gaps"]]
+    for x0, y0, x1, y1 in scene["room_probe"]:
+        values.append(float(x1 - x0 - 2 * HALF_STROKE - 1))
+        values.append(float(y1 - y0 - 2 * HALF_STROKE - 1))
+    return round(min(values), 6)
+
+
+def is_quarantined(scene) -> bool:
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def latent_symmetries(scene) -> list:
+    """Pixel-identical relabelings of the latent scene that must preserve gold.
+
+    Walls are painted in one colour as symmetric bands about their centre line,
+    so paint order is bookkeeping, and each wall is stored as an unordered pair
+    of endpoints, so swapping its endpoints cannot move any pixel.
+    """
+    transforms = []
+    reordered = dict(scene)
+    reordered["walls"] = list(reversed(scene["walls"]))
+    transforms.append(("wall_draw_order_reversal", reordered))
+    flipped = dict(scene)
+    flipped["walls"] = [[bx, by, ax, ay] for ax, ay, bx, by in scene["walls"]]
+    transforms.append(("wall_endpoint_order_flip", flipped))
+    return transforms
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _split(rng, rects) -> list | None:
+    """Guillotine one room in two; returns the dividing wall or None."""
+    order = sorted(range(len(rects)), key=lambda i: -(rects[i][2] - rects[i][0]) * (rects[i][3] - rects[i][1]))
+    for index in order[:3]:
+        x0, y0, x1, y1 = rects[index]
+        axes = []
+        if x1 - x0 >= 2 * MIN_ROOM_DIM:
+            axes.append("v")
+        if y1 - y0 >= 2 * MIN_ROOM_DIM:
+            axes.append("h")
+        if not axes:
+            continue
+        if rng.random() < 0.5:
+            axes.reverse()
+        axis = axes[0]
+        if axis == "v":
+            x = rng.randint(x0 + MIN_ROOM_DIM, x1 - MIN_ROOM_DIM)
+            wall = [x, y0, x, y1]
+            children = [[x0, y0, x, y1], [x, y0, x1, y1]]
+        else:
+            y = rng.randint(y0 + MIN_ROOM_DIM, y1 - MIN_ROOM_DIM)
+            wall = [x0, y, x1, y]
+            children = [[x0, y0, x1, y], [x0, y, x1, y1]]
+        rects[index : index + 1] = children
+        return wall
+    return None
+
+
+def _spur(rng, room):
+    """One non-dividing wall inside a room: an attached dead end or a free island.
+
+    Returns (wall, gaps) where every gap is the raster white gap in pixels
+    between the loose ink end and the ink it stops short of.
+    """
+    x0, y0, x1, y1 = room
+    width, height = x1 - x0, y1 - y0
+    horizontal = rng.random() < 0.5
+    span = width if horizontal else height
+    limit = min(MAX_END_GAP, span - 2 * HALF_STROKE - 1 - MIN_SPUR_LENGTH)
+    if rng.random() < 0.72:  # attached dead end
+        gap = rng.randint(MIN_END_GAP, max(MIN_END_GAP, limit))
+        length = span - 2 * HALF_STROKE - 1 - gap
+        if horizontal:
+            offset = rng.randint(y0 + CORNER_KEEPOUT, y1 - CORNER_KEEPOUT)
+            if rng.random() < 0.5:
+                wall = [x0, offset, x0 + length, offset]
+            else:
+                wall = [x1 - length, offset, x1, offset]
+        else:
+            offset = rng.randint(x0 + CORNER_KEEPOUT, x1 - CORNER_KEEPOUT)
+            if rng.random() < 0.5:
+                wall = [offset, y0, offset, y0 + length]
+            else:
+                wall = [offset, y1 - length, offset, y1]
+        return wall, [gap]
+    room_limit = max(MIN_END_GAP, (span - 2 * HALF_STROKE - 1 - MIN_SPUR_LENGTH) // 2)
+    near = rng.randint(MIN_END_GAP, min(MAX_END_GAP, room_limit))
+    far = rng.randint(MIN_END_GAP, min(MAX_END_GAP, room_limit))
+    if horizontal:
+        offset = rng.randint(y0 + CORNER_KEEPOUT, y1 - CORNER_KEEPOUT)
+        wall = [x0 + HALF_STROKE + 1 + near, offset, x1 - HALF_STROKE - 1 - far, offset]
+    else:
+        offset = rng.randint(x0 + CORNER_KEEPOUT, x1 - CORNER_KEEPOUT)
+        wall = [offset, y0 + HALF_STROKE + 1 + near, offset, y1 - HALF_STROKE - 1 - far]
+    return wall, [near, far]
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    target_rooms = 3 + int(seed) % 4
+    rects = [list(PLATE)]
+    dividing: list = []
+    while len(rects) < target_rooms:
+        wall = _split(rng, rects)
+        if wall is None:
+            break
+        dividing.append(wall)
+    spur_budget = WALL_TOTAL - len(dividing)
+    hosts = sorted(range(len(rects)), key=lambda i: -(rects[i][2] - rects[i][0]) * (rects[i][3] - rects[i][1]))
+    rng.shuffle(hosts)
+    spurs: list = []
+    gaps: list = []
+    for host in hosts:
+        if len(spurs) == spur_budget:
+            break
+        wall, wall_gaps = _spur(rng, rects[host])
+        spurs.append(wall)
+        gaps.extend(wall_gaps)
+    walls = dividing + spurs
+    rng.shuffle(walls)
+    return {
+        "canvas": list(CANVAS),
+        "background": list(BACKGROUND),
+        "ink_color": list(INK_COLOR),
+        "plate": list(PLATE),
+        "half_stroke": HALF_STROKE,
+        "wall_total": len(walls),
+        "walls": [list(wall) for wall in walls],
+        "end_gaps": list(gaps),
+        "room_probe": [list(rect) for rect in rects],
+    }
+
+
+# --------------------------------------------------------------------------
+# rasterisation
+# --------------------------------------------------------------------------
+def _band(wall, half):
+    ax, ay, bx, by = wall
+    return [min(ax, bx) - half, min(ay, by) - half, max(ax, bx) + half, max(ay, by) + half]
+
+
+def render(scene) -> Image.Image:
+    width, height = int(scene["canvas"][0]), int(scene["canvas"][1])
+    image = Image.new("RGB", (width, height), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    ink = tuple(scene["ink_color"])
+    half = int(scene["half_stroke"])
+    x0, y0, x1, y1 = scene["plate"]
+    for band in (
+        [x0, y0, x1, y0],
+        [x0, y1, x1, y1],
+        [x0, y0, x0, y1],
+        [x1, y0, x1, y1],
+    ):
+        draw.rectangle(_band(band, half), fill=ink)
+    for wall in scene["walls"]:
+        draw.rectangle(_band(wall, half), fill=ink)
+    return image

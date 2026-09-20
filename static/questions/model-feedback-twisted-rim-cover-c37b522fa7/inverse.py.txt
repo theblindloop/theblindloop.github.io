@@ -1,0 +1,200 @@
+"""Independent PNG-only inverse for Twisted Rim Cover."""
+
+from __future__ import annotations
+
+from collections import Counter, deque
+
+import numpy as np
+from PIL import Image
+
+WIDTH, HEIGHT = 1200, 800
+N, CELL = 7, 42
+PANEL_ORIGINS = ((20, 181), (417, 181), (814, 181))
+GRID_OFFSET = (36, 137)
+INK = np.array((42, 47, 57), dtype=np.int16)
+GRID = np.array((203, 209, 216), dtype=np.int16)
+START = (3, 3)
+TERMINALS = {"A": (0, 0), "B": (0, 6), "C": (6, 0), "D": (6, 6)}
+DIRECTIONS = ((-1, 0), (0, 1), (1, 0), (0, -1))
+MARK_COLORS = {
+    "S": (215, 70, 65), "A": (247, 174, 47), "B": (45, 119, 204),
+    "C": (76, 166, 88), "D": (150, 82, 191),
+}
+LAYER_COLORS = {0: (251, 251, 247), 1: (31, 35, 43)}
+MODE_COLORS = {False: (72, 164, 103), True: (231, 116, 66)}
+MODE_KEY_X = {"P": 399, "Q": 619}
+PORTAL_COLORS = {"P": (25, 151, 171), "Q": (146, 79, 190)}
+RIM_COLORS = {
+    "red": (224, 68, 75), "gold": (244, 177, 43),
+    "green": (50, 166, 101), "blue": (54, 122, 214),
+}
+
+
+def _color_count(patch, color):
+    ref = np.array(color, dtype=np.int16)
+    return int((np.abs(patch.astype(np.int16) - ref).max(axis=2) <= 3).sum())
+
+
+def _all_edges(blocked):
+    out = []
+    for r in range(N):
+        for c in range(N):
+            if (r, c) in blocked:
+                continue
+            for dr, dc in ((0, 1), (1, 0)):
+                nxt = (r + dr, c + dc)
+                if 0 <= nxt[0] < N and 0 <= nxt[1] < N and nxt not in blocked:
+                    out.append(((r, c), nxt))
+    return out
+
+
+def _segment_patch(arr, gx, gy, edge):
+    (r1, c1), (r2, c2) = edge
+    if r1 == r2:
+        x = gx + max(c1, c2) * CELL
+        cy = gy + r1 * CELL + CELL // 2
+        return arr[cy - 11:cy + 12, x - 4:x + 5]
+    y = gy + max(r1, r2) * CELL
+    cx = gx + c1 * CELL + CELL // 2
+    return arr[y - 4:y + 5, cx - 11:cx + 12]
+
+
+def _read_rims(arr, cx, cy):
+    patches = (arr[cy - 17:cy - 12, cx - 6:cx + 7],
+               arr[cy - 6:cy + 7, cx + 12:cx + 17],
+               arr[cy + 12:cy + 17, cx - 6:cx + 7],
+               arr[cy - 6:cy + 7, cx - 17:cx - 12])
+    result = []
+    for patch in patches:
+        counts = {tag: _color_count(patch, color) for tag, color in RIM_COLORS.items()}
+        tag, count = max(counts.items(), key=lambda item: item[1])
+        if count < 45 or sum(v >= 25 for v in counts.values()) != 1:
+            return None
+        result.append(tag)
+    return result if sorted(result) == sorted(RIM_COLORS) else None
+
+
+def _read_plan(arr, x0, y0):
+    gx, gy = x0 + GRID_OFFSET[0], y0 + GRID_OFFSET[1]
+    terminal_layers = {}
+    for label, (r, c) in {"S": START, **TERMINALS}.items():
+        cx, cy = gx + c * CELL + CELL // 2, gy + r * CELL + CELL // 2
+        if _color_count(arr[cy - 13:cy + 5, cx - 11:cx + 12], MARK_COLORS[label]) < 100:
+            return None
+        layer_counts = {layer: _color_count(arr[cy + 7:cy + 14, cx - 8:cx + 9], color)
+                        for layer, color in LAYER_COLORS.items()}
+        layer, count = max(layer_counts.items(), key=lambda item: item[1])
+        if count < 45:
+            return None
+        if label == "S" and layer != 0:
+            return None
+        if label != "S":
+            terminal_layers[label] = layer
+    portals = {symbol: [] for symbol in PORTAL_COLORS}
+    blocked = set()
+    for r in range(N):
+        for c in range(N):
+            cx, cy = gx + c * CELL + CELL // 2, gy + r * CELL + CELL // 2
+            patch = arr[cy - 7:cy + 8, cx - 7:cx + 8]
+            hits = [symbol for symbol, color in PORTAL_COLORS.items()
+                    if _color_count(patch, color) >= 90]
+            if len(hits) > 1:
+                return None
+            if hits:
+                rims = _read_rims(arr, cx, cy)
+                if rims is None:
+                    return None
+                portals[hits[0]].append({"cell": (r, c), "rims": tuple(rims)})
+                blocked.add((r, c))
+    if any(len(entries) != 2 for entries in portals.values()) or len(blocked) != 4:
+        return None
+    for entries in portals.values():
+        entries.sort(key=lambda entry: entry["cell"])
+    walls = []
+    for edge in _all_edges(blocked):
+        patch = _segment_patch(arr, gx, gy, edge).astype(np.int16)
+        ink_fraction = float((np.abs(patch - INK).max(axis=2) <= 3).mean())
+        grid_fraction = float((np.abs(patch - GRID).max(axis=2) <= 3).mean())
+        if ink_fraction >= 0.69:
+            walls.append(edge)
+        elif grid_fraction < 0.12:
+            return None
+    return walls, portals, blocked, terminal_layers
+
+
+def _normalize(portals):
+    return {symbol: tuple((entry["cell"], entry["rims"]) for entry in entries)
+            for symbol, entries in portals.items()}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    if image.size != (WIDTH, HEIGHT):
+        return "abstain"
+    arr = np.asarray(image.convert("RGB"))
+    seam_modes = {}
+    for symbol, x in MODE_KEY_X.items():
+        patch = arr[106:131, x + 16:x + 41]
+        counts = {mode: _color_count(patch, color) for mode, color in MODE_COLORS.items()}
+        mode, count = max(counts.items(), key=lambda item: item[1])
+        if count < 420:
+            return "abstain"
+        seam_modes[symbol] = mode
+    if sorted(seam_modes.values()) != [False, True]:
+        return "abstain"
+    plans = []
+    reference = None
+    blocked = None
+    terminal_layers = None
+    for origin in PANEL_ORIGINS:
+        result = _read_plan(arr, *origin)
+        if result is None:
+            return "abstain"
+        plan, portals, panel_blocked, panel_layers = result
+        normalized = _normalize(portals)
+        if reference is None:
+            reference, blocked, terminal_layers = normalized, panel_blocked, panel_layers
+        elif normalized != reference or panel_blocked != blocked or panel_layers != terminal_layers:
+            return "abstain"
+        plans.append(plan)
+    counts = Counter(tuple(sorted(edge)) for plan in plans for edge in plan)
+    if any(count not in (1, 2) for count in counts.values()):
+        return "abstain"
+    walls = {edge for edge, count in counts.items() if count % 2}
+    graph = {(cell, layer): set() for r in range(N) for c in range(N)
+             if (cell := (r, c)) not in blocked for layer in (0, 1)}
+    for edge in _all_edges(blocked):
+        edge = tuple(sorted(edge))
+        if edge not in walls:
+            a, b = edge
+            for layer in (0, 1):
+                graph[(a, layer)].add((b, layer))
+                graph[(b, layer)].add((a, layer))
+    for symbol, entries in reference.items():
+        first, second = entries
+        sides = []
+        for cell, rims in (first, second):
+            side_map = {}
+            for index, tag in enumerate(rims):
+                dr, dc = DIRECTIONS[index]
+                side_map[tag] = (cell[0] + dr, cell[1] + dc)
+            sides.append(side_map)
+        for tag in RIM_COLORS:
+            a, b = sides[0][tag], sides[1][tag]
+            if (a, 0) not in graph or (b, 0) not in graph:
+                return "abstain"
+            flip = int(bool(seam_modes[symbol]))
+            for layer in (0, 1):
+                graph[(a, layer)].add((b, layer ^ flip))
+                graph[(b, layer ^ flip)].add((a, layer))
+    start = (START, 0)
+    seen = {start}
+    queue = deque([start])
+    while queue:
+        cell = queue.popleft()
+        for nxt in graph[cell]:
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    hits = [label for label, cell in TERMINALS.items()
+            if (cell, terminal_layers[label]) in seen]
+    return hits[0] if len(hits) == 1 else "abstain"

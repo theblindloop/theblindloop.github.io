@@ -1,0 +1,264 @@
+"""Deterministic scene sampling and rendering for uneven_scale_readout.
+
+Four horizontal scales carry unevenly spaced ticks. Consecutive ticks are worth
+one unit each, so a pointer's value is the number of ticks strictly to its left
+plus its fractional position inside the gap it stands in. Pixel distance is
+deliberately decoupled from value.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 900, 560
+X0, X1 = 110, 810
+LANE_Y = (110, 230, 350, 470)
+MIN_INTERVAL = 52.0
+MIN_ROUNDED_INTERVAL = 40
+RAIL_RGB = (70, 70, 70)
+BACKGROUND = (255, 255, 255)
+COLOR_NAMES = ("red", "green", "blue", "orange")
+COLOR_RGB = {
+    "red": (214, 39, 40),
+    "green": (44, 160, 44),
+    "blue": (31, 119, 180),
+    "orange": (255, 127, 14),
+}
+QUARANTINE_MARGIN = 0.30
+MIN_MARGIN = 0.20
+MIN_FRACTION = 0.12
+MAX_FRACTION = 0.88
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def _split(rng: random.Random, total: float, parts: int) -> list[float] | None:
+    """Split ``total`` px into ``parts`` intervals of at least MIN_INTERVAL px."""
+
+    if parts == 0:
+        return [] if total < 0.75 else None
+    extra = total - parts * MIN_INTERVAL
+    if extra < 0.0:
+        return None
+    cuts = sorted(rng.uniform(0.0, extra) for _ in range(parts - 1))
+    bounds = [0.0] + cuts + [extra]
+    return [MIN_INTERVAL + (bounds[k + 1] - bounds[k]) for k in range(parts)]
+
+
+def _build_ticks(rng: random.Random, intervals: int, value: float, pointer: int):
+    """Tick x positions realising ``value`` for a pointer drawn at ``pointer``."""
+
+    index = int(value)
+    frac = value - index
+    left_need = index * MIN_INTERVAL
+    right_need = (intervals - 1 - index) * MIN_INTERVAL
+    if index == 0:
+        width = (pointer - X0) / frac
+    elif index == intervals - 1:
+        width = (X1 - pointer) / (1.0 - frac)
+    else:
+        upper = min(
+            (pointer - X0 - left_need) / frac,
+            (X1 - right_need - pointer) / (1.0 - frac),
+            (X1 - X0) - (intervals - 1) * MIN_INTERVAL,
+        )
+        if upper < MIN_INTERVAL + 8.0:
+            return None
+        width = rng.uniform(MIN_INTERVAL, min(upper, 250.0))
+    if width < MIN_INTERVAL or width > 320.0:
+        return None
+    left_edge = pointer - frac * width
+    right_edge = left_edge + width
+    left = _split(rng, left_edge - X0, index)
+    right = _split(rng, X1 - right_edge, intervals - 1 - index)
+    if left is None or right is None:
+        return None
+    widths = left + [width] + right
+    if max(widths) / min(widths) < 1.30:
+        return None
+    xs = [float(X0)]
+    for step in widths:
+        xs.append(xs[-1] + step)
+    ticks = [int(round(x)) for x in xs]
+    ticks[0], ticks[-1] = X0, X1
+    for k in range(len(ticks) - 1):
+        if ticks[k + 1] - ticks[k] < MIN_ROUNDED_INTERVAL:
+            return None
+    return ticks
+
+
+def _value(ticks: list[int], pointer: int) -> float | None:
+    """Value read by a pointer: whole ticks passed plus fractional position."""
+
+    xs = sorted(int(t) for t in ticks)
+    for k in range(len(xs) - 1):
+        if xs[k] < pointer < xs[k + 1]:
+            return k + (pointer - xs[k]) / float(xs[k + 1] - xs[k])
+    return None
+
+
+def _attempt(rng: random.Random, seed: int) -> dict | None:
+    colors = list(COLOR_NAMES)
+    rng.shuffle(colors)
+    answer = COLOR_NAMES[seed % 4]
+    winner = colors.index(answer)
+    intervals = [rng.choice((5, 6, 7, 8)) for _ in range(4)]
+    smallest = min(intervals)
+
+    shared = rng.randint(1, smallest - 2)
+    frac_win = rng.uniform(0.46, 0.82)
+    frac_run = rng.uniform(0.14, frac_win - 0.22)
+    runner = rng.choice([k for k in range(4) if k != winner])
+    values: list[float | None] = [None] * 4
+    values[winner] = shared + frac_win
+    values[runner] = shared + frac_run
+    ceiling = shared + frac_run - 0.20
+    # In three scenes out of four a losing pointer is forced to stand further
+    # across its own gap than the winner, so the bare fraction is not the answer.
+    force_fraction_trap = (seed // 16) % 4 != 0
+    low_lanes = [lane for lane in range(4) if values[lane] is None]
+    for position, lane in enumerate(low_lanes):
+        if force_fraction_trap and position == 0:
+            trap = rng.uniform(min(frac_win + 0.04, 0.84), MAX_FRACTION - 0.02)
+            trial = (shared - 1) + trap
+            if trial < 0.5 or trial > ceiling:
+                return None
+            values[lane] = trial
+            continue
+        for _ in range(24):
+            trial = rng.uniform(0.55, ceiling)
+            if MIN_FRACTION + 0.02 <= trial - int(trial) <= MAX_FRACTION - 0.02:
+                values[lane] = trial
+                break
+        if values[lane] is None:
+            return None
+
+    # The winner's left-to-right pixel rank is fixed by the seed, so neither the
+    # rightmost nor the leftmost pointer is the answer more often than chance.
+    drawn = sorted(rng.randint(X0 + 70, X1 - 70) for _ in range(4))
+    if len(set(drawn)) < 4:
+        return None
+    target_rank = (seed // 4) % 4
+    others = [lane for lane in range(4) if lane != winner]
+    rng.shuffle(others)
+    rest = [x for position, x in enumerate(drawn) if position != target_rank]
+    pointers = [0] * 4
+    pointers[winner] = drawn[target_rank]
+    for lane, x in zip(others, rest):
+        pointers[lane] = x
+    ticks: list[list[int]] = []
+    for lane in range(4):
+        built = _build_ticks(rng, intervals[lane], float(values[lane]), pointers[lane])
+        if built is None:
+            return None
+        ticks.append(built)
+
+    scene = {"colors": colors, "ticks": ticks, "pointers": pointers}
+    actual = [_value(ticks[lane], pointers[lane]) for lane in range(4)]
+    if any(v is None for v in actual):
+        return None
+    for lane in range(4):
+        xs = ticks[lane]
+        index = int(actual[lane])
+        frac = actual[lane] - index
+        if not (MIN_FRACTION <= frac <= MAX_FRACTION):
+            return None
+        if pointers[lane] - xs[index] < 6 or xs[index + 1] - pointers[lane] < 6:
+            return None
+    order = sorted(range(4), key=lambda k: actual[k], reverse=True)
+    if order[0] != winner:
+        return None
+    if actual[order[0]] - actual[order[1]] < MIN_MARGIN:
+        return None
+    if int(actual[order[0]]) != int(actual[order[1]]):
+        return None
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one latent scene."""
+
+    rng = random.Random(int(seed) * 7919 + 13)
+    for _ in range(900):
+        scene = _attempt(rng, int(seed))
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def render(scene: dict) -> Image.Image:
+    """Rasterise a latent scene."""
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for lane, y in enumerate(LANE_Y):
+        draw.rectangle([X0, y - 1, X1, y + 1], fill=RAIL_RGB)
+        for tick in scene["ticks"][lane]:
+            draw.rectangle([tick - 1, y + 3, tick + 1, y + 19], fill=RAIL_RGB)
+        pointer = int(scene["pointers"][lane])
+        fill = COLOR_RGB[scene["colors"][lane]]
+        draw.polygon(
+            [(pointer, y - 6), (pointer - 14, y - 33), (pointer + 14, y - 33)],
+            fill=fill,
+        )
+    return image
+
+
+# --------------------------------------------------------------------------- #
+# gold, margin, quarantine, aliases
+# --------------------------------------------------------------------------- #
+def values(scene: dict) -> dict[str, float]:
+    """Value read by each coloured pointer."""
+
+    out: dict[str, float] = {}
+    for lane, name in enumerate(scene["colors"]):
+        read = _value(scene["ticks"][lane], int(scene["pointers"][lane]))
+        if read is None:
+            raise ValueError("pointer does not lie strictly inside a gap")
+        out[name] = read
+    return out
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour of the pointer reading the largest value."""
+
+    read = values(scene)
+    return max(read, key=lambda name: read[name])
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin in scale units."""
+
+    ranked = sorted(values(scene).values(), reverse=True)
+    return round(ranked[0] - ranked[1], 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Near-boundary scenes stay in the bundle but out of headline claims."""
+
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Nontrivial latent changes that leave the raster byte-identical."""
+
+    reversed_scene = {
+        "colors": list(scene["colors"]),
+        "ticks": [list(reversed(row)) for row in scene["ticks"]],
+        "pointers": list(scene["pointers"]),
+    }
+    rotated_scene = {
+        "colors": list(scene["colors"]),
+        "ticks": [row[2:] + row[:2] for row in scene["ticks"]],
+        "pointers": list(scene["pointers"]),
+    }
+    return [
+        ("tick_list_reversed", reversed_scene),
+        ("tick_list_rotated", rotated_scene),
+    ]

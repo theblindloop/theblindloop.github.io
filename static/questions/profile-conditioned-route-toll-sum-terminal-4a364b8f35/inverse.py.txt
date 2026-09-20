@@ -1,0 +1,143 @@
+"""Independent pixel-only inverse for the route-toll world."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+COLORS = {
+    "green": np.array((35, 176, 91)),
+    "gray": np.array((135, 145, 157)),
+    "orange": np.array((242, 137, 38)),
+    "purple": np.array((142, 74, 196)),
+    "blue": np.array((47, 112, 210)),
+    "cyan": np.array((20, 190, 205)),
+    "dark": np.array((39, 45, 54)),
+}
+
+
+def _mask(arr: np.ndarray, rgb: np.ndarray, tolerance: float = 28.0) -> np.ndarray:
+    return np.linalg.norm(arr.astype(float) - rgb.astype(float), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 8) -> list[tuple[float, float, int]]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        todo = [(int(y), int(x))]
+        seen[y, x] = True
+        pts = []
+        while todo:
+            cy, cx = todo.pop()
+            pts.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    todo.append((ny, nx))
+        if len(pts) >= minimum:
+            ys = [p[0] for p in pts]
+            xs = [p[1] for p in pts]
+            out.append((sum(xs) / len(xs), sum(ys) / len(ys), len(pts)))
+    return out
+
+
+def _corridor_score(mask: np.ndarray, p: tuple[float, float], q: tuple[float, float]) -> float:
+    values = []
+    for t in np.linspace(0.12, 0.88, 80):
+        x = int(round(p[0] + t * (q[0] - p[0])))
+        y = int(round(p[1] + t * (q[1] - p[1])))
+        y0, y1 = max(0, y - 3), min(mask.shape[0], y + 4)
+        x0, x1 = max(0, x - 3), min(mask.shape[1], x + 4)
+        values.append(bool(mask[y0:y1, x0:x1].any()))
+    return sum(values) / len(values)
+
+
+def _point_segment_distance(p, a, b) -> float:
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    wx, wy = p[0] - a[0], p[1] - a[1]
+    den = vx * vx + vy * vy
+    t = max(0.0, min(1.0, (wx * vx + wy * vy) / den))
+    return math.hypot(p[0] - (a[0] + t * vx), p[1] - (a[1] + t * vy))
+
+
+def _has_interior_node(nodes, i: int, j: int) -> bool:
+    """Reject a long apparent edge that merely passes through another node."""
+    a, b = nodes[i], nodes[j]
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    den = vx * vx + vy * vy
+    for k, p in enumerate(nodes):
+        if k in (i, j):
+            continue
+        t = ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / den
+        if 0.12 < t < 0.88 and _point_segment_distance(p, a, b) < 24:
+            return True
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    nodes = []
+    root = None
+    terminal_color = {}
+    for name in ("green", "gray", "orange", "purple", "blue"):
+        comps = _components(_mask(arr, COLORS[name]), minimum=35)
+        expected = 3 if name == "gray" else 1
+        if len(comps) != expected:
+            raise ValueError(f"expected {expected} {name} node components, found {len(comps)}")
+        for comp in comps:
+            index = len(nodes)
+            nodes.append((comp[0], comp[1]))
+            if name == "green":
+                root = index
+            elif name in ("orange", "purple", "blue"):
+                terminal_color[index] = name
+    if root is None or len(nodes) != 7:
+        raise ValueError("node reconstruction failed")
+
+    dark = _mask(arr, COLORS["dark"], tolerance=32.0)
+    edges = []
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if not _has_interior_node(nodes, i, j) and _corridor_score(dark, nodes[i], nodes[j]) > 0.82:
+                edges.append((i, j))
+    if len(edges) != 6:
+        raise ValueError(f"expected six tree links, found {len(edges)}")
+
+    diamonds = [(x, y) for x, y, _ in _components(_mask(arr, COLORS["cyan"]), minimum=18)]
+    if not 12 <= len(diamonds) <= 18:
+        raise ValueError(f"unexpected diamond count {len(diamonds)}")
+    weights = [0] * len(edges)
+    for point in diamonds:
+        distances = [_point_segment_distance(point, nodes[a], nodes[b]) for a, b in edges]
+        order = sorted(range(len(distances)), key=distances.__getitem__)
+        if distances[order[0]] > 24 or distances[order[1]] - distances[order[0]] < 3:
+            raise ValueError("ambiguous diamond ownership")
+        weights[order[0]] += 1
+
+    graph = {i: [] for i in range(len(nodes))}
+    for (a, b), weight in zip(edges, weights):
+        graph[a].append((b, weight))
+        graph[b].append((a, weight))
+    totals = {}
+    queue = deque([(root, -1, 0)])
+    visited = set()
+    while queue:
+        node, parent, total = queue.popleft()
+        if node in visited:
+            raise ValueError("graph is not a tree")
+        visited.add(node)
+        if node in terminal_color:
+            totals[terminal_color[node]] = total
+        for nxt, weight in graph[node]:
+            if nxt != parent:
+                queue.append((nxt, node, total + weight))
+    winners = [color for color, total in totals.items() if total == 5]
+    if len(winners) != 1:
+        raise ValueError(f"no unique total-five terminal: {totals}")
+    return winners[0]

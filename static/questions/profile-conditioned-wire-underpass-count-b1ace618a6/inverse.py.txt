@@ -1,0 +1,142 @@
+"""Independent pixel-only inverse arm for wire_underpass_count.
+
+Receives a PNG and nothing else: no scene, no renderer, no analytic gold, no
+prompt module.  It re-derives the answer by actually following a stroke:
+
+ 1. locate the green start port by colour and take its centroid;
+ 2. read the outgoing stroke direction from an annulus of dark ink around it;
+ 3. refine that direction by searching for the ray that collects the most ink,
+    which recovers the traced wire's centreline (a ray that drifts off the wire
+    collects little ink) rather than a global fit of all the ink in the image;
+ 4. walk that centreline and cut it into ink runs and background runs.  An
+    over-crossing leaves the ink continuous; an under-crossing leaves the
+    signature break / crossing-wire ink / break, i.e. exactly two background
+    runs of a few pixels each;
+ 5. report half the number of interior background runs, abstaining ("unknown")
+    when the run structure is odd, out of range, or unstable across the set of
+    near-optimal rays.
+
+Geometry constants below are properties of the published question contract
+(wires are straight strokes of a few pixels width, breaks are short), not
+copies of renderer state.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "wire_underpass_count-oracle-0.1.0"
+
+_INK_MAX = 140            # dark ink threshold, per channel
+_ANN_LO, _ANN_HI = 15.0, 25.0   # start-direction annulus radii, px
+_ANGLE_SPAN_DEG = 5.0     # refinement window around the annulus estimate
+_ANGLE_STEP_DEG = 0.02
+_STEP = 0.5               # ray sampling step, px
+_T0 = 14.0                # skip the start-port disk
+_T_MAX = 760.0
+_END_RUN_PX = 25.0        # a background run this long means the wire ended
+_BREAK_MIN_PX, _BREAK_MAX_PX = 3.5, 22.0   # plausible occlusion break length
+_MID_MIN_PX, _MID_MAX_PX = 1.5, 24.0       # ink of the wire passing over
+_PLATEAU_PX = 1.0         # rays within this much ink of the best are "near-optimal"
+_AGREE = 0.95             # required agreement among the READABLE near-optimal rays
+_MIN_READABLE = 0.5       # ...and this fraction of them must be readable at all
+_MAX_UNDER = 3
+
+
+def _masks(image: Image.Image):
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    green = (g > 110) & (r < 110) & (b < 130)
+    ink = (r < _INK_MAX) & (g < _INK_MAX) & (b < _INK_MAX) & ~green
+    return ink, green
+
+
+def _runs(mask: np.ndarray):
+    """[(value, start, length), ...] run-length encoding of a 1-D bool array."""
+    out = []
+    if mask.size == 0:
+        return out
+    edges = np.flatnonzero(np.diff(mask.astype(np.int8))) + 1
+    starts = np.concatenate(([0], edges))
+    ends = np.concatenate((edges, [mask.size]))
+    for s, e in zip(starts, ends):
+        out.append((bool(mask[s]), int(s), int(e - s)))
+    return out
+
+
+def _count_along(cov: np.ndarray):
+    """(reach_px, count_or_None) for one sampled ray."""
+    rl = _runs(cov)
+    end = cov.size
+    for val, s, ln in rl:
+        if not val and ln * _STEP > _END_RUN_PX:
+            end = s
+            break
+    reach = end * _STEP
+    interior = [(v, s, ln) for (v, s, ln) in rl if s + ln <= end]
+    if not interior or not interior[0][0]:
+        return reach, None            # must start on ink
+    gaps = [ln * _STEP for (v, _s, ln) in interior if not v]
+    inks = [ln * _STEP for (v, _s, ln) in interior[1:] if v]
+    if len(gaps) % 2 != 0:
+        return reach, None
+    if any(not (_BREAK_MIN_PX <= gp <= _BREAK_MAX_PX) for gp in gaps):
+        return reach, None
+    # interior runs alternate ink, gap, ink, gap, ...; the ink run between the
+    # two breaks of under-crossing k is inks[2k] -- the wire passing over.
+    for k in range(0, len(gaps) // 2):
+        if 2 * k < len(inks) and not (_MID_MIN_PX <= inks[2 * k] <= _MID_MAX_PX):
+            return reach, None
+    n = len(gaps) // 2
+    if n > _MAX_UNDER:
+        return reach, None
+    return reach, n
+
+
+def decision_from_image(image: Image.Image) -> str:
+    ink, green = _masks(image)
+    h, w = ink.shape
+    gy, gx = np.nonzero(green)
+    if gy.size < 40:
+        return "unknown"
+    px, py = float(gx.mean()), float(gy.mean())
+
+    yy, xx = np.nonzero(ink)
+    d = np.hypot(xx - px, yy - py)
+    sel = (d >= _ANN_LO) & (d <= _ANN_HI)
+    if sel.sum() < 8:
+        return "unknown"
+    dx, dy = float((xx[sel] - px).mean()), float((yy[sel] - py).mean())
+    theta0 = np.arctan2(dy, dx)
+
+    ts = np.arange(_T0, _T_MAX, _STEP)
+    offs = np.deg2rad(
+        np.arange(-_ANGLE_SPAN_DEG, _ANGLE_SPAN_DEG + 1e-9, _ANGLE_STEP_DEG)
+    )
+    thetas = theta0 + offs
+    xs = px + np.outer(np.cos(thetas), ts)
+    ys = py + np.outer(np.sin(thetas), ts)
+    xi = np.rint(xs).astype(np.int64)
+    yi = np.rint(ys).astype(np.int64)
+    inside = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+    cov = np.zeros(xi.shape, dtype=bool)
+    cov[inside] = ink[yi[inside], xi[inside]]
+
+    # A ray that drifts off the traced wire collects little ink, so total ink
+    # along the ray -- not how far it happens to reach -- identifies the
+    # centreline.  Every ray within a couple of pixels of that optimum must
+    # agree on the run structure, otherwise the trace is not stable.
+    ink_px = cov.sum(axis=1) * _STEP
+    best = float(ink_px.max())
+    plateau = [k for k in range(cov.shape[0]) if ink_px[k] >= best - _PLATEAU_PX]
+    votes = [_count_along(cov[k])[1] for k in plateau]
+    good = [v for v in votes if v is not None]
+    if not good or len(good) < _MIN_READABLE * len(votes):
+        return "unknown"
+    # Rays that clip a stroke edge yield an unreadable run structure and simply
+    # do not vote; we abstain when the READABLE rays disagree with each other.
+    top = max(set(good), key=lambda v: (good.count(v), -v))
+    if good.count(top) / len(good) < _AGREE:
+        return "unknown"
+    return str(top)

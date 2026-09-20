@@ -1,0 +1,264 @@
+"""Deterministic renderer for the ordered-checkpoint trace world.
+
+The latent route is a single, non-branching serpentine polyline.  The only
+fields read by ``analytic_gold`` are the two normalized arc-length parameters
+of the checkpoints; those fields are also rendered as the two colored marks.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw
+
+
+RENDERER_VERSION = "trace_checkpoint_order-0.1.0"
+WIDTH = 512
+HEIGHT = 512
+SUPERSAMPLE = 4
+QUARANTINE_GAP = 0.12
+TURN_CLEARANCE_PX = 18.0
+
+ORANGE_PALETTE = ((239, 126, 42), (226, 111, 48), (244, 143, 51))
+VIOLET_PALETTE = ((143, 78, 181), (126, 73, 171), (158, 86, 184))
+START_PALETTE = ((28, 157, 116), (27, 142, 128), (40, 166, 105))
+END_PALETTE = ((78, 105, 128), (70, 91, 119), (91, 111, 132))
+LINE_PALETTE = ((39, 48, 55), (46, 53, 61), (42, 57, 59))
+BACKGROUND_PALETTE = ((250, 249, 246), (248, 249, 247), (251, 248, 244))
+
+
+def _route_length(waypoints: list[list[float]]) -> float:
+    return sum(
+        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        for a, b in zip(waypoints, waypoints[1:])
+    )
+
+
+def _route_point(
+    waypoints: list[list[float]], t: float
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return a point and unit tangent at normalized polyline position ``t``."""
+
+    t = min(1.0, max(0.0, float(t)))
+    lengths = [
+        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        for a, b in zip(waypoints, waypoints[1:])
+    ]
+    total = sum(lengths)
+    target = t * total
+    walked = 0.0
+    for index, length in enumerate(lengths):
+        if target <= walked + length or index == len(lengths) - 1:
+            fraction = 0.0 if length == 0 else (target - walked) / length
+            a, b = waypoints[index], waypoints[index + 1]
+            dx = float(b[0]) - float(a[0])
+            dy = float(b[1]) - float(a[1])
+            point = (float(a[0]) + fraction * dx, float(a[1]) + fraction * dy)
+            tangent = (dx / length, dy / length) if length else (1.0, 0.0)
+            return point, tangent
+        walked += length
+    last = waypoints[-1]
+    return (float(last[0]), float(last[1])), (1.0, 0.0)
+
+
+def _nearest_turn_distance(waypoints: list[list[float]], t: float) -> float:
+    total = _route_length(waypoints)
+    if total <= 0:
+        return 0.0
+    distances = []
+    walked = 0.0
+    segment_lengths = [
+        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        for a, b in zip(waypoints, waypoints[1:])
+    ]
+    for index, (a, b) in enumerate(zip(waypoints, waypoints[1:])):
+        length = math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        walked += length
+        if 0 < index < len(segment_lengths) - 1:
+            before = waypoints[index - 1]
+            pivot = waypoints[index]
+            after = waypoints[index + 1]
+            v1 = (float(pivot[0]) - float(before[0]), float(pivot[1]) - float(before[1]))
+            v2 = (float(after[0]) - float(pivot[0]), float(after[1]) - float(pivot[1]))
+            n1, n2 = math.hypot(*v1), math.hypot(*v2)
+            if n1 and n2:
+                cosine = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)))
+                if math.degrees(math.acos(cosine)) >= 35.0:
+                    distances.append(abs(float(t) * total - walked))
+    return min(distances) if distances else total
+
+
+def _sample_checkpoint_times(
+    rng: random.Random, waypoints: list[list[float]], seed: int
+) -> tuple[float, float]:
+    """Sample balanced order and three visible difficulty bands."""
+
+    # The deterministic residue guarantees that a 24-scene stress run and the
+    # 16-scene submitted gallery contain both quarantined and clean examples.
+    band = int(seed) % 5
+    if band == 0:
+        gap = rng.uniform(0.045, 0.105)
+        first_low, first_high = 0.62, 0.76
+    elif band == 1:
+        gap = rng.uniform(0.14, 0.24)
+        first_low, first_high = 0.56, 0.72
+    else:
+        gap = rng.uniform(0.28, 0.40)
+        first_low, first_high = 0.46, 0.56
+    order = rng.randrange(2)
+    for _ in range(200):
+        first = rng.uniform(first_low, first_high)
+        second = first + gap
+        if (
+            _nearest_turn_distance(waypoints, first) >= TURN_CLEARANCE_PX
+            and _nearest_turn_distance(waypoints, second) >= TURN_CLEARANCE_PX
+        ):
+            if order == 0:
+                return first, second
+            return second, first
+        first = rng.uniform(first_low, first_high)
+    # The route has long straight spans, so this deterministic fallback is
+    # safely away from every turn even if the random rejection loop is unlucky.
+    first = first_low
+    second = first + gap
+    return (first, second) if order == 0 else (second, first)
+
+
+def _make_waypoints(rng: random.Random, width: int, height: int) -> list[list[float]]:
+    """Build a sparse, self-avoiding winding diagonal route."""
+
+    left = rng.uniform(42.0, 54.0)
+    right = rng.uniform(width - 54.0, width - 42.0)
+    top = rng.uniform(42.0, 54.0)
+    bottom = rng.uniform(height - 54.0, height - 42.0)
+    for _ in range(250):
+        point_count = rng.choice((17, 19, 21))
+        amplitude_x = rng.uniform(42.0, 68.0)
+        amplitude_y = rng.uniform(38.0, 64.0)
+        frequency_x = rng.choice((1.75, 2.0, 2.25))
+        frequency_y = rng.choice((1.5, 1.75, 2.0))
+        phase_x = rng.uniform(0.0, 2.0 * math.pi)
+        phase_y = rng.uniform(0.0, 2.0 * math.pi)
+        points: list[list[float]] = []
+        for index in range(point_count):
+            u = index / (point_count - 1)
+            envelope = math.sin(math.pi * u)
+            x = left + (right - left) * u + amplitude_x * math.sin(
+                2.0 * math.pi * frequency_x * u + phase_x
+            ) * envelope
+            y = bottom - (bottom - top) * u + amplitude_y * math.sin(
+                2.0 * math.pi * frequency_y * u + phase_y
+            ) * envelope
+            points.append([x, y])
+        if any(
+            math.hypot(points[i][0] - points[j][0], points[i][1] - points[j][1]) < 30.0
+            for i in range(point_count)
+            for j in range(i + 3, point_count)
+        ):
+            continue
+        if rng.random() < 0.5:
+            points.reverse()
+        if rng.random() < 0.5:
+            points = [[float(width) - x, y] for x, y in points]
+        if rng.random() < 0.5:
+            points = [[x, float(height) - y] for x, y in points]
+        return [[round(float(x), 3), round(float(y), 3)] for x, y in points]
+    return [
+        [round(left + (right - left) * u, 3), round(bottom - (bottom - top) * u, 3)]
+        for u in (index / 10.0 for index in range(11))
+    ]
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    rng = random.Random(int(seed))
+    width, height = WIDTH, HEIGHT
+    waypoints = _make_waypoints(rng, width, height)
+    orange_t, violet_t = _sample_checkpoint_times(rng, waypoints, int(seed))
+    return {
+        "width": width,
+        "height": height,
+        "waypoints": waypoints,
+        "orange_t": round(float(orange_t), 6),
+        "violet_t": round(float(violet_t), 6),
+        "stroke_width": rng.choice((6, 7, 8)),
+        "checkpoint_radius": rng.choice((11, 12, 13)),
+        "start_radius": rng.choice((18, 19, 20, 21)),
+        "line_color": list(rng.choice(LINE_PALETTE)),
+        "background": list(rng.choice(BACKGROUND_PALETTE)),
+        "start_color": list(rng.choice(START_PALETTE)),
+        "end_color": list(rng.choice(END_PALETTE)),
+        "orange_color": list(rng.choice(ORANGE_PALETTE)),
+        "violet_color": list(rng.choice(VIOLET_PALETTE)),
+    }
+
+
+def _scaled(point: tuple[float, float], scale: int) -> tuple[int, int]:
+    return (int(round(point[0] * scale)), int(round(point[1] * scale)))
+
+
+def _ellipse(
+    draw: ImageDraw.ImageDraw,
+    center: tuple[float, float],
+    radius: float,
+    color: tuple[int, int, int],
+    scale: int,
+) -> None:
+    x, y = center
+    r = radius * scale
+    draw.ellipse(
+        (int(round(x * scale - r)), int(round(y * scale - r)), int(round(x * scale + r)), int(round(y * scale + r))),
+        fill=color,
+    )
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    scale = SUPERSAMPLE
+    width, height = int(scene["width"]), int(scene["height"])
+    background = tuple(int(value) for value in scene["background"])
+    line_color = tuple(int(value) for value in scene["line_color"])
+    waypoints = [[float(point[0]), float(point[1])] for point in scene["waypoints"]]
+    route = [_scaled((point[0], point[1]), scale) for point in waypoints]
+    image = Image.new("RGB", (width * scale, height * scale), background)
+    draw = ImageDraw.Draw(image)
+    stroke = int(round(float(scene["stroke_width"]) * scale))
+    draw.line(route, fill=line_color, width=stroke, joint="curve")
+
+    start, _ = _route_point(waypoints, 0.0)
+    finish, _ = _route_point(waypoints, 1.0)
+    orange, _ = _route_point(waypoints, float(scene["orange_t"]))
+    violet, _ = _route_point(waypoints, float(scene["violet_t"]))
+    _ellipse(draw, start, float(scene["start_radius"]), tuple(scene["start_color"]), scale)
+    _ellipse(draw, finish, float(scene["checkpoint_radius"] + 4), tuple(scene["end_color"]), scale)
+    _ellipse(draw, orange, float(scene["checkpoint_radius"]), tuple(scene["orange_color"]), scale)
+    _ellipse(draw, violet, float(scene["checkpoint_radius"]), tuple(scene["violet_color"]), scale)
+
+    # Keep the trace visibly continuous through every marker.  The narrower
+    # dark center leaves a broad, color-segmentable rim around each checkpoint.
+    inner_stroke = max(3, int(round(float(scene["stroke_width"]) * 0.52 * scale)))
+    draw.line(route, fill=line_color, width=inner_stroke, joint="curve")
+    image = image.resize((width, height), Image.Resampling.LANCZOS)
+    return image
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    if float(scene["orange_t"]) < float(scene["violet_t"]):
+        return "orange"
+    return "violet"
+
+
+def margin(scene: dict[str, Any]) -> float:
+    return abs(float(scene["orange_t"]) - float(scene["violet_t"]))
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    waypoints = [[float(point[0]), float(point[1])] for point in scene["waypoints"]]
+    return margin(scene) < QUARANTINE_GAP or min(
+        _nearest_turn_distance(waypoints, float(scene["orange_t"])),
+        _nearest_turn_distance(waypoints, float(scene["violet_t"])),
+    ) < TURN_CLEARANCE_PX
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    return []

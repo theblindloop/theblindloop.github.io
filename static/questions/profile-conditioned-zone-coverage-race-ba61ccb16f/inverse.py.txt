@@ -1,0 +1,166 @@
+"""Independent image-only inverse for the three-zone coverage race."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_ZONE_FILLS = ((222, 239, 252), (253, 241, 210), (222, 245, 232))
+_LABELS = tuple("ABCD")
+
+
+def _near(arr: np.ndarray, color: tuple[int, int, int], tolerance: int = 2) -> np.ndarray:
+    target = np.asarray(color, dtype=np.int16)
+    return np.max(np.abs(arr.astype(np.int16) - target), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    remaining = set(zip(*np.nonzero(mask), strict=True))
+    groups: list[np.ndarray] = []
+    while remaining:
+        start = remaining.pop()
+        queue: deque[tuple[int, int]] = deque([start])
+        points = [start]
+        while queue:
+            y, x = queue.popleft()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    queue.append(neighbor)
+                    points.append(neighbor)
+        groups.append(np.asarray(points, dtype=np.int32))
+    return groups
+
+
+def _zone_boxes(arr: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    boxes: list[tuple[int, int, int, int, int]] = []
+    for zone, color in enumerate(_ZONE_FILLS):
+        for points in _components(_near(arr, color)):
+            if not 15000 <= len(points) <= 26000:
+                continue
+            y0, x0 = points.min(axis=0)
+            y1, x1 = points.max(axis=0)
+            if 185 <= x1 - x0 <= 205 and 115 <= y1 - y0 <= 130:
+                boxes.append((zone, int(x0), int(y0), int(x1), int(y1)))
+    boxes.sort(key=lambda box: (box[1], box[2]))
+    if len(boxes) != 15:
+        raise ValueError(f"expected fifteen zone bands, recovered {len(boxes)}")
+    return boxes
+
+
+def _panel_groups(boxes: list[tuple[int, int, int, int, int]]) -> list[list[tuple[int, int, int, int, int]]]:
+    groups: list[list[tuple[int, int, int, int, int]]] = []
+    for box in boxes:
+        center_x = (box[1] + box[3]) / 2
+        if not groups or abs(center_x - (groups[-1][0][1] + groups[-1][0][3]) / 2) > 25:
+            groups.append([box])
+        else:
+            groups[-1].append(box)
+    if len(groups) != 5 or any(len(group) != 3 or {box[0] for box in group} != {0, 1, 2} for group in groups):
+        raise ValueError("zone bands do not resolve into five complete ordered panels")
+    return groups
+
+
+def _token_components(arr: np.ndarray) -> list[np.ndarray]:
+    work = arr.astype(np.int16)
+    spread = work.max(axis=2) - work.min(axis=2)
+    saturated = (spread >= 70) & (work.max(axis=2) >= 135) & (work.min(axis=2) <= 190)
+    tokens: list[np.ndarray] = []
+    for points in _components(saturated):
+        if not 780 <= len(points) <= 1150:
+            continue
+        y0, x0 = points.min(axis=0)
+        y1, x1 = points.max(axis=0)
+        if 34 <= x1 - x0 <= 38 and 34 <= y1 - y0 <= 38:
+            tokens.append(points)
+    if len(tokens) != 20:
+        raise ValueError(f"expected twenty colored tokens, recovered {len(tokens)}")
+    return tokens
+
+
+def _pip_identity(arr: np.ndarray, token: np.ndarray) -> int:
+    y0, x0 = token.min(axis=0)
+    y1, x1 = token.max(axis=0)
+    crop = arr[max(0, y0 - 1) : y1 + 2, max(0, x0 - 1) : x1 + 2]
+    dark = crop.max(axis=2) <= 75
+    pips = 0
+    for points in _components(dark):
+        if 12 <= len(points) <= 35:
+            py0, px0 = points.min(axis=0)
+            py1, px1 = points.max(axis=0)
+            if px1 - px0 <= 6 and py1 - py0 <= 6:
+                pips += 1
+    if pips not in (1, 2, 3, 4):
+        raise ValueError(f"token pip label is invalid: {pips}")
+    return pips - 1
+
+
+def _parse(image: Image.Image) -> tuple[list[list[int]], float]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 600 or arr.shape[1] < 1100:
+        raise ValueError("raster is too small")
+    panels = _panel_groups(_zone_boxes(arr))
+    tokens = _token_components(arr)
+    token_info = []
+    for index, token in enumerate(tokens):
+        identity = _pip_identity(arr, token)
+        cy, cx = token.mean(axis=0)
+        token_info.append((index, identity, float(cx), float(cy)))
+
+    states: list[list[int]] = []
+    clearances: list[float] = []
+    used: set[int] = set()
+    for zones in panels:
+        panel = [-1] * 4
+        panel_members = 0
+        for zone, x0, y0, x1, y1 in zones:
+            for index, identity, cx, cy in token_info:
+                if index in used or not (x0 < cx < x1 and y0 < cy < y1):
+                    continue
+                if panel[identity] != -1:
+                    raise ValueError("duplicate pip identity in one panel")
+                clearance = min(cx - x0, x1 - cx, cy - y0, y1 - cy)
+                if clearance < 24:
+                    raise ValueError("token-to-zone membership is too close to a boundary")
+                panel[identity] = zone
+                clearances.append(float(clearance))
+                used.add(index)
+                panel_members += 1
+        if panel_members != 4 or any(value < 0 for value in panel):
+            raise ValueError("a panel does not contain exactly one of every identity")
+        states.append(panel)
+    if len(used) != 20:
+        raise ValueError("unassigned colored tokens remain")
+    return states, min(clearances)
+
+
+def _winner(states: list[list[int]]) -> int:
+    completions: list[int] = []
+    for identity in range(4):
+        visited: set[int] = set()
+        completion = len(states)
+        for panel, row in enumerate(states):
+            visited.add(row[identity])
+            if len(visited) == 3:
+                completion = panel
+                break
+        completions.append(completion)
+    earliest = min(completions)
+    if earliest >= len(states):
+        raise ValueError("no complete three-zone tour is visible")
+    winners = [identity for identity, panel in enumerate(completions) if panel == earliest]
+    if len(winners) != 1:
+        raise ValueError("earliest completion is not unique")
+    if sorted(completions)[1] - earliest < 1:
+        raise ValueError("runner-up completion margin collapsed")
+    return winners[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover ordered panels, zone colors, and pip identities, then replay coverage."""
+    states, spatial_clearance = _parse(image)
+    if spatial_clearance < 24:
+        raise ValueError("pixel membership margin is too small")
+    return _LABELS[_winner(states)]

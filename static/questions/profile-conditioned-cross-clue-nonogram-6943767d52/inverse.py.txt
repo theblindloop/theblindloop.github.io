@@ -1,0 +1,144 @@
+"""Independent PNG-only inverse: detect clues, solve, then classify."""
+
+from __future__ import annotations
+
+from collections import deque
+from PIL import Image
+import numpy as np
+
+_TEMPLATES = {
+    "circle": ("..####..", ".##..##.", "##....##", "#......#", "#......#", "##....##", ".##..##.", "..####.."),
+    "kite": ("...##...", "..####..", ".######.", "##....##", ".##..##.", "..####..", "...##...", "...##..."),
+    "plus": ("...##...", "...##...", "...##...", "########", "########", "...##...", "...##...", "...##..."),
+    "X": ("##....##", ".##..##.", "..####..", "...##...", "...##...", "..####..", ".##..##.", "##....##"),
+}
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    result = []
+    h, w = mask.shape
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        xs, ys = [], []
+        while queue:
+            yy, xx = queue.popleft()
+            xs.append(xx); ys.append(yy)
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = yy + dy, xx + dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        result.append((min(xs), min(ys), max(xs), max(ys), len(xs)))
+    return result
+
+
+def _line_positions(dark: np.ndarray, axis: int) -> list[int]:
+    scores = dark.sum(axis=axis)
+    candidates = np.flatnonzero(scores > 180)
+    groups: list[list[int]] = []
+    for value in candidates:
+        if not groups or value > groups[-1][-1] + 1:
+            groups.append([int(value)])
+        else:
+            groups[-1].append(int(value))
+    return [round(sum(group) / len(group)) for group in groups]
+
+
+def _extract_clues(image: Image.Image) -> tuple[list[tuple[int, ...]], list[tuple[int, ...]]]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    dark = (arr[:, :, 0] < 90) & (arr[:, :, 1] < 90) & (arr[:, :, 2] < 90)
+    xs = _line_positions(dark, axis=0)
+    ys = _line_positions(dark, axis=1)
+    if len(xs) != 9 or len(ys) != 9:
+        raise ValueError("missing 8 by 8 grid fiducials")
+    x0, x1, y0, y1 = xs[0], xs[-1], ys[0], ys[-1]
+    pitch_x = (x1 - x0) / 8.0
+    pitch_y = (y1 - y0) / 8.0
+    if not (25 <= pitch_x <= 35 and 25 <= pitch_y <= 35):
+        raise ValueError("unstable grid pitch")
+
+    blue = (arr[:, :, 2] - arr[:, :, 0] > 80) & (arr[:, :, 2] - arr[:, :, 1] > 35) & (arr[:, :, 2] > 130)
+    components = [c for c in _components(blue) if c[4] >= 50]
+    rows: list[list[tuple[float, int]]] = [[] for _ in range(8)]
+    cols: list[list[tuple[float, int]]] = [[] for _ in range(8)]
+    for left, top, right, bottom, _ in components:
+        cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
+        width, height = right - left + 1, bottom - top + 1
+        if right < x0 - 3 and y0 < cy < y1:
+            row = int((cy - y0) // pitch_y)
+            length = int(round(width / 10.0))
+            if 0 <= row < 8 and 1 <= length <= 8 and height <= 12:
+                rows[row].append((cx, length))
+        elif bottom < y0 - 3 and x0 < cx < x1:
+            col = int((cx - x0) // pitch_x)
+            length = int(round(height / 10.0))
+            if 0 <= col < 8 and 1 <= length <= 8 and width <= 12:
+                cols[col].append((cy, length))
+    if any(not group for group in rows + cols):
+        raise ValueError("missing clue bars")
+    row_clues = [tuple(length for _, length in sorted(group)) for group in rows]
+    col_clues = [tuple(length for _, length in sorted(group)) for group in cols]
+    return row_clues, col_clues
+
+
+def _line_options(clue: tuple[int, ...], size: int = 8) -> list[tuple[int, ...]]:
+    options: list[tuple[int, ...]] = []
+    def place(index: int, start: int, row: list[int]) -> None:
+        if index == len(clue):
+            options.append(tuple(row + [0] * (size - len(row))))
+            return
+        remaining = sum(clue[index:]) + max(0, len(clue) - index - 1)
+        for position in range(start, size - remaining + 1):
+            prefix = row + [0] * (position - len(row)) + [1] * clue[index]
+            if index + 1 < len(clue):
+                prefix.append(0)
+                place(index + 1, len(prefix), prefix)
+            else:
+                place(index + 1, len(prefix), prefix)
+    place(0, 0, [])
+    return options
+
+
+def _solve(rows: list[tuple[int, ...]], cols: list[tuple[int, ...]]) -> list[list[int]]:
+    row_options = [_line_options(clue) for clue in rows]
+    col_options = [_line_options(clue) for clue in cols]
+    solutions: list[list[tuple[int, ...]]] = []
+    def visit(y: int, chosen: list[tuple[int, ...]]) -> None:
+        if len(solutions) > 1:
+            return
+        if y == 8:
+            solutions.append(list(chosen))
+            return
+        for option in row_options[y]:
+            viable = True
+            for x, value in enumerate(option):
+                prefix = tuple([chosen[yy][x] for yy in range(y)] + [value])
+                if not any(candidate[: y + 1] == prefix for candidate in col_options[x]):
+                    viable = False
+                    break
+            if viable:
+                chosen.append(option)
+                visit(y + 1, chosen)
+                chosen.pop()
+    visit(0, [])
+    if len(solutions) != 1:
+        raise ValueError(f"clues have {len(solutions)} solutions")
+    return [list(row) for row in solutions[0]]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    row_clues, col_clues = _extract_clues(image)
+    solved = _solve(row_clues, col_clues)
+    scores = []
+    for name, text_rows in _TEMPLATES.items():
+        template = [[int(ch == "#") for ch in row] for row in text_rows]
+        distance = sum(a != b for ra, rb in zip(solved, template) for a, b in zip(ra, rb))
+        scores.append((distance, name))
+    scores.sort()
+    if scores[0][0] != 0 or scores[1][0] - scores[0][0] < 8:
+        raise ValueError("unrecognized or ambiguous reconstruction")
+    return scores[0][1]

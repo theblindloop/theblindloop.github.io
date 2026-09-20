@@ -1,0 +1,176 @@
+"""Pixel-only inverse arm for signal_lamp_crate_match.
+
+Input: one PNG. Knowledge: only the public question contract - one grey framed
+signal plate carrying dark round lamps, and four crates coloured red, amber,
+green and blue whose dark upright bar counts are a permutation of 2, 3, 4, 5.
+
+Method
+------
+1. Chroma segmentation splits strongly coloured ink (the crates) from grey ink.
+2. Each crate's 4-connected chromatic component is hue-classified against the
+   four colour names declared in the question.
+3. Bars are the dark 4-connected components lying inside a crate's box; lamps are
+   the dark components lying inside the mid-grey plate's box.
+4. The answer is the colour of the crate whose bar count equals the lamp count.
+
+No renderer state, latent scene, prompt code or analytic gold is consulted. The
+arm abstains whenever the two components are not both legible.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "signal_lamp_crate_match-oracle-0.1.0"
+
+CHROMA_THRESHOLD = 46
+DARK_MAX = 80
+PLATE_GREY_LO = 140
+PLATE_GREY_HI = 215
+PLATE_CHROMA_MAX = 30
+MIN_CRATE_AREA = 1500
+MIN_PLATE_AREA = 3000
+MIN_MARK_AREA = 60
+HUE_TOLERANCE = 24.0
+ANSWERS = ("red", "amber", "green", "blue")
+HUE_ANCHORS = {"red": 0.0, "amber": 37.0, "green": 141.0, "blue": 222.0}
+ABSTAIN = "abstain"
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """4-connected components of a boolean mask, as (n, 2) index arrays."""
+    height, width = mask.shape
+    seen = np.zeros((height, width), dtype=bool)
+    out: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = deque([(start_y, start_x)])
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        out.append(np.array(pixels, dtype=np.int32))
+    return out
+
+
+def _box(pixels: np.ndarray) -> tuple[int, int, int, int]:
+    return (
+        int(pixels[:, 0].min()),
+        int(pixels[:, 0].max()),
+        int(pixels[:, 1].min()),
+        int(pixels[:, 1].max()),
+    )
+
+
+def _modal_colour(arr: np.ndarray, pixels: np.ndarray) -> tuple[int, int, int]:
+    values = arr[pixels[:, 0], pixels[:, 1]].astype(np.int32)
+    packed = values[:, 0] * 65536 + values[:, 1] * 256 + values[:, 2]
+    unique, counts = np.unique(packed, return_counts=True)
+    winner = int(unique[int(np.argmax(counts))])
+    return (winner >> 16) & 255, (winner >> 8) & 255, winner & 255
+
+
+def _hue(rgb: tuple[int, int, int]) -> float:
+    red, green, blue = (float(channel) for channel in rgb)
+    high, low = max(red, green, blue), min(red, green, blue)
+    delta = high - low
+    if delta <= 0.0:
+        return -1.0
+    if high == red:
+        hue = 60.0 * (((green - blue) / delta) % 6.0)
+    elif high == green:
+        hue = 60.0 * (2.0 + (blue - red) / delta)
+    else:
+        hue = 60.0 * (4.0 + (red - green) / delta)
+    return hue % 360.0
+
+
+def _classify(rgb: tuple[int, int, int]) -> str | None:
+    hue = _hue(rgb)
+    if hue < 0.0:
+        return None
+    best, best_distance = None, 1e9
+    for name, anchor in HUE_ANCHORS.items():
+        distance = abs((hue - anchor + 180.0) % 360.0 - 180.0)
+        if distance < best_distance:
+            best, best_distance = name, distance
+    return best if best_distance <= HUE_TOLERANCE else None
+
+
+def _marks_in_box(dark_components, box) -> list[np.ndarray] | None:
+    y0, y1, x0, x1 = box
+    inside = []
+    for pixels in dark_components:
+        my0, my1, mx0, mx1 = _box(pixels)
+        centre_y = 0.5 * (my0 + my1)
+        centre_x = 0.5 * (mx0 + mx1)
+        if y0 <= centre_y <= y1 and x0 <= centre_x <= x1:
+            if not (y0 <= my0 and my1 <= y1 and x0 <= mx0 and mx1 <= x1):
+                return None  # a mark straddling the component border: unreadable
+            if len(pixels) < MIN_MARK_AREA:
+                return None
+            inside.append(pixels)
+    return inside
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Colour of the crate whose bar count equals the lamp count."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    high = arr.max(axis=-1).astype(np.int16)
+    low = arr.min(axis=-1).astype(np.int16)
+    chroma = high - low
+
+    dark_components = [
+        pixels for pixels in _components(high <= DARK_MAX) if len(pixels) >= 12
+    ]
+    if not dark_components:
+        return ABSTAIN
+
+    crate_mask = chroma >= CHROMA_THRESHOLD
+    crates = [pixels for pixels in _components(crate_mask) if len(pixels) >= MIN_CRATE_AREA]
+    if len(crates) != 4:
+        return ABSTAIN
+
+    by_colour: dict[str, int] = {}
+    for pixels in crates:
+        name = _classify(_modal_colour(arr, pixels))
+        if name is None or name in by_colour:
+            return ABSTAIN
+        bars = _marks_in_box(dark_components, _box(pixels))
+        if bars is None or not (2 <= len(bars) <= 5):
+            return ABSTAIN
+        by_colour[name] = len(bars)
+    if sorted(by_colour.values()) != [2, 3, 4, 5]:
+        return ABSTAIN
+
+    plate_mask = (
+        (chroma <= PLATE_CHROMA_MAX) & (high >= PLATE_GREY_LO) & (high <= PLATE_GREY_HI)
+    )
+    plates = [pixels for pixels in _components(plate_mask) if len(pixels) >= MIN_PLATE_AREA]
+    if len(plates) != 1:
+        return ABSTAIN
+    lamps = _marks_in_box(dark_components, _box(plates[0]))
+    if lamps is None or not (2 <= len(lamps) <= 5):
+        return ABSTAIN
+    for pixels in lamps:
+        my0, my1, mx0, mx1 = _box(pixels)
+        span_y = my1 - my0 + 1
+        span_x = mx1 - mx0 + 1
+        if min(span_y, span_x) / max(span_y, span_x) < 0.6:
+            return ABSTAIN  # a lamp is round; a bar-like blob is not a lamp
+
+    target = len(lamps)
+    matches = [name for name, count in by_colour.items() if count == target]
+    if len(matches) != 1 or matches[0] not in ANSWERS:
+        return ABSTAIN
+    return matches[0]

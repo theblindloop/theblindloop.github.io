@@ -1,0 +1,133 @@
+"""Independent RGB-only inverse for the bend-radius route question."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+# These constants are deliberately duplicated rather than imported from the
+# renderer.  The inverse receives only the final pixels and the public route
+# layout, never a latent scene or renderer state.
+_INK = np.asarray((18, 72, 112), dtype=np.float32)
+_FIELD_X0 = (230, 410, 590)
+_STATION_STEP = 24
+_STATION_COUNT = 7
+_TIGHT_CUTOFF = 22.0
+_OPEN_CUTOFF = 40.0
+_COLOR_RADIUS = 70.0
+_MIN_COMPONENT_PIXELS = 160
+_MIN_SEGMENT_SAMPLES = 8
+
+
+def _route_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    distance = np.sqrt(np.sum((array - _INK) ** 2, axis=2))
+    return distance < _COLOR_RADIUS
+
+
+def _route_component(mask: np.ndarray) -> np.ndarray:
+    """Retain exactly one connected route and reject erased or noisy rasters."""
+
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[list[tuple[int, int]]] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= _MIN_COMPONENT_PIXELS:
+            components.append(points)
+    if len(components) != 1:
+        raise ValueError("navy route is not exactly one connected trace")
+    component = np.zeros_like(mask, dtype=bool)
+    ys, xs = zip(*components[0], strict=True)
+    component[np.asarray(ys), np.asarray(xs)] = True
+    return component
+
+
+def _center_y_by_column(mask: np.ndarray, x: int) -> float:
+    if x < 0 or x >= mask.shape[1]:
+        raise ValueError("segment sample is outside raster")
+    y_values = np.flatnonzero(mask[:, x])
+    if len(y_values) == 0:
+        raise ValueError("route segment is missing")
+    return float(np.median(y_values))
+
+
+def _segment_heading(mask: np.ndarray, x_start: int, x_end: int) -> float:
+    """Fit a straight centerline to one station-to-station route segment."""
+
+    xs: list[float] = []
+    ys: list[float] = []
+    left = x_start + 6
+    right = x_end - 6
+    for x in range(left, right + 1):
+        y = _center_y_by_column(mask, x)
+        xs.append(float(x))
+        ys.append(y)
+    if len(xs) < _MIN_SEGMENT_SAMPLES:
+        raise ValueError("too few pixels for route-segment fit")
+    slope, _intercept = np.polyfit(np.asarray(xs), np.asarray(ys), 1)
+    angle = math.degrees(math.atan2(float(slope), 1.0))
+    if not math.isfinite(angle):
+        raise ValueError("route-segment angle is not finite")
+    return angle
+
+
+def _field_classes(mask: np.ndarray, x0: int) -> tuple[str, ...]:
+    headings = [
+        _segment_heading(
+            mask,
+            x0 + index * _STATION_STEP,
+            x0 + (index + 1) * _STATION_STEP,
+        )
+        for index in range(_STATION_COUNT - 1)
+    ]
+    classes: list[str] = []
+    for left, right in zip(headings[:-1], headings[1:], strict=True):
+        angle = abs(right - left)
+        if angle < _TIGHT_CUTOFF:
+            classes.append("tight")
+        elif angle < _OPEN_CUTOFF:
+            classes.append("medium")
+        else:
+            classes.append("open")
+    if len(classes) != _STATION_COUNT - 2:
+        raise ValueError("route field has the wrong number of bend classes")
+    return tuple(classes)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return A or B from a final raster without consulting scene data."""
+
+    mask = _route_component(_route_mask(image))
+    reference = _field_classes(mask, _FIELD_X0[0])
+    scores: dict[str, int] = {}
+    for slot, x0 in (("A", _FIELD_X0[1]), ("B", _FIELD_X0[2])):
+        reflected = tuple(reversed(_field_classes(mask, x0)))
+        scores[slot] = sum(a == b for a, b in zip(reflected, reference, strict=True))
+    if scores["A"] == scores["B"]:
+        raise ValueError("pixel-derived candidate curvature rhythms are tied")
+    return "A" if scores["A"] > scores["B"] else "B"

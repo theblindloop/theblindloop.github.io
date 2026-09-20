@@ -1,0 +1,174 @@
+"""Independent pixel-only inverse for the compact crest trace."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ROUTE_RGB = np.asarray((31, 68, 103), dtype=np.float32)
+GREEN_RGB = np.asarray((39, 177, 105), dtype=np.float32)
+RED_RGB = np.asarray((220, 67, 63), dtype=np.float32)
+AMBER_RGB = np.asarray((241, 157, 35), dtype=np.float32)
+VIOLET_RGB = np.asarray((167, 78, 190), dtype=np.float32)
+
+
+def _color_mask(array: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    return np.linalg.norm(array.astype(np.float32) - color[None, None, :], axis=2) <= tolerance
+
+
+def _center(array: np.ndarray, color: np.ndarray, *, minimum: int = 20) -> tuple[float, float]:
+    points = np.argwhere(_color_mask(array, color, 62.0))
+    if len(points) < minimum:
+        raise ValueError("required colored marker is absent or fragmented")
+    # Each color occurs once.  Taking all matching pixels, rather than one
+    # connected lobe, remains stable when the dark route crosses a marker.
+    yx = points.astype(np.float64).mean(axis=0)
+    return float(yx[1]), float(yx[0])
+
+
+def _largest_component(mask: np.ndarray, minimum: int = 120) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            component.append((cy, cx))
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    if len(best) < minimum:
+        raise ValueError("connected route is absent or too fragmented")
+    return np.asarray(best, dtype=np.float64)
+
+
+def _route_centerline(
+    array: np.ndarray,
+    green: tuple[float, float],
+    red: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    route = _color_mask(array, ROUTE_RGB, 48.0)
+    component = _largest_component(route)
+    ys = component[:, 0].astype(np.int32)
+    xs = component[:, 1].astype(np.int32)
+    unique_x = np.unique(xs)
+    if len(unique_x) < 80:
+        raise ValueError("trace has insufficient horizontal support")
+    if int(unique_x[-1] - unique_x[0]) < 95:
+        raise ValueError("trace is too short for a stable crest")
+    left_port = min(float(green[0]), float(red[0]))
+    right_port = max(float(green[0]), float(red[0]))
+    if float(unique_x[0]) > left_port + 16.0 or float(unique_x[-1]) < right_port - 16.0:
+        raise ValueError("route component does not reach both visible ports")
+    gaps = np.diff(unique_x)
+    if len(gaps) and int(gaps.max()) > 5:
+        raise ValueError("trace centerline has a broken raster gap")
+
+    medians = np.asarray(
+        [np.median(ys[xs == x]) for x in unique_x], dtype=np.float64
+    )
+    # Endpoint markers hide the first/last few route columns.  Add their
+    # visible color centers as endpoint anchors, then interpolate the route.
+    path_x = np.concatenate((np.asarray([green[0], red[0]]), unique_x.astype(np.float64)))
+    path_y = np.concatenate((np.asarray([green[1], red[1]]), medians))
+    order = np.argsort(path_x, kind="stable")
+    path_x, path_y = path_x[order], path_y[order]
+    collapsed_x: list[float] = []
+    collapsed_y: list[float] = []
+    for x, y in zip(path_x, path_y):
+        if collapsed_x and abs(float(x) - collapsed_x[-1]) < 1e-9:
+            collapsed_y[-1] = (collapsed_y[-1] + float(y)) / 2.0
+        else:
+            collapsed_x.append(float(x))
+            collapsed_y.append(float(y))
+    path_x = np.asarray(collapsed_x, dtype=np.float64)
+    path_y = np.asarray(collapsed_y, dtype=np.float64)
+    cumulative = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(path_x), np.diff(path_y)))))
+    total = float(cumulative[-1])
+    if total < 105.0:
+        raise ValueError("recovered route is too short")
+    if green[0] > red[0]:
+        path_x = path_x[::-1]
+        path_y = path_y[::-1]
+        directed_cumulative = np.concatenate(
+            ([0.0], np.cumsum(np.hypot(np.diff(path_x), np.diff(path_y))))
+        )
+    else:
+        directed_cumulative = cumulative
+    return path_x, path_y, directed_cumulative
+
+
+def _smooth(values: np.ndarray, radius: int = 5) -> np.ndarray:
+    if len(values) < 2 * radius + 1:
+        return values
+    kernel = np.ones(2 * radius + 1, dtype=np.float64) / float(2 * radius + 1)
+    padded = np.pad(values, (radius, radius), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _crest_distance(path_y: np.ndarray, directed_cumulative: np.ndarray) -> float:
+    total = float(directed_cumulative[-1])
+    interior = (directed_cumulative > 18.0) & (directed_cumulative < total - 18.0)
+    if int(interior.sum()) < 20:
+        raise ValueError("trace has no stable interior")
+    smoothed = _smooth(path_y)
+    candidates = np.flatnonzero(interior)
+    minimum = float(np.min(smoothed[candidates]))
+    crest_candidates = candidates[smoothed[candidates] <= minimum + 1.2]
+    if len(crest_candidates) == 0:
+        raise ValueError("unique topmost point is not recoverable")
+    # A compact average over the rounded apex is more stable than choosing
+    # one antialiased column, while the prominence test rejects flat/broken traces.
+    crest_index = int(round(float(np.mean(crest_candidates))))
+    return float(directed_cumulative[crest_index])
+
+
+def _marker_distance(
+    center: tuple[float, float],
+    path_x: np.ndarray,
+    path_y: np.ndarray,
+    directed_cumulative: np.ndarray,
+) -> float:
+    left = min(float(path_x[0]), float(path_x[-1]))
+    right = max(float(path_x[0]), float(path_x[-1]))
+    if center[0] < left - 12.0 or center[0] > right + 12.0:
+        raise ValueError("checkpoint lies outside the trace")
+    if path_x[0] > path_x[-1]:
+        route_y = float(np.interp(center[0], path_x[::-1], path_y[::-1]))
+    else:
+        route_y = float(np.interp(center[0], path_x, path_y))
+    if abs(route_y - center[1]) > 17.0:
+        raise ValueError("checkpoint is not attached to the trace")
+    if path_x[0] > path_x[-1]:
+        return float(np.interp(center[0], path_x[::-1], directed_cumulative[::-1]))
+    return float(np.interp(center[0], path_x, directed_cumulative))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the checkpoint nearer to the route crest from the PNG alone."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    green = _center(array, GREEN_RGB)
+    red = _center(array, RED_RGB)
+    amber = _center(array, AMBER_RGB)
+    violet = _center(array, VIOLET_RGB)
+    path_x, path_y, directed_cumulative = _route_centerline(array, green, red)
+    crest = _crest_distance(path_y, directed_cumulative)
+    amber_distance = abs(_marker_distance(amber, path_x, path_y, directed_cumulative) - crest)
+    violet_distance = abs(_marker_distance(violet, path_x, path_y, directed_cumulative) - crest)
+    gap = abs(amber_distance - violet_distance)
+    if gap < 7.0:
+        raise ValueError("crest comparison is too close in the raster")
+    return "amber" if amber_distance <= violet_distance else "violet"

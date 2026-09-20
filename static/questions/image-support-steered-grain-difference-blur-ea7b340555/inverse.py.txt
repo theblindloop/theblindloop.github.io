@@ -1,0 +1,107 @@
+"""Independent final-PNG inverse arm for the grain-difference transform."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= 80:
+            groups.append(np.asarray(points, dtype=int))
+    return groups
+
+
+def _locate_payloads(array: np.ndarray) -> list[np.ndarray]:
+    high = array.max(axis=2).astype(int)
+    low = array.min(axis=2).astype(int)
+    saturated = (high >= 120) & ((high - low) >= 70)
+    groups = _components(saturated)
+    if len(groups) != 2:
+        raise ValueError(f"expected two visible saturated fiducial frames, found {len(groups)}")
+    boxes = []
+    for points in groups:
+        y0, x0 = points.min(axis=0)
+        y1, x1 = points.max(axis=0)
+        height, width = int(y1 - y0 + 1), int(x1 - x0 + 1)
+        if not (34 <= width <= 42 and 34 <= height <= 42):
+            raise ValueError("fiducial frame has invalid square extent")
+        cx = (int(x0) + int(x1)) // 2
+        top = saturated[int(y0) : int(y0) + 3, cx - 2 : cx + 3]
+        bottom = saturated[int(y1) - 2 : int(y1) + 1, cx - 2 : cx + 3]
+        if top.size == 0 or float(top.mean()) >= 0.65 or float(bottom.mean()) <= 0.85:
+            raise ValueError("frame notch is missing or not oriented upward")
+        boxes.append((int(x0), int(y0), int(x1), int(y1)))
+    boxes.sort()
+    payloads = []
+    for x0, y0, x1, y1 in boxes:
+        payload = array[y0 + 5 : y0 + 33, x0 + 5 : x0 + 33]
+        if payload.shape != (28, 28, 3):
+            raise ValueError("fiducial-defined payload has invalid dimensions")
+        payloads.append(payload)
+    return payloads
+
+
+def _difference_raster(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    left, right = _locate_payloads(array)
+    left_dark = left.mean(axis=2) < 120.0
+    right_dark = right.mean(axis=2) < 120.0
+    absolute_difference = np.logical_xor(left_dark, right_dark).astype(np.float64)
+    # Pooling the 4x4 grain blocks is the declared low-pass blur.
+    pooled = absolute_difference.reshape(7, 4, 7, 4).mean(axis=(1, 3))
+    if np.any((pooled > 0.20) & (pooled < 0.80)):
+        raise ValueError("blurred difference contains unstable intermediate cells")
+    return pooled >= 0.5
+
+
+def _templates() -> dict[str, np.ndarray]:
+    h = np.zeros((7, 7), dtype=bool)
+    h[:, 0] = h[:, 6] = True
+    h[3, :] = True
+    u = np.zeros((7, 7), dtype=bool)
+    u[:6, 0] = u[:6, 6] = True
+    u[6, :] = True
+    pi = np.zeros((7, 7), dtype=bool)
+    pi[0, :] = True
+    pi[1:, 0] = pi[1:, 6] = True
+    return {"H": h, "U": u, "Pi": pi}
+
+
+def image_measurement(image: Image.Image) -> dict:
+    raster = _difference_raster(image)
+    distances = sorted(
+        (int(np.count_nonzero(raster != template)), name)
+        for name, template in _templates().items()
+    )
+    gap = float(distances[1][0] - distances[0][0])
+    decision = "ambiguous" if gap == 0 else distances[0][1]
+    return {
+        "decision": decision,
+        "margin": gap,
+        "best_distance": distances[0][0],
+        "runner_up_distance": distances[1][0],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(image_measurement(image)["decision"])

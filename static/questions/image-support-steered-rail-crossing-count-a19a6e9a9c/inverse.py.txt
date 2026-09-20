@@ -1,0 +1,130 @@
+"""Independent final-PNG inverse for Local Rail Crossing Count."""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+
+import numpy as np
+from PIL import Image
+
+_NAVY = np.array((24, 47, 72), dtype=np.int32)
+_GOLD = np.array((221, 166, 35), dtype=np.int32)
+_BLUE = np.array((38, 110, 210), dtype=np.int32)
+_ORANGE = np.array((232, 111, 32), dtype=np.int32)
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: int = 12) -> np.ndarray:
+    delta = array.astype(np.int32) - color
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _component_sizes(mask: np.ndarray) -> list[int]:
+    ys, xs = np.nonzero(mask)
+    if not len(xs):
+        return []
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = mask[y0:y1, x0:x1]
+    seen = np.zeros_like(sub, dtype=bool)
+    sizes = []
+    for sy, sx in np.argwhere(sub):
+        y, x = int(sy), int(sx)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(y, x)])
+        size = 0
+        while queue:
+            cy, cx = queue.popleft()
+            size += 1
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < sub.shape[0] and 0 <= nx < sub.shape[1] and sub[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        sizes.append(size)
+    return sorted(sizes, reverse=True)
+
+
+def _single_marker(mask: np.ndarray, name: str) -> np.ndarray:
+    sizes = _component_sizes(mask)
+    if len(sizes) != 1 or not 45 <= sizes[0] <= 140:
+        raise ValueError(f"{name} endpoint ring is missing or malformed")
+    yy, xx = np.nonzero(mask)
+    return np.array((float(xx.mean()), float(yy.mean())))
+
+
+def _stable_signs(values: list[tuple[int, float]]) -> list[int]:
+    if len(values) < 90:
+        raise ValueError("too little route centerline remains")
+    raw = []
+    for position, value in values:
+        sign = 1 if value >= 3.25 else -1 if value <= -3.25 else 0
+        raw.append((position, sign))
+    runs: list[tuple[int, int]] = []
+    for position, sign in raw:
+        if sign == 0:
+            continue
+        if runs and runs[-1][0] == sign:
+            runs[-1] = (sign, runs[-1][1] + 1)
+        else:
+            runs.append((sign, 1))
+    signs = [sign for sign, length in runs if length >= 5]
+    compact: list[int] = []
+    for sign in signs:
+        if not compact or compact[-1] != sign:
+            compact.append(sign)
+    return compact
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 200 or array.shape[1] < 200:
+        raise ValueError("unsupported raster")
+
+    route_mask = _mask(array, _NAVY)
+    rail_mask = _mask(array, _GOLD)
+    blue = _single_marker(_mask(array, _BLUE), "blue")
+    orange = _single_marker(_mask(array, _ORANGE), "orange")
+    route_sizes = _component_sizes(route_mask)
+    if len(route_sizes) != 1 or not 520 <= route_sizes[0] <= 1100:
+        raise ValueError("navy trace is missing, broken, or malformed")
+    if int(rail_mask.sum()) < 220:
+        raise ValueError("gold rail is missing or too short")
+
+    rail_y, rail_x = np.nonzero(rail_mask)
+    rail_xy = np.column_stack((rail_x, rail_y)).astype(np.float64)
+    rail_center = rail_xy.mean(axis=0)
+    centered = rail_xy - rail_center
+    values, vectors = np.linalg.eigh(centered.T @ centered / len(centered))
+    if values[-1] < 1200.0 or values[-1] / max(values[0], 0.1) < 150.0:
+        raise ValueError("gold pixels do not form one straight reference rail")
+    tangent = vectors[:, -1]
+    normal = np.array((-tangent[1], tangent[0]))
+
+    route_y, route_x = np.nonzero(route_mask)
+    route_xy = np.column_stack((route_x, route_y)).astype(np.float64)
+    relative = route_xy - rail_center
+    longitudinal = relative @ tangent
+    signed = relative @ normal
+    if float(longitudinal.max() - longitudinal.min()) < 105.0:
+        raise ValueError("navy trace has insufficient longitudinal extent")
+    if float(signed.max() - signed.min()) < 31.0:
+        raise ValueError("navy trace does not visibly visit both rail sides")
+
+    bins: dict[int, list[float]] = defaultdict(list)
+    for position, distance in zip(np.rint(longitudinal).astype(int), signed, strict=True):
+        bins[int(position)].append(float(distance))
+    centers = [(position, float(np.median(distances))) for position, distances in sorted(bins.items())]
+    signs = _stable_signs(centers)
+    if len(signs) < 3:
+        raise ValueError("could not recover alternating rail-side runs")
+    crossings = sum(a != b for a, b in zip(signs, signs[1:]))
+
+    endpoint_sides = [float((point - rail_center) @ normal) for point in (blue, orange)]
+    if endpoint_sides[0] * endpoint_sides[1] <= 0 or min(abs(value) for value in endpoint_sides) < 8.0:
+        raise ValueError("endpoint rings do not visibly lie on the same rail side")
+    if crossings == 2:
+        return "two"
+    if crossings == 4:
+        return "four"
+    raise ValueError(f"unsupported recovered crossing count: {crossings}")

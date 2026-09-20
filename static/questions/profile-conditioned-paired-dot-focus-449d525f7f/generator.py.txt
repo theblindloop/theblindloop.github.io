@@ -1,0 +1,260 @@
+"""Deterministic renderer for the paired-dot focus question world.
+
+The latent answer is never stored separately.  It is recomputed by treating
+each two-point group as an infinite line and scoring every visible candidate
+ring by its mean perpendicular distance to all such lines.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+
+WIDTH = 640
+HEIGHT = 640
+SCALE = 3
+COLORS = ("red", "blue", "green", "orange")
+COLOR_RGB = {
+    "red": (205, 55, 76),
+    "blue": (38, 113, 178),
+    "green": (35, 145, 99),
+    "orange": (224, 132, 35),
+}
+STYLE_VARIANTS = (
+    ((249, 248, 244), (31, 39, 48)),
+    ((246, 249, 250), (43, 37, 53)),
+)
+QUARANTINE_MARGIN = 8.0
+
+
+def _rotate(vector: tuple[float, float], angle: float) -> tuple[float, float]:
+    c, s = math.cos(angle), math.sin(angle)
+    x, y = vector
+    return c * x - s * y, s * x + c * y
+
+
+def _candidate_layout(rng: random.Random, seed: int) -> tuple[list[dict], int, int]:
+    """Return counterbalanced colored candidates, target slot, and rival slot."""
+    cx = 320.0 + rng.uniform(-28.0, 28.0)
+    cy = 320.0 + rng.uniform(-28.0, 28.0)
+    phase = rng.uniform(0.0, 2.0 * math.pi)
+    positions = []
+    for slot in range(4):
+        angle = phase + slot * math.pi / 2.0 + rng.uniform(-0.08, 0.08)
+        radius = rng.uniform(112.0, 142.0)
+        positions.append(
+            [round(cx + radius * math.cos(angle), 3), round(cy + radius * math.sin(angle), 3)]
+        )
+
+    # Across each block of 16 consecutive seeds, every answer color occupies
+    # every angular slot once.  The remaining color-to-slot bindings are random.
+    target_color = COLORS[seed % 4]
+    target_slot = (seed // 4) % 4
+    remaining_colors = [color for color in COLORS if color != target_color]
+    rng.shuffle(remaining_colors)
+    slot_colors: list[str | None] = [None] * 4
+    slot_colors[target_slot] = target_color
+    for slot in range(4):
+        if slot_colors[slot] is None:
+            slot_colors[slot] = remaining_colors.pop()
+    candidates = [
+        {"color": str(slot_colors[slot]), "center": positions[slot]} for slot in range(4)
+    ]
+    rival_slot = (target_slot + 2) % 4
+    # Serialized candidate order is also a nuisance variable.
+    rng.shuffle(candidates)
+    return candidates, target_slot, rival_slot
+
+
+def _center_for_color(candidates: list[dict], color: str) -> tuple[float, float]:
+    for candidate in candidates:
+        if candidate["color"] == color:
+            return float(candidate["center"][0]), float(candidate["center"][1])
+    raise ValueError(f"missing candidate color {color!r}")
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced, randomized, JSON-serializable scene."""
+    rng = random.Random(int(seed))
+    candidates, target_slot, rival_slot = _candidate_layout(rng, int(seed))
+    target_color = COLORS[int(seed) % 4]
+    target = _center_for_color(candidates, target_color)
+
+    # Recover the rival by its geometric slot rather than serialized order.
+    layout_center = (
+        sum(float(item["center"][0]) for item in candidates) / 4.0,
+        sum(float(item["center"][1]) for item in candidates) / 4.0,
+    )
+    angular = sorted(
+        candidates,
+        key=lambda item: (
+            math.atan2(
+                float(item["center"][1]) - layout_center[1],
+                float(item["center"][0]) - layout_center[0],
+            )
+            + 2.0 * math.pi
+        )
+        % (2.0 * math.pi),
+    )
+    # The slot order above may wrap at a different phase.  The farthest ring is
+    # an unambiguous visual rival and avoids any dependence on serialized order.
+    rival_item = max(
+        candidates,
+        key=lambda item: math.hypot(
+            float(item["center"][0]) - target[0],
+            float(item["center"][1]) - target[1],
+        ),
+    )
+    rival = (float(rival_item["center"][0]), float(rival_item["center"][1]))
+
+    pair_count = 14
+    boundary_case = int(seed) % 12 == 0
+    # Six of fourteen axes favor the rival in deliberately near-boundary scenes.
+    rival_axes = set(rng.sample(range(pair_count), 6)) if boundary_case else set()
+    midpoints: list[tuple[float, float]] = []
+    dot_pairs: list[list[list[float]]] = []
+    ring_centers = [tuple(map(float, item["center"])) for item in candidates]
+
+    for pair_index in range(pair_count):
+        for _ in range(5000):
+            midpoint = (rng.uniform(62.0, 578.0), rng.uniform(62.0, 578.0))
+            if math.hypot(midpoint[0] - target[0], midpoint[1] - target[1]) < 92.0:
+                continue
+            if any(math.hypot(midpoint[0] - x, midpoint[1] - y) < 45.0 for x, y in ring_centers):
+                continue
+            if any(math.hypot(midpoint[0] - x, midpoint[1] - y) < 52.0 for x, y in midpoints):
+                continue
+            break
+        else:
+            raise RuntimeError("could not place isolated dot pair")
+
+        focus = rival if pair_index in rival_axes else target
+        vx, vy = focus[0] - midpoint[0], focus[1] - midpoint[1]
+        norm = math.hypot(vx, vy)
+        unit = (vx / norm, vy / norm)
+        jitter_deg = rng.gauss(0.0, 0.45 if not boundary_case else 0.25)
+        unit = _rotate(unit, math.radians(jitter_deg))
+        half_length = rng.uniform(8.0, 10.0)
+        p1 = [
+            round(midpoint[0] - half_length * unit[0], 3),
+            round(midpoint[1] - half_length * unit[1], 3),
+        ]
+        p2 = [
+            round(midpoint[0] + half_length * unit[0], 3),
+            round(midpoint[1] + half_length * unit[1], 3),
+        ]
+        midpoints.append(midpoint)
+        dot_pairs.append([p1, p2])
+
+    rng.shuffle(dot_pairs)
+    background, ink = STYLE_VARIANTS[int(seed) % len(STYLE_VARIANTS)]
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "dot_pairs": dot_pairs,
+        "candidate_rings": candidates,
+        "dot_radius": 5.2,
+        "ring_radius": 13.0,
+        "ring_width": 5.5,
+        "background": list(background),
+        "ink_color": list(ink),
+    }
+
+
+def _point_line_distance(point: Iterable[float], pair: list[list[float]]) -> float:
+    px, py = map(float, point)
+    x1, y1 = map(float, pair[0])
+    x2, y2 = map(float, pair[1])
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        raise ValueError("dot pair has coincident centers")
+    return abs(dx * (y1 - py) - (x1 - px) * dy) / length
+
+
+def _scores(scene: dict) -> list[tuple[float, str]]:
+    pairs = scene["dot_pairs"]
+    candidates = scene["candidate_rings"]
+    if len(pairs) < 3 or len(candidates) != 4:
+        raise ValueError("scene requires at least three pairs and four candidates")
+    values = []
+    for candidate in candidates:
+        distances = [_point_line_distance(candidate["center"], pair) for pair in pairs]
+        values.append((sum(distances) / len(distances), str(candidate["color"])))
+    return sorted(values, key=lambda item: (item[0], item[1]))
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return the color whose visible center best fits all implied axes."""
+    return _scores(scene)[0][1]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up score minus winner score, in source-image pixels."""
+    scores = _scores(scene)
+    return scores[1][0] - scores[0][0]
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Exercise render-identical reparameterizations of unordered marks."""
+    reverse_pairs = copy.deepcopy(scene)
+    reverse_pairs["dot_pairs"] = list(reversed(reverse_pairs["dot_pairs"]))
+    reverse_candidates = copy.deepcopy(scene)
+    reverse_candidates["candidate_rings"] = list(reversed(reverse_candidates["candidate_rings"]))
+    return [
+        ("reverse_unordered_pair_list", reverse_pairs),
+        ("reverse_unordered_candidate_list", reverse_candidates),
+    ]
+
+
+def translated(scene: dict, dx: float, dy: float) -> dict:
+    """Label-preserving, pixel-changing translation used by candidate tests."""
+    twin = copy.deepcopy(scene)
+    twin["dot_pairs"] = [
+        [[point[0] + dx, point[1] + dy] for point in pair] for pair in twin["dot_pairs"]
+    ]
+    for candidate in twin["candidate_rings"]:
+        candidate["center"] = [candidate["center"][0] + dx, candidate["center"][1] + dy]
+    return twin
+
+
+def render(scene: dict) -> Image.Image:
+    """Render only declared scene fields, with deterministic supersampling."""
+    width, height = int(scene["width"]), int(scene["height"])
+    scale = SCALE
+    background = tuple(int(value) for value in scene["background"])
+    ink = tuple(int(value) for value in scene["ink_color"])
+    image = Image.new("RGB", (width * scale, height * scale), background)
+    draw = ImageDraw.Draw(image)
+
+    dot_radius = float(scene["dot_radius"]) * scale
+    for pair in scene["dot_pairs"]:
+        for point in pair:
+            x, y = float(point[0]) * scale, float(point[1]) * scale
+            draw.ellipse(
+                (x - dot_radius, y - dot_radius, x + dot_radius, y + dot_radius),
+                fill=ink,
+            )
+
+    ring_radius = float(scene["ring_radius"]) * scale
+    ring_width = max(1, round(float(scene["ring_width"]) * scale))
+    for candidate in scene["candidate_rings"]:
+        x = float(candidate["center"][0]) * scale
+        y = float(candidate["center"][1]) * scale
+        color = COLOR_RGB[str(candidate["color"])]
+        draw.ellipse(
+            (x - ring_radius, y - ring_radius, x + ring_radius, y + ring_radius),
+            outline=color,
+            width=ring_width,
+        )
+
+    return image.resize((width, height), Image.Resampling.LANCZOS)

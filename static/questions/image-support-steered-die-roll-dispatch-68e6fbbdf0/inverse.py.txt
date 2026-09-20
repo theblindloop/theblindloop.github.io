@@ -1,0 +1,131 @@
+"""Independent pixel-only inverse arm for Die Roll Dispatch."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for yy, xx in np.argwhere(mask):
+        y, x = int(yy), int(xx)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _center(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 0].mean()), float(component[:, 1].mean())
+
+
+def _one_component(mask: np.ndarray, name: str, minimum: int) -> np.ndarray:
+    components = _components(mask, minimum)
+    if len(components) != 1:
+        raise ValueError(f"{name} face is missing or ambiguous")
+    return components[0]
+
+
+def _pip_count(ink: np.ndarray, face: np.ndarray) -> int:
+    y0, x0 = face.min(axis=0)
+    y1, x1 = face.max(axis=0)
+    inside = np.zeros_like(ink)
+    inside[y0:y1 + 1, x0:x1 + 1] = ink[y0:y1 + 1, x0:x1 + 1]
+    pips = _components(inside, 70)
+    if not 1 <= len(pips) <= 6:
+        raise ValueError("face pip count is not in 1..6")
+    for pip in pips:
+        ys, xs = pip[:, 0], pip[:, 1]
+        if xs.max() - xs.min() > 16 or ys.max() - ys.min() > 16:
+            raise ValueError("pip shape is ambiguous")
+    return len(pips)
+
+
+def _arrow_direction(component: np.ndarray) -> str:
+    ys, xs = component[:, 0], component[:, 1]
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    if min(y1 - y0, x1 - x0) < 45:
+        raise ValueError("arrow glyph too small")
+    band = 11
+    edges = {
+        "up": int(np.sum(ys <= y0 + band)),
+        "down": int(np.sum(ys >= y1 - band)),
+        "left": int(np.sum(xs <= x0 + band)),
+        "right": int(np.sum(xs >= x1 - band)),
+    }
+    ordered = sorted(edges.items(), key=lambda item: item[1], reverse=True)
+    if ordered[0][1] - ordered[1][1] < 24:
+        raise ValueError("arrow direction is ambiguous")
+    # The broad tail produces the largest extreme band; the arrow points away from it.
+    opposite = {"up": "down", "down": "up", "left": "right", "right": "left"}
+    return opposite[ordered[0][0]]
+
+
+def _roll(faces: dict[str, int], direction: str) -> dict[str, int]:
+    f = dict(faces)
+    if direction == "up":
+        return {**f, "top": f["front"], "back": f["top"], "bottom": f["back"], "front": f["bottom"]}
+    if direction == "down":
+        return {**f, "top": f["back"], "front": f["top"], "bottom": f["front"], "back": f["bottom"]}
+    if direction == "right":
+        return {**f, "top": f["left"], "right": f["top"], "bottom": f["right"], "left": f["bottom"]}
+    if direction == "left":
+        return {**f, "top": f["right"], "left": f["top"], "bottom": f["left"], "right": f["bottom"]}
+    raise ValueError(direction)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    top_mask = (r < 80) & (g > 145) & (g < 205) & (b > 165)
+    front_mask = (r > 210) & (g > 110) & (g < 175) & (b < 100)
+    right_mask = (r > 105) & (r < 165) & (g > 60) & (g < 120) & (b > 155)
+    arrow_mask = (r < 80) & (g > 115) & (g < 170) & (b < 115)
+    badge_mask = (r > 170) & (g < 95) & (b < 100)
+    ink = (r < 65) & (g < 70) & (b < 75)
+
+    top_face = _one_component(top_mask, "top", 5000)
+    front_face = _one_component(front_mask, "front", 5000)
+    right_face = _one_component(right_mask, "right", 5000)
+    top = _pip_count(ink, top_face)
+    front = _pip_count(ink, front_face)
+    right = _pip_count(ink, right_face)
+    if front in (top, 7 - top) or right in (top, 7 - top, front, 7 - front):
+        raise ValueError("visible faces do not define three distinct die axes")
+
+    arrows = _components(arrow_mask, 900)
+    badges = _components(badge_mask, 70)
+    if len(arrows) != 2 or len(badges) != 3:
+        raise ValueError("two arrows and three order dots are required")
+    events: dict[int, str] = {}
+    badge_centers = [_center(component) for component in badges]
+    for arrow in arrows:
+        ay, ax = _center(arrow)
+        count = sum(1 for by, bx in badge_centers if abs(by - ay) < 32 and 65 < ax - bx < 115)
+        if count not in (1, 2) or count in events:
+            raise ValueError("roll card order is missing or duplicated")
+        events[count] = _arrow_direction(arrow)
+    if set(events) != {1, 2}:
+        raise ValueError("roll order cannot be resolved")
+
+    faces = {"top": top, "bottom": 7 - top, "front": front, "back": 7 - front,
+             "right": right, "left": 7 - right}
+    for number in (1, 2):
+        faces = _roll(faces, events[number])
+    return str(faces["top"])

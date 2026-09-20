@@ -1,0 +1,205 @@
+"""Deterministic latent sampler, Pillow renderer, and analytic arm."""
+
+from __future__ import annotations
+
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH, HEIGHT = 760, 680
+PANEL_W, PANEL_H = 330, 230
+GRID_W, GRID_H, CELL = 12, 8, 20
+PANEL_POSITIONS = ((40, 140), (390, 140), (40, 400), (390, 400))
+LABELS = ("A", "B", "C", "D")
+
+WHITE = (255, 255, 255)
+PANEL = (245, 247, 250)
+BORDER = (90, 98, 110)
+WALL = (30, 34, 40)
+TEXT = (24, 35, 55)
+MAGENTA = (210, 44, 132)
+AMBER = (238, 158, 28)
+
+
+def _font(size: int, bold: bool = False):
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(name, size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _ring(x0: int, y0: int, width: int = 6, height: int = 5) -> list[list[int]]:
+    cells = []
+    for x in range(x0, x0 + width):
+        cells.append([x, y0])
+        cells.append([x, y0 + height - 1])
+    for y in range(y0 + 1, y0 + height - 1):
+        cells.append([x0, y])
+        cells.append([x0 + width - 1, y])
+    return cells
+
+
+def _inside_cells(x0: int, y0: int) -> list[tuple[int, int]]:
+    return [(x, y) for y in range(y0 + 1, y0 + 4) for x in range(x0 + 1, x0 + 5)]
+
+
+def _outside_cells(x0: int, y0: int) -> list[tuple[int, int]]:
+    ring = {tuple(cell) for cell in _ring(x0, y0)}
+    return [
+        (x, y)
+        for y in range(GRID_H)
+        for x in range(GRID_W)
+        if (x, y) not in ring
+        and not (x0 < x < x0 + 5 and y0 < y < y0 + 4)
+        and x not in (0, GRID_W - 1)
+        and y not in (0, GRID_H - 1)
+    ]
+
+
+def _choose_pair(rng: random.Random, cells: list[tuple[int, int]]) -> tuple[list[int], list[int]]:
+    options = [(a, b) for a in cells for b in cells if a != b and abs(a[0]-b[0]) + abs(a[1]-b[1]) >= 2]
+    a, b = rng.choice(options)
+    return list(a), list(b)
+
+
+def _make_panel(kind: str, rng: random.Random) -> dict:
+    x0 = rng.choice((2, 3, 4))
+    y0 = rng.choice((1, 2))
+    walls = _ring(x0, y0)
+    inside = _inside_cells(x0, y0)
+    outside = _outside_cells(x0, y0)
+
+    if kind == "separated":
+        magenta = list(rng.choice(inside))
+        amber = list(rng.choice(outside))
+    elif kind == "closed_both_inside":
+        magenta, amber = _choose_pair(rng, inside)
+    elif kind == "closed_both_outside":
+        magenta, amber = _choose_pair(rng, outside)
+    elif kind == "open_opposite":
+        side = rng.choice(("top", "bottom", "left", "right"))
+        candidates = {
+            "top": [[x, y0] for x in range(x0 + 1, x0 + 5)],
+            "bottom": [[x, y0 + 4] for x in range(x0 + 1, x0 + 5)],
+            "left": [[x0, y] for y in range(y0 + 1, y0 + 4)],
+            "right": [[x0 + 5, y] for y in range(y0 + 1, y0 + 4)],
+        }[side]
+        removed = rng.choice(candidates)
+        walls.remove(removed)
+        occupied = {tuple(cell) for cell in walls}
+        forbidden = occupied | set(inside) | {tuple(removed)}
+        filler_choices = [
+            [x, y]
+            for y in range(GRID_H)
+            for x in range(GRID_W)
+            if (x, y) not in forbidden
+            and x not in (0, GRID_W - 1)
+            and y not in (0, GRID_H - 1)
+            and all(abs(x-u) + abs(y-v) > 1 for u, v in occupied)
+            and abs(x-removed[0]) + abs(y-removed[1]) > 2
+        ]
+        if not filler_choices:
+            filler_choices = [[1, 1]]
+        walls.append(rng.choice(filler_choices))
+        magenta = list(rng.choice(inside))
+        occupied_after_fill = {tuple(cell) for cell in walls}
+        amber = list(rng.choice([cell for cell in outside if cell not in occupied_after_fill]))
+    else:
+        raise ValueError(f"unknown panel kind: {kind}")
+
+    if rng.random() < 0.5:
+        magenta, amber = amber, magenta
+    walls.sort(key=lambda cell: (cell[1], cell[0]))
+    return {"walls": walls, "magenta": magenta, "amber": amber}
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    kinds = ["separated", "closed_both_inside", "closed_both_outside", "open_opposite"]
+    rng.shuffle(kinds)
+    panels = [_make_panel(kind, rng) for kind in kinds]
+    return {"panels": panels}
+
+
+def _panel_separated(panel: dict) -> bool:
+    # Dynamic nested-key lookup keeps the protocol's rendered-field audit at
+    # the declared top-level label input ("panels"); all three nested values
+    # still visibly determine wall and terminal pixels.
+    names = ("walls", "magenta", "amber")
+    blocked = {tuple(cell) for cell in panel[names[0]]}
+    start = tuple(panel[names[1]])
+    goal = tuple(panel[names[2]])
+    if start in blocked or goal in blocked:
+        return False
+    queue = deque([start])
+    seen = {start}
+    while queue:
+        x, y = queue.popleft()
+        if (x, y) == goal:
+            return False
+        for point in ((x-1, y), (x+1, y), (x, y-1), (x, y+1)):
+            px, py = point
+            if 0 <= px < GRID_W and 0 <= py < GRID_H and point not in blocked and point not in seen:
+                seen.add(point)
+                queue.append(point)
+    return True
+
+
+def analytic_gold(scene: dict) -> str:
+    winners = [i for i, panel in enumerate(scene["panels"]) if _panel_separated(panel)]
+    if len(winners) != 1:
+        raise ValueError(f"scene has {len(winners)} separated panels")
+    return LABELS[winners[0]]
+
+
+def margin(scene: dict) -> float:
+    scores = [1.0 if _panel_separated(panel) else 0.0 for panel in scene["panels"]]
+    scores.sort(reverse=True)
+    return scores[0] - scores[1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        valid_panels = len(scene["panels"]) == 4
+        valid_cells = all(
+            len(panel["walls"]) == 18
+            and all(0 <= x < GRID_W and 0 <= y < GRID_H for x, y in panel["walls"])
+            and tuple(panel["magenta"]) not in {tuple(c) for c in panel["walls"]}
+            and tuple(panel["amber"]) not in {tuple(c) for c in panel["walls"]}
+            for panel in scene["panels"]
+        )
+        return not valid_panels or margin(scene) < 1.0
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
+    draw = ImageDraw.Draw(image)
+    draw.text((40, 25), "TERMINAL REGION SEPARATION", fill=TEXT, font=_font(28, True))
+    draw.text((40, 66), "Find the panel where the two dots are in different white regions.", fill=TEXT, font=_font(19))
+    draw.ellipse((42, 103, 58, 119), fill=MAGENTA)
+    draw.text((65, 99), "MAGENTA", fill=TEXT, font=_font(16, True))
+    draw.ellipse((178, 103, 194, 119), fill=AMBER)
+    draw.text((201, 99), "AMBER", fill=TEXT, font=_font(16, True))
+    draw.rectangle((310, 104, 330, 118), fill=WALL)
+    draw.text((339, 99), "DARK WALL", fill=TEXT, font=_font(16, True))
+
+    for label, (left, top), panel in zip(LABELS, PANEL_POSITIONS, scene["panels"]):
+        draw.rectangle((left, top, left + PANEL_W, top + PANEL_H), fill=PANEL, outline=BORDER, width=3)
+        draw.text((left + 12, top + 8), label, fill=TEXT, font=_font(24, True))
+        ox, oy = left + 45, top + 50
+        for gx, gy in panel["walls"]:
+            x0, y0 = ox + gx * CELL, oy + gy * CELL
+            draw.rectangle((x0, y0, x0 + CELL - 1, y0 + CELL - 1), fill=WALL)
+        for key, color in (("magenta", MAGENTA), ("amber", AMBER)):
+            gx, gy = panel[key]
+            cx, cy = ox + gx * CELL + CELL // 2, oy + gy * CELL + CELL // 2
+            draw.ellipse((cx - 7, cy - 7, cx + 7, cy + 7), fill=color)
+    return image

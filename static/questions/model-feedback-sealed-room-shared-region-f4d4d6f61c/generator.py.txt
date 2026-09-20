@@ -1,0 +1,344 @@
+"""Deterministic latent scene, raster, analytic gold and margin.
+
+The scene is a rectangular field of cells cut into sealed rooms by black walls.
+Only the *background* conducts: two marks belong together when white space joins
+them without crossing ink. The label is therefore a property of the complement
+of the drawn ink, not of anything drawn.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+GRID = 8
+CELL = 80
+ORIGIN = 40
+WALL = 14
+WIDTH = HEIGHT = ORIGIN * 2 + GRID * CELL
+
+DISK_RADIUS = 18
+STAR_RADIUS = 18
+JITTER = 3
+MIN_MARGIN = 11.0
+MIN_TREE_DISTANCE = 6
+N_REGIONS = 3
+
+DISK_COLORS = ("red", "gold", "magenta")
+
+PALETTE = {
+    "background": (255, 255, 255),
+    "wall": (0, 0, 0),
+    "start": (0, 90, 220),
+    "red": (220, 30, 30),
+    "gold": (235, 170, 0),
+    "magenta": (190, 0, 150),
+}
+
+
+# --------------------------------------------------------------------------
+# cell helpers
+# --------------------------------------------------------------------------
+def _neighbours(r: int, c: int):
+    if r > 0:
+        yield r - 1, c
+    if r < GRID - 1:
+        yield r + 1, c
+    if c > 0:
+        yield r, c - 1
+    if c < GRID - 1:
+        yield r, c + 1
+
+
+def _edge_key(a, b):
+    return tuple(sorted((tuple(a), tuple(b))))
+
+
+def _cell_centre(cell, jitter=(0, 0)):
+    r, c = cell
+    x = ORIGIN + c * CELL + CELL / 2 + jitter[0]
+    y = ORIGIN + r * CELL + CELL / 2 + jitter[1]
+    return x, y
+
+
+def _passage_set(scene) -> set:
+    return {_edge_key(p[:2], p[2:]) for p in scene["passages"]}
+
+
+def _reachable_cells(scene, start) -> set:
+    passages = _passage_set(scene)
+    seen = {tuple(start)}
+    queue = deque([tuple(start)])
+    while queue:
+        r, c = queue.popleft()
+        for nb in _neighbours(r, c):
+            if nb in seen:
+                continue
+            if _edge_key((r, c), nb) in passages:
+                seen.add(nb)
+                queue.append(nb)
+    return seen
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _grow_regions(rng):
+    cells = [(r, c) for r in range(GRID) for c in range(GRID)]
+    seeds = rng.sample(cells, N_REGIONS)
+    label = {}
+    frontier = []
+    for idx, cell in enumerate(seeds):
+        label[cell] = idx
+        frontier.append((idx, cell))
+    while frontier:
+        pick = rng.randrange(len(frontier))
+        idx, cell = frontier.pop(pick)
+        for nb in _neighbours(*cell):
+            if nb not in label:
+                label[nb] = idx
+                frontier.append((idx, nb))
+    return label
+
+
+def _spanning_tree(rng, cells, root):
+    members = set(cells)
+    tree = []
+    seen = {root}
+    stack = [root]
+    while stack:
+        cur = stack[-1]
+        options = [nb for nb in _neighbours(*cur) if nb in members and nb not in seen]
+        if not options:
+            stack.pop()
+            continue
+        nxt = options[rng.randrange(len(options))]
+        seen.add(nxt)
+        tree.append(_edge_key(cur, nxt))
+        stack.append(nxt)
+    return tree, seen
+
+
+def _tree_distances(passages, start):
+    dist = {tuple(start): 0}
+    queue = deque([tuple(start)])
+    while queue:
+        cur = queue.popleft()
+        for nb in _neighbours(*cur):
+            if nb not in dist and _edge_key(cur, nb) in passages:
+                dist[nb] = dist[cur] + 1
+                queue.append(nb)
+    return dist
+
+
+def _attempt(rng, answer_colour):
+    label = _grow_regions(rng)
+    groups = {}
+    for cell, idx in label.items():
+        groups.setdefault(idx, []).append(cell)
+    for cells in groups.values():
+        cells.sort()
+    if len(groups) != N_REGIONS or min(len(v) for v in groups.values()) < 8:
+        return None
+
+    passages = []
+    for idx, cells in groups.items():
+        root = cells[rng.randrange(len(cells))]
+        tree, seen = _spanning_tree(rng, cells, root)
+        if len(seen) != len(cells):
+            return None
+        passages.extend(tree)
+    passage_set = set(passages)
+
+    home = max(groups, key=lambda k: (len(groups[k]), k))
+    home_cells = groups[home]
+    start_cell = home_cells[rng.randrange(len(home_cells))]
+    dist = _tree_distances(passage_set, start_cell)
+
+    far = [cell for cell in home_cells if dist.get(cell, -1) >= MIN_TREE_DISTANCE]
+    if not far:
+        return None
+    answer_cell = far[rng.randrange(len(far))]
+    sx, sy = _cell_centre(start_cell)
+    ax, ay = _cell_centre(answer_cell)
+    answer_gap = (ax - sx) ** 2 + (ay - sy) ** 2
+
+    disks = [{"colour": answer_colour, "cell": list(answer_cell)}]
+    others = [colour for colour in DISK_COLORS if colour != answer_colour]
+    for offset, idx in enumerate(sorted(k for k in groups if k != home)):
+        pool = []
+        for cell in groups[idx]:
+            cx, cy = _cell_centre(cell)
+            gap = (cx - sx) ** 2 + (cy - sy) ** 2
+            if gap < answer_gap:
+                pool.append((gap, cell))
+        if not pool:
+            return None
+        pool.sort()
+        # a visually near decoy: pick among the three closest wrong-room cells
+        gap, cell = pool[rng.randrange(min(3, len(pool)))]
+        disks.append({"colour": others[offset], "cell": list(cell)})
+
+    used = {tuple(start_cell)} | {tuple(d["cell"]) for d in disks}
+    if len(used) != 4:
+        return None
+
+    for disk in disks:
+        disk["jitter"] = [rng.randint(-JITTER, JITTER), rng.randint(-JITTER, JITTER)]
+    scene = {
+        "grid": GRID,
+        "passages": sorted([list(a) + list(b) for a, b in passages]),
+        "start": {
+            "cell": list(start_cell),
+            "jitter": [rng.randint(-JITTER, JITTER), rng.randint(-JITTER, JITTER)],
+        },
+        "disks": disks,
+    }
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    answer_colour = DISK_COLORS[seed % len(DISK_COLORS)]
+    for attempt in range(600):
+        rng = random.Random((seed + 1) * 1_000_003 + attempt)
+        scene = _attempt(rng, answer_colour)
+        if scene is None:
+            continue
+        if _gold_or_none(scene) != answer_colour:
+            continue
+        if margin(scene) < MIN_MARGIN:
+            continue
+        return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# gold and margin
+# --------------------------------------------------------------------------
+def _gold_or_none(scene):
+    reached = _reachable_cells(scene, scene["start"]["cell"])
+    hits = [d["colour"] for d in scene["disks"] if tuple(d["cell"]) in reached]
+    return hits[0] if len(hits) == 1 else None
+
+
+def analytic_gold(scene: dict) -> str:
+    decision = _gold_or_none(scene)
+    if decision is None:
+        raise ValueError("scene does not expose exactly one reachable disk")
+    return decision
+
+
+def _marker_clearance(cell, jitter, radius) -> float:
+    half = (CELL - WALL) / 2.0
+    return min(half - abs(jitter[0]), half - abs(jitter[1])) - radius
+
+
+def margin(scene: dict) -> float:
+    values = [float(WALL), float(CELL - WALL)]
+    values.append(
+        _marker_clearance(scene["start"]["cell"], scene["start"]["jitter"], STAR_RADIUS)
+    )
+    for disk in scene["disks"]:
+        values.append(_marker_clearance(disk["cell"], disk["jitter"], DISK_RADIUS))
+    return float(min(values))
+
+
+def is_quarantined(scene: dict) -> bool:
+    if _gold_or_none(scene) is None:
+        return True
+    return margin(scene) < MIN_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    reversed_passages = {
+        **scene,
+        "passages": [p[2:] + p[:2] for p in reversed(scene["passages"])],
+    }
+    rotated_disks = {**scene, "disks": scene["disks"][1:] + scene["disks"][:1]}
+    return [
+        ("passage_record_order_and_endpoint_order", reversed_passages),
+        ("disk_record_order", rotated_disks),
+    ]
+
+
+def open_boundary(scene: dict) -> dict:
+    """Knock out the single wall that seals the nearest wrong room."""
+    passages = _passage_set(scene)
+    home = _reachable_cells(scene, scene["start"]["cell"])
+    wrong = [d for d in scene["disks"] if tuple(d["cell"]) not in home][0]
+    other = _reachable_cells(scene, wrong["cell"])
+    for r in range(GRID):
+        for c in range(GRID):
+            if (r, c) not in home:
+                continue
+            for nb in _neighbours(r, c):
+                if nb in other and _edge_key((r, c), nb) not in passages:
+                    return {
+                        **scene,
+                        "passages": sorted(
+                            scene["passages"] + [[r, c, nb[0], nb[1]]]
+                        ),
+                    }
+    raise RuntimeError("no separating wall found")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _star_points(cx, cy, radius):
+    import math
+
+    pts = []
+    for i in range(10):
+        rad = radius if i % 2 == 0 else radius * 0.42
+        angle = -math.pi / 2 + i * math.pi / 5
+        pts.append((cx + rad * math.cos(angle), cy + rad * math.sin(angle)))
+    return pts
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), PALETTE["background"])
+    draw = ImageDraw.Draw(image)
+    half = WALL // 2
+    passages = _passage_set(scene)
+
+    right = ORIGIN + GRID * CELL
+    draw.rectangle([ORIGIN - half, ORIGIN - half, right + half, ORIGIN + half], fill=PALETTE["wall"])
+    draw.rectangle([ORIGIN - half, right - half, right + half, right + half], fill=PALETTE["wall"])
+    draw.rectangle([ORIGIN - half, ORIGIN - half, ORIGIN + half, right + half], fill=PALETTE["wall"])
+    draw.rectangle([right - half, ORIGIN - half, right + half, right + half], fill=PALETTE["wall"])
+
+    for r in range(GRID):
+        for c in range(GRID):
+            for nb in ((r + 1, c), (r, c + 1)):
+                if nb[0] >= GRID or nb[1] >= GRID:
+                    continue
+                if _edge_key((r, c), nb) in passages:
+                    continue
+                if nb[0] == r + 1:
+                    y = ORIGIN + (r + 1) * CELL
+                    x0 = ORIGIN + c * CELL
+                    draw.rectangle(
+                        [x0 - half, y - half, x0 + CELL + half, y + half],
+                        fill=PALETTE["wall"],
+                    )
+                else:
+                    x = ORIGIN + (c + 1) * CELL
+                    y0 = ORIGIN + r * CELL
+                    draw.rectangle(
+                        [x - half, y0 - half, x + half, y0 + CELL + half],
+                        fill=PALETTE["wall"],
+                    )
+
+    for disk in scene["disks"]:
+        cx, cy = _cell_centre(disk["cell"], disk["jitter"])
+        draw.ellipse(
+            [cx - DISK_RADIUS, cy - DISK_RADIUS, cx + DISK_RADIUS, cy + DISK_RADIUS],
+            fill=PALETTE[disk["colour"]],
+        )
+
+    sx, sy = _cell_centre(scene["start"]["cell"], scene["start"]["jitter"])
+    draw.polygon(_star_points(sx, sy, STAR_RADIUS), fill=PALETTE["start"])
+    return image

@@ -1,0 +1,156 @@
+"""Independent pixel-only oracle for ordered waypoint traversal."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+MARKER_RGB = {
+    "amber": np.asarray((232, 154, 35), dtype=np.float32),
+    "teal": np.asarray((26, 157, 151), dtype=np.float32),
+    "violet": np.asarray((143, 77, 190), dtype=np.float32),
+}
+
+
+def _background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:3].reshape(-1, 3),
+            array[-3:].reshape(-1, 3),
+            array[:, :3].reshape(-1, 3),
+            array[:, -3:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    return np.median(border, axis=0).astype(np.float32)
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    remaining = mask.copy()
+    found: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(remaining)):
+        if not remaining[y, x]:
+            continue
+        remaining[y, x] = False
+        queue: deque[tuple[int, int]] = deque([(int(y), int(x))])
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in (
+                (cy - 1, cx),
+                (cy + 1, cx),
+                (cy, cx - 1),
+                (cy, cx + 1),
+            ):
+                if 0 <= ny < height and 0 <= nx < width and remaining[ny, nx]:
+                    remaining[ny, nx] = False
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            found.append(np.asarray(points, dtype=np.int32))
+    return found
+
+
+def _dilate(mask: np.ndarray) -> np.ndarray:
+    expanded = mask.copy()
+    for dy, dx in (
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+    ):
+        shifted = np.zeros_like(mask)
+        y0, y1 = max(0, dy), min(mask.shape[0], mask.shape[0] + dy)
+        x0, x1 = max(0, dx), min(mask.shape[1], mask.shape[1] + dx)
+        sy0, sy1 = max(0, -dy), min(mask.shape[0], mask.shape[0] - dy)
+        sx0, sx1 = max(0, -dx), min(mask.shape[1], mask.shape[1] - dx)
+        shifted[y0:y1, x0:x1] = mask[sy0:sy1, sx0:sx1]
+        expanded |= shifted
+    return expanded
+
+
+def _route_mask(array: np.ndarray, background: np.ndarray) -> np.ndarray:
+    delta = np.linalg.norm(array.astype(np.float32) - background, axis=2)
+    foreground = delta > 24.0
+    foreground = _dilate(foreground)
+    components = _components(foreground, minimum=120)
+    if len(components) != 1:
+        raise ValueError("the colored wire is not one connected foreground route")
+    route = np.zeros_like(foreground)
+    route[components[0][:, 0], components[0][:, 1]] = True
+    if int(route.sum()) < 3500:
+        raise ValueError("wire has too little visible foreground")
+    return route
+
+
+def _marker_points(array: np.ndarray, name: str) -> np.ndarray:
+    color = MARKER_RGB[name]
+    distance = np.linalg.norm(array.astype(np.float32) - color, axis=2)
+    mask = distance < 82.0
+    components = _components(mask, minimum=30)
+    if not components:
+        raise ValueError(f"missing {name} waypoint ring")
+    points = max(components, key=len)
+    if len(points) < 90:
+        raise ValueError(f"incomplete {name} waypoint ring")
+    return points
+
+
+def _arrow_center(array: np.ndarray) -> np.ndarray:
+    dark = np.max(array, axis=2) < 68.0
+    components = _components(dark, minimum=20)
+    if not components:
+        raise ValueError("missing black start arrow")
+    points = max(components, key=len)
+    if len(points) < 45:
+        raise ValueError("start arrow is too small")
+    return points.astype(np.float64).mean(axis=0)
+
+
+def _geodesic_distances(route: np.ndarray, center: np.ndarray) -> np.ndarray:
+    height, width = route.shape
+    source_y, source_x = np.argwhere(route).astype(np.float64)[
+        np.argmin(
+            np.sum((np.argwhere(route).astype(np.float64) - center[None, :]) ** 2, axis=1)
+        )
+    ].astype(int)
+    distances = np.full((height, width), -1, dtype=np.int32)
+    distances[source_y, source_x] = 0
+    queue: deque[tuple[int, int]] = deque([(int(source_y), int(source_x))])
+    while queue:
+        cy, cx = queue.popleft()
+        next_distance = int(distances[cy, cx]) + 1
+        for ny, nx in (
+            (cy - 1, cx),
+            (cy + 1, cx),
+            (cy, cx - 1),
+            (cy, cx + 1),
+        ):
+            if 0 <= ny < height and 0 <= nx < width:
+                if route[ny, nx] and distances[ny, nx] < 0:
+                    distances[ny, nx] = next_distance
+                    queue.append((ny, nx))
+    return distances
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    background = _background(array)
+    route = _route_mask(array, background)
+    arrow = _arrow_center(array)
+    distances = _geodesic_distances(route, arrow)
+    ordered: list[tuple[int, str]] = []
+    for name in ("amber", "teal", "violet"):
+        points = _marker_points(array, name)
+        values = distances[points[:, 0], points[:, 1]]
+        reachable = values[values >= 0]
+        if len(reachable) < 20:
+            raise ValueError(f"{name} waypoint is disconnected from the start")
+        ordered.append((int(np.min(reachable)), name))
+    ordered.sort(key=lambda item: item[0])
+    if ordered[1][0] - ordered[0][0] < 28 or ordered[2][0] - ordered[1][0] < 28:
+        raise ValueError("waypoint order is not separated enough to answer")
+    return ordered[1][1]

@@ -1,0 +1,170 @@
+"""Independent pixel-only inverse for Affine Beacon Correspondence.
+
+The oracle knows only the public palette and glyph vocabulary. It discovers
+the two landmark clusters, classifies matching shapes by raster geometry,
+recovers the magenta point's barycentric coordinates, transfers them to the
+other cluster, and reads the nearest target dot's visible color.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
+import numpy as np
+from PIL import Image
+
+INK = np.array((30, 41, 59), dtype=np.int32)
+QUERY_MAGENTA = np.array((219, 39, 119), dtype=np.int32)
+TAG_COLORS = {
+    "amber": np.array((217, 119, 6), dtype=np.int32),
+    "cyan": np.array((8, 145, 178), dtype=np.int32),
+    "violet": np.array((124, 58, 237), dtype=np.int32),
+}
+
+
+class OracleAbstention(ValueError):
+    """The raster no longer exposes one complete, unique visual decision."""
+
+
+@dataclass(frozen=True)
+class Component:
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    area: int
+    cx: float
+    cy: float
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0 + 1
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0 + 1
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float = 7.0) -> np.ndarray:
+    delta = array.astype(np.int32) - color
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum_area: int) -> list[Component]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[Component] = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while stack:
+            y, x = stack.pop()
+            xs.append(x)
+            ys.append(y)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(xs) >= minimum_area:
+            output.append(
+                Component(
+                    min(xs), min(ys), max(xs), max(ys), len(xs),
+                    float(sum(xs) / len(xs)), float(sum(ys) / len(ys)),
+                )
+            )
+    return output
+
+
+def _shape_code(item: Component) -> int:
+    if not (37 <= item.width <= 51 and 37 <= item.height <= 51):
+        raise OracleAbstention("damaged or implausibly sized landmark")
+    ratio = item.width / float(item.height)
+    fill = item.area / float(item.width * item.height)
+    if not 0.82 <= ratio <= 1.22:
+        raise OracleAbstention("landmark aspect ratio is ambiguous")
+    if fill > 0.94:
+        return 1  # square
+    if 0.70 < fill < 0.86:
+        return 0  # circle
+    if 0.43 < fill < 0.61:
+        return 2  # centered triangle
+    raise OracleAbstention("landmark shape is ambiguous")
+
+
+def _landmark_groups(array: np.ndarray) -> tuple[dict[int, tuple[float, float]], dict[int, tuple[float, float]]]:
+    items = _components(_mask(array, INK), 500)
+    if len(items) != 6:
+        raise OracleAbstention(f"expected six intact landmarks, found {len(items)}")
+    ordered = sorted(items, key=lambda item: item.cx)
+    gaps = [ordered[index + 1].cx - ordered[index].cx for index in range(5)]
+    split = max(range(5), key=gaps.__getitem__) + 1
+    if split != 3 or gaps[split - 1] < 160.0:
+        raise OracleAbstention("could not separate two three-landmark panels")
+
+    parsed: list[dict[int, tuple[float, float]]] = []
+    for group in (ordered[:split], ordered[split:]):
+        mapping: dict[int, tuple[float, float]] = {}
+        for item in group:
+            code = _shape_code(item)
+            if code in mapping:
+                raise OracleAbstention("a panel repeats a landmark shape")
+            mapping[code] = (item.cx, item.cy)
+        if set(mapping) != {0, 1, 2}:
+            raise OracleAbstention("a panel lacks a landmark identity")
+        parsed.append(mapping)
+    return parsed[0], parsed[1]
+
+
+def _single_dot(array: np.ndarray, color: np.ndarray) -> tuple[float, float]:
+    items = _components(_mask(array, color), 300)
+    if len(items) != 1:
+        raise OracleAbstention("a required dot color is missing or split")
+    item = items[0]
+    fill = item.area / float(item.width * item.height)
+    if not (23 <= item.width <= 29 and 23 <= item.height <= 29 and 0.70 < fill < 0.86):
+        raise OracleAbstention("a required dot is damaged")
+    return item.cx, item.cy
+
+
+def _weights(point: tuple[float, float], triangle: list[tuple[float, float]]) -> np.ndarray:
+    matrix = np.array(
+        [
+            [triangle[0][0], triangle[1][0], triangle[2][0]],
+            [triangle[0][1], triangle[1][1], triangle[2][1]],
+            [1.0, 1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    if abs(float(np.linalg.det(matrix))) < 1000.0:
+        raise OracleAbstention("landmark triangle is degenerate")
+    return np.linalg.solve(matrix, np.array([point[0], point[1], 1.0], dtype=np.float64))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the transferred beacon color from pixels alone, or abstain."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    left, right = _landmark_groups(array)
+    query = _single_dot(array, QUERY_MAGENTA)
+    targets = {tag: _single_dot(array, color) for tag, color in TAG_COLORS.items()}
+
+    source_triangle = [left[index] for index in range(3)]
+    target_triangle = [right[index] for index in range(3)]
+    weights = _weights(query, source_triangle)
+    if float(weights.min()) < 0.10 or float(weights.max()) > 0.72:
+        raise OracleAbstention("magenta point is not a clear interior beacon")
+    projected = np.sum(np.asarray(target_triangle) * weights[:, None], axis=0)
+    ranking = sorted(
+        (math.dist(projected, point), tag) for tag, point in targets.items()
+    )
+    if ranking[0][0] > 8.0:
+        raise OracleAbstention("no target dot coincides with the transferred beacon")
+    if ranking[1][0] - ranking[0][0] < 35.0:
+        raise OracleAbstention("target dots do not expose a unique transfer")
+    return ranking[0][1]

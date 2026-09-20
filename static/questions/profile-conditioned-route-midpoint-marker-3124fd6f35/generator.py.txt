@@ -1,0 +1,255 @@
+"""Deterministic latent sampler and raster renderer for route_midpoint_marker."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+from PIL import Image, ImageDraw, ImageFont
+
+CHECKPOINT_COLORS = ("red", "blue", "orange")
+MIN_MARGIN = 48.0
+
+PALETTES = (
+    {
+        "background": "#faf9f5", "ink": "#263238", "corridor": "#cfd5d8",
+        "green": "#28a35c", "purple": "#8950b5", "red": "#df4650",
+        "blue": "#347fd5", "orange": "#ee8b2c",
+    },
+    {
+        "background": "#f7fafc", "ink": "#30343b", "corridor": "#cad8d1",
+        "green": "#218c57", "purple": "#7b4ca5", "red": "#c94b55",
+        "blue": "#356eb7", "orange": "#d77a25",
+    },
+    {
+        "background": "#fffaf2", "ink": "#202a35", "corridor": "#d9d2c5",
+        "green": "#36a66a", "purple": "#9256b4", "red": "#e2555e",
+        "blue": "#437fd0", "orange": "#ed963c",
+    },
+)
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size
+        )
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _walk(rng: random.Random, size: int = 7, edges: int = 18) -> list[tuple[int, int]]:
+    """Return a randomized self-avoiding unit-grid walk by bounded backtracking."""
+    for _ in range(80):
+        start = (rng.randrange(size), rng.randrange(size))
+        path = [start]
+        used = {start}
+
+        def extend() -> bool:
+            if len(path) == edges + 1:
+                return True
+            x, y = path[-1]
+            options = [
+                (x + dx, y + dy)
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                if 0 <= x + dx < size
+                and 0 <= y + dy < size
+                and (x + dx, y + dy) not in used
+            ]
+            rng.shuffle(options)
+            # Prefer cells that leave room, while retaining seeded tie randomization.
+            options.sort(
+                key=lambda p: sum(
+                    0 <= p[0] + dx < size
+                    and 0 <= p[1] + dy < size
+                    and (p[0] + dx, p[1] + dy) not in used
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                ),
+                reverse=True,
+            )
+            for nxt in options:
+                path.append(nxt)
+                used.add(nxt)
+                if extend():
+                    return True
+                used.remove(nxt)
+                path.pop()
+            return False
+
+        if extend():
+            return path
+    raise RuntimeError("could not construct a self-avoiding route")
+
+
+def _total_length(route: list[dict]) -> float:
+    return sum(
+        math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+        for a, b in zip(route, route[1:])
+    )
+
+
+def _point_at(route: list[dict], target: float) -> tuple[float, float]:
+    remaining = max(0.0, min(_total_length(route), target))
+    for a, b in zip(route, route[1:]):
+        length = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+        if remaining <= length:
+            t = remaining / length
+            return (
+                a["x"] + t * (b["x"] - a["x"]),
+                a["y"] + t * (b["y"] - a["y"]),
+            )
+        remaining -= length
+    return route[-1]["x"], route[-1]["y"]
+
+
+def _checkpoint_progress(route: list[dict], checkpoints: list[dict]) -> dict[str, float]:
+    cumulative = 0.0
+    segments = []
+    for a, b in zip(route, route[1:]):
+        dx, dy = b["x"] - a["x"], b["y"] - a["y"]
+        length = math.hypot(dx, dy)
+        segments.append((cumulative, a, dx, dy, length))
+        cumulative += length
+    result = {}
+    for checkpoint in checkpoints:
+        best = None
+        for base, a, dx, dy, length in segments:
+            t = ((checkpoint["x"] - a["x"]) * dx + (checkpoint["y"] - a["y"]) * dy) / (length * length)
+            t = max(0.0, min(1.0, t))
+            qx, qy = a["x"] + t * dx, a["y"] + t * dy
+            offset = math.hypot(checkpoint["x"] - qx, checkpoint["y"] - qy)
+            candidate = (offset, base + t * length)
+            if best is None or candidate < best:
+                best = candidate
+        if best is None or best[0] > 0.01:
+            raise ValueError("checkpoint is not on the visible route")
+        result[checkpoint["color"]] = best[1]
+    return result
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a balanced route with one checkpoint nearest its arclength midpoint."""
+    rng = random.Random(int(seed))
+    width = height = 640
+    winner = CHECKPOINT_COLORS[int(seed) % len(CHECKPOINT_COLORS)]
+    others = [color for color in CHECKPOINT_COLORS if color != winner]
+    rng.shuffle(others)
+
+    for _ in range(100):
+        cells = _walk(rng)
+        x_gaps = [rng.randint(60, 78) for _ in range(6)]
+        y_gaps = [rng.randint(60, 78) for _ in range(6)]
+        xs = [0]
+        ys = [0]
+        for gap in x_gaps:
+            xs.append(xs[-1] + gap)
+        for gap in y_gaps:
+            ys.append(ys[-1] + gap)
+        x_offset = (width - xs[-1]) / 2.0
+        y_offset = 86.0 + (height - 86.0 - ys[-1]) / 2.0
+        route = [
+            {"x": round(x_offset + xs[x], 3), "y": round(y_offset + ys[y], 3)}
+            for x, y in cells
+        ]
+        total = _total_length(route)
+        difficulty = (int(seed) // 3) % 4
+        if difficulty == 0:
+            runner_error = rng.uniform(60.0, 68.0)
+        elif difficulty in (1, 2):
+            runner_error = rng.uniform(88.0, 112.0)
+        else:
+            runner_error = rng.uniform(135.0, 165.0)
+        side = rng.choice((-1.0, 1.0))
+        third_side = -side if rng.random() < 0.75 else side
+        distances = [total / 2.0, total / 2.0 + side * runner_error]
+        distances.append(total / 2.0 + third_side * rng.uniform(0.27, 0.36) * total)
+        checkpoint_colors = [winner, others[0], others[1]]
+        checkpoints = []
+        for distance, color in zip(distances, checkpoint_colors):
+            x, y = _point_at(route, distance)
+            checkpoints.append({"x": round(x, 3), "y": round(y, 3), "color": color})
+        special = [route[0], route[-1], *checkpoints]
+        if min(
+            math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+            for index, a in enumerate(special)
+            for b in special[index + 1 :]
+        ) >= 38.0:
+            break
+    else:
+        raise RuntimeError("could not place separated route markers")
+
+    return {
+        "width": width,
+        "height": height,
+        "route": route,
+        "checkpoints": checkpoints,
+        "palette": copy.deepcopy(PALETTES[(int(seed) // 3) % len(PALETTES)]),
+        "path_width": 3,
+    }
+
+
+def _metrics(route: list[dict], checkpoints: list[dict]) -> list[tuple[float, str]]:
+    halfway = _total_length(route) / 2.0
+    progress = _checkpoint_progress(route, checkpoints)
+    return sorted((abs(distance - halfway), color) for color, distance in progress.items())
+
+
+def analytic_gold(scene: dict) -> str:
+    """Select the visible checkpoint nearest half the complete route arclength."""
+    scores = _metrics(scene["route"], scene["checkpoints"])
+    if len(scores) != 3 or abs(scores[1][0] - scores[0][0]) < 1e-9:
+        return "ambiguous"
+    return scores[0][1]
+
+
+def margin(scene: dict) -> float:
+    scores = _metrics(scene["route"], scene["checkpoints"])
+    return float(scores[1][0] - scores[0][0]) if len(scores) >= 2 else 0.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    return analytic_gold(scene) == "ambiguous" or margin(scene) < MIN_MARGIN
+
+
+def _ring(draw: ImageDraw.ImageDraw, x: float, y: float, color: str, background: str) -> None:
+    outer, inner = 14.0, 7.0
+    draw.ellipse((x - outer, y - outer, x + outer, y + outer), fill=color)
+    draw.ellipse((x - inner, y - inner, x + inner, y + inner), fill=background)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render a light route corridor, crisp centerline, and five marker rings."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    route = scene["route"]
+    checkpoints = scene["checkpoints"]
+    palette = scene["palette"]
+    path_width = int(scene["path_width"])
+    image = Image.new("RGB", (width, height), palette["background"])
+    draw = ImageDraw.Draw(image)
+    points = [(point["x"], point["y"]) for point in route]
+    draw.line(points, fill=palette["corridor"], width=11, joint="curve")
+    for checkpoint in checkpoints:
+        _ring(
+            draw, checkpoint["x"], checkpoint["y"],
+            palette[checkpoint["color"]], palette["background"],
+        )
+    _ring(draw, route[0]["x"], route[0]["y"], palette["green"], palette["background"])
+    _ring(draw, route[-1]["x"], route[-1]["y"], palette["purple"], palette["background"])
+    draw.line(points, fill=palette["ink"], width=path_width, joint="curve")
+    draw.text(
+        (18, 16), "FOLLOW THE BLACK CENTERLINE | ALONG-ROUTE DISTANCE",
+        fill=palette["ink"], font=_font(17),
+    )
+    draw.text(
+        (18, 42), "GREEN = START    PURPLE = FINISH",
+        fill=palette["ink"], font=_font(14),
+    )
+    return image
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["checkpoints"] = list(reversed(twin["checkpoints"]))
+    return [("reverse_disjoint_checkpoint_storage", twin)]

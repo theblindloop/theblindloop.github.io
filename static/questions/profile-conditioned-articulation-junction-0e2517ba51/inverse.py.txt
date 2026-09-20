@@ -1,0 +1,194 @@
+"""Independent raster-only inverse for articulation-junction selection.
+
+The inverse sees only the final RGB image.  It segments the three saturated
+node fills and the neutral node fills, samples dark centerlines between every
+pair of recovered node centers, reconstructs the visible adjacency, then
+recomputes component counts after removing each colored vertex.  It does not
+import renderer, prompts, generate, verify, or analytic-gold code.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 1200
+HEIGHT = 900
+COLORS = {
+    "red": np.asarray((214, 66, 78), dtype=np.float32),
+    "blue": np.asarray((51, 116, 211), dtype=np.float32),
+    "green": np.asarray((48, 158, 101), dtype=np.float32),
+}
+
+
+class OracleError(ValueError):
+    """The raster does not expose a stable graph reconstruction."""
+
+
+def _components(mask: np.ndarray, minimum: int = 100) -> list[np.ndarray]:
+    """Return connected pixel coordinates for compact filled components."""
+
+    seeds = np.argwhere(mask)
+    visited = np.zeros(mask.shape, dtype=bool)
+    result = []
+    height, width = mask.shape
+    for seed_y, seed_x in seeds:
+        y0, x0 = int(seed_y), int(seed_x)
+        if visited[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        visited[y0, x0] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for next_y, next_x in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= next_y < height and 0 <= next_x < width and mask[next_y, next_x] and not visited[next_y, next_x]:
+                    visited[next_y, next_x] = True
+                    stack.append((next_y, next_x))
+        if len(pixels) >= minimum:
+            result.append(np.asarray(pixels, dtype=np.float64))
+    return result
+
+
+def _one_center(mask: np.ndarray, name: str) -> np.ndarray:
+    groups = _components(mask, minimum=160)
+    if len(groups) != 1:
+        raise OracleError(f"expected one {name} node, found {len(groups)}")
+    points = groups[0]
+    return points[:, [1, 0]].mean(axis=0) + 0.5
+
+
+def _centers(array: np.ndarray) -> tuple[list[np.ndarray], dict[str, int]]:
+    centers: list[np.ndarray] = []
+    color_indices: dict[str, int] = {}
+    red, green, blue = (array[:, :, index] for index in range(3))
+    masks = {
+        "red": (red > 145) & (red > green + 42) & (red > blue + 32),
+        "blue": (blue > 135) & (blue > red + 38) & (blue > green + 24),
+        "green": (green > 112) & (green > red + 34) & (green > blue + 20),
+    }
+    for name in ("red", "blue", "green"):
+        color_indices[name] = len(centers)
+        centers.append(_one_center(masks[name], name))
+
+    neutral = (
+        (red >= 195)
+        & (red <= 238)
+        & (green >= 205)
+        & (green <= 245)
+        & (blue >= 215)
+        & (blue <= 250)
+        & (blue - red > 12)
+        & (green - red > 6)
+    )
+    neutral_groups = _components(neutral, minimum=160)
+    if len(neutral_groups) != 6:
+        raise OracleError(f"expected six neutral nodes, found {len(neutral_groups)}")
+    for group in neutral_groups:
+        centers.append(group[:, [1, 0]].mean(axis=0) + 0.5)
+    if len(centers) != 9:
+        raise OracleError(f"expected nine nodes, found {len(centers)}")
+    return centers, color_indices
+
+
+def _edge_signal(dark: np.ndarray, first: np.ndarray, second: np.ndarray) -> float:
+    values = []
+    for t in np.linspace(0.29, 0.71, 30):
+        x = int(round(float(first[0] + t * (second[0] - first[0]))))
+        y = int(round(float(first[1] + t * (second[1] - first[1]))))
+        patch = dark[max(0, y - 2) : y + 3, max(0, x - 2) : x + 3]
+        values.append(float(patch.mean() > 0.22))
+    return float(np.mean(values))
+
+
+def _has_intermediate_node(centers: list[np.ndarray], left: int, right: int) -> bool:
+    """Reject a non-edge chord that runs through a third visible junction."""
+
+    first, second = centers[left], centers[right]
+    dx = float(second[0] - first[0])
+    dy = float(second[1] - first[1])
+    denom = dx * dx + dy * dy
+    if denom <= 0.0:
+        return True
+    for index, point in enumerate(centers):
+        if index in (left, right):
+            continue
+        t = ((float(point[0] - first[0]) * dx) + (float(point[1] - first[1]) * dy)) / denom
+        if not 0.15 < t < 0.85:
+            continue
+        distance = math.hypot(
+            float(point[0] - (first[0] + t * dx)),
+            float(point[1] - (first[1] + t * dy)),
+        )
+        if distance < 34.0:
+            return True
+    return False
+
+
+def _recover_edges(array: np.ndarray, centers: list[np.ndarray]) -> list[tuple[int, int]]:
+    channel_range = array.max(axis=2) - array.min(axis=2)
+    dark = (array.mean(axis=2) < 165.0) & (channel_range < 58.0)
+    found = []
+    signals = []
+    for left in range(len(centers)):
+        for right in range(left + 1, len(centers)):
+            if _has_intermediate_node(centers, left, right):
+                continue
+            signal = _edge_signal(dark, centers[left], centers[right])
+            signals.append((signal, left, right))
+            if signal >= 0.64:
+                found.append((left, right))
+    if len(found) != 10:
+        raise OracleError(f"expected ten visible links, recovered {len(found)}")
+    return found
+
+
+def _component_count(node_count: int, edges: list[tuple[int, int]], removed: int | None = None) -> int:
+    adjacency = [[] for _ in range(node_count)]
+    for left, right in edges:
+        if left == removed or right == removed:
+            continue
+        adjacency[left].append(right)
+        adjacency[right].append(left)
+    seen = set()
+    count = 0
+    for start in range(node_count):
+        if start == removed or start in seen:
+            continue
+        count += 1
+        queue = deque([start])
+        seen.add(start)
+        while queue:
+            node = queue.popleft()
+            for neighbor in adjacency[node]:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    queue.append(neighbor)
+    return count
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the color of the unique visible articulation junction."""
+
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        raise OracleError(f"unexpected image size {rgb.size}")
+    array = np.asarray(rgb, dtype=np.float32)
+    centers, color_indices = _centers(array)
+    edges = _recover_edges(array, centers)
+    baseline = _component_count(len(centers), edges)
+    if baseline != 1:
+        raise OracleError(f"recovered network is not connected: {baseline} components")
+    winners = []
+    for color, index in color_indices.items():
+        change = _component_count(len(centers), edges, removed=index) - baseline
+        if change > 0:
+            winners.append(color)
+    if len(winners) != 1:
+        raise OracleError(f"expected one articulation color, found {winners}")
+    return winners[0]

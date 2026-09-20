@@ -1,0 +1,123 @@
+"""Image-only inverse arm for the lattice-vacancy world.
+
+Receives one PNG and the public question contract; never the latent scene.
+
+Pipeline (reconstructs the declared global evidence, the negative space of the
+lattice, and classifies only that structure):
+
+1. background colour = modal pixel colour; foreground = pixels far from it;
+2. lattice registration: column and row occupancy profiles are cut into runs,
+   each run's centroid is a lattice coordinate; the coordinates must be evenly
+   spaced or the arm abstains;
+3. occupancy: a site is filled when foreground ink sits at its intersection;
+4. the vacancy set (the negative space of the lattice) is scored on every row,
+   column and both diagonal families; the direction of the unique maximal line
+   is returned, otherwise the arm abstains.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "lattice_vacancy_line-oracle-0.1.0"
+
+INK_THRESHOLD = 90  # channel distance from the background colour
+MIN_LATTICE = 6  # fewer detected rows or columns is not a readable lattice
+SPACING_TOLERANCE = 2.5  # px deviation from a uniform lattice fit
+PROBE = 2  # half-width of the occupancy probe window, px
+
+FAMILIES = ("row", "column", "down", "up")
+
+
+class OracleError(RuntimeError):
+    """Raised when the image does not support a confident reading."""
+
+
+def _foreground(image: Image.Image) -> np.ndarray:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    flat = rgb.reshape(-1, 3)
+    packed = (flat[:, 0].astype(np.int32) << 16) | (flat[:, 1].astype(np.int32) << 8) | flat[:, 2].astype(np.int32)
+    values, counts = np.unique(packed, return_counts=True)
+    modal = int(values[int(np.argmax(counts))])
+    background = np.array([(modal >> 16) & 255, (modal >> 8) & 255, modal & 255], dtype=np.int16)
+    return np.abs(rgb - background).max(axis=2) > INK_THRESHOLD
+
+
+def _run_centres(profile: np.ndarray) -> list[float]:
+    centres: list[float] = []
+    start = None
+    for index, value in enumerate(profile):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            centres.append((start + index - 1) / 2.0)
+            start = None
+    if start is not None:
+        centres.append((start + len(profile) - 1) / 2.0)
+    return centres
+
+
+def _regular(centres: list[float]) -> list[float]:
+    if len(centres) < MIN_LATTICE:
+        raise OracleError(f"only {len(centres)} lattice coordinates detected")
+    count = len(centres)
+    index = np.arange(count, dtype=float)
+    values = np.array(centres, dtype=float)
+    slope, intercept = np.polyfit(index, values, 1)
+    if slope <= 1.0:
+        raise OracleError("degenerate lattice spacing")
+    if float(np.max(np.abs(values - (slope * index + intercept)))) > SPACING_TOLERANCE:
+        raise OracleError("lattice coordinates are not evenly spaced")
+    return [float(slope * k + intercept) for k in range(count)]
+
+
+def _line_key(family: str, i: int, j: int) -> int:
+    if family == "row":
+        return i
+    if family == "column":
+        return j
+    if family == "down":
+        return j - i
+    return i + j
+
+
+def decision_from_image(image: Image.Image) -> str:
+    mask = _foreground(image)
+    if not mask.any():
+        raise OracleError("no ink found")
+    xs = _regular(_run_centres(mask.any(axis=0)))
+    ys = _regular(_run_centres(mask.any(axis=1)))
+
+    height, width = mask.shape
+    holes: list[tuple[int, int]] = []
+    for i, y in enumerate(ys):
+        for j, x in enumerate(xs):
+            row = int(round(y))
+            col = int(round(x))
+            window = mask[
+                max(row - PROBE, 0) : min(row + PROBE + 1, height),
+                max(col - PROBE, 0) : min(col + PROBE + 1, width),
+            ]
+            if not window.any():
+                holes.append((i, j))
+    if not holes:
+        raise OracleError("the lattice has no vacancies")
+
+    scores: dict = {family: {} for family in FAMILIES}
+    for i, j in holes:
+        for family in FAMILIES:
+            key = _line_key(family, i, j)
+            scores[family][key] = scores[family].get(key, 0) + 1
+    flat = sorted(
+        (
+            (count, family, key)
+            for family in FAMILIES
+            for key, count in scores[family].items()
+        ),
+        key=lambda item: (-item[0], item[1], item[2]),
+    )
+    best = flat[0]
+    if len([item for item in flat if item[0] == best[0]]) != 1:
+        raise OracleError("no unique maximal vacancy line")
+    return best[1]

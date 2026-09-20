@@ -1,0 +1,171 @@
+"""Pixel-only inverse arm for ``envelope_stamp_corner``.
+
+Receives one rasterised PNG and nothing else: no latent scene, no renderer, no
+prompt module, no generator, no verifier, no analytic gold. It re-derives the
+answer with geometry that shares no code with the renderer.
+
+Method (colour-agnostic; roles are recovered from painted structure only):
+
+1. The background is the most frequent colour in the image.
+2. The envelope's paper is the largest non-background colour class; its bounding
+   box delimits the envelope region R.
+3. The envelope mask is every non-background pixel inside R. Its centroid is the
+   envelope's centre and its second moments give the two axes of the painted
+   rectangle: the minor axis is the envelope's top-to-bottom direction and the
+   major axis its side-to-side direction, whatever the turn angle. Both are
+   unaffected by anything printed on the envelope, because every printed part
+   lies inside the same rectangle of ink.
+4. The flap is the second-largest colour class inside R. Its centroid lies well
+   off centre towards the top edge, so the sign of its projection on the minor
+   axis orients that axis into the envelope's own "up"; "right" is that vector
+   turned a quarter turn clockwise on the page, which is the reader's right once
+   the envelope is turned upright without being flipped over.
+5. The stamp is the one remaining colour class that is small, square-ish in
+   bounding box and solidly filled -- address strokes fail either the aspect or
+   the fill test at every turn angle.
+6. The stamp centre is projected on those two axes; the signs name the corner.
+
+The arm abstains (returns ``"abstain"``) when the flap is missing or too small,
+when the envelope is too square for its two axes to be told apart, when the flap
+does not orient the minor axis, when the stamp is not uniquely identifiable, or
+when either projection is within 6 px of an envelope mid-line.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "envelope_stamp_corner-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+MIN_FLAP_FRACTION = 0.08
+MIN_AXIS_RATIO = 1.15
+MIN_UP_NORM_PX = 4.0
+MIN_PROJECTION_PX = 6.0
+MIN_STAMP_PX = 300
+MAX_STAMP_FRACTION = 0.15
+MAX_STAMP_ASPECT = 1.5
+MIN_STAMP_FILL = 0.45
+
+
+@dataclass
+class Measurement:
+    decision: str
+    runner_up_margin: float
+    up: tuple
+    envelope_center: tuple
+    stamp_center: tuple
+    stamp_area: int
+    flap_fraction: float
+    reason: str
+
+
+def _classes(packed: np.ndarray) -> list:
+    values, counts = np.unique(packed, return_counts=True)
+    order = np.argsort(-counts)
+    return [(int(values[i]), int(counts[i])) for i in order]
+
+
+def _centroid(mask: np.ndarray) -> tuple:
+    ys, xs = np.nonzero(mask)
+    return (float(xs.mean()), float(ys.mean()))
+
+
+def measure(image: Image.Image) -> Measurement:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint32)
+    packed = (arr[:, :, 0] << 16) | (arr[:, :, 1] << 8) | arr[:, :, 2]
+
+    ranked = _classes(packed)
+    if len(ranked) < 4:
+        return Measurement(ABSTAIN, 0.0, (0.0, 0.0), (0.0, 0.0), (0.0, 0.0), 0, 0.0,
+                           "fewer than four colour classes in the image")
+    background = ranked[0][0]
+    ink_ranked = [c for c in ranked if c[0] != background]
+    body_value = ink_ranked[0][0]
+
+    body_mask = packed == body_value
+    ys, xs = np.nonzero(body_mask)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    pad = 3
+    y0, y1 = max(0, y0 - pad), min(packed.shape[0] - 1, y1 + pad)
+    x0, x1 = max(0, x0 - pad), min(packed.shape[1] - 1, x1 + pad)
+    window = packed[y0:y1 + 1, x0:x1 + 1]
+
+    env_mask = window != background
+    env_area = int(env_mask.sum())
+    if env_area < 2000:
+        return Measurement(ABSTAIN, 0.0, (0.0, 0.0), (0.0, 0.0), (0.0, 0.0), 0, 0.0,
+                           "envelope region too small")
+    ecx, ecy = _centroid(env_mask)
+
+    eys, exs = np.nonzero(env_mask)
+    dxs = exs - ecx
+    dys = eys - ecy
+    cov = np.array([[float((dxs * dxs).mean()), float((dxs * dys).mean())],
+                    [float((dxs * dys).mean()), float((dys * dys).mean())]])
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    if eigvals[0] <= 0.0 or eigvals[1] / eigvals[0] < MIN_AXIS_RATIO:
+        return Measurement(ABSTAIN, 0.0, (0.0, 0.0), (ecx, ecy), (0.0, 0.0), 0, 0.0,
+                           "envelope is too square for its two axes to be told apart")
+    minor = eigvecs[:, 0]  # eigenvector of the smaller spread: top-to-bottom axis
+
+    local = [c for c in _classes(window) if c[0] not in (background, body_value)]
+    if not local:
+        return Measurement(ABSTAIN, 0.0, (0.0, 0.0), (ecx, ecy), (0.0, 0.0), 0, 0.0,
+                           "no ink other than the envelope paper")
+
+    flap_value, flap_area = local[0]
+    flap_fraction = flap_area / float(env_area)
+    if flap_fraction < MIN_FLAP_FRACTION:
+        return Measurement(ABSTAIN, 0.0, (0.0, 0.0), (ecx, ecy), (0.0, 0.0), 0, flap_fraction,
+                           "no flap large enough to orient the envelope")
+    fcx, fcy = _centroid(window == flap_value)
+    flap_lift = (fcx - ecx) * float(minor[0]) + (fcy - ecy) * float(minor[1])
+    if abs(flap_lift) < MIN_UP_NORM_PX:
+        return Measurement(ABSTAIN, 0.0, (0.0, 0.0), (ecx, ecy), (0.0, 0.0), 0, flap_fraction,
+                           "flap does not sit off centre along the envelope's short axis")
+    sign = 1.0 if flap_lift > 0 else -1.0
+    ux, uy = sign * float(minor[0]), sign * float(minor[1])
+    rx, ry = -uy, ux
+
+    stamp = None
+    for value, area in local[1:]:
+        if area < MIN_STAMP_PX or area > MAX_STAMP_FRACTION * env_area:
+            continue
+        mask = window == value
+        mys, mxs = np.nonzero(mask)
+        bw = float(mxs.max() - mxs.min() + 1)
+        bh = float(mys.max() - mys.min() + 1)
+        aspect = max(bw, bh) / min(bw, bh)
+        fill = area / (bw * bh)
+        if aspect <= MAX_STAMP_ASPECT and fill >= MIN_STAMP_FILL:
+            if stamp is not None:
+                return Measurement(ABSTAIN, 0.0, (ux, uy), (ecx, ecy), (0.0, 0.0), 0,
+                                   flap_fraction, "more than one square patch on the envelope")
+            stamp = (float(mxs.mean()), float(mys.mean()), area)
+    if stamp is None:
+        return Measurement(ABSTAIN, 0.0, (ux, uy), (ecx, ecy), (0.0, 0.0), 0, flap_fraction,
+                           "no square stamp patch found on the envelope")
+
+    scx, scy, sarea = stamp
+    dx, dy = scx - ecx, scy - ecy
+    proj_up = dx * ux + dy * uy
+    proj_right = dx * rx + dy * ry
+    runner_up = float(min(abs(proj_up), abs(proj_right)))
+    if runner_up < MIN_PROJECTION_PX:
+        return Measurement(ABSTAIN, runner_up, (ux, uy), (ecx, ecy), (scx, scy), int(sarea),
+                           flap_fraction, "stamp centre sits on an envelope mid-line")
+
+    vertical = "top" if proj_up > 0 else "bottom"
+    horizontal = "right" if proj_right > 0 else "left"
+    return Measurement(f"{vertical}-{horizontal}", runner_up, (ux, uy), (ecx, ecy),
+                       (scx, scy), int(sarea), flap_fraction, "ok")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Corner of the envelope holding the stamp, read from the raster alone."""
+    return measure(image).decision

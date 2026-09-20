@@ -1,0 +1,379 @@
+"""Occluded-rod join world.
+
+Latent scene z = {width, height, palette, panels}.
+
+Two gray divider lines split the canvas into four equal quadrants. Every
+quadrant holds one wide vertical gray band and one coloured rod that passes
+behind that band, so only a left piece and a right piece of the rod remain
+visible. In exactly one quadrant the two visible pieces are the two ends of a
+single straight rod: the left piece's centre line continues exactly into the
+right piece. In every other quadrant the right piece is displaced parallel to
+that continuation, or hinged away from it, so that its centre line departs from
+the continuation by a visible amount.
+
+The decision is the quadrant whose hidden rod continues straight. The margin is
+the smallest mean centre-line departure among the competing quadrants, in
+pixels.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "occluded_rod_join_panel-0.1.0"
+
+WIDTH = 640
+HEIGHT = 448
+HALF_W = WIDTH // 2
+HALF_H = HEIGHT // 2
+SUPERSAMPLE = 3
+
+MARGIN = 16
+TRIM = 4
+
+MIN_DEPARTURE = 9.0
+QUARANTINE_DEPARTURE = 10.0
+
+QUADRANTS = ("top_left", "top_right", "bottom_left", "bottom_right")
+
+ROD_COLORS = (
+    (206, 44, 44),
+    (36, 72, 196),
+    (24, 132, 58),
+    (128, 44, 170),
+    (214, 110, 16),
+    (14, 132, 140),
+)
+
+PALETTES = (
+    {"background": (255, 255, 255), "divider": (104, 104, 104), "band": (150, 150, 150),
+     "block": (196, 196, 196)},
+    {"background": (249, 249, 249), "divider": (96, 96, 96), "band": (140, 140, 140),
+     "block": (188, 188, 188)},
+    {"background": (245, 245, 245), "divider": (110, 110, 110), "band": (158, 158, 158),
+     "block": (202, 202, 202)},
+    {"background": (252, 252, 252), "divider": (88, 88, 88), "band": (146, 146, 146),
+     "block": (192, 192, 192)},
+)
+
+
+def _band_center(panel: dict) -> tuple:
+    """Centre of the drawn occluding band: the only locator gold may use."""
+    return float(panel["bx"]), (float(panel["band_top"]) + float(panel["band_bottom"])) / 2.0
+
+
+def _quadrant_of(bx: float, by: float) -> str:
+    col = 1 if bx >= HALF_W else 0
+    row = 1 if by >= HALF_H else 0
+    return QUADRANTS[2 * row + col]
+
+
+def _right_span(bx: float, bw: float, x_right: float) -> tuple:
+    """Measured columns of the right piece, trimmed at both ends."""
+    return int(round(bx + bw / 2.0)) + TRIM, int(round(x_right)) - TRIM
+
+
+def _line_y(slope: float, intercept: float, bx: float, x: float) -> float:
+    return slope * (x - bx) + intercept
+
+
+def _mean_departure(bx, bw, x_right, slope, intercept, shift, hinge) -> float:
+    """Mean absolute centre-line departure over the right piece, in pixels."""
+    start, end = _right_span(bx, bw, x_right)
+    if end <= start:
+        raise ValueError("right piece has no measurable span")
+    total = 0.0
+    for x in range(start, end + 1):
+        left = _line_y(slope, intercept, bx, x)
+        right = _line_y(slope + hinge, intercept + shift, bx, x)
+        total += abs(right - left)
+    return round(total / (end - start + 1), 6)
+
+
+def departure(panel: dict) -> float:
+    """Centre-line departure of one panel, read from its rendered geometry."""
+    return _mean_departure(
+        panel["bx"],
+        panel["bw"],
+        panel["x_right"],
+        panel["slope"],
+        panel["intercept"],
+        panel["shift"],
+        panel["hinge"],
+    )
+
+
+def _departures(scene: dict) -> dict:
+    """Per-quadrant departure, keyed by the rendered position of each band."""
+    values = {}
+    for panel in scene["panels"]:
+        name = _quadrant_of(
+            float(panel["bx"]),
+            (float(panel["band_top"]) + float(panel["band_bottom"])) / 2.0,
+        )
+        if name in values:
+            raise ValueError(f"quadrant {name} is populated twice")
+        values[name] = _mean_departure(
+            panel["bx"],
+            panel["bw"],
+            panel["x_right"],
+            panel["slope"],
+            panel["intercept"],
+            panel["shift"],
+            panel["hinge"],
+        )
+    if len(values) != len(QUADRANTS):
+        raise ValueError("scene does not populate every quadrant exactly once")
+    return values
+
+
+def analytic_gold(scene: dict) -> str:
+    """Quadrant whose two visible rod pieces lie on one straight line."""
+    winners = [name for name, value in _departures(scene).items() if value == 0.0]
+    if len(winners) != 1:
+        raise ValueError(f"scene has no unique straight rod: {sorted(winners)}")
+    return winners[0]
+
+
+def margin(scene: dict) -> float:
+    """Smallest centre-line departure among the non-straight quadrants."""
+    others = [value for value in _departures(scene).values() if value != 0.0]
+    if len(others) != len(QUADRANTS) - 1:
+        raise ValueError("scene does not hold exactly three competing quadrants")
+    return round(min(others), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Near-boundary scenes whose closest competitor is hard to separate."""
+    return bool(margin(scene) < QUARANTINE_DEPARTURE)
+
+
+def latent_symmetries(scene: dict):
+    """Storage-order aliases: the panel list and each block list are unordered."""
+    panels_shuffled = dict(scene, panels=[scene["panels"][i] for i in (2, 0, 3, 1)])
+    reblocked = []
+    for panel in scene["panels"]:
+        panel = dict(panel)
+        panel["blocks"] = list(reversed(panel["blocks"]))
+        reblocked.append(panel)
+    return [
+        ("panel_record_order", panels_shuffled),
+        ("block_record_order", dict(scene, panels=reblocked)),
+    ]
+
+
+def _rect_overlaps(a: tuple, b: tuple, pad: float = 0.0) -> bool:
+    return not (
+        a[2] + pad <= b[0]
+        or b[2] + pad <= a[0]
+        or a[3] + pad <= b[1]
+        or b[3] + pad <= a[1]
+    )
+
+
+def _panel_lines(panel: dict, x: float) -> tuple:
+    left = _line_y(panel["slope"], panel["intercept"], panel["bx"], x)
+    right = _line_y(
+        panel["slope"] + panel["hinge"],
+        panel["intercept"] + panel["shift"],
+        panel["bx"],
+        x,
+    )
+    return left, right
+
+
+def _rod_band(panel: dict, x0: float, x1: float) -> tuple:
+    ys = [*_panel_lines(panel, x0), *_panel_lines(panel, x1)]
+    half = panel["thickness"] / 2.0
+    return (x0, min(ys) - half, x1, max(ys) + half)
+
+
+def _sample_panel(rng: random.Random, col: int, row: int, straight: bool,
+                  target_departure: float, color: tuple, block_count: int) -> dict:
+    x0 = col * HALF_W
+    y0 = row * HALF_H
+    xi0 = x0 + MARGIN
+    xi1 = x0 + HALF_W - MARGIN
+    yi0 = y0 + MARGIN
+    yi1 = y0 + HALF_H - MARGIN
+    for _ in range(400):
+        bw = rng.randrange(30, 47, 2)
+        bx = float(rng.randint(x0 + 118, x0 + 202))
+        thickness = rng.randint(9, 14)
+        slope = round(rng.uniform(-0.24, 0.24), 4)
+        intercept = float(rng.randint(int(yi0) + 48, int(yi1) - 48))
+        panel = {
+            "bx": bx,
+            "bw": int(bw),
+            "band_top": float(y0 + 10),
+            "band_bottom": float(y0 + HALF_H - 10),
+            "x_left": float(xi0),
+            "x_right": float(xi1),
+            "thickness": int(thickness),
+            "slope": slope,
+            "intercept": intercept,
+            "shift": 0.0,
+            "hinge": 0.0,
+            "color": list(color),
+            "blocks": [],
+        }
+        if not straight:
+            start, end = _right_span(bx, bw, panel["x_right"])
+            if end <= start:
+                continue
+            sign = rng.choice((-1.0, 1.0))
+            if rng.random() < 0.5:
+                panel["shift"] = round(sign * target_departure, 6)
+            else:
+                mean_offset = sum(x - bx for x in range(start, end + 1)) / (end - start + 1)
+                if mean_offset <= 1.0:
+                    continue
+                panel["hinge"] = round(sign * target_departure / mean_offset, 8)
+            if abs(departure(panel) - target_departure) > 1e-3:
+                continue
+        extremes = [*_panel_lines(panel, xi0), *_panel_lines(panel, xi1)]
+        low = min(extremes)
+        high = max(extremes)
+        if low - thickness / 2.0 - 2 < yi0 or high + thickness / 2.0 + 2 > yi1:
+            continue
+        rod_box = _rod_band(panel, xi0, xi1)
+        band_box = (bx - bw / 2.0, panel["band_top"], bx + bw / 2.0, panel["band_bottom"])
+        blocks = []
+        for _ in range(block_count):
+            for _attempt in range(60):
+                bwid = rng.randint(11, 22)
+                bhei = rng.randint(11, 22)
+                px = float(rng.randint(int(xi0) + 2, int(xi1) - bwid - 2))
+                py = float(rng.randint(int(yi0) + 2, int(yi1) - bhei - 2))
+                cand = (px, py, px + bwid, py + bhei)
+                if _rect_overlaps(cand, rod_box, pad=7.0):
+                    continue
+                if _rect_overlaps(cand, band_box, pad=6.0):
+                    continue
+                if any(_rect_overlaps(cand, other, pad=6.0) for other in blocks):
+                    continue
+                blocks.append(cand)
+                break
+        panel["blocks"] = [[round(v, 3) for v in block] for block in blocks]
+        return panel
+    raise RuntimeError("could not place a panel")
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(repr(("occluded_rod_join_panel", seed)))
+    target = seed % len(QUADRANTS)
+    palette_index = rng.randrange(len(PALETTES))
+    tight = (seed // len(QUADRANTS)) % 3 == 0
+    for _ in range(500):
+        if tight:
+            departures = [round(rng.uniform(9.2, 11.4), 3)]
+        else:
+            departures = [round(rng.uniform(12.0, 17.0), 3)]
+        while len(departures) < len(QUADRANTS) - 1:
+            departures.append(round(departures[0] + rng.uniform(3.0, 12.0), 3))
+        rng.shuffle(departures)
+        colors = rng.sample(ROD_COLORS, len(QUADRANTS))
+        block_counts = [1, 1, 2, 2]
+        rng.shuffle(block_counts)
+        panels = []
+        queue = list(departures)
+        ok = True
+        for index, name in enumerate(QUADRANTS):
+            row, col = divmod(index, 2)
+            straight = index == target
+            value = 0.0 if straight else queue.pop()
+            try:
+                panels.append(
+                    _sample_panel(
+                        rng, col, row, straight, value, colors[index], block_counts[index]
+                    )
+                )
+            except RuntimeError:
+                ok = False
+                break
+        if not ok:
+            continue
+        thicknesses = [panel["thickness"] for panel in panels]
+        if thicknesses[target] in (max(thicknesses), min(thicknesses)):
+            continue
+        widths = [panel["bw"] for panel in panels]
+        if widths[target] in (max(widths), min(widths)):
+            continue
+        if [len(panel["blocks"]) for panel in panels] != block_counts:
+            continue
+        tilts = [abs(panel["slope"]) for panel in panels]
+        if tilts[target] in (max(tilts), min(tilts)):
+            continue
+        rng.shuffle(panels)
+        scene = {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "palette": palette_index,
+            "panels": panels,
+        }
+        if analytic_gold(scene) != QUADRANTS[target]:
+            continue
+        if margin(scene) < MIN_DEPARTURE:
+            continue
+        return scene
+    raise RuntimeError(f"could not sample a valid scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    palette = PALETTES[scene["palette"] % len(PALETTES)]
+    width = scene["width"]
+    height = scene["height"]
+    ss = SUPERSAMPLE
+    image = Image.new("RGB", (width * ss, height * ss), palette["background"])
+    draw = ImageDraw.Draw(image)
+
+    def box(rect, fill):
+        draw.rectangle(
+            [
+                (round(rect[0] * ss), round(rect[1] * ss)),
+                (round(rect[2] * ss) - 1, round(rect[3] * ss) - 1),
+            ],
+            fill=fill,
+        )
+
+    for panel in scene["panels"]:
+        color = tuple(panel["color"])
+        half = panel["thickness"] / 2.0
+        pieces = (
+            (panel["x_left"], panel["bx"], panel["slope"], panel["intercept"]),
+            (
+                panel["bx"],
+                panel["x_right"],
+                panel["slope"] + panel["hinge"],
+                panel["intercept"] + panel["shift"],
+            ),
+        )
+        for x_from, x_to, piece_slope, piece_intercept in pieces:
+            y_from = _line_y(piece_slope, piece_intercept, panel["bx"], x_from)
+            y_to = _line_y(piece_slope, piece_intercept, panel["bx"], x_to)
+            draw.polygon(
+                [
+                    (x_from * ss, (y_from - half) * ss),
+                    (x_to * ss, (y_to - half) * ss),
+                    (x_to * ss, (y_to + half) * ss),
+                    (x_from * ss, (y_from + half) * ss),
+                ],
+                fill=color,
+            )
+        box(
+            (
+                panel["bx"] - panel["bw"] / 2.0,
+                panel["band_top"],
+                panel["bx"] + panel["bw"] / 2.0,
+                panel["band_bottom"],
+            ),
+            palette["band"],
+        )
+        for block in panel["blocks"]:
+            box(tuple(block), palette["block"])
+
+    box((0, HALF_H - 1, width, HALF_H + 1), palette["divider"])
+    box((HALF_W - 1, 0, HALF_W + 1, height), palette["divider"])
+    return image.resize((width, height), Image.LANCZOS)

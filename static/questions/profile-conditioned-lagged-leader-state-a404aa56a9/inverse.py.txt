@@ -1,0 +1,137 @@
+"""Independent image-only inverse for the checkpoint-follower world.
+
+This module intentionally duplicates the public raster layout and palette-key
+logic instead of importing the renderer.  It recovers the state palette from
+the visible STATE KEY, the identity palette from the visible IDENTITY KEY, and
+then pairs each identity swatch with its state marker in every panel.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 1440
+HEIGHT = 900
+PANEL_LEFTS = (20, 255, 490, 725, 960, 1195)
+PANEL_CENTERS = (130, 365, 600, 835, 1070, 1305)
+PANEL_WIDTH = 220
+PANEL_TOP = 205
+PANEL_BOTTOM = 810
+LEADER_Y = 302
+LEADER_MARKER_X = (185, 420, 655, 890, 1125, 1360)
+ROW_Y = (442, 535, 628, 721)
+TILE_MARKER_X = (184, 419, 654, 889, 1124, 1359)
+STATE_KEY_X = (930, 1030, 1130)
+STATE_KEY_Y = 104
+LABEL_KEY_X = (100, 220, 340, 460)
+LABEL_KEY_Y = 858
+COLOR_TOLERANCE = 58.0
+LABELS = ("A", "B", "C", "D")
+
+
+def _key_color(arr: np.ndarray, x: int, y: int) -> tuple[int, int, int]:
+    patch = arr[y - 3 : y + 4, x - 3 : x + 4].astype(np.float32)
+    pixel = np.median(patch.reshape(-1, 3), axis=0).round().astype(int)
+    return tuple(int(value) for value in pixel)
+
+
+def _distance_to_color(arr: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    delta = arr.astype(np.float32) - np.asarray(color, dtype=np.float32)
+    return np.sqrt(np.sum(delta * delta, axis=-1))
+
+
+def _marker_state(
+    arr: np.ndarray,
+    x: int,
+    y: int,
+    state_colors: list[tuple[int, int, int]],
+) -> int:
+    patch = arr[y - 29 : y + 30, x - 29 : x + 30]
+    values = patch.reshape(-1, 3).astype(np.float32)
+    distances = np.stack(
+        [np.sqrt(np.sum((values - np.asarray(color, dtype=np.float32)) ** 2, axis=1)) for color in state_colors],
+        axis=1,
+    )
+    nearest = distances.argmin(axis=1)
+    close = distances.min(axis=1) <= COLOR_TOLERANCE
+    counts = np.bincount(nearest[close], minlength=3)
+    state = int(counts.argmax())
+    if int(counts[state]) < 120:
+        raise ValueError("state marker is missing or unreadable")
+    return state
+
+
+def _identity_centers(
+    arr: np.ndarray,
+    panel: int,
+    identity_colors: list[tuple[int, int, int]],
+) -> list[float]:
+    left = PANEL_LEFTS[panel]
+    crop = arr[PANEL_TOP : PANEL_BOTTOM + 1, left : left + PANEL_WIDTH]
+    centers: list[float] = []
+    for color in identity_colors:
+        distance = _distance_to_color(crop, color)
+        ys, xs = np.where(distance <= COLOR_TOLERANCE)
+        # A real label swatch is a single solid block, much larger than any
+        # antialiased edge or accidental palette-neighbor speck.
+        if len(ys) < 200:
+            raise ValueError("identity swatch is missing or ambiguous")
+        centers.append(float(ys.mean() + PANEL_TOP))
+    if any(abs(center - LEADER_Y) < 45 for center in centers):
+        raise ValueError("identity swatch collided with the LEADER row")
+    if len({round(center, 1) for center in centers}) != 4:
+        raise ValueError("identity rows are not separated")
+    return centers
+
+
+def _decode_panel(
+    arr: np.ndarray,
+    panel: int,
+    identity_colors: list[tuple[int, int, int]],
+    state_colors: list[tuple[int, int, int]],
+) -> list[int]:
+    centers = _identity_centers(arr, panel, identity_colors)
+    states: list[int] = []
+    for y in centers:
+        states.append(_marker_state(arr, TILE_MARKER_X[panel], int(round(y)), state_colors))
+    return states
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the unique lagged identity from the final RGB raster only."""
+
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        raise ValueError(f"unexpected image size {rgb.size}")
+    arr = np.asarray(rgb, dtype=np.uint8)
+    identity_colors = [_key_color(arr, x, LABEL_KEY_Y) for x in LABEL_KEY_X]
+    state_colors = [_key_color(arr, x, STATE_KEY_Y) for x in STATE_KEY_X]
+    if len(set(identity_colors)) != 4 or len(set(state_colors)) != 3:
+        raise ValueError("visible palette keys are not distinct")
+
+    leader = [
+        _marker_state(arr, x, LEADER_Y, state_colors)
+        for x in LEADER_MARKER_X
+    ]
+    trajectories = [[None] * 6 for _ in range(4)]
+    for panel in range(6):
+        decoded = _decode_panel(arr, panel, identity_colors, state_colors)
+        centers = _identity_centers(arr, panel, identity_colors)
+        # _decode_panel returns states in identity-key order by pairing each
+        # identity swatch to the nearest marker, independent of row order.
+        if len(centers) != 4:
+            raise ValueError("four identity rows are required")
+        for identity, state in enumerate(decoded):
+            trajectories[identity][panel] = state
+
+    reference = leader[:-1]
+    scores = [
+        sum(value == expected for value, expected in zip(trajectory[1:], reference))
+        for trajectory in trajectories
+    ]
+    best = max(scores)
+    if best != 5 or scores.count(best) != 1:
+        raise ValueError(f"no unique exact lagged follower: {scores}")
+    return LABELS[scores.index(best)]

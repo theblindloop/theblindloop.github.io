@@ -1,0 +1,167 @@
+"""Independent image-only inverse arm for the equal-link chain question.
+
+This module deliberately duplicates the public palette and reconstructs an
+undirected node/connector graph from raster measurements. It receives no latent
+scene, renderer state, source vector object, filename, or metadata.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+_COLORS = ("red", "blue", "green", "purple")
+_RGB = {
+    "background": (248, 247, 243),
+    "dark": (31, 42, 56),
+    "gray": (150, 158, 168),
+    "gold": (235, 174, 45),
+    "red": (220, 60, 58),
+    "blue": (48, 112, 210),
+    "green": (46, 156, 92),
+    "purple": (145, 80, 190),
+}
+
+
+def _mask_near(array: np.ndarray, rgb: tuple[int, int, int], tolerance: float) -> np.ndarray:
+    delta = array.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int32) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 8-connected component coordinates as (y,x) arrays."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        queue = [(sy, sx)]
+        seen[sy, sx] = True
+        points = []
+        while queue:
+            y, x = queue.pop()
+            points.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= 80:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _nodes(array: np.ndarray) -> list[dict]:
+    nodes = []
+    for color in (*_COLORS, "gold", "gray"):
+        components = _components(_mask_near(array, _RGB[color], 42.0))
+        expected = 2 if color == "gold" else 1 if color in _COLORS else 9
+        if len(components) != expected:
+            raise ValueError(f"expected {expected} {color} joint components, found {len(components)}")
+        for points in components:
+            y, x = points.mean(axis=0)
+            nodes.append({"x": float(x), "y": float(y), "color": color, "area": len(points)})
+    if len(nodes) != 15:
+        raise ValueError(f"expected 15 visible joints, found {len(nodes)}")
+    return nodes
+
+
+def _dark_coverage(array: np.ndarray, first: dict, second: dict) -> float:
+    dark = _mask_near(array, _RGB["dark"], 58.0)
+    x0, y0, x1, y1 = first["x"], first["y"], second["x"], second["y"]
+    distance = math.hypot(x1 - x0, y1 - y0)
+    trim = min(0.30, 14.0 / max(distance, 1.0))
+    hits = []
+    for fraction in np.linspace(trim, 1.0 - trim, 31):
+        x = int(round(x0 + fraction * (x1 - x0)))
+        y = int(round(y0 + fraction * (y1 - y0)))
+        y0s, y1s = max(0, y - 4), min(dark.shape[0], y + 5)
+        x0s, x1s = max(0, x - 4), min(dark.shape[1], x + 5)
+        hits.append(bool(dark[y0s:y1s, x0s:x1s].any()))
+    return float(np.mean(hits))
+
+
+def _graph(array: np.ndarray, nodes: list[dict]) -> list[set[int]]:
+    distances = np.full((len(nodes), len(nodes)), np.inf)
+    nearest = []
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            d = math.hypot(nodes[i]["x"] - nodes[j]["x"], nodes[i]["y"] - nodes[j]["y"])
+            distances[i, j] = distances[j, i] = d
+        nearest.append(float(np.min(distances[i])))
+    typical = float(np.median(nearest))
+    if not 45.0 <= typical <= 95.0:
+        raise ValueError(f"implausible joint spacing {typical:.2f}")
+    graph = [set() for _ in nodes]
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if distances[i, j] <= 1.34 * typical and _dark_coverage(array, nodes[i], nodes[j]) >= 0.84:
+                graph[i].add(j)
+                graph[j].add(i)
+    degrees = sorted(len(edges) for edges in graph)
+    if degrees != [1, 1] + [2] * 13:
+        raise ValueError(f"visible connectors do not form one path: degrees={degrees}")
+    endpoints = {index for index, edges in enumerate(graph) if len(edges) == 1}
+    gold = {index for index, node in enumerate(nodes) if node["color"] == "gold"}
+    if endpoints != gold:
+        raise ValueError("the two gold disks are not exactly the visible chain endpoints")
+    reached = set()
+    queue = [next(iter(endpoints))]
+    while queue:
+        here = queue.pop()
+        if here in reached:
+            continue
+        reached.add(here)
+        queue.extend(graph[here] - reached)
+    if len(reached) != len(nodes):
+        raise ValueError("chain graph is disconnected")
+    return graph
+
+
+def _distances(graph: list[set[int]], start: int) -> list[int]:
+    output = [-1] * len(graph)
+    output[start] = 0
+    queue = deque([start])
+    while queue:
+        here = queue.popleft()
+        for neighbor in graph[here]:
+            if output[neighbor] < 0:
+                output[neighbor] = output[here] + 1
+                queue.append(neighbor)
+    return output
+
+
+def analyze_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 100:
+        raise ValueError("unsupported raster")
+    nodes = _nodes(array)
+    graph = _graph(array, nodes)
+    gold = [i for i, node in enumerate(nodes) if node["color"] == "gold"]
+    first, second = _distances(graph, gold[0]), _distances(graph, gold[1])
+    candidates = []
+    for index, node in enumerate(nodes):
+        if node["color"] in _COLORS:
+            candidates.append((abs(first[index] - second[index]), node["color"], index))
+    candidates.sort()
+    if len(candidates) != 4 or candidates[0][0] != 0 or candidates[1][0] < 2:
+        raise ValueError(f"no unique, separated colored graph center: {candidates}")
+    return {
+        "decision": str(candidates[0][1]),
+        "margin": float(candidates[1][0] - candidates[0][0]),
+        "candidate_imbalances": {str(color): int(score) for score, color, _ in candidates},
+        "node_count": len(nodes),
+        "edge_count": sum(map(len, graph)) // 2,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

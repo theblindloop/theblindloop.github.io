@@ -1,0 +1,175 @@
+"""Independent pixel-only graph reconstruction arm.
+
+The inverse segments the four visible ink roles, recovers node and corridor
+components, binds every corridor component to its two nearest node components,
+validates two equal-size trees, then computes the endpoint-conditioned path
+property.  It receives no scene state and deliberately abstains on damage.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+DARK_COLORS = ((28, 43, 61), (35, 49, 58), (23, 52, 61))
+NEUTRAL_COLORS = ((128, 87, 166), (143, 82, 158), (112, 91, 174))
+START_COLORS = ((37, 108, 190), (28, 116, 180), (47, 104, 188))
+FINISH_COLORS = ((225, 123, 38), (232, 113, 35), (214, 132, 29))
+
+
+def _near_any(array: np.ndarray, colors: tuple[tuple[int, int, int], ...]) -> np.ndarray:
+    pixels = array.astype(np.int32)
+    distances = []
+    for color in colors:
+        delta = pixels - np.asarray(color, dtype=np.int32)
+        distances.append(np.sum(delta * delta, axis=2))
+    return np.min(np.stack(distances), axis=0) <= 36
+
+
+def _components(mask: np.ndarray, minimum_area: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    output: list[np.ndarray] = []
+    for raw_y, raw_x in np.argwhere(mask):
+        y, x = int(raw_y), int(raw_x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = [(y, x)]
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.pop()
+            points.append((cy, cx))
+            for ny in (cy - 1, cy, cy + 1):
+                for nx in (cx - 1, cx, cx + 1):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and not seen[ny, nx]
+                        and mask[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= minimum_area:
+            output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _node_records(mask: np.ndarray, role: str) -> list[dict]:
+    records = []
+    for points in _components(mask, minimum_area=80):
+        ys = points[:, 0]
+        xs = points[:, 1]
+        height = int(ys.max() - ys.min() + 1)
+        width = int(xs.max() - xs.min() + 1)
+        area = int(len(points))
+        if not (690 <= area <= 780 and 30 <= width <= 31 and 30 <= height <= 31):
+            raise ValueError(f"damaged {role} node component")
+        records.append(
+            {
+                "role": role,
+                "center": np.asarray([float(xs.mean()), float(ys.mean())]),
+                "points": points,
+            }
+        )
+    return records
+
+
+def _graph_components(adjacency: list[set[int]]) -> list[set[int]]:
+    unseen = set(range(len(adjacency)))
+    groups = []
+    while unseen:
+        root = min(unseen)
+        group = {root}
+        queue = [root]
+        unseen.remove(root)
+        while queue:
+            current = queue.pop()
+            for neighbor in adjacency[current]:
+                if neighbor in unseen:
+                    unseen.remove(neighbor)
+                    group.add(neighbor)
+                    queue.append(neighbor)
+        groups.append(group)
+    return groups
+
+
+def _path_score(adjacency: list[set[int]], start: int, finish: int) -> int:
+    parents: dict[int, int | None] = {start: None}
+    queue = deque([start])
+    while queue:
+        current = queue.popleft()
+        if current == finish:
+            break
+        for neighbor in sorted(adjacency[current]):
+            if neighbor not in parents:
+                parents[neighbor] = current
+                queue.append(neighbor)
+    if finish not in parents:
+        raise ValueError("colored endpoints are disconnected")
+    path = []
+    current: int | None = finish
+    while current is not None:
+        path.append(current)
+        current = parents[current]
+    return sum(len(adjacency[index]) == 3 for index in path)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape != (420, 960, 3):
+        raise ValueError("unexpected canvas dimensions")
+
+    neutral = _node_records(_near_any(array, NEUTRAL_COLORS), "purple")
+    starts = _node_records(_near_any(array, START_COLORS), "blue")
+    finishes = _node_records(_near_any(array, FINISH_COLORS), "orange")
+    if len(neutral) != 12 or len(starts) != 2 or len(finishes) != 2:
+        raise ValueError("expected twelve purple and two nodes of each endpoint role")
+    nodes = neutral + starts + finishes
+
+    dark_components = _components(_near_any(array, DARK_COLORS), minimum_area=100)
+    if len(dark_components) != 14:
+        raise ValueError("expected fourteen isolated corridor components")
+
+    adjacency: list[set[int]] = [set() for _ in nodes]
+    seen_edges: set[tuple[int, int]] = set()
+    centers = np.stack([node["center"] for node in nodes])
+    for points in dark_components:
+        xy = points[:, ::-1].astype(np.float64)
+        minima = []
+        for center in centers:
+            minima.append(float(np.min(np.sum((xy - center) ** 2, axis=1))))
+        near = [index for index, value in enumerate(minima) if value <= 430.0]
+        if len(near) != 2:
+            raise ValueError("corridor does not bind exactly two visible nodes")
+        first, second = sorted(near)
+        edge = (first, second)
+        if edge in seen_edges:
+            raise ValueError("duplicate recovered corridor")
+        seen_edges.add(edge)
+        adjacency[first].add(second)
+        adjacency[second].add(first)
+
+    groups = _graph_components(adjacency)
+    if len(groups) != 2:
+        raise ValueError("expected two disconnected graph panels")
+    panel_rows = []
+    for group in groups:
+        degrees = sorted(len(adjacency[index]) for index in group)
+        edge_count = sum(len(adjacency[index]) for index in group) // 2
+        if len(group) != 8 or edge_count != 7 or degrees != [1, 1, 1, 1, 1, 3, 3, 3]:
+            raise ValueError("panel is not an intact expected tree")
+        group_starts = [index for index in group if nodes[index]["role"] == "blue"]
+        group_finishes = [index for index in group if nodes[index]["role"] == "orange"]
+        if len(group_starts) != 1 or len(group_finishes) != 1:
+            raise ValueError("panel endpoint roles are ambiguous")
+        score = _path_score(adjacency, group_starts[0], group_finishes[0])
+        mean_x = float(np.mean([nodes[index]["center"][0] for index in group]))
+        panel_rows.append((mean_x, score))
+    panel_rows.sort()
+    left_score, right_score = panel_rows[0][1], panel_rows[1][1]
+    if left_score == right_score:
+        raise ValueError("equal on-path junction counts are quarantined")
+    return "left" if left_score > right_score else "right"

@@ -1,0 +1,120 @@
+"""Independent pixel-only inverse arm for courtyard boundary matching."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_NAMES = ("background", "teal", "yellow", "cyan", "orange")
+_RGB = np.asarray(
+    ([246, 243, 234], [35, 126, 132], [244, 194, 46], [24, 183, 214], [230, 102, 38]),
+    dtype=np.int16,
+)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return coordinate arrays for 4-connected components inside a small mask."""
+
+    work = mask.copy()
+    components: list[np.ndarray] = []
+    height, width = work.shape
+    while work.any():
+        sy, sx = (int(v) for v in np.argwhere(work)[0])
+        work[sy, sx] = False
+        queue = deque([(sy, sx)])
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            if y and work[y - 1, x]:
+                work[y - 1, x] = False
+                queue.append((y - 1, x))
+            if y + 1 < height and work[y + 1, x]:
+                work[y + 1, x] = False
+                queue.append((y + 1, x))
+            if x and work[y, x - 1]:
+                work[y, x - 1] = False
+                queue.append((y, x - 1))
+            if x + 1 < width and work[y, x + 1]:
+                work[y, x + 1] = False
+                queue.append((y, x + 1))
+        components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _single_rectangle(mask: np.ndarray, name: str) -> tuple[int, int, int, int]:
+    points = np.argwhere(mask)
+    if len(points) < 150:
+        raise ValueError(f"{name} patch is missing or too small")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0) + 1
+    if len(points) != int((y1 - y0) * (x1 - x0)) or not mask[y0:y1, x0:x1].all():
+        raise ValueError(f"{name} patch is not one solid rectangle")
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def _touches(component_mask: np.ndarray, patch_mask: np.ndarray) -> bool:
+    adjacent = np.zeros_like(component_mask)
+    adjacent[1:] |= component_mask[:-1]
+    adjacent[:-1] |= component_mask[1:]
+    adjacent[:, 1:] |= component_mask[:, :-1]
+    adjacent[:, :-1] |= component_mask[:, 1:]
+    return bool(np.any(adjacent & patch_mask))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 128:
+        raise ValueError("unsupported raster")
+    distances = ((array[:, :, None, :] - _RGB.astype(np.int32)[None, None, :, :]) ** 2).sum(axis=3)
+    labels = distances.argmin(axis=2)
+    if int(distances.min(axis=2).max()) > 48 * 48:
+        raise ValueError("raster contains colors outside the public palette")
+
+    ink = labels != 0
+    points = np.argwhere(ink)
+    if len(points) < 20000:
+        raise ValueError("solid sheet is missing")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0) + 1
+    height, width = int(y1 - y0), int(x1 - x0)
+    if not (195 <= width <= 235 and 195 <= height <= 235):
+        raise ValueError("sheet extent is outside the declared visual world")
+    local_labels = labels[y0:y1, x0:x1]
+
+    # A valid sheet fills its rectangular support except for exactly two solid,
+    # enclosed white rectangles. This rejects destructive tile ablations rather
+    # than silently guessing from a surviving local cue.
+    white_components = _components(local_labels == 0)
+    if len(white_components) != 2:
+        raise ValueError("sheet must expose exactly two enclosed courtyards")
+    courtyard_masks: list[np.ndarray] = []
+    for points_local in white_components:
+        cy0, cx0 = points_local.min(axis=0)
+        cy1, cx1 = points_local.max(axis=0) + 1
+        if cy0 == 0 or cx0 == 0 or cy1 == height or cx1 == width:
+            raise ValueError("a courtyard is open to the exterior")
+        if len(points_local) != int((cy1 - cy0) * (cx1 - cx0)):
+            raise ValueError("courtyard boundary is corrupted")
+        mask = np.zeros_like(local_labels, dtype=bool)
+        mask[points_local[:, 0], points_local[:, 1]] = True
+        courtyard_masks.append(mask)
+
+    patch_masks: dict[str, np.ndarray] = {}
+    for index, name in ((2, "yellow"), (3, "cyan"), (4, "orange")):
+        full_mask = labels == index
+        _single_rectangle(full_mask, name)
+        patch_masks[name] = full_mask[y0:y1, x0:x1]
+
+    associations: dict[str, int] = {}
+    for name, patch_mask in patch_masks.items():
+        hits = [i for i, courtyard in enumerate(courtyard_masks) if _touches(courtyard, patch_mask)]
+        if len(hits) != 1:
+            raise ValueError(f"{name} must edge-touch exactly one courtyard")
+        associations[name] = hits[0]
+    matches = [color for color in ("cyan", "orange") if associations[color] == associations["yellow"]]
+    if len(matches) != 1:
+        raise ValueError("pixel evidence does not identify one matching patch")
+    return matches[0]

@@ -1,0 +1,182 @@
+"""Independent raster-only inverse for the detached-trace question."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in (
+                (cy - 1, cx),
+                (cy + 1, cx),
+                (cy, cx - 1),
+                (cy, cx + 1),
+                (cy - 1, cx - 1),
+                (cy - 1, cx + 1),
+                (cy + 1, cx - 1),
+                (cy + 1, cx + 1),
+            ):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= minimum:
+            found.append(np.asarray(points, dtype=np.float64))
+    return sorted(found, key=len, reverse=True)
+
+
+def _centers(array: np.ndarray, kind: str) -> list[np.ndarray]:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    if kind == "green":
+        mask = (green > 105) & (green > red + 45) & (green > blue + 10) & (red < 125)
+        minimum = 20
+        expected = 2
+    elif kind == "red":
+        mask = (red > 135) & (red > green + 45) & (red > blue + 35) & (green < 125)
+        minimum = 20
+        expected = 2
+    elif kind == "amber":
+        mask = (red > 165) & (green > 95) & (green < 205) & (blue < 105) & (red > green + 35)
+        minimum = 4
+        expected = 1
+    elif kind == "violet":
+        mask = (red > 105) & (blue > 125) & (blue > green + 35) & (green < 145)
+        minimum = 4
+        expected = 1
+    else:
+        raise ValueError(f"unknown color kind: {kind}")
+    components = _components(mask, minimum)
+    if expected == 1:
+        if not components:
+            raise ValueError(f"expected a {kind} marker component, found none")
+        return [np.concatenate(components, axis=0).mean(axis=0)[::-1]]
+    if len(components) != expected:
+        raise ValueError(f"expected {expected} {kind} marker components, found {len(components)}")
+    return [component.mean(axis=0)[::-1] for component in components]
+
+
+def _route_components(array: np.ndarray) -> list[np.ndarray]:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    # The dark blue trace is deliberately separated from every marker color.
+    mask = (red < 105) & (green < 145) & (blue > 95) & (blue > green + 22)
+    components = _components(mask, 45)
+    if len(components) != 2:
+        raise ValueError(f"expected two disconnected trace components, found {len(components)}")
+    return components
+
+
+def _nearest(point: np.ndarray, components: list[np.ndarray]) -> int:
+    distances = [float(np.min(np.sum((component[:, ::-1] - point) ** 2, axis=1))) for component in components]
+    order = np.argsort(np.asarray(distances))
+    if len(order) > 1 and distances[int(order[1])] - distances[int(order[0])] < 16.0:
+        raise ValueError("ambiguous marker-to-trace binding")
+    return int(order[0])
+
+
+def _fraction_from_trace(
+    component: np.ndarray,
+    green_center: np.ndarray,
+    red_center: np.ndarray,
+    checkpoint_center: np.ndarray,
+) -> float:
+    # The generated centerlines are x-monotone.  Median y per x suppresses
+    # the finite stroke width and reconstructs the ordered raster centerline.
+    ys = component[:, 0]
+    xs = component[:, 1]
+    unique_x = np.unique(xs.astype(np.int32))
+    medians = np.asarray([np.median(ys[xs.astype(np.int32) == x]) for x in unique_x], dtype=np.float64)
+    path_x = np.concatenate(([green_center[0]], unique_x.astype(np.float64), [red_center[0]]))
+    path_y = np.concatenate(([green_center[1]], medians, [red_center[1]]))
+    order = np.argsort(path_x, kind="stable")
+    path_x = path_x[order]
+    path_y = path_y[order]
+    collapsed_x: list[float] = []
+    collapsed_y: list[float] = []
+    for x, y in zip(path_x, path_y):
+        if collapsed_x and abs(x - collapsed_x[-1]) < 1e-9:
+            collapsed_y[-1] = (collapsed_y[-1] + float(y)) / 2.0
+        else:
+            collapsed_x.append(float(x))
+            collapsed_y.append(float(y))
+    path_x = np.asarray(collapsed_x)
+    path_y = np.asarray(collapsed_y)
+    if checkpoint_center[0] < path_x[0] - 7.0 or checkpoint_center[0] > path_x[-1] + 7.0:
+        raise ValueError("checkpoint is outside its trace")
+    path_y_at_checkpoint = float(np.interp(checkpoint_center[0], path_x, path_y))
+    if abs(path_y_at_checkpoint - checkpoint_center[1]) > 18.0:
+        raise ValueError("checkpoint is not on its bound trace")
+    steps = np.hypot(np.diff(path_x), np.diff(path_y))
+    cumulative = np.concatenate(([0.0], np.cumsum(steps)))
+    if cumulative[-1] < 35.0:
+        raise ValueError("trace is too short")
+    checkpoint_distance = float(np.interp(checkpoint_center[0], path_x, cumulative))
+    if green_center[0] > red_center[0]:
+        checkpoint_distance = float(cumulative[-1] - checkpoint_distance)
+    return checkpoint_distance / float(cumulative[-1])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    greens = _centers(array, "green")
+    reds = _centers(array, "red")
+    amber = _centers(array, "amber")[0]
+    violet = _centers(array, "violet")[0]
+    components = _route_components(array)
+    marker_centers = {"amber": amber, "violet": violet}
+    fractions: dict[str, float] = {}
+    used_green: set[int] = set()
+    used_red: set[int] = set()
+    for component_index, component in enumerate(components):
+        green_distances = [float(np.min(np.sum((component[:, ::-1] - point) ** 2, axis=1))) for point in greens]
+        red_distances = [float(np.min(np.sum((component[:, ::-1] - point) ** 2, axis=1))) for point in reds]
+        green_index = int(np.argmin(green_distances))
+        red_index = int(np.argmin(red_distances))
+        if green_index in used_green or red_index in used_red:
+            raise ValueError("endpoint binding is not one-to-one")
+        used_green.add(green_index)
+        used_red.add(red_index)
+        checkpoint_label = min(
+            marker_centers,
+            key=lambda label: float(np.min(np.sum((component[:, ::-1] - marker_centers[label]) ** 2, axis=1))),
+        )
+        checkpoint_distance = float(
+            np.min(np.sum((component[:, ::-1] - marker_centers[checkpoint_label]) ** 2, axis=1))
+        )
+        other_label = "violet" if checkpoint_label == "amber" else "amber"
+        other_distance = float(
+            np.min(np.sum((component[:, ::-1] - marker_centers[other_label]) ** 2, axis=1))
+        )
+        if other_distance - checkpoint_distance < 25.0:
+            raise ValueError("checkpoint binding is ambiguous")
+        fractions[checkpoint_label] = _fraction_from_trace(
+            component,
+            greens[green_index],
+            reds[red_index],
+            marker_centers[checkpoint_label],
+        )
+    if set(fractions) != {"amber", "violet"}:
+        raise ValueError("both checkpoint labels must be bound")
+    gap = abs(fractions["amber"] - fractions["violet"])
+    if gap < 0.12:
+        raise ValueError("trace-order comparison is too close")
+    return "amber" if fractions["amber"] < fractions["violet"] else "violet"

@@ -1,0 +1,208 @@
+"""Independent pixel-only inverse arm for quota_drain_race.
+
+Receives one RGB image and nothing else.  It segments the two framed panels,
+reads the quota card (a coloured disc plus a dot glyph per row), reads the
+delivery lane (twelve coloured discs stacked top to bottom), walks the lane
+paying off one unit of the arriving colour's quota at each cell, and returns
+the colour whose quota reaches zero first.  It abstains by raising ValueError
+whenever the structure it requires is not unambiguously present.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "quota_drain_race-oracle-0.1.0"
+
+_PALETTE = (
+    ("teal", (18, 140, 148)),
+    ("violet", (128, 60, 168)),
+    ("orange", (226, 118, 30)),
+    ("moss", (108, 150, 44)),
+)
+_COLOUR_TOLERANCE = 40.0
+_DARK_MAX = 120
+_LANE_CELLS = 12
+_CARD_ROWS = 4
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Four-connected components of a boolean mask, via row runs."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(index: int) -> int:
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != root:
+            parent[index], index = root, parent[index]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list[tuple[int, int, int]] = []
+    row_index: list[list[int]] = []
+    for y in range(height):
+        row = mask[y]
+        current: list[int] = []
+        if row.any():
+            padded = np.concatenate(([0], row.astype(np.int8), [0]))
+            edges = np.flatnonzero(np.diff(padded))
+            for start, end in zip(edges[0::2], edges[1::2]):
+                current.append(len(runs))
+                runs.append((y, int(start), int(end)))
+                parent.append(len(parent))
+        row_index.append(current)
+        if y and current and row_index[y - 1]:
+            for a in row_index[y - 1]:
+                _, a0, a1 = runs[a]
+                for b in current:
+                    _, b0, b1 = runs[b]
+                    if b0 < a1 and a0 < b1:
+                        union(a, b)
+
+    groups: dict[int, dict] = {}
+    for index, (y, x0, x1) in enumerate(runs):
+        root = find(index)
+        entry = groups.get(root)
+        if entry is None:
+            groups[root] = {
+                "y0": y,
+                "y1": y + 1,
+                "x0": x0,
+                "x1": x1,
+                "area": x1 - x0,
+                "sx": (x0 + x1 - 1) / 2.0 * (x1 - x0),
+                "sy": float(y) * (x1 - x0),
+            }
+            continue
+        entry["y0"] = min(entry["y0"], y)
+        entry["y1"] = max(entry["y1"], y + 1)
+        entry["x0"] = min(entry["x0"], x0)
+        entry["x1"] = max(entry["x1"], x1)
+        entry["area"] += x1 - x0
+        entry["sx"] += (x0 + x1 - 1) / 2.0 * (x1 - x0)
+        entry["sy"] += float(y) * (x1 - x0)
+
+    out = []
+    for entry in groups.values():
+        entry["w"] = entry["x1"] - entry["x0"]
+        entry["h"] = entry["y1"] - entry["y0"]
+        entry["cx"] = entry["sx"] / entry["area"]
+        entry["cy"] = entry["sy"] / entry["area"]
+        out.append(entry)
+    return out
+
+
+def _bands(values: list[float], expected: int, tolerance: float) -> list[list[int]]:
+    """Group indices whose values fall into `expected` well-separated bands."""
+    if not values:
+        raise ValueError("nothing to band")
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    groups: list[list[int]] = [[order[0]]]
+    for index in order[1:]:
+        if values[index] - values[groups[-1][-1]] > tolerance:
+            groups.append([index])
+        else:
+            groups[-1].append(index)
+    if len(groups) != expected:
+        raise ValueError(f"expected {expected} bands, found {len(groups)}")
+    return groups
+
+
+def _inside(box: dict, cx: float, cy: float) -> bool:
+    return box["x0"] <= cx <= box["x1"] and box["y0"] <= cy <= box["y1"]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or min(array.shape[:2]) < 200:
+        raise ValueError("image is too small to carry two panels")
+
+    dark = np.all(array < _DARK_MAX, axis=2)
+    dark_parts = _components(dark)
+    frames = [c for c in dark_parts if c["w"] >= 90 and c["h"] >= 250]
+    if len(frames) != 2:
+        raise ValueError("did not find exactly two panel frames")
+
+    chips: list[dict] = []
+    for name, rgb in _PALETTE:
+        distance = np.linalg.norm(array - np.asarray(rgb, dtype=np.float32), axis=2)
+        for part in _components(distance < _COLOUR_TOLERANCE):
+            if part["area"] < 120 or part["w"] > 80 or part["h"] > 80:
+                continue
+            part["colour"] = name
+            chips.append(part)
+
+    pips = [
+        c
+        for c in dark_parts
+        if 5 <= c["w"] <= 18 and 5 <= c["h"] <= 18 and c["area"] >= 40
+    ]
+
+    card_frame = lane_frame = None
+    for frame in frames:
+        held = [c for c in chips if _inside(frame, c["cx"], c["cy"])]
+        if len(held) == _CARD_ROWS:
+            if card_frame is not None:
+                raise ValueError("two candidate quota cards")
+            card_frame = frame
+        elif len(held) == _LANE_CELLS:
+            if lane_frame is not None:
+                raise ValueError("two candidate delivery lanes")
+            lane_frame = frame
+    if card_frame is None or lane_frame is None:
+        raise ValueError("panels do not carry the required discs")
+
+    # --- quota card -------------------------------------------------------
+    card_chips = [c for c in chips if _inside(card_frame, c["cx"], c["cy"])]
+    row_h = card_frame["h"] / float(_CARD_ROWS)
+    row_bands = _bands([c["cy"] for c in card_chips], _CARD_ROWS, row_h * 0.5)
+    if any(len(band) != 1 for band in row_bands):
+        raise ValueError("quota card rows do not hold one disc each")
+    rows = [card_chips[band[0]] for band in row_bands]
+    if len({r["colour"] for r in rows}) != _CARD_ROWS:
+        raise ValueError("quota card colours are not four distinct colours")
+    if max(r["cx"] for r in rows) - min(r["cx"] for r in rows) > row_h * 0.5:
+        raise ValueError("quota card discs are not in one column")
+
+    card_pips = [p for p in pips if _inside(card_frame, p["cx"], p["cy"])]
+    if not _CARD_ROWS <= len(card_pips) <= 3 * _CARD_ROWS:
+        raise ValueError("unreadable quota glyphs")
+    quotas: dict[str, int] = {}
+    counts = [0] * _CARD_ROWS
+    disc_x = sum(r["cx"] for r in rows) / float(_CARD_ROWS)
+    for pip in card_pips:
+        if pip["cx"] <= disc_x:
+            raise ValueError("a quota dot does not sit right of its disc")
+        near = [i for i in range(_CARD_ROWS) if abs(pip["cy"] - rows[i]["cy"]) < row_h * 0.5]
+        if len(near) != 1:
+            raise ValueError("a quota dot does not belong to exactly one row")
+        counts[near[0]] += 1
+    for index, row in enumerate(rows):
+        if not 1 <= counts[index] <= 3:
+            raise ValueError("a quota glyph is not one, two or three dots")
+        quotas[row["colour"]] = counts[index]
+
+    # --- delivery lane ----------------------------------------------------
+    lane_chips = [c for c in chips if _inside(lane_frame, c["cx"], c["cy"])]
+    cell_h = lane_frame["h"] / float(_LANE_CELLS)
+    lane_bands = _bands([c["cy"] for c in lane_chips], _LANE_CELLS, cell_h * 0.6)
+    if any(len(band) != 1 for band in lane_bands):
+        raise ValueError("delivery lane cells do not hold one disc each")
+    lane = [lane_chips[band[0]]["colour"] for band in lane_bands]
+    if any(colour not in quotas for colour in lane):
+        raise ValueError("a delivery colour has no quota row")
+
+    # --- race to zero -----------------------------------------------------
+    paid = {colour: 0 for colour in quotas}
+    for colour in lane:
+        paid[colour] += 1
+        if paid[colour] >= quotas[colour]:
+            return colour
+    raise ValueError("no quota reaches zero inside the lane")

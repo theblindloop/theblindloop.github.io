@@ -1,0 +1,159 @@
+"""Independent inverse arm: recover the answer from final RGB pixels only."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+REFERENCE_FRAME = (105, 114, 126)
+INK = (28, 33, 40)
+TAG_RGB = {
+    "amber": (225, 151, 32),
+    "cyan": (25, 158, 181),
+    "violet": (132, 82, 190),
+}
+TRACK_RGB = {
+    "red": (205, 63, 69),
+    "green": (47, 151, 91),
+    "blue": (50, 103, 190),
+}
+
+
+class OracleAbstention(ValueError):
+    """The raster lacks a unique, well-formed switchboard solution."""
+
+
+def _mask(array: np.ndarray, rgb: tuple[int, int, int], tolerance: int = 8) -> np.ndarray:
+    delta = array.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _runs(values: np.ndarray, *, minimum: int = 1) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(values)
+    if not len(indices):
+        return []
+    groups: list[tuple[int, int]] = []
+    start = previous = int(indices[0])
+    for value in indices[1:]:
+        current = int(value)
+        if current > previous + 1:
+            if previous - start + 1 >= minimum:
+                groups.append((start, previous))
+            start = current
+        previous = current
+    if previous - start + 1 >= minimum:
+        groups.append((start, previous))
+    return groups
+
+
+def _bbox(mask: np.ndarray, *, minimum_pixels: int) -> tuple[int, int, int, int]:
+    points = np.argwhere(mask)
+    if len(points) < minimum_pixels:
+        raise OracleAbstention(f"color component has only {len(points)} pixels")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def _ink_order(
+    ink: np.ndarray, box: tuple[int, int, int, int], side: str
+) -> tuple[str, str, str]:
+    x0, y0, x1, y1 = box
+    width = x1 - x0 + 1
+    if width < 65 or y1 - y0 < 80:
+        raise OracleAbstention("reference bank is truncated")
+    if side == "left":
+        glyph = ink[y0:y1 + 1, x0 + width * 8 // 100:x0 + width * 36 // 100]
+    else:
+        glyph = ink[y0:y1 + 1, x0 + width * 64 // 100:x0 + width * 92 // 100]
+    occupied = glyph.sum(axis=1) >= 2
+    bands = _runs(occupied, minimum=8)
+    if len(bands) != 3:
+        raise OracleAbstention(f"expected three separated glyph bands, found {len(bands)}")
+    counts = []
+    for first, last in bands:
+        pad0, pad1 = max(0, first - 1), min(glyph.shape[0], last + 2)
+        counts.append(int(glyph[pad0:pad1].sum()))
+    ranked = sorted(range(3), key=lambda index: counts[index])
+    if min(counts[ranked[1]] - counts[ranked[0]], counts[ranked[2]] - counts[ranked[1]]) < 35:
+        raise OracleAbstention(f"shape ink ranks are ambiguous: {counts}")
+    names = ["", "", ""]
+    for rank, lane in enumerate(ranked):
+        names[lane] = ("triangle", "circle", "square")[rank]
+    return tuple(names)  # type: ignore[return-value]
+
+
+def _reference_orders(array: np.ndarray) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    gray = _mask(array, REFERENCE_FRAME)
+    columns = gray.sum(axis=0) >= 3
+    clusters = _runs(columns, minimum=20)
+    if len(clusters) != 2:
+        raise OracleAbstention(f"expected two reference frame clusters, found {len(clusters)}")
+    boxes = []
+    for first, last in clusters:
+        local = gray[:, first:last + 1]
+        ys = np.flatnonzero(local.sum(axis=1))
+        if len(ys) < 30:
+            raise OracleAbstention("reference frame is incomplete")
+        boxes.append((first, int(ys.min()), last, int(ys.max())))
+    ink = _mask(array, INK, tolerance=12)
+    return _ink_order(ink, boxes[0], "left"), _ink_order(ink, boxes[1], "right")
+
+
+def _endpoint_colors(
+    array: np.ndarray, box: tuple[int, int, int, int], side: str
+) -> tuple[str, str, str]:
+    x0, y0, x1, y1 = box
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if width < 80 or height < 85:
+        raise OracleAbstention("candidate frame is truncated")
+    if side == "left":
+        xa, xb = x0 + width * 6 // 100, x0 + width * 18 // 100
+    else:
+        xa, xb = x0 + width * 82 // 100, x0 + width * 94 // 100
+    ya, yb = y0 + 5, y0 + height * 78 // 100
+    strips = {name: _mask(array[ya:yb, xa:xb], rgb) for name, rgb in TRACK_RGB.items()}
+    occupied = np.zeros(yb - ya, dtype=bool)
+    for track_mask in strips.values():
+        occupied |= track_mask.sum(axis=1) >= 2
+    bands = _runs(occupied, minimum=4)
+    if len(bands) != 3:
+        raise OracleAbstention(f"expected three route ports on {side}, found {len(bands)}")
+    result = []
+    for first, last in bands:
+        counts = {name: int(track_mask[first:last + 1].sum()) for name, track_mask in strips.items()}
+        ordered = sorted(counts, key=counts.get, reverse=True)
+        if counts[ordered[0]] < 12 or counts[ordered[0]] - counts[ordered[1]] < 8:
+            raise OracleAbstention(f"ambiguous route port colors: {counts}")
+        result.append(ordered[0])
+    if len(set(result)) != 3:
+        raise OracleAbstention(f"route colors are not one-to-one: {result}")
+    return tuple(result)  # type: ignore[return-value]
+
+
+def _candidate_mapping(
+    array: np.ndarray, box: tuple[int, int, int, int]
+) -> tuple[int, int, int]:
+    left = _endpoint_colors(array, box, "left")
+    right = _endpoint_colors(array, box, "right")
+    return tuple(right.index(color) for color in left)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return amber/cyan/violet using only visible palette roles and geometry."""
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 100 or array.shape[1] < 100:
+        raise OracleAbstention("image is too small")
+    left_order, right_order = _reference_orders(array)
+    required = tuple(right_order.index(kind) for kind in left_order)
+    matches = []
+    for tag, rgb in TAG_RGB.items():
+        box = _bbox(_mask(array, rgb), minimum_pixels=170)
+        mapping = _candidate_mapping(array, box)
+        if mapping == required:
+            matches.append(tag)
+    if len(matches) != 1:
+        raise OracleAbstention(f"expected one completing frame, found {matches}")
+    return matches[0]

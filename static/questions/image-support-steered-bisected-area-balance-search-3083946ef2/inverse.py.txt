@@ -1,0 +1,139 @@
+"""Independent PNG-only inverse for bilateral blue-area balance.
+
+The inverse uses only public visual conventions: four ordered image quadrants,
+blue region pixels, and each visible gold vertical rule. It receives no latent
+mask, answer, seed, renderer state, or source geometry.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ISLAND_RGB = (37, 104, 151)
+RULE_RGB = (238, 174, 45)
+LABELS = ("A", "B", "C", "D")
+COLOR_TOLERANCE = 24
+MIN_INTACT_AREA_PX = 25_000
+INTACT_AREA_RATIO = 0.995
+ZERO_TOLERANCE_PX = 8
+MIN_RUNNER_GAP_PX = 1_500
+
+
+def _color_mask(array: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    delta = array.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2) <= COLOR_TOLERANCE * COLOR_TOLERANCE
+
+
+def _component_count(mask: np.ndarray) -> int:
+    ys, xs = np.nonzero(mask)
+    if not len(xs):
+        return 0
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    pending = mask[y0:y1, x0:x1].copy()
+    height, width = pending.shape
+    count = 0
+    while pending.any():
+        y, x = (int(value) for value in np.argwhere(pending)[0])
+        count += 1
+        queue = deque([(y, x)])
+        pending[y, x] = False
+        while queue:
+            cy, cx = queue.popleft()
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and pending[ny, nx]:
+                    pending[ny, nx] = False
+                    queue.append((ny, nx))
+    return count
+
+
+def _rule_x(
+    local_rule: np.ndarray,
+    local_island: np.ndarray,
+    x_offset: int,
+    fallback: float,
+) -> float:
+    island_y, _ = np.nonzero(local_island)
+    visible_rule = local_rule
+    if len(island_y):
+        rows = np.arange(local_rule.shape[0])
+        outside_island = (rows < int(island_y.min())) | (rows > int(island_y.max()))
+        visible_rule = local_rule & outside_island[:, None]
+    _, xs = np.nonzero(visible_rule)
+    if len(xs) < 20:
+        # Destructive ablations of a losing panel should not invent remote
+        # support. The image quadrant itself still visibly defines its center.
+        return fallback
+    return float(np.median(xs) + x_offset)
+
+
+def analyze_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    height, width = array.shape[:2]
+    if width < 400 or height < 400:
+        raise ValueError("image is too small for the four visible candidate panels")
+    island = _color_mask(array, ISLAND_RGB)
+    rule = _color_mask(array, RULE_RGB)
+    x_cuts = (0, width // 2, width)
+    y_cuts = (0, height // 2, height)
+    records = []
+    index = 0
+    for row in range(2):
+        for column in range(2):
+            x0, x1 = x_cuts[column], x_cuts[column + 1]
+            y0, y1 = y_cuts[row], y_cuts[row + 1]
+            local_island = island[y0:y1, x0:x1]
+            local_rule = rule[y0:y1, x0:x1]
+            divider_x = _rule_x(local_rule, local_island, x0, (x0 + x1) / 2.0)
+            global_columns = np.arange(x0, x1)
+            left_area = int(local_island[:, global_columns < divider_x].sum())
+            right_area = int(local_island[:, global_columns >= divider_x].sum())
+            area = left_area + right_area
+            records.append(
+                {
+                    "label": LABELS[index],
+                    "area_px": area,
+                    "left_area_px": left_area,
+                    "right_area_px": right_area,
+                    "difference_px": abs(left_area - right_area),
+                    "components": _component_count(local_island),
+                    "divider_x": divider_x,
+                }
+            )
+            index += 1
+
+    maximum_area = max(record["area_px"] for record in records)
+    if maximum_area < MIN_INTACT_AREA_PX:
+        raise ValueError("no intact island-sized blue region was recovered")
+    eligible = [
+        record
+        for record in records
+        if record["area_px"] >= maximum_area * INTACT_AREA_RATIO
+    ]
+    if len(eligible) < 2:
+        raise ValueError("fewer than two intact candidates remain")
+    balanced = [
+        record for record in eligible if record["difference_px"] <= ZERO_TOLERANCE_PX
+    ]
+    if len(balanced) != 1:
+        raise ValueError(f"expected one equal-half-area winner, found {len(balanced)}")
+    ranked = sorted(eligible, key=lambda record: (record["difference_px"], record["label"]))
+    if ranked[0] is not balanced[0]:
+        raise ValueError("balanced region did not rank first")
+    if ranked[0]["components"] != 1:
+        raise ValueError("winning blue region is not one connected component")
+    gap = float(ranked[1]["difference_px"] - ranked[0]["difference_px"])
+    if gap < MIN_RUNNER_GAP_PX:
+        raise ValueError(f"bilateral-area search is ambiguous: runner-up gap {gap:.1f}px")
+    return {
+        "decision": str(ranked[0]["label"]),
+        "margin_px": gap,
+        "measurements": records,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

@@ -1,0 +1,163 @@
+"""Independent final-PNG parser for Ribbon Link Correspondence.
+
+This module deliberately shares no imports or helpers with the latent renderer.
+It segments the public palette, recovers landmark components and their shapes,
+orders them within two raster rows, finds the marked upper edge, transfers its
+unordered endpoint identities to the lower row, and only then reads edge color.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BG = (250, 248, 242)
+ROUTE_RGB = (55, 62, 70)
+BLACK_RGB = (18, 21, 25)
+QUERY_RGB = (210, 48, 142)
+COLOR_TO_NAME = {
+    (234, 153, 30): "amber",
+    (24, 166, 188): "cyan",
+    (132, 82, 190): "violet",
+}
+ALLOWED = {BG, ROUTE_RGB, BLACK_RGB, QUERY_RGB, *COLOR_TO_NAME}
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        seen[sy, sx] = True
+        queue = deque([(sy, sx)])
+        points = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _mask(array: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    return np.all(array == np.asarray(rgb, dtype=np.uint8), axis=2)
+
+
+def _component_stats(points: np.ndarray) -> tuple[float, float, int, int, float, float]:
+    ys = points[:, 0]
+    xs = points[:, 1]
+    width = int(xs.max() - xs.min() + 1)
+    height = int(ys.max() - ys.min() + 1)
+    fill = float(len(points) / (width * height))
+    relative_y = float((ys.mean() - ys.min()) / max(1, height - 1))
+    return float(xs.mean()), float(ys.mean()), width, height, fill, relative_y
+
+
+def _shape_name(points: np.ndarray) -> str:
+    _, _, width, height, fill, relative_y = _component_stats(points)
+    if not (25 <= width <= 36 and 25 <= height <= 34 and len(points) >= 430):
+        raise ValueError("damaged landmark component")
+    if fill > 0.92:
+        return "square"
+    if fill > 0.68:
+        return "circle"
+    if relative_y > 0.54 or width > height + 2:
+        return "triangle"
+    return "diamond"
+
+
+def _one_colored_segment(array: np.ndarray, rgb: tuple[int, int, int]) -> tuple[float, float]:
+    parts = _components(_mask(array, rgb))
+    if len(parts) != 1:
+        raise ValueError("missing or split colored bridge")
+    x, y, width, height, fill, _ = _component_stats(parts[0])
+    if not (40 <= width <= 55 and 7 <= height <= 11 and fill > 0.88):
+        raise ValueError("damaged colored bridge")
+    return x, y
+
+
+def _gap_index(x: float, centers: list[float]) -> int:
+    midpoints = [(centers[i] + centers[i + 1]) / 2.0 for i in range(3)]
+    index = int(np.argmin(np.abs(np.asarray(midpoints) - x)))
+    if abs(midpoints[index] - x) > 4.0:
+        raise ValueError("bridge is not centered between adjacent landmarks")
+    return index
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or array.shape[0] < 200 or array.shape[1] < 300:
+        raise ValueError("invalid raster")
+    colors = {tuple(int(v) for v in row) for row in np.unique(array.reshape(-1, 3), axis=0)}
+    if not colors <= ALLOWED:
+        raise ValueError("unexpected raster color")
+
+    foreground = ~_mask(array, BG)
+    foreground_parts = _components(foreground)
+    if len(foreground_parts) != 1 or len(foreground_parts[0]) < 5000:
+        raise ValueError("ribbon is absent, broken, or incomplete")
+
+    route_parts = _components(_mask(array, ROUTE_RGB))
+    route_points = sum(len(part) for part in route_parts)
+    route_all = np.concatenate(route_parts, axis=0) if route_parts else np.empty((0, 2), int)
+    if route_points < 1250 or len(route_all) == 0:
+        raise ValueError("return ribbon backbone is incomplete")
+    _, _, route_width, route_height, _, _ = _component_stats(route_all)
+    if not (250 <= route_width <= 310 and 40 <= route_height <= 60):
+        raise ValueError("return ribbon geometry is malformed")
+
+    landmarks = _components(_mask(array, BLACK_RGB))
+    if len(landmarks) != 8:
+        raise ValueError("expected eight separate landmarks")
+    recovered = [(_component_stats(part), _shape_name(part)) for part in landmarks]
+    recovered.sort(key=lambda item: item[0][1])
+    top_raw, bottom_raw = recovered[:4], recovered[4:]
+    if max(item[0][1] for item in top_raw) + 30 >= min(item[0][1] for item in bottom_raw):
+        raise ValueError("landmark rows are not separate")
+    top_raw.sort(key=lambda item: item[0][0])
+    bottom_raw.sort(key=lambda item: item[0][0])
+    top_centers = [item[0][0] for item in top_raw]
+    bottom_centers = [item[0][0] for item in bottom_raw]
+    if any(not 68 <= b - a <= 80 for a, b in zip(top_centers, top_centers[1:])):
+        raise ValueError("upper landmark spacing is malformed")
+    if any(not 68 <= b - a <= 80 for a, b in zip(bottom_centers, bottom_centers[1:])):
+        raise ValueError("lower landmark spacing is malformed")
+    top_order = [item[1] for item in top_raw]
+    bottom_order = [item[1] for item in bottom_raw]
+    expected_shapes = {"circle", "square", "diamond", "triangle"}
+    if set(top_order) != expected_shapes or set(bottom_order) != expected_shapes:
+        raise ValueError("each run must contain one of every landmark")
+
+    query_x, query_y = _one_colored_segment(array, QUERY_RGB)
+    if query_y >= (np.mean([item[0][1] for item in top_raw]) + np.mean([item[0][1] for item in bottom_raw])) / 2:
+        raise ValueError("marked bridge is not on the upper run")
+    query_index = _gap_index(query_x, top_centers)
+    target = frozenset(top_order[query_index : query_index + 2])
+
+    color_at_gap: dict[int, str] = {}
+    for rgb, name in COLOR_TO_NAME.items():
+        x, y = _one_colored_segment(array, rgb)
+        if y <= query_y + 20:
+            raise ValueError("answer bridge is not on the lower run")
+        index = _gap_index(x, bottom_centers)
+        if index in color_at_gap:
+            raise ValueError("two answer colors occupy one lower link")
+        color_at_gap[index] = name
+    if set(color_at_gap) != {0, 1, 2}:
+        raise ValueError("lower links are incomplete")
+    matches = [
+        index
+        for index in range(3)
+        if frozenset(bottom_order[index : index + 2]) == target
+    ]
+    if len(matches) != 1:
+        raise ValueError("marked relation has no unique correspondence")
+    return color_at_gap[matches[0]]

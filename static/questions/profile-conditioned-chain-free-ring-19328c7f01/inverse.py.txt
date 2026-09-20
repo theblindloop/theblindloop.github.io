@@ -1,0 +1,161 @@
+"""Pixel-only oracle for chain_free_ring.
+
+Input: the final PNG only. No scene, no renderer, no gold.
+
+Pipeline: segment each palette colour, fit a circle to each coloured ring,
+intersect the fitted circles to locate every crossing, read at each crossing
+which colour is unbroken (the ring in front), and report the colour of the
+single ring that is in front at both crossings with each neighbour (or behind
+at both) -- the ring that interlocks with nobody. Abstains with "unknown".
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "chain_free_ring-oracle-0.1.0"
+
+ABSTAIN = "unknown"
+
+# The public answer set of the question; the oracle is allowed to know the
+# names and inks of the answer vocabulary, nothing about a particular scene.
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "blue": (33, 82, 196),
+    "brown": (121, 76, 40),
+    "green": (22, 128, 60),
+    "orange": (230, 126, 20),
+    "purple": (124, 52, 172),
+    "red": (198, 40, 44),
+}
+
+COLOR_TOLERANCE = 26
+MIN_RING_PIXELS = 900
+PROBE_RADIUS = 4.0
+MIN_FRONT_PIXELS = 8
+MAX_BEHIND_PIXELS = 2
+
+
+def _masks(arr: np.ndarray) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for name, rgb in PALETTE.items():
+        diff = np.abs(arr.astype(np.int16) - np.array(rgb, dtype=np.int16))
+        mask = diff.max(axis=2) <= COLOR_TOLERANCE
+        if int(mask.sum()) >= MIN_RING_PIXELS:
+            out[name] = mask
+    return out
+
+
+def _fit_circle(mask: np.ndarray) -> tuple[float, float, float, float] | None:
+    ys, xs = np.nonzero(mask)
+    if xs.size < 200:
+        return None
+    x = xs.astype(np.float64)
+    y = ys.astype(np.float64)
+    a = np.stack([x, y, np.ones_like(x)], axis=1)
+    b = -(x * x + y * y)
+    sol, *_ = np.linalg.lstsq(a, b, rcond=None)
+    cx, cy = -sol[0] / 2.0, -sol[1] / 2.0
+    val = cx * cx + cy * cy - sol[2]
+    if val <= 1.0:
+        return None
+    r = math.sqrt(val)
+    resid = np.abs(np.hypot(x - cx, y - cy) - r)
+    return cx, cy, r, float(resid.mean())
+
+
+def _intersections(
+    c1: tuple[float, float, float], c2: tuple[float, float, float]
+) -> list[tuple[float, float]] | None:
+    (x1, y1, r1), (x2, y2, r2) = c1, c2
+    dx, dy = x2 - x1, y2 - y1
+    d = math.hypot(dx, dy)
+    if d >= r1 + r2 or d <= abs(r1 - r2) or d == 0.0:
+        return None
+    a = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d)
+    h2 = r1 * r1 - a * a
+    if h2 <= 0.0:
+        return None
+    h = math.sqrt(h2)
+    bx, by = x1 + a * dx / d, y1 + a * dy / d
+    ux, uy = -dy / d, dx / d
+    return [(bx + h * ux, by + h * uy), (bx - h * ux, by - h * uy)]
+
+
+def _disk_count(mask: np.ndarray, point: tuple[float, float], radius: float) -> int:
+    h, w = mask.shape
+    x0 = max(0, int(math.floor(point[0] - radius)))
+    x1 = min(w, int(math.ceil(point[0] + radius)) + 1)
+    y0 = max(0, int(math.floor(point[1] - radius)))
+    y1 = min(h, int(math.ceil(point[1] + radius)) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    inside = (xs - point[0]) ** 2 + (ys - point[1]) ** 2 <= radius * radius
+    return int(np.count_nonzero(mask[y0:y1, x0:x1] & inside))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    masks = _masks(arr)
+    if len(masks) != 5:
+        return ABSTAIN
+
+    circles: dict[str, tuple[float, float, float]] = {}
+    for name, mask in masks.items():
+        fit = _fit_circle(mask)
+        if fit is None or fit[3] > 3.2 or not 30.0 < fit[2] < 200.0:
+            return ABSTAIN
+        circles[name] = (fit[0], fit[1], fit[2])
+
+    names = sorted(circles)
+    neighbours: dict[str, set[str]] = {n: set() for n in names}
+    interlocked: dict[str, set[str]] = {n: set() for n in names}
+    crossings: list[tuple[float, float]] = []
+
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            n1, n2 = names[i], names[j]
+            pts = _intersections(circles[n1], circles[n2])
+            if pts is None:
+                continue
+            fronts = []
+            for point in pts:
+                c1 = _disk_count(masks[n1], point, PROBE_RADIUS)
+                c2 = _disk_count(masks[n2], point, PROBE_RADIUS)
+                if max(c1, c2) < MIN_FRONT_PIXELS or min(c1, c2) > MAX_BEHIND_PIXELS:
+                    return ABSTAIN
+                fronts.append(n1 if c1 > c2 else n2)
+            crossings.extend(pts)
+            neighbours[n1].add(n2)
+            neighbours[n2].add(n1)
+            if fronts[0] != fronts[1]:
+                interlocked[n1].add(n2)
+                interlocked[n2].add(n1)
+
+    if any(len(neighbours[n]) != 2 for n in names):
+        return ABSTAIN
+    if len(crossings) != 10:
+        return ABSTAIN
+    for u in range(len(crossings)):
+        for v in range(u + 1, len(crossings)):
+            if math.dist(crossings[u], crossings[v]) < 14.0:
+                return ABSTAIN
+
+    # the five rings must form one closed chain
+    walk, current, previous = [names[0]], names[0], None
+    for _ in range(len(names) - 1):
+        step = [n for n in sorted(neighbours[current]) if n != previous]
+        if not step:
+            return ABSTAIN
+        previous, current = current, step[0]
+        walk.append(current)
+    if len(set(walk)) != len(names):
+        return ABSTAIN
+
+    free = [n for n in names if not interlocked[n]]
+    if len(free) != 1:
+        return ABSTAIN
+    return free[0]

@@ -1,0 +1,186 @@
+"""Independent RGB-only connectivity oracle for the bridge-cut world."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ROUTE_RGB = np.array((37, 52, 68), dtype=np.float32)
+COLOR_RGB = {
+    "green": np.array((37, 171, 104), dtype=np.float32),
+    "amber": np.array((230, 153, 35), dtype=np.float32),
+    "violet": np.array((135, 84, 193), dtype=np.float32),
+    "ring": np.array((35, 146, 211), dtype=np.float32),
+}
+CUT_RADIUS = 19.0
+
+
+class OracleFitError(ValueError):
+    """The final raster does not expose an unambiguous marked route graph."""
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist(), strict=True):
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        queue: deque[tuple[int, int]] = deque([(int(y0), int(x0))])
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= min_area:
+            found.append(np.asarray(pixels, dtype=np.float64))
+    return found
+
+
+def _merge_nearby(parts: list[np.ndarray], distance_limit: float) -> list[np.ndarray]:
+    clusters: list[list[np.ndarray]] = []
+    centers: list[np.ndarray] = []
+    for part in parts:
+        center = part.mean(axis=0)
+        match = None
+        for index, existing in enumerate(centers):
+            if float(np.linalg.norm(center - existing)) <= distance_limit:
+                match = index
+                break
+        if match is None:
+            clusters.append([part])
+            centers.append(center)
+        else:
+            clusters[match].append(part)
+            centers[match] = np.concatenate(clusters[match], axis=0).mean(axis=0)
+    return [np.concatenate(cluster, axis=0) for cluster in clusters]
+
+
+def _centers(array: np.ndarray, rgb: np.ndarray, expected: int) -> list[np.ndarray]:
+    distance = np.linalg.norm(array - rgb[None, None, :], axis=2)
+    # Exact marker interiors are large; the tighter threshold excludes gray
+    # antialias pixels where a colored ring meets the dark route.
+    parts = _components(distance < 60.0, min_area=18)
+    parts = _merge_nearby(parts, distance_limit=34.0)
+    if len(parts) != expected:
+        raise OracleFitError(f"expected {expected} colored markers, found {len(parts)}")
+    return [part.mean(axis=0) for part in parts]
+
+
+def _nearest_component(
+    center: np.ndarray, components: list[np.ndarray]
+) -> tuple[int, float]:
+    distances = [float(np.linalg.norm(part - center[None, :], axis=1).min()) for part in components]
+    index = int(np.argmin(distances))
+    return index, distances[index]
+
+
+def _nearest_pixel(center: np.ndarray, component: np.ndarray) -> tuple[int, int]:
+    distances = np.linalg.norm(component - center[None, :], axis=1)
+    row, col = component[int(np.argmin(distances))]
+    return int(row), int(col)
+
+
+def _reachable(mask: np.ndarray, start: tuple[int, int], target: tuple[int, int]) -> bool:
+    if not mask[start] or not mask[target]:
+        return False
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    seen[start] = True
+    queue: deque[tuple[int, int]] = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        if (y, x) == target:
+            return True
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Find the terminal whose ringed edge is a graph bridge from pixels only."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    route_distance = np.linalg.norm(array - ROUTE_RGB[None, None, :], axis=2)
+    route_mask = route_distance < 72.0
+    components = _components(route_mask, min_area=120)
+    if len(components) != 2:
+        raise OracleFitError(f"expected two disconnected route networks, found {len(components)}")
+
+    greens = _centers(array, COLOR_RGB["green"], 2)
+    ambers = _centers(array, COLOR_RGB["amber"], 1)
+    violets = _centers(array, COLOR_RGB["violet"], 1)
+    rings = _centers(array, COLOR_RGB["ring"], 2)
+    terminals = [("amber", ambers[0]), ("violet", violets[0])]
+
+    green_links = [_nearest_component(center, components) for center in greens]
+    if any(distance > 28.0 for _, distance in green_links):
+        raise OracleFitError("a green start is not bound to a route network")
+    terminal_links = [
+        (color, center, *_nearest_component(center, components))
+        for color, center in terminals
+    ]
+    if any(distance > 28.0 for _, _, _, distance in terminal_links):
+        raise OracleFitError("a terminal is not bound to a route network")
+    ring_links = [(*_nearest_component(center, components), center) for center in rings]
+    if any(distance > 24.0 for _, distance, _ in ring_links):
+        raise OracleFitError("a ring is not bound to a route edge")
+
+    green_by_component: dict[int, np.ndarray] = {}
+    for center, (component_id, _) in zip(greens, green_links, strict=True):
+        if component_id in green_by_component:
+            raise OracleFitError("a route network has multiple green starts")
+        green_by_component[component_id] = center
+    terminal_by_component: dict[int, tuple[str, np.ndarray]] = {}
+    for color, center, component_id, _ in terminal_links:
+        if component_id in terminal_by_component:
+            raise OracleFitError("a route network has multiple colored terminals")
+        terminal_by_component[component_id] = (color, center)
+
+    bridge_colors: list[str] = []
+    for component_id, component in enumerate(components):
+        if component_id not in green_by_component or component_id not in terminal_by_component:
+            raise OracleFitError("each network needs one green start and one terminal")
+        marked = [item for item in ring_links if item[0] == component_id]
+        if len(marked) != 1:
+            raise OracleFitError("each network needs exactly one ringed edge")
+
+        component_mask = np.zeros_like(route_mask, dtype=bool)
+        component_mask[component[:, 0].astype(int), component[:, 1].astype(int)] = True
+        ring_center = marked[0][2]
+        yy, xx = np.ogrid[:array.shape[0], :array.shape[1]]
+        cut = (yy - ring_center[0]) ** 2 + (xx - ring_center[1]) ** 2 <= CUT_RADIUS**2
+        altered = component_mask & ~cut
+        start_pixel = _nearest_pixel(green_by_component[component_id], component)
+        terminal_color, terminal_center = terminal_by_component[component_id]
+        terminal_pixel = _nearest_pixel(terminal_center, component)
+        if not _reachable(component_mask, start_pixel, terminal_pixel):
+            raise OracleFitError("unmarked route is not connected from start to terminal")
+        if not _reachable(altered, start_pixel, terminal_pixel):
+            bridge_colors.append(terminal_color)
+
+    if len(bridge_colors) != 1:
+        raise OracleFitError("exactly one marked edge must disconnect its terminal")
+    return bridge_colors[0]

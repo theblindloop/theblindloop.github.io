@@ -1,0 +1,159 @@
+"""Independent PNG-only graph reconstruction and shortest-route decision."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "orange": np.array((229, 99, 47), dtype=np.int16),
+    "green": np.array((44, 150, 83), dtype=np.int16),
+    "purple": np.array((138, 83, 181), dtype=np.int16),
+    "cyan": np.array((33, 183, 204), dtype=np.int16),
+    "yellow": np.array((244, 194, 37), dtype=np.int16),
+}
+
+
+def _components(mask: np.ndarray, minimum: int = 180) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        stack = [(int(y), int(x))]
+        group = []
+        while stack:
+            cy, cx = stack.pop()
+            group.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(group) >= minimum:
+            groups.append(group)
+    return groups
+
+
+def _color_groups(arr: np.ndarray) -> dict[str, list[tuple[float, float]]]:
+    names = list(PALETTE)
+    distances = np.stack(
+        [np.linalg.norm(arr.astype(np.int16) - PALETTE[name], axis=2) for name in names], axis=2
+    )
+    labels = distances.argmin(axis=2)
+    best = distances.min(axis=2)
+    result = {}
+    for index, name in enumerate(names):
+        groups = _components((labels == index) & (best < 72))
+        centers = []
+        for group in groups:
+            ys = np.fromiter((point[0] for point in group), dtype=float)
+            xs = np.fromiter((point[1] for point in group), dtype=float)
+            centers.append((float(xs.mean()), float(ys.mean())))
+        result[name] = centers
+    return result
+
+
+def _coverage(dark: np.ndarray, p: tuple[float, float], q: tuple[float, float]) -> float:
+    dx, dy = q[0] - p[0], q[1] - p[1]
+    length = math.hypot(dx, dy)
+    if length < 55:
+        return 0.0
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    samples = max(40, int(length - 48))
+    hits = 0
+    for step in range(samples):
+        distance = 24.0 + (length - 48.0) * (step + 0.5) / samples
+        cx, cy = p[0] + ux * distance, p[1] + uy * distance
+        found = False
+        for offset in (-3, -2, -1, 0, 1, 2, 3):
+            x = int(round(cx + nx * offset))
+            y = int(round(cy + ny * offset))
+            if 0 <= y < dark.shape[0] and 0 <= x < dark.shape[1] and dark[y, x]:
+                found = True
+                break
+        hits += int(found)
+    return hits / samples
+
+
+def _graph(dark: np.ndarray, centers: list[tuple[float, float]]) -> list[set[int]]:
+    graph = [set() for _ in centers]
+    confidence = 1.0
+    for a in range(len(centers)):
+        for b in range(a + 1, len(centers)):
+            px, py = centers[a]
+            qx, qy = centers[b]
+            length2 = (qx - px) ** 2 + (qy - py) ** 2
+            blocked = False
+            for c, (rx, ry) in enumerate(centers):
+                if c in (a, b):
+                    continue
+                along = ((rx - px) * (qx - px) + (ry - py) * (qy - py)) / length2
+                if 0.08 < along < 0.92:
+                    sx, sy = px + along * (qx - px), py + along * (qy - py)
+                    if math.hypot(rx - sx, ry - sy) < 23:
+                        blocked = True
+                        break
+            coverage = 0.0 if blocked else _coverage(dark, centers[a], centers[b])
+            confidence = min(confidence, abs(coverage - 0.78))
+            if coverage > 0.78:
+                graph[a].add(b)
+                graph[b].add(a)
+    if sum(map(len, graph)) // 2 != 19 or confidence < 0.10:
+        raise ValueError("ambiguous link segmentation")
+    return graph
+
+
+def _distance(graph: list[set[int]], start: int, finish: int, removed: int | None = None) -> int:
+    if removed in (start, finish):
+        return 10_000
+    distances = {start: 0}
+    pending = deque([start])
+    while pending:
+        node = pending.popleft()
+        for neighbor in graph[node]:
+            if neighbor == removed or neighbor in distances:
+                continue
+            distances[neighbor] = distances[node] + 1
+            pending.append(neighbor)
+    return distances.get(finish, 10_000)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    groups = _color_groups(arr)
+    if len(groups["yellow"]) != 2:
+        raise ValueError(f"expected two yellow terminals, found {len(groups['yellow'])}")
+    if len(groups["cyan"]) != 10:
+        raise ValueError(f"expected ten ordinary stations, found {len(groups['cyan'])}")
+    if any(len(groups[color]) != 1 for color in ("orange", "green", "purple")):
+        raise ValueError("expected one station of each candidate color")
+
+    tagged = []
+    for point in groups["yellow"]:
+        tagged.append((point, "terminal"))
+    for point in groups["cyan"]:
+        tagged.append((point, "ordinary"))
+    for color in ("orange", "green", "purple"):
+        tagged.append((groups[color][0], color))
+    centers = [item[0] for item in tagged]
+    dark = (arr[:, :, 0] < 135) & (arr[:, :, 1] < 135) & (arr[:, :, 2] < 135)
+    graph = _graph(dark, centers)
+    terminals = [index for index, item in enumerate(tagged) if item[1] == "terminal"]
+    baseline = _distance(graph, terminals[0], terminals[1])
+    if baseline != 4:
+        raise ValueError(f"unexpected terminal distance {baseline}")
+    penalties = {}
+    for color in ("orange", "green", "purple"):
+        node = next(index for index, item in enumerate(tagged) if item[1] == color)
+        penalties[color] = _distance(graph, terminals[0], terminals[1], node) - baseline
+    best = max(penalties.values())
+    winners = [color for color, value in penalties.items() if value == best]
+    if len(winners) != 1 or best < 2 or sorted(penalties.values()) != [0, 0, 2]:
+        raise ValueError(f"ambiguous shortest-route decision {penalties}")
+    return winners[0]

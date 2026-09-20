@@ -1,0 +1,135 @@
+"""Independent image-only inverse for the transpose-overlay world.
+
+This module intentionally repeats only public geometric constants and glyph
+templates. It never imports renderer state or accepts a latent scene.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+SYMBOLS = ("arch", "loop", "fork", "kite")
+BASE_LEVEL = 145.0
+SIGNAL_LEVEL = 32.0
+RED = np.array((224, 58, 62), dtype=np.float32)
+BLUE = np.array((54, 92, 224), dtype=np.float32)
+
+
+def _components(mask: np.ndarray) -> list[tuple[float, float, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[tuple[float, float, int]] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= 20:
+            ys = np.array([p[0] for p in points], dtype=np.float64)
+            xs = np.array([p[1] for p in points], dtype=np.float64)
+            found.append((float(xs.mean()), float(ys.mean()), len(points)))
+    return found
+
+
+def _role_interior(arr: np.ndarray, role_color: np.ndarray) -> np.ndarray:
+    distance = np.linalg.norm(arr - role_color[None, None, :], axis=2)
+    mask = distance < 35.0
+    marks = _components(mask)
+    if len(marks) != 4:
+        raise ValueError(f"expected four {role_color.tolist()} fiducials, found {len(marks)}")
+    xs = sorted(mark[0] for mark in marks)
+    ys = sorted(mark[1] for mark in marks)
+    # The four corner dots have only two distinct x/y coordinates.
+    left = 0.5 * (xs[0] + xs[1])
+    right = 0.5 * (xs[2] + xs[3])
+    top = 0.5 * (ys[0] + ys[1])
+    bottom = 0.5 * (ys[2] + ys[3])
+    size = int(round((right - left) - 24.0))
+    if size < 128 or size > 240 or abs((bottom - top) - (size + 24)) > 3.0:
+        raise ValueError("fiducials do not define a square panel")
+    x0 = int(round(left + 12.0))
+    y0 = int(round(top + 12.0))
+    if x0 < 0 or y0 < 0 or x0 + size > arr.shape[1] or y0 + size > arr.shape[0]:
+        raise ValueError("panel crop is outside image")
+    return arr[y0 : y0 + size, x0 : x0 + size, 0].astype(np.float32)
+
+
+def _points(symbol: str, size: int) -> list[tuple[int, int]]:
+    s = float(size - 1)
+    values = {
+        "arch": ((0.27, 0.74), (0.27, 0.42), (0.50, 0.20), (0.73, 0.42), (0.73, 0.74)),
+        "fork": ((0.50, 0.79), (0.50, 0.48), (0.27, 0.23)),
+        "kite": ((0.50, 0.15), (0.76, 0.50), (0.50, 0.85), (0.24, 0.50), (0.50, 0.15)),
+    }
+    return [(int(round(s * x)), int(round(s * y))) for x, y in values[symbol]]
+
+
+def _glyph_mask(symbol: str, size: int, stroke_variant: int) -> np.ndarray:
+    canvas = Image.new("L", (int(size), int(size)), 0)
+    draw = ImageDraw.Draw(canvas)
+    width = max(7, int(round(size * (0.052 + 0.006 * int(stroke_variant)))))
+    if symbol == "loop":
+        pad_x = int(round(size * 0.25))
+        pad_y = int(round(size * 0.18))
+        draw.ellipse((pad_x, pad_y, size - 1 - pad_x, size - 1 - pad_y), outline=255, width=width)
+    elif symbol == "fork":
+        points = _points(symbol, size)
+        draw.line(points, fill=255, width=width, joint="curve")
+        draw.line((points[1], (int(round((size - 1) * 0.73)), int(round((size - 1) * 0.23)))), fill=255, width=width)
+    else:
+        draw.line(_points(symbol, size), fill=255, width=width, joint="curve")
+    return np.asarray(canvas, dtype=np.float32) / 255.0
+
+
+def _scores(transformed: np.ndarray) -> list[tuple[float, str]]:
+    size = int(transformed.shape[0])
+    lo = max(0, int(round(0.10 * size)))
+    hi = min(size, int(round(0.90 * size)))
+    scores: list[tuple[float, str]] = []
+    for symbol in SYMBOLS:
+        best = float("inf")
+        for variant in (0, 1):
+            target = BASE_LEVEL - SIGNAL_LEVEL * _glyph_mask(symbol, size, variant)
+            mse = float(np.mean((transformed[lo:hi, lo:hi] - target[lo:hi, lo:hi]) ** 2))
+            best = min(best, mse)
+        scores.append((best, symbol))
+    return sorted(scores, key=lambda item: (item[0], item[1]))
+
+
+def confidence_margin(image: Image.Image) -> float:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    reference = _role_interior(arr, RED)
+    recording = _role_interior(arr, BLUE)
+    if reference.shape != recording.shape:
+        raise ValueError("role panels have different sizes")
+    transformed = 0.5 * (reference + recording.T)
+    ranked = _scores(transformed)
+    gap = ranked[1][0] - ranked[0][0]
+    return float(gap / 1000.0)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    reference = _role_interior(arr, RED)
+    recording = _role_interior(arr, BLUE)
+    if reference.shape != recording.shape:
+        raise ValueError("role panels have different sizes")
+    # The public operation: transpose only the blue-marked recording panel,
+    # then average corresponding pixels before template classification.
+    transformed = 0.5 * (reference + recording.T)
+    ranked = _scores(transformed)
+    gap = (ranked[1][0] - ranked[0][0]) / 1000.0
+    if not np.isfinite(gap) or gap < 0.08:
+        raise ValueError(f"ambiguous transpose reconstruction margin {gap:.4f}")
+    return ranked[0][1]

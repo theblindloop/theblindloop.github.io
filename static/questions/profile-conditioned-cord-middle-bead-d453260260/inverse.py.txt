@@ -1,0 +1,131 @@
+"""Pixel-only oracle for cord_middle_bead.
+
+Receives one rendered PNG and nothing else.  It segments the cord stroke and
+the three beads, checks that everything is one connected stroke, floods the
+stroke geodesically from one of its tips, and reports the bead whose
+along-stroke position is the median.  Ambiguous rasters return "unknown".
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "cord_middle_bead-oracle-0.1.0"
+
+ABSTAIN = "unknown"
+POOL = 3                      # max-pool factor for the geodesic flood
+MIN_BEAD_PIXELS = 200
+MIN_ORDER_GAP = 12            # pooled units (~36 px of cord) between neighbours
+
+_REFERENCE = {
+    "red": (215, 45, 45),
+    "blue": (40, 85, 205),
+    "amber": (240, 165, 20),
+}
+
+
+def _pool_or(mask: np.ndarray, k: int) -> np.ndarray:
+    h, w = mask.shape
+    ph, pw = (-h) % k, (-w) % k
+    if ph or pw:
+        mask = np.pad(mask, ((0, ph), (0, pw)))
+    h, w = mask.shape
+    return mask.reshape(h // k, k, w // k, k).any(axis=(1, 3))
+
+
+def _flood(mask: np.ndarray, starts):
+    """8-connected BFS distance map over a boolean mask."""
+    dist = np.full(mask.shape, -1, dtype=np.int32)
+    dq = deque()
+    for r, c in starts:
+        if mask[r, c] and dist[r, c] < 0:
+            dist[r, c] = 0
+            dq.append((r, c))
+    h, w = mask.shape
+    while dq:
+        r, c = dq.popleft()
+        d = dist[r, c] + 1
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < h and 0 <= cc < w and mask[rr, cc] and dist[rr, cc] < 0:
+                    dist[rr, cc] = d
+                    dq.append((rr, cc))
+    return dist
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    mx = arr.max(axis=2)
+    mn = arr.min(axis=2)
+
+    background = (mn > 230)
+    chromatic = (~background) & ((mx - mn) > 60)
+    stroke = (~background) & (~chromatic)
+    ink = stroke | chromatic
+    if ink.sum() < 2000:
+        return ABSTAIN
+
+    # --- bead segmentation: cluster the chromatic pixels by exact colour -----
+    cols = arr[chromatic]
+    if cols.size == 0:
+        return ABSTAIN
+    keys = (cols[:, 0].astype(np.int64) << 16) | (cols[:, 1].astype(np.int64) << 8) | cols[:, 2]
+    uniq, counts = np.unique(keys, return_counts=True)
+    groups = [(int(u), int(c)) for u, c in zip(uniq, counts) if c >= MIN_BEAD_PIXELS]
+    if len(groups) != 3:
+        return ABSTAIN
+
+    beads = {}
+    ys, xs = np.nonzero(chromatic)
+    for key, _count in groups:
+        rgb = ((key >> 16) & 255, (key >> 8) & 255, key & 255)
+        name, best = None, None
+        for cand, ref in _REFERENCE.items():
+            d = sum((int(rgb[i]) - ref[i]) ** 2 for i in range(3))
+            if best is None or d < best:
+                name, best = cand, d
+        if best > 6000 or name in beads:
+            return ABSTAIN
+        sel = keys == key
+        beads[name] = (float(ys[sel].mean()), float(xs[sel].mean()))
+    if len(beads) != 3:
+        return ABSTAIN
+
+    # --- one connected stroke? ---------------------------------------------
+    pooled = _pool_or(ink, POOL)
+    seed = np.argwhere(pooled)[0]
+    reach = _flood(pooled, [(int(seed[0]), int(seed[1]))])
+    if int((reach >= 0).sum()) != int(pooled.sum()):
+        return ABSTAIN                     # more than one stroke / broken cord
+
+    # --- geodesic order along the stroke -----------------------------------
+    tip = np.unravel_index(int(np.argmax(reach)), reach.shape)
+    dist = _flood(pooled, [(int(tip[0]), int(tip[1]))])
+
+    order = {}
+    for name, (cy, cx) in beads.items():
+        pr, pc = int(cy // POOL), int(cx // POOL)
+        val = -1
+        for rad in range(0, 6):
+            r0, r1 = max(pr - rad, 0), min(pr + rad + 1, dist.shape[0])
+            c0, c1 = max(pc - rad, 0), min(pc + rad + 1, dist.shape[1])
+            win = dist[r0:r1, c0:c1]
+            if (win >= 0).any():
+                val = int(win[win >= 0].mean())
+                break
+        if val < 0:
+            return ABSTAIN
+        order[name] = val
+
+    ranked = sorted(order.items(), key=lambda kv: kv[1])
+    if (ranked[1][1] - ranked[0][1] < MIN_ORDER_GAP
+            or ranked[2][1] - ranked[1][1] < MIN_ORDER_GAP):
+        return ABSTAIN
+    return ranked[1][0]

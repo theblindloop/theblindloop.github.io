@@ -1,0 +1,174 @@
+"""Pixel-only inverse arm for coil_curl_majority.
+
+Receives one rasterised PNG and nothing else: no latent scene, no analytic gold,
+no renderer import.  It vectorises the saturated ink into axis-aligned strokes,
+rebuilds the route graph, walks it from the capped end and returns the turn
+majority.  Any structural doubt yields ``"abstain"``.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+SAT_MIN = 45            # min(channel spread) accepted as saturated ink
+MIN_STROKE = 40         # shortest accepted stroke length in px
+MIN_THICK = 3           # shortest accepted stroke thickness in px
+RUN_TOL = 12            # px tolerance when stacking runs into one stroke
+JOIN_TOL = 17           # px radius that fuses stroke ends into one node
+CAP_WIN = 17            # half-window used to weigh the cap block
+CAP_RATIO = 1.6         # required ink-mass advantage of the capped end
+ABSTAIN = "abstain"
+
+
+def _ink_mask(image):
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    spread = arr.max(axis=2) - arr.min(axis=2)
+    return spread >= SAT_MIN, arr
+
+
+def _single_hue(arr, mask):
+    if mask.sum() < 500:
+        return False
+    vals = arr[mask]
+    ref = np.median(vals, axis=0)
+    return bool(np.all(np.abs(vals - ref) <= 70))
+
+
+def _runs(mask):
+    """Horizontal runs per row: yields (row, x0, x1)."""
+    padded = np.pad(mask, ((0, 0), (1, 1)))
+    diff = np.diff(padded.astype(np.int8), axis=1)
+    for y in range(mask.shape[0]):
+        starts = np.flatnonzero(diff[y] == 1)
+        ends = np.flatnonzero(diff[y] == -1) - 1
+        for x0, x1 in zip(starts, ends):
+            if x1 - x0 + 1 >= MIN_STROKE:
+                yield y, int(x0), int(x1)
+
+
+def _strokes(mask):
+    """Axis-aligned strokes as ((ax, ay), (bx, by)) centreline endpoints."""
+    out = []
+    for horizontal in (True, False):
+        work = mask if horizontal else mask.T
+        groups = []
+        for y, x0, x1 in _runs(work):
+            hit = None
+            for g in groups:
+                if (abs(g["x0"] - x0) <= RUN_TOL and abs(g["x1"] - x1) <= RUN_TOL
+                        and y - g["ylast"] <= 1):
+                    hit = g
+                    break
+            if hit is None:
+                groups.append({"x0": x0, "x1": x1, "y0": y, "ylast": y, "rows": 1})
+            else:
+                hit["x0"] = min(hit["x0"], x0)
+                hit["x1"] = max(hit["x1"], x1)
+                hit["ylast"] = y
+                hit["rows"] += 1
+        for g in groups:
+            if g["rows"] < MIN_THICK:
+                continue
+            c = (g["y0"] + g["ylast"]) / 2.0
+            if horizontal:
+                out.append(((float(g["x0"]), c), (float(g["x1"]), c)))
+            else:
+                out.append(((c, float(g["x0"])), (c, float(g["x1"]))))
+    return out
+
+
+def _nodes(strokes):
+    """Cluster stroke ends into nodes; return (node_points, edges)."""
+    pts = []
+    for a, b in strokes:
+        pts.extend([a, b])
+    labels = [-1] * len(pts)
+    centres = []
+    for idx, p in enumerate(pts):
+        for k, c in enumerate(centres):
+            if abs(p[0] - c[0]) <= JOIN_TOL and abs(p[1] - c[1]) <= JOIN_TOL:
+                labels[idx] = k
+                break
+        if labels[idx] < 0:
+            centres.append(p)
+            labels[idx] = len(centres) - 1
+    edges = [(labels[2 * k], labels[2 * k + 1]) for k in range(len(strokes))]
+    return centres, edges
+
+
+def _unit(a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    if abs(dx) >= abs(dy):
+        return (1 if dx > 0 else -1, 0)
+    return (0, 1 if dy > 0 else -1)
+
+
+def decision_from_image(image) -> str:
+    mask, arr = _ink_mask(image)
+    if not _single_hue(arr, mask):
+        return ABSTAIN
+
+    strokes = _strokes(mask)
+    if not 3 <= len(strokes) <= 40:
+        return ABSTAIN
+    centres, edges = _nodes(strokes)
+    if len(centres) != len(strokes) + 1:
+        return ABSTAIN
+
+    adj = {k: [] for k in range(len(centres))}
+    for e, (u, v) in enumerate(edges):
+        if u == v:
+            return ABSTAIN
+        adj[u].append((v, e))
+        adj[v].append((u, e))
+    ends = [k for k in adj if len(adj[k]) == 1]
+    if len(ends) != 2 or any(len(adj[k]) > 2 for k in adj):
+        return ABSTAIN
+
+    seen = {ends[0]}
+    stack = [ends[0]]
+    while stack:
+        cur = stack.pop()
+        for nxt, _ in adj[cur]:
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    if len(seen) != len(centres):
+        return ABSTAIN
+
+    weights = []
+    for k in ends:
+        x, y = int(round(centres[k][0])), int(round(centres[k][1]))
+        x0, x1 = max(0, x - CAP_WIN), min(mask.shape[1], x + CAP_WIN + 1)
+        y0, y1 = max(0, y - CAP_WIN), min(mask.shape[0], y + CAP_WIN + 1)
+        weights.append(float(mask[y0:y1, x0:x1].sum()))
+    if min(weights) <= 0:
+        return ABSTAIN
+    hi, lo = (0, 1) if weights[0] >= weights[1] else (1, 0)
+    if weights[hi] < CAP_RATIO * weights[lo]:
+        return ABSTAIN
+
+    node = ends[hi]
+    prev_edge = -1
+    dirs = []
+    while True:
+        step = [(v, e) for v, e in adj[node] if e != prev_edge]
+        if not step:
+            break
+        nxt, edge = step[0]
+        dirs.append(_unit(centres[node], centres[nxt]))
+        node, prev_edge = nxt, edge
+    if len(dirs) < 3:
+        return ABSTAIN
+
+    left = right = 0
+    for prev_d, next_d in zip(dirs, dirs[1:]):
+        if next_d == (prev_d[1], -prev_d[0]):
+            left += 1
+        elif next_d == (-prev_d[1], prev_d[0]):
+            right += 1
+        else:
+            return ABSTAIN
+    if left == right:
+        return ABSTAIN
+    return "left" if left > right else "right"

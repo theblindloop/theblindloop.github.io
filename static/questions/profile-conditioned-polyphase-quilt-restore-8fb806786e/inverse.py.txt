@@ -1,0 +1,170 @@
+"""Independent image-only inverse for the polyphase quilt question."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+_TILE_SIZES = (224, 240, 256, 272)
+_MARK_SIZE = 18
+_MARK_GAP = 7
+_SYMBOLS = ("arch", "bolt", "fork", "crown")
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    boxes: list[tuple[int, int, int, int]] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        min_x = max_x = x
+        min_y = max_y = y
+        count = 0
+        while queue:
+            cy, cx = queue.popleft()
+            count += 1
+            min_x, max_x = min(min_x, cx), max(max_x, cx)
+            min_y, max_y = min(min_y, cy), max(max_y, cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if count >= 100:
+            boxes.append((min_x, min_y, max_x, max_y))
+    return boxes
+
+
+def _locate_tile(image: Image.Image) -> tuple[int, int, int, int]:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    spread = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+    colorful = (spread > 55) & (rgb.max(axis=2) > 120)
+    boxes = _components(colorful)
+    if len(boxes) != 4:
+        raise ValueError(f"expected four colored corner marks, found {len(boxes)}")
+    centers = [((a + c) / 2.0, (b + d) / 2.0, a, b, c, d) for a, b, c, d in boxes]
+    left = sorted(centers, key=lambda item: item[0])[:2]
+    right = sorted(centers, key=lambda item: item[0])[2:]
+    top = sorted(centers, key=lambda item: item[1])[:2]
+    bottom = sorted(centers, key=lambda item: item[1])[2:]
+    tile_x = max(int(item[4]) for item in left) + _MARK_GAP + 1
+    tile_y = max(int(item[5]) for item in top) + _MARK_GAP + 1
+    right_edge = min(int(item[2]) for item in right)
+    bottom_edge = min(int(item[3]) for item in bottom)
+    width = right_edge - _MARK_GAP - tile_x
+    height = bottom_edge - _MARK_GAP - tile_y
+    if width != height or width not in _TILE_SIZES or width % 2:
+        raise ValueError(f"marks do not enclose a supported square: {(width, height)}")
+    return tile_x, tile_y, width, height
+
+
+def _deinterleave(recorded: np.ndarray) -> np.ndarray:
+    size = recorded.shape[0]
+    half = size // 2
+    restored = np.empty_like(recorded, dtype=np.float32)
+    restored[:half, :half] = recorded[0::2, 0::2]
+    restored[:half, half:] = recorded[0::2, 1::2]
+    restored[half:, :half] = recorded[1::2, 0::2]
+    restored[half:, half:] = recorded[1::2, 1::2]
+    return restored
+
+
+def _edge_mean(values: np.ndarray, size: int = 7) -> np.ndarray:
+    radius = size // 2
+    padded = np.pad(values, ((radius, radius), (radius, radius)), mode="edge")
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(0).cumsum(1)
+    total = (
+        integral[size:, size:]
+        - integral[:-size, size:]
+        - integral[size:, :-size]
+        + integral[:-size, :-size]
+    )
+    return total / float(size * size)
+
+
+def _glyph_points(symbol: str) -> tuple[tuple[float, float], ...]:
+    if symbol == "arch":
+        return ((0.22, 0.70), (0.27, 0.54), (0.37, 0.41), (0.50, 0.36),
+                (0.63, 0.41), (0.73, 0.54), (0.78, 0.70))
+    if symbol == "bolt":
+        return ((0.58, 0.20), (0.36, 0.49), (0.51, 0.49), (0.40, 0.80),
+                (0.68, 0.45), (0.53, 0.45))
+    if symbol == "fork":
+        return ((0.50, 0.78), (0.50, 0.49), (0.29, 0.25),
+                (0.50, 0.49), (0.71, 0.25))
+    if symbol == "crown":
+        return ((0.24, 0.73), (0.24, 0.34), (0.39, 0.55),
+                (0.50, 0.27), (0.61, 0.55), (0.76, 0.34),
+                (0.76, 0.73), (0.24, 0.73))
+    raise ValueError(symbol)
+
+
+def _template(symbol: str, dx: int, dy: int, scale: float) -> np.ndarray:
+    size = 64
+    mask = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(mask)
+    cx = size * 0.5 + dx
+    cy = size * 0.5 + dy
+    points = [
+        (cx + (x - 0.5) * size * scale, cy + (y - 0.5) * size * scale)
+        for x, y in _glyph_points(symbol)
+    ]
+    width = max(3, int(round(size * 0.055 * scale)))
+    draw.line(points, fill=255, width=width, joint="curve")
+    return np.asarray(mask, dtype=np.float32) / 255.0
+
+
+def _classify(restored: np.ndarray) -> tuple[str, float]:
+    smoothed = _edge_mean(restored, 7)
+    resized = Image.fromarray(np.clip(smoothed, 0, 255).astype(np.uint8), mode="L").resize(
+        (64, 64), Image.Resampling.BILINEAR
+    )
+    values = np.asarray(resized, dtype=np.float32)
+    high = float(np.percentile(values, 88.0))
+    low = float(np.percentile(values, 12.0))
+    spread = max(18.0, high - low)
+    observed = np.clip((high - values) / spread, 0.0, 1.0)
+    observed_centered = (observed - float(observed.mean())).reshape(-1)
+    observed_norm = float(np.linalg.norm(observed_centered))
+    if observed_norm < 1.0:
+        raise ValueError("restored raster has insufficient glyph evidence")
+
+    best_by_symbol: dict[str, float] = {}
+    for symbol in _SYMBOLS:
+        best = -1.0
+        for scale in (0.88, 1.00, 1.12):
+            for dy in range(-6, 7, 2):
+                for dx in range(-6, 7, 2):
+                    template = _template(symbol, dx, dy, scale)
+                    centered = (template - float(template.mean())).reshape(-1)
+                    norm = float(np.linalg.norm(centered))
+                    score = float(np.dot(observed_centered, centered) / (observed_norm * norm))
+                    best = max(best, score)
+        best_by_symbol[symbol] = best
+    ranking = sorted(((score, symbol) for symbol, score in best_by_symbol.items()), reverse=True)
+    best_score, best_symbol = ranking[0]
+    runner_score = ranking[1][0]
+    return best_symbol, float(best_score - runner_score)
+
+
+def _measure(image: Image.Image) -> tuple[str, float]:
+    tile_x, tile_y, width, height = _locate_tile(image)
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    recorded = rgb[tile_y : tile_y + height, tile_x : tile_x + width, 0].astype(np.float32)
+    return _classify(_deinterleave(recorded))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    decision, _ = _measure(image)
+    return decision
+
+
+def confidence_margin(image: Image.Image) -> float:
+    _, margin = _measure(image)
+    return margin

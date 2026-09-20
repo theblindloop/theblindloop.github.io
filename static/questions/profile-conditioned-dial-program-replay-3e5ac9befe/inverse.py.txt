@@ -1,0 +1,157 @@
+"""Independent image-only inverse arm for the dial-program raster."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+_CHIP = np.array((255, 250, 225), dtype=np.int16)
+_CARD = np.array((235, 244, 252), dtype=np.int16)
+_TEMPLATES = {
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
+    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+}
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _near(arr: np.ndarray, color: np.ndarray, tolerance: float = 12.0) -> np.ndarray:
+    return np.linalg.norm(arr.astype(np.int16) - color, axis=2) <= tolerance
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(values)
+    if not len(indices):
+        return []
+    breaks = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.r_[indices[0], indices[breaks + 1]]
+    ends = np.r_[indices[breaks], indices[-1]]
+    return [(int(a), int(b)) for a, b in zip(starts, ends, strict=True)]
+
+
+def _rect_components(mask: np.ndarray, minimum_area: int) -> list[tuple[int, int, int, int]]:
+    """Recover separated rectangular fill islands without fixed canvas coordinates."""
+    boxes: list[tuple[int, int, int, int]] = []
+    for y0, y1 in _runs(mask.any(axis=1)):
+        for x0, x1 in _runs(mask[y0 : y1 + 1].any(axis=0)):
+            area = int(mask[y0 : y1 + 1, x0 : x1 + 1].sum())
+            if area >= minimum_area:
+                boxes.append((x0, y0, x1, y1))
+    return boxes
+
+
+def _recognize_letter(dark: np.ndarray, box: tuple[int, int, int, int]) -> tuple[str, float]:
+    x0, y0, x1, y1 = box
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    # The chip itself supplies scale and center. Only the central glyph is read;
+    # no absolute position from the renderer is used.
+    half_w = max(12, int((x1 - x0 + 1) * 0.34))
+    half_h = max(17, int((y1 - y0 + 1) * 0.43))
+    xa, xb = max(0, round(cx - half_w)), min(dark.shape[1], round(cx + half_w + 1))
+    ya, yb = max(0, round(cy - half_h)), min(dark.shape[0], round(cy + half_h + 1))
+    ys, xs = np.nonzero(dark[ya:yb, xa:xb])
+    if len(xs) < 40:
+        raise PixelParseError("station label is missing or too faint")
+    xs, ys = xs + xa, ys + ya
+    gx0, gx1, gy0, gy1 = int(xs.min()), int(xs.max()) + 1, int(ys.min()), int(ys.max()) + 1
+    observed = np.zeros((7, 5), dtype=bool)
+    for row in range(7):
+        ry0 = gy0 + round(row * (gy1 - gy0) / 7)
+        ry1 = gy0 + round((row + 1) * (gy1 - gy0) / 7)
+        for col in range(5):
+            rx0 = gx0 + round(col * (gx1 - gx0) / 5)
+            rx1 = gx0 + round((col + 1) * (gx1 - gx0) / 5)
+            cell = dark[ry0:max(ry1, ry0 + 1), rx0:max(rx1, rx0 + 1)]
+            observed[row, col] = bool(cell.mean() > 0.28)
+    scores = {}
+    for label, rows in _TEMPLATES.items():
+        expected = np.array([[bit == "1" for bit in row] for row in rows])
+        scores[label] = int(np.count_nonzero(observed != expected))
+    ranking = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    if ranking[0][1] > 3 or ranking[1][1] - ranking[0][1] < 2:
+        raise PixelParseError(f"ambiguous station glyph scores {ranking}")
+    return ranking[0][0], float(ranking[1][1] - ranking[0][1])
+
+
+def _is_orange(pixels: np.ndarray) -> np.ndarray:
+    return ((pixels[..., 0] > 180) & (pixels[..., 1] > 70) &
+            (pixels[..., 1] < 175) & (pixels[..., 2] < 90))
+
+
+def _is_purple(pixels: np.ndarray) -> np.ndarray:
+    return ((pixels[..., 0] > 85) & (pixels[..., 0] < 180) &
+            (pixels[..., 1] < 105) & (pixels[..., 2] > 125))
+
+
+def _decode(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3 or min(arr.shape[:2]) < 100:
+        raise PixelParseError("raster is too small")
+    chips = _rect_components(_near(arr, _CHIP), minimum_area=900)
+    if len(chips) != 4:
+        raise PixelParseError(f"expected four station chips, found {len(chips)}")
+    dark = np.all(arr < 85, axis=2)
+    labels: dict[str, tuple[float, float]] = {}
+    label_margins = []
+    for box in chips:
+        label, runner_gap = _recognize_letter(dark, box)
+        if label in labels:
+            raise PixelParseError(f"duplicate station label {label}")
+        x0, y0, x1, y1 = box
+        labels[label] = ((x0 + x1) / 2, (y0 + y1) / 2)
+        label_margins.append(runner_gap)
+    if set(labels) != set(_TEMPLATES):
+        raise PixelParseError(f"station labels incomplete: {sorted(labels)}")
+
+    # The marker reds have a blue channel above the orange operation palette;
+    # this extra bound prevents orange triangles from shifting the ring centroid.
+    red = ((arr[..., 0] > 155) & (arr[..., 1] < 105) &
+           (arr[..., 2] > 40) & (arr[..., 2] < 110))
+    ry, rx = np.nonzero(red)
+    if len(rx) < 250:
+        raise PixelParseError("marked start ring is missing")
+    ring_center = (float(rx.mean()), float(ry.mean()))
+    distances = sorted(
+        ((math.dist(ring_center, center), label) for label, center in labels.items()),
+        key=lambda item: item[0],
+    )
+    chip_scale = np.mean([box[2] - box[0] + 1 for box in chips])
+    if distances[0][0] > 0.55 * chip_scale or distances[1][0] - distances[0][0] < chip_scale:
+        raise PixelParseError("start ring does not identify one station cleanly")
+    state = ("A", "B", "C", "D").index(distances[0][1])
+
+    cards = _rect_components(_near(arr, _CARD), minimum_area=1800)
+    if not 5 <= len(cards) <= 7:
+        raise PixelParseError(f"expected five to seven operation cards, found {len(cards)}")
+    cards.sort(key=lambda box: (box[0] + box[2]) / 2)
+    event_margins = []
+    for x0, y0, x1, y1 in cards:
+        crop = arr[y0 : y1 + 1, x0 : x1 + 1]
+        orange = int(_is_orange(crop).sum())
+        purple = int(_is_purple(crop).sum())
+        event_margins.append(abs(orange - purple) / max(orange + purple, 1))
+        if orange > 250 and purple < 50:
+            state = (state + 1) % 4
+        elif purple > 250 and orange < 50:
+            state = (0, 3, 2, 1)[state]
+        else:
+            raise PixelParseError(
+                f"operation card is erased or ambiguous (orange={orange}, purple={purple})"
+            )
+    confidence = min([*label_margins, *(8.0 * value for value in event_margins)])
+    return ("A", "B", "C", "D")[state], float(confidence)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _decode(image)[0]
+
+
+def decision_margin_from_image(image: Image.Image) -> float:
+    """Pixel-only gap between the winning parse and its nearest runner-up."""
+    return _decode(image)[1]

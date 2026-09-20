@@ -1,0 +1,362 @@
+"""Renderer for paddock_gate_gap.
+
+One animal (a filled round blob) stands inside a fence loop drawn as a closed
+polygon of thick straight rails.  On one rail a stretch of paint may be missing:
+that break is the gate.  Gold is whether the animal can walk off the page
+without crossing painted fence, which is a connectivity property of the fence
+ink, not of where the animal happens to stand.
+
+Every latent field is painted into the raster.  The only field that feeds
+analytic gold is the gap width, and a gap is visible paint that is absent.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "paddock_gate_gap-renderer-0.1.0"
+
+W = 400
+H = 400
+
+# The animal can leave ("yes") or is held in ("no").
+DECISIONS = ("yes", "no")
+# A pen drawn round an animal is expected to hold it: the closed fence is the
+# canonical variant.  Recorded for analysis only; never used as gold.
+CANONICAL_DECISION = "no"
+
+QUARANTINE_PX = 8.0
+
+WHITE = (255, 255, 255)
+DECOR_GREY = (150, 150, 150)
+
+_FENCE_INKS = (
+    (94, 62, 38), (40, 62, 104), (36, 92, 66), (110, 44, 44),
+    (58, 58, 62), (96, 74, 26),
+)
+_ANIMAL_INKS = (
+    (222, 96, 32), (206, 44, 96), (60, 132, 208), (196, 156, 24),
+    (128, 72, 176), (30, 150, 130),
+)
+_BAR_INKS = (
+    (168, 168, 176), (176, 156, 132), (150, 164, 150), (170, 150, 160),
+)
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    for _ in range(400):
+        scene = _try_scene(rng)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"could not sample a valid scene for seed {seed}")
+
+
+def _try_scene(rng: random.Random) -> dict | None:
+    n = rng.choice((5, 6, 7, 8))
+    cx = rng.uniform(188.0, 212.0)
+    cy = rng.uniform(188.0, 212.0)
+    rad = rng.uniform(118.0, 150.0)
+    phase = rng.uniform(0.0, 2.0 * math.pi)
+    poly = []
+    for i in range(n):
+        a = phase + 2.0 * math.pi * i / n
+        r = rad * rng.uniform(0.86, 1.0)
+        poly.append((round(cx + r * math.cos(a), 3), round(cy + r * math.sin(a), 3)))
+    for x, y in poly:
+        if not (18.0 <= x <= W - 18.0 and 18.0 <= y <= H - 18.0):
+            return None
+
+    # answer-independent nuisances first
+    stroke = float(rng.randint(9, 13))
+    gate_edge = rng.randrange(n)
+    gate_t = round(rng.uniform(0.34, 0.66), 4)
+    fence_color = list(_FENCE_INKS[rng.randrange(len(_FENCE_INKS))])
+    animal_color = list(_ANIMAL_INKS[rng.randrange(len(_ANIMAL_INKS))])
+    bar_color = list(_BAR_INKS[rng.randrange(len(_BAR_INKS))])
+
+    # the answer, sampled independently of every nuisance above
+    is_open = rng.random() < 0.5
+    near_boundary = rng.random() < 0.18
+    if is_open:
+        gap = float(rng.randint(5, 7)) if near_boundary else float(rng.randint(11, 34))
+    else:
+        gap = 0.0
+        if near_boundary:
+            stroke = float(rng.randint(5, 7))
+
+    # the gate break must fit inside its rail
+    ax, ay = poly[gate_edge]
+    bx, by = poly[(gate_edge + 1) % n]
+    edge_len = math.hypot(bx - ax, by - ay)
+    if edge_len < gap + 2.0 * stroke + 30.0:
+        return None
+
+    animal_r = float(rng.randint(13, 19))
+    animal = _place_animal(rng, poly, animal_r, stroke)
+    if animal is None:
+        return None
+    bars = _place_bars(rng, poly, animal, stroke)
+
+    return {
+        "width": W,
+        "height": H,
+        "poly": poly,
+        "stroke": stroke,
+        "gate_edge": gate_edge,
+        "gate_t": gate_t,
+        "gap": gap,
+        "animal": animal,
+        "bars": bars,
+        "fence_color": fence_color,
+        "animal_color": animal_color,
+        "bar_color": bar_color,
+    }
+
+
+def _dist_to_poly(poly: list, px: float, py: float) -> float:
+    best = 1e9
+    n = len(poly)
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % n]
+        vx, vy = bx - ax, by - ay
+        L2 = vx * vx + vy * vy
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / L2))
+        best = min(best, math.hypot(px - (ax + t * vx), py - (ay + t * vy)))
+    return best
+
+
+def _inside(poly: list, px: float, py: float) -> bool:
+    hit = False
+    n = len(poly)
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i - 1) % n]
+        if (ay > py) != (by > py) and px < (bx - ax) * (py - ay) / (by - ay) + ax:
+            hit = not hit
+    return hit
+
+
+def _place_animal(rng: random.Random, poly: list, r: float, stroke: float):
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    for _ in range(120):
+        x = round(rng.uniform(min(xs), max(xs)), 3)
+        y = round(rng.uniform(min(ys), max(ys)), 3)
+        if not _inside(poly, x, y):
+            continue
+        if _dist_to_poly(poly, x, y) < r + stroke + 16.0:
+            continue
+        return [x, y, r]
+    return None
+
+
+def _place_bars(rng: random.Random, poly: list, animal: list, stroke: float) -> list:
+    """Elongated decoration inside the pen: never fence, never round."""
+    bars: list = []
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    want = rng.randint(1, 3)
+    for _ in range(150):
+        if len(bars) >= want:
+            break
+        bl = round(rng.uniform(38.0, 62.0), 3)
+        bw = round(rng.uniform(8.0, 12.0), 3)
+        horiz = rng.random() < 0.5
+        x = round(rng.uniform(min(xs), max(xs)), 3)
+        y = round(rng.uniform(min(ys), max(ys)), 3)
+        hx, hy = (bl / 2.0, bw / 2.0) if horiz else (bw / 2.0, bl / 2.0)
+        ok = True
+        for cxx in (x - hx, x + hx):
+            for cyy in (y - hy, y + hy):
+                if not _inside(poly, cxx, cyy) or _dist_to_poly(poly, cxx, cyy) < stroke + 14.0:
+                    ok = False
+        if not ok:
+            continue
+        if math.hypot(x - animal[0], y - animal[1]) < animal[2] + max(hx, hy) + 18.0:
+            continue
+        clash = False
+        for ox, oy, ohx, ohy in bars:
+            if abs(x - ox) < hx + ohx + 14.0 and abs(y - oy) < hy + ohy + 14.0:
+                clash = True
+        if clash:
+            continue
+        bars.append([x, y, round(hx, 3), round(hy, 3)])
+    return bars
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _rail_pieces(scene: dict) -> list:
+    """Painted pieces of the fence: (ax, ay, bx, by) segments."""
+    poly = scene["poly"]
+    n = len(poly)
+    pieces = []
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % n]
+        if i != scene["gate_edge"] or scene["gap"] <= 0.0:
+            pieces.append((ax, ay, bx, by))
+            continue
+        L = math.hypot(bx - ax, by - ay)
+        ux, uy = (bx - ax) / L, (by - ay) / L
+        mid = scene["gate_t"] * L
+        s0 = mid - scene["gap"] / 2.0
+        s1 = mid + scene["gap"] / 2.0
+        pieces.append((ax, ay, ax + ux * s0, ay + uy * s0))
+        pieces.append((ax + ux * s1, ay + uy * s1, bx, by))
+    return pieces
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (scene["width"], scene["height"]), WHITE)
+    d = ImageDraw.Draw(img)
+
+    # fixed decoration, identical in every image of the set
+    for x, y in ((14, 14), (scene["width"] - 15, 14), (14, scene["height"] - 15),
+                 (scene["width"] - 15, scene["height"] - 15)):
+        d.line([(x - 5, y), (x + 5, y)], fill=DECOR_GREY, width=2)
+
+    bar = tuple(scene["bar_color"])
+    for x, y, hx, hy in scene["bars"]:
+        d.rectangle([x - hx, y - hy, x + hx, y + hy], fill=bar)
+
+    ink = tuple(scene["fence_color"])
+    half = scene["stroke"] / 2.0
+    for ax, ay, bx, by in _rail_pieces(scene):
+        L = math.hypot(bx - ax, by - ay)
+        if L < 1e-6:
+            continue
+        nx, ny = -(by - ay) / L * half, (bx - ax) / L * half
+        d.polygon(
+            [(ax + nx, ay + ny), (bx + nx, by + ny), (bx - nx, by - ny), (ax - nx, ay - ny)],
+            fill=ink,
+        )
+    # square the corners so a thick loop has no pinholes at its vertices
+    for i, (vx, vy) in enumerate(scene["poly"]):
+        if scene["gap"] > 0.0 and i in (scene["gate_edge"], (scene["gate_edge"] + 1) % len(scene["poly"])):
+            pass
+        d.ellipse([vx - half, vy - half, vx + half, vy + half], fill=ink)
+
+    ax, ay, ar = scene["animal"]
+    d.ellipse([ax - ar, ay - ar, ax + ar, ay + ar], fill=tuple(scene["animal_color"]))
+    return img
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    return "yes" if scene["gap"] > 0.0 else "no"
+
+
+def runner_up(scene: dict) -> str:
+    return "no" if analytic_gold(scene) == "yes" else "yes"
+
+
+def margin(scene: dict) -> float:
+    """Pixels of paint that must be added or removed to flip the answer.
+
+    Open pen: the break must be painted shut, which costs its width.
+    Closed pen: the loop must be cut, which costs the rail's painted width.
+    """
+    return float(scene["gap"]) if scene["gap"] > 0.0 else float(scene["stroke"])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict) -> list:
+    return []
+
+
+# --------------------------------------------------------------------------
+# label-preserving and label-transforming edits (used by verify.py)
+# --------------------------------------------------------------------------
+def translate(scene: dict, dx: float, dy: float) -> dict:
+    s = _copy(scene)
+    s["poly"] = [(round(x + dx, 3), round(y + dy, 3)) for x, y in scene["poly"]]
+    s["animal"] = [scene["animal"][0] + dx, scene["animal"][1] + dy, scene["animal"][2]]
+    s["bars"] = [[b[0] + dx, b[1] + dy, b[2], b[3]] for b in scene["bars"]]
+    return s
+
+
+def recolor(scene: dict) -> dict:
+    s = _copy(scene)
+    s["fence_color"] = list(_FENCE_INKS[(_FENCE_INKS.index(tuple(scene["fence_color"])) + 3) % len(_FENCE_INKS)])
+    s["animal_color"] = list(_ANIMAL_INKS[(_ANIMAL_INKS.index(tuple(scene["animal_color"])) + 2) % len(_ANIMAL_INKS)])
+    s["bar_color"] = list(_BAR_INKS[(_BAR_INKS.index(tuple(scene["bar_color"])) + 1) % len(_BAR_INKS)])
+    return s
+
+
+def move_animal(scene: dict, seed: int) -> dict:
+    """The animal stands somewhere else inside the same pen: gold cannot move."""
+    rng = random.Random(seed * 31 + 7)
+    placed = _place_animal(rng, scene["poly"], scene["animal"][2], scene["stroke"])
+    if placed is None:
+        return _copy(scene)
+    s = _copy(scene)
+    s["animal"] = placed
+    return s
+
+
+def permute_decor(scene: dict, seed: int) -> dict:
+    rng = random.Random(seed * 17 + 3)
+    s = _copy(scene)
+    s["bars"] = _place_bars(rng, scene["poly"], scene["animal"], scene["stroke"])
+    return s
+
+
+def move_gate(scene: dict) -> dict:
+    """Same break, different rail: an escape route is an escape route."""
+    s = _copy(scene)
+    n = len(scene["poly"])
+    for k in range(1, n):
+        cand = (scene["gate_edge"] + k) % n
+        ax, ay = scene["poly"][cand]
+        bx, by = scene["poly"][(cand + 1) % n]
+        if math.hypot(bx - ax, by - ay) >= scene["gap"] + 2.0 * scene["stroke"] + 30.0:
+            s["gate_edge"] = cand
+            return s
+    return s
+
+
+def set_state(scene: dict, open_pen: bool, gap: float = 16.0) -> dict:
+    s = _copy(scene)
+    s["gap"] = float(gap) if open_pen else 0.0
+    return s
+
+
+def collapse_margin(scene: dict) -> dict:
+    """Drive the visible separation to zero: the break closes."""
+    s = _copy(scene)
+    s["gap"] = 0.0
+    s["stroke"] = 0.0
+    return s
+
+
+def ink_pixels(image: Image.Image) -> int:
+    import numpy as np
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    return int((arr.min(axis=-1) < 235).sum())
+
+
+def _copy(scene: dict) -> dict:
+    s = dict(scene)
+    s["poly"] = [tuple(p) for p in scene["poly"]]
+    s["animal"] = list(scene["animal"])
+    s["bars"] = [list(b) for b in scene["bars"]]
+    s["fence_color"] = list(scene["fence_color"])
+    s["animal_color"] = list(scene["animal_color"])
+    s["bar_color"] = list(scene["bar_color"])
+    return s

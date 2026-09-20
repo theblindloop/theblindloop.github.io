@@ -1,0 +1,157 @@
+"""Pixel-only inverse arm for the join-board pip relay world.
+
+This module receives the finished raster and nothing else.  It segments the two
+white panels, parses each panel row into its pip group and its colour block,
+finds the framed token square on the bare board, and only then composes the two
+bindings through the shared pip-count alphabet.  It imports no scene state and
+no code from the forward arm.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "joinboard_pip_relay_bind-oracle-0.1.0"
+
+# Public palette from the question contract; re-declared here so that the image
+# path stays independent of every forward-arm module.
+ANCHORS = {
+    "red": (200, 40, 40),
+    "blue": (40, 70, 200),
+    "green": (35, 150, 60),
+    "purple": (150, 50, 190),
+    "orange": (240, 150, 30),
+    "teal": (20, 160, 160),
+    "pink": (240, 110, 180),
+    "brown": (120, 80, 35),
+}
+TAG_NAMES = ("red", "blue", "green", "purple")
+SLOT_NAMES = ("orange", "teal", "pink", "brown")
+
+
+class OracleAbstain(Exception):
+    """Raised when the raster does not present a legible join board."""
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            spans.append((start, index - 1))
+            start = None
+    if start is not None:
+        spans.append((start, len(flags) - 1))
+    return spans
+
+
+def _nearest(rgb) -> str:
+    return min(ANCHORS, key=lambda name: math.dist(rgb, ANCHORS[name]))
+
+
+def _panels(white: np.ndarray) -> list[tuple[int, int, int, int]]:
+    columns = _runs(white.sum(axis=0) > 30)
+    columns = [span for span in columns if span[1] - span[0] > 60]
+    if len(columns) != 2:
+        raise OracleAbstain(f"expected two white panels, found {len(columns)}")
+    boxes = []
+    for x0, x1 in columns:
+        rows = _runs(white[:, x0 : x1 + 1].sum(axis=1) > 30)
+        rows = [span for span in rows if span[1] - span[0] > 60]
+        if len(rows) != 1:
+            raise OracleAbstain("panel column band is not a single rectangle")
+        boxes.append((x0, x1, rows[0][0], rows[0][1]))
+    return boxes
+
+
+def _parse_panel(pixels: np.ndarray, box: tuple[int, int, int, int]) -> dict:
+    x0, x1, y0, y1 = box
+    crop = pixels[y0 + 2 : y1 - 1, x0 + 2 : x1 - 1]
+    ink = crop.min(axis=2) < 240
+    dark = crop.max(axis=2) < 90
+    bands = [span for span in _runs(ink.any(axis=1)) if span[1] - span[0] >= 8]
+    if len(bands) != 4:
+        raise OracleAbstain(f"panel has {len(bands)} rows, expected 4")
+
+    rows = []
+    for top, bottom in bands:
+        band_ink = ink[top : bottom + 1]
+        band_dark = dark[top : bottom + 1]
+        objects = [span for span in _runs(band_ink.any(axis=0)) if span[1] - span[0] >= 4]
+        pips = []
+        colours = []
+        for left, right in objects:
+            piece_ink = band_ink[:, left : right + 1]
+            piece_dark = band_dark[:, left : right + 1]
+            if right - left + 1 < 20 and piece_dark.sum() > 0.6 * piece_ink.sum():
+                pips.append((left, right))
+            else:
+                patch = crop[top : bottom + 1, left : right + 1][piece_ink]
+                colours.append((left, patch.mean(axis=0)))
+        if len(colours) != 1 or not 1 <= len(pips) <= 4:
+            raise OracleAbstain("panel row is not one colour block plus a pip group")
+        rows.append(
+            {
+                "pips": len(pips),
+                "colour": _nearest(colours[0][1]),
+                "colour_x": colours[0][0],
+                "pip_x": min(left for left, _ in pips),
+            }
+        )
+
+    if sorted(row["pips"] for row in rows) != [1, 2, 3, 4]:
+        raise OracleAbstain("pip counts in a panel are not 1, 2, 3 and 4")
+    kind = "tag" if all(row["colour_x"] < row["pip_x"] for row in rows) else "slot"
+    if kind == "slot" and not all(row["pip_x"] < row["colour_x"] for row in rows):
+        raise OracleAbstain("panel row layout is inconsistent")
+    return {"kind": kind, "rows": rows}
+
+
+def _token(pixels: np.ndarray, boxes: list[tuple[int, int, int, int]]) -> str:
+    dark = pixels.max(axis=2) < 90
+    for x0, x1, y0, y1 in boxes:
+        dark[max(0, y0 - 8) : y1 + 9, max(0, x0 - 8) : x1 + 9] = False
+    columns = [span for span in _runs(dark.any(axis=0)) if span[1] - span[0] >= 12]
+    if len(columns) != 1:
+        raise OracleAbstain(f"expected one framed token, found {len(columns)}")
+    x0, x1 = columns[0]
+    rows = [span for span in _runs(dark[:, x0 : x1 + 1].any(axis=1)) if span[1] - span[0] >= 12]
+    if len(rows) != 1:
+        raise OracleAbstain("token frame is not a single square")
+    y0, y1 = rows[0]
+    inner = pixels[y0 + 8 : y1 - 7, x0 + 8 : x1 - 7]
+    if inner.size == 0:
+        raise OracleAbstain("token frame has no visible interior")
+    lit = inner.reshape(-1, 3)[inner.max(axis=2).reshape(-1) >= 90]
+    if lit.size == 0:
+        raise OracleAbstain("token interior is not a colour block")
+    return _nearest(lit.mean(axis=0))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    pixels = np.asarray(image.convert("RGB")).astype(np.int16)
+    white = (pixels.min(axis=2) >= 246)
+    boxes = _panels(white)
+    parsed = [_parse_panel(pixels, box) for box in boxes]
+    kinds = {panel["kind"]: panel for panel in parsed}
+    if len(kinds) != 2:
+        raise OracleAbstain("the two panels have the same layout")
+
+    tag, slot = kinds["tag"], kinds["slot"]
+    if {row["colour"] for row in tag["rows"]} != set(TAG_NAMES):
+        raise OracleAbstain("tag panel colours are not the four input colours")
+    if {row["colour"] for row in slot["rows"]} != set(SLOT_NAMES):
+        raise OracleAbstain("slot panel colours are not the four output colours")
+
+    token = _token(pixels, boxes)
+    if token not in TAG_NAMES:
+        raise OracleAbstain("token colour is not one of the four input colours")
+
+    key_pip = next(row["pips"] for row in tag["rows"] if row["colour"] == token)
+    index = next(i for i, row in enumerate(slot["rows"]) if row["pips"] == key_pip)
+    return f"{slot['rows'][index]['colour']}|row{index + 1}"

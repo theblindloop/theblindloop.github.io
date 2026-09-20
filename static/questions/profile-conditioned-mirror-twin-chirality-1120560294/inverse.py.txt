@@ -1,0 +1,139 @@
+"""Pixel-only inverse arm for the mirror-twin chirality world.
+
+This module receives a PNG and nothing else. It never imports the renderer,
+prompts, generator, verifier or any analytic-gold code, and it never accepts a
+latent scene. It shares no geometry constants with the renderer beyond the
+PUBLIC visual contract stated in the question text: two same-coloured shapes,
+one on each side of an achromatic bar, on achromatic decoration.
+
+Method, independent of how the image was produced:
+
+1. Label a pixel chromatic iff ``max(R,G,B) - min(R,G,B) >= SAT_MIN``. The white
+   page, the grey bar, the grey pips and the grey baseline all drop out; only
+   the two coloured shapes survive.
+2. Project the chromatic mask onto the x axis. Each shape is a horizontally
+   contiguous block of columns, so the projection must contain exactly two
+   substantial runs; anything else (missing ink, extra ink, noise) abstains.
+3. Crop each shape to its own bounding box. Test the two public hypotheses by
+   best overlap under a small translation search: "copied" compares the right
+   crop with the left crop, "mirrored" compares it with the left crop flipped
+   left-to-right. Intersection-over-union scores both.
+4. Answer with the better-scoring hypothesis, and abstain when the winner is a
+   poor fit or the runner-up gap is too small to call.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "mirror_twin_chirality-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+
+SAT_MIN = 60          # renderer palette chroma >= 130; grey decoration chroma 0
+MIN_VALUE = 60        # reject near-black chromatic mush
+MIN_RUN_PX = 8        # column runs narrower than this are antialiasing crumbs
+MIN_SHAPE_W = 40      # a five-column shape is at least this wide
+MAX_SHAPE_W = 260
+MIN_SHAPE_PX = 1200   # smallest plausible shape area
+AREA_RATIO_MIN = 0.80 # the twins must carry comparable ink
+SHIFT = 3             # translation search radius, in pixels
+IOU_MIN = 0.60        # winner must actually fit
+GAP_MIN = 0.020       # runner-up decision margin required to answer
+
+
+def _chromatic_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    hi = arr.max(axis=-1)
+    lo = arr.min(axis=-1)
+    return ((hi - lo) >= SAT_MIN) & (hi >= MIN_VALUE)
+
+
+def _column_runs(cols: np.ndarray) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start = None
+    for i, v in enumerate(cols):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append((start, i))
+            start = None
+    if start is not None:
+        runs.append((start, len(cols)))
+    return [r for r in runs if r[1] - r[0] >= MIN_RUN_PX]
+
+
+def _crop(mask: np.ndarray, x0: int, x1: int) -> np.ndarray:
+    sub = mask[:, x0:x1]
+    rows = np.nonzero(sub.any(axis=1))[0]
+    return sub[rows.min(): rows.max() + 1]
+
+
+def _best_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Best IoU of two binary crops over a small translation search."""
+    h = max(a.shape[0], b.shape[0]) + 2 * SHIFT + 2
+    w = max(a.shape[1], b.shape[1]) + 2 * SHIFT + 2
+    pa = np.zeros((h, w), dtype=bool)
+    pb = np.zeros((h, w), dtype=bool)
+    # bottom-left aligned: both shapes stand on a baseline
+    pa[h - SHIFT - 1 - a.shape[0]: h - SHIFT - 1, SHIFT + 1: SHIFT + 1 + a.shape[1]] = a
+    pb[h - SHIFT - 1 - b.shape[0]: h - SHIFT - 1, SHIFT + 1: SHIFT + 1 + b.shape[1]] = b
+    best = 0.0
+    for dy in range(-SHIFT, SHIFT + 1):
+        rolled_y = np.roll(pb, dy, axis=0)
+        for dx in range(-SHIFT, SHIFT + 1):
+            shifted = np.roll(rolled_y, dx, axis=1)
+            inter = int(np.logical_and(pa, shifted).sum())
+            union = int(np.logical_or(pa, shifted).sum())
+            if union:
+                best = max(best, inter / float(union))
+    return best
+
+
+def measure(image: Image.Image) -> dict:
+    mask = _chromatic_mask(image)
+    report: dict = {"chromatic_px": int(mask.sum()), "reason": None}
+    runs = _column_runs(mask.any(axis=0))
+    if len(runs) != 2:
+        report["reason"] = f"expected two coloured shapes, found {len(runs)}"
+        return report
+    widths = [r[1] - r[0] for r in runs]
+    if min(widths) < MIN_SHAPE_W or max(widths) > MAX_SHAPE_W:
+        report["reason"] = f"implausible shape widths {widths}"
+        return report
+
+    left = _crop(mask, *runs[0])
+    right = _crop(mask, *runs[1])
+    areas = [int(left.sum()), int(right.sum())]
+    report["shape_px"] = areas
+    if min(areas) < MIN_SHAPE_PX:
+        report["reason"] = f"coloured evidence too small {areas}"
+        return report
+    if min(areas) / float(max(areas)) < AREA_RATIO_MIN:
+        report["reason"] = f"twins carry very different ink {areas}"
+        return report
+
+    iou_copy = _best_iou(left, right)
+    iou_mirror = _best_iou(np.fliplr(left), right)
+    gap = abs(iou_mirror - iou_copy)
+    report.update(
+        {
+            "iou_copied": round(iou_copy, 6),
+            "iou_mirrored": round(iou_mirror, 6),
+            "decision_gap": round(gap, 6),
+        }
+    )
+    if max(iou_copy, iou_mirror) < IOU_MIN:
+        report["reason"] = f"neither hypothesis fits (best {max(iou_copy, iou_mirror):.3f})"
+        return report
+    if gap < GAP_MIN:
+        report["reason"] = f"runner-up gap too small ({gap:.4f})"
+        return report
+    report["decision"] = "mirrored" if iou_mirror > iou_copy else "copied"
+    return report
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """The public inverse arm: "mirrored", "copied", or "abstain"."""
+    return measure(image).get("decision", ABSTAIN)

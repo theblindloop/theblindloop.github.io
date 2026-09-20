@@ -1,0 +1,128 @@
+"""Independent image-only inverse for the paired heatmap reversal."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_LABEL_PALETTE = {
+    "amber": np.asarray((218.0, 145.0, 44.0)),
+    "teal": np.asarray((32.0, 157.0, 148.0)),
+    "violet": np.asarray((136.0, 78.0, 188.0)),
+}
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    """Return 8-connected pixel components without renderer geometry."""
+
+    height, width = mask.shape
+    pending = {tuple(int(value) for value in point) for point in np.argwhere(mask)}
+    found: list[np.ndarray] = []
+    while pending:
+        start = pending.pop()
+        queue: deque[tuple[int, int]] = deque([start])
+        pixels = [start]
+        while queue:
+            y, x = queue.popleft()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    neighbour = (y + dy, x + dx)
+                    ny, nx = neighbour
+                    if 0 <= ny < height and 0 <= nx < width and neighbour in pending:
+                        pending.remove(neighbour)
+                        queue.append(neighbour)
+                        pixels.append(neighbour)
+        if len(pixels) >= minimum:
+            found.append(np.asarray(pixels, dtype=np.int32))
+    return found
+
+
+def _label_centers(array: np.ndarray) -> dict[str, tuple[float, float]]:
+    centers: dict[str, tuple[float, float]] = {}
+    for name, color in _LABEL_PALETTE.items():
+        distance = np.linalg.norm(array.astype(np.float32) - color, axis=2)
+        components = _components(distance <= 58.0, 100)
+        if len(components) != 1:
+            raise ValueError(f"expected one visible {name} row key")
+        points = components[0]
+        centers[name] = (float(points[:, 1].mean()), float(points[:, 0].mean()))
+    ys = sorted(point[1] for point in centers.values())
+    if max(ys[index + 1] - ys[index] for index in range(2)) < 18.0:
+        raise ValueError("row keys are not separated")
+    return centers
+
+
+def _heat_cells(array: np.ndarray) -> list[tuple[float, float, float]]:
+    """Find the six warm-hued cell interiors and measure their luminance."""
+
+    red = array[:, :, 0].astype(np.float32)
+    green = array[:, :, 1].astype(np.float32)
+    blue = array[:, :, 2].astype(np.float32)
+    # The heat ramp is red/orange; row-key amber is excluded by its much larger
+    # green-blue gap, and remote context is too pale to pass the red-green test.
+    mask = (
+        (red > green + 27.0)
+        & (green > blue + 8.0)
+        & (green - blue < 70.0)
+        & (red < 248.0)
+    )
+    cells: list[tuple[float, float, float]] = []
+    for points in _components(mask, 180):
+        y0, x0 = points.min(axis=0)
+        y1, x1 = points.max(axis=0)
+        if not (12 <= int(x1 - x0 + 1) <= 24 and 15 <= int(y1 - y0 + 1) <= 30):
+            continue
+        luminance = float(
+            np.mean(
+                0.299 * array[points[:, 0], points[:, 1], 0]
+                + 0.587 * array[points[:, 0], points[:, 1], 1]
+                + 0.114 * array[points[:, 0], points[:, 1], 2]
+            )
+        )
+        cells.append((float(points[:, 1].mean()), float(points[:, 0].mean()), luminance))
+    if len(cells) != 6:
+        raise ValueError(f"expected six separated heat cells, found {len(cells)}")
+    cells.sort(key=lambda item: (item[0], item[1]))
+    if cells[3][0] - cells[2][0] < 45.0:
+        raise ValueError("two heatmap panels are not separated")
+    return cells
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the reversal row from the final PNG only."""
+
+    if not isinstance(image, Image.Image):
+        raise TypeError("decision_from_image expects a PIL image")
+    array = np.asarray(image.convert("RGB"))
+    if array.shape != (512, 512, 3):
+        raise ValueError("unexpected canvas size")
+    labels = _label_centers(array)
+    cells = _heat_cells(array)
+    row_y = {name: point[1] for name, point in labels.items()}
+    assigned: dict[str, dict[str, tuple[float, float]]] = {
+        name: {} for name in labels
+    }
+    left_cells = cells[:3]
+    right_cells = cells[3:]
+    for panel, panel_cells in (("P", left_cells), ("Q", right_cells)):
+        for x, y, luminance in panel_cells:
+            label = min(labels, key=lambda name: abs(row_y[name] - y))
+            if abs(row_y[label] - y) > 16.0 or panel in assigned[label]:
+                raise ValueError("heat cell to row-key binding is ambiguous")
+            assigned[label][panel] = (x, luminance)
+    if any(set(values) != {"P", "Q"} for values in assigned.values()):
+        raise ValueError("each row must expose one cell in both panels")
+
+    hottest = min(assigned, key=lambda name: assigned[name]["P"][1])
+    coldest = max(assigned, key=lambda name: assigned[name]["Q"][1])
+    p_scores = sorted(assigned[name]["P"][1] for name in assigned)
+    q_scores = sorted(assigned[name]["Q"][1] for name in assigned)
+    if p_scores[1] - p_scores[0] < 2.0 or q_scores[-1] - q_scores[-2] < 2.0:
+        raise ValueError("heatmap extreme margin is unresolved")
+    if hottest != coldest:
+        raise ValueError("raster does not expose one common reversal row")
+    return hottest

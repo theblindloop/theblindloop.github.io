@@ -1,0 +1,141 @@
+"""Independent pixel-only inverse for Trail-Tick Turtle Reveal.
+
+This module intentionally shares no imports, scene data, geometry constants, or
+analytic-gold code with the renderer. It segments visible colors, validates one
+continuous marked carrier, orders ticks from the red ring toward the gold
+triangle, and classifies the recovered command string by edit distance.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_LEFT_COLORS = np.asarray(((25, 181, 205), (36, 193, 189), (47, 165, 211)), dtype=np.int32)
+_RIGHT_COLORS = np.asarray(((239, 126, 48), (229, 139, 42), (242, 111, 57)), dtype=np.int32)
+_TRAIL_COLOR = np.asarray((35, 45, 60), dtype=np.int32)
+_START_COLOR = np.asarray((205, 54, 63), dtype=np.int32)
+_END_COLOR = np.asarray((235, 188, 43), dtype=np.int32)
+_PROGRAMS = {
+    "stair": "LR" * 8,
+    "wave": "RLLR" * 4,
+    "crown": "RRLL" * 4,
+}
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _near_any(array: np.ndarray, colors: np.ndarray, tolerance: int = 42) -> np.ndarray:
+    work = array.astype(np.int32)
+    delta = work[:, :, None, :] - colors[None, None, :, :]
+    return np.min(np.sum(delta * delta, axis=3), axis=2) <= tolerance * tolerance
+
+
+def _near(array: np.ndarray, color: np.ndarray, tolerance: int = 42) -> np.ndarray:
+    work = array.astype(np.int32)
+    delta = work - color
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 8-connected foreground components as (y,x) point arrays."""
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    output: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        queue = deque([(y0, x0)])
+        seen[y0, x0] = True
+        points = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int16))
+    return output
+
+
+def _single_centroid(mask: np.ndarray, name: str, minimum: int) -> np.ndarray:
+    comps = [points for points in _components(mask) if len(points) >= minimum]
+    if len(comps) != 1:
+        raise OracleAbstention(f"expected one visible {name} fiducial")
+    # Return x,y to make vector arithmetic conventional.
+    return comps[0][:, ::-1].astype(np.float64).mean(axis=0)
+
+
+def _tick_centers(mask: np.ndarray, name: str) -> list[np.ndarray]:
+    comps = [points for points in _components(mask) if len(points) >= 65]
+    if len(comps) != 8:
+        raise OracleAbstention(f"expected eight intact {name} command ticks")
+    if any(len(points) < 105 or len(points) > 300 for points in comps):
+        raise OracleAbstention(f"damaged {name} command tick")
+    return [points[:, ::-1].astype(np.float64).mean(axis=0) for points in comps]
+
+
+def _carrier_is_one_component(foreground: np.ndarray, start: np.ndarray, end: np.ndarray) -> None:
+    comps = [points for points in _components(foreground) if len(points) >= 20]
+    if len(comps) != 1:
+        raise OracleAbstention("the marked carrier is not one continuous component")
+    points = comps[0][:, ::-1].astype(np.float64)
+    span = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+    endpoint_span = float(np.linalg.norm(end - start))
+    if span < 420.0 or endpoint_span < 420.0:
+        raise OracleAbstention("the ring-to-triangle trail is missing or truncated")
+
+
+def _hamming(a: str, b: str) -> int:
+    return sum(x != y for x, y in zip(a, b)) + abs(len(a) - len(b))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the revealed symbol from the final raster, or abstain."""
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 128 or array.shape[1] < 128:
+        raise OracleAbstention("unsupported raster")
+
+    left_mask = _near_any(array, _LEFT_COLORS)
+    right_mask = _near_any(array, _RIGHT_COLORS)
+    trail_mask = _near(array, _TRAIL_COLOR)
+    start_mask = _near(array, _START_COLOR)
+    end_mask = _near(array, _END_COLOR)
+
+    start = _single_centroid(start_mask, "red ring", 250)
+    end = _single_centroid(end_mask, "gold triangle", 250)
+    left = _tick_centers(left_mask, "cyan")
+    right = _tick_centers(right_mask, "orange")
+
+    foreground = trail_mask | left_mask | right_mask | start_mask | end_mask
+    _carrier_is_one_component(foreground, start, end)
+
+    direction = end - start
+    norm = float(np.linalg.norm(direction))
+    if norm <= 0:
+        raise OracleAbstention("coincident endpoint fiducials")
+    direction /= norm
+    ordered = [(float((center - start) @ direction), "L") for center in left]
+    ordered.extend((float((center - start) @ direction), "R") for center in right)
+    ordered.sort()
+    projections = [item[0] for item in ordered]
+    if projections[0] < 8.0 or projections[-1] > norm - 8.0:
+        raise OracleAbstention("command lies outside the marked carrier endpoints")
+    if min(np.diff(projections)) < 12.0:
+        raise OracleAbstention("command order is visually ambiguous")
+    program = "".join(command for _, command in ordered)
+
+    ranked = sorted((_hamming(program, template), label) for label, template in _PROGRAMS.items())
+    if len(ranked) < 2 or ranked[0][0] == ranked[1][0]:
+        return "ambiguous"
+    return ranked[0][1]

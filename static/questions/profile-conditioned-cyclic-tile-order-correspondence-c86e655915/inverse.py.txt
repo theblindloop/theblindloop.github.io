@@ -1,0 +1,144 @@
+"""Independent image-only inverse arm for cyclic tile-order correspondence.
+
+No renderer data or global layout coordinates are used.  The oracle locates the
+eight chromatic tile components, extracts a relative 3x3 binary glyph from each
+detected bounding box, solves the complete 4! cross-panel assignment, and then
+tests the recovered clockwise permutation up to cyclic rotation.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+@dataclass(frozen=True)
+class _Component:
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    area: int
+    cx: float
+    cy: float
+
+
+def _components(mask: np.ndarray) -> list[_Component]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[_Component] = []
+    for y, x in zip(*np.nonzero(mask), strict=True):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            py, px = queue.popleft()
+            points.append((py, px))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) < 900:
+            continue
+        ys = np.fromiter((point[0] for point in points), dtype=np.int32)
+        xs = np.fromiter((point[1] for point in points), dtype=np.int32)
+        result.append(
+            _Component(
+                int(xs.min()),
+                int(ys.min()),
+                int(xs.max()),
+                int(ys.max()),
+                len(points),
+                float(xs.mean()),
+                float(ys.mean()),
+            )
+        )
+    return result
+
+
+def _signature(arr: np.ndarray, component: _Component) -> str:
+    width = component.x1 - component.x0 + 1
+    height = component.y1 - component.y0 + 1
+    cx = (component.x0 + component.x1) / 2.0
+    cy = (component.y0 + component.y1) / 2.0
+    patch_radius = max(2, int(round(min(width, height) * 0.035)))
+    bits = []
+    for row in range(3):
+        for col in range(3):
+            px = int(round(cx + (col - 1) * width * 0.185))
+            py = int(round(cy + (row - 1) * height * 0.185))
+            patch = arr[
+                max(0, py - patch_radius) : py + patch_radius + 1,
+                max(0, px - patch_radius) : px + patch_radius + 1,
+            ]
+            luminance = patch.astype(np.float32).mean(axis=2)
+            bits.append("1" if float((luminance < 90).mean()) > 0.55 else "0")
+    return "".join(bits)
+
+
+def _cyclic_indices(order: tuple[int, ...]) -> bool:
+    canonical = (0, 1, 2, 3)
+    doubled = canonical + canonical
+    return any(doubled[offset : offset + 4] == order for offset in range(4))
+
+
+def _analyse(image: Image.Image) -> tuple[str, float, tuple[int, ...]]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    high = arr.max(axis=2).astype(np.int16)
+    low = arr.min(axis=2).astype(np.int16)
+    # Tile fills and borders are chromatic; paper, panel lines, text, glyphs,
+    # and the direction guide are achromatic.  No particular palette is known.
+    chromatic = (high - low >= 22) & (high >= 80)
+    components = _components(chromatic)
+    if len(components) != 8:
+        raise ValueError(f"expected eight visible tile components, found {len(components)}")
+
+    by_y = sorted(components, key=lambda item: item.cy)
+    top = sorted(by_y[:4], key=lambda item: item.cx)
+    bottom = by_y[4:]
+    if max(item.cy for item in top) >= min(item.cy for item in bottom):
+        raise ValueError("row and ring tile groups are not separated")
+
+    ring_cx = sum(item.cx for item in bottom) / 4.0
+    ring_cy = sum(item.cy for item in bottom) / 4.0
+    bottom = sorted(
+        bottom,
+        key=lambda item: math.atan2(item.cy - ring_cy, item.cx - ring_cx) % (2.0 * math.pi),
+    )
+
+    top_signatures = [_signature(arr, item) for item in top]
+    bottom_signatures = [_signature(arr, item) for item in bottom]
+    if len(set(top_signatures)) != 4 or len(set(bottom_signatures)) != 4:
+        raise ValueError("tile glyphs are not uniquely recoverable")
+
+    scored: list[tuple[int, tuple[int, ...]]] = []
+    for assignment in itertools.permutations(range(4)):
+        cost = sum(
+            sum(a != b for a, b in zip(bottom_signatures[j], top_signatures[i], strict=True))
+            for j, i in enumerate(assignment)
+        )
+        scored.append((cost, assignment))
+    scored.sort()
+    if scored[0][0] != 0:
+        raise ValueError(f"no exact cross-panel glyph assignment; best cost {scored[0][0]}")
+    runner_up_gap = float(scored[1][0] - scored[0][0])
+    if runner_up_gap < 6.0:
+        raise ValueError(f"ambiguous glyph assignment; runner-up gap {runner_up_gap}")
+    assignment = scored[0][1]
+    return ("yes" if _cyclic_indices(assignment) else "no", runner_up_gap, assignment)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _analyse(image)[0]

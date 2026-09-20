@@ -1,0 +1,234 @@
+"""Scene sampler, renderer and analytic gold for slope_extension_finish.
+
+Four straight coloured segments are drawn in the left half of the picture and a
+solid black vertical FINISH LINE stands near the right edge. Each segment is
+continued to the right at its own slope until it meets the finish line; the
+answer is the colour whose extended line meets the finish line highest, i.e. at
+the smallest row index.
+
+The drawn segments never cross one another, so their visible vertical order is
+fixed across the drawn region: the reading that decides the answer lives
+entirely outside the inked part of each segment and has to be produced by
+carrying a slope forward. The sampler enforces a balanced cue profile so that
+the topmost drawn segment and the steepest rising segment each win only at
+chance rate. All endpoints are integers and every mark is a hard-edged Pillow
+primitive, so the raster carries exactly the geometry the analytic arm uses.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "slope_extension_finish-renderer-1.0.0"
+
+WIDTH = 680
+HEIGHT = 440
+BACKGROUND = (255, 255, 255)
+
+INK = (16, 16, 16)  # finish line and bottom rail
+DECOR = (206, 206, 206)  # pale grey decoration, achromatic on purpose
+
+COLOR_NAMES = ("red", "green", "blue", "orange")
+COLOR_RGB = {
+    "red": (214, 28, 28),
+    "green": (22, 142, 62),
+    "blue": (34, 68, 210),
+    "orange": (242, 150, 16),
+}
+
+SEG_WIDTH = 3
+LINE_WIDTH = 3
+RAIL_Y = 424
+TOP_Y = 20
+
+REF_LEFT = 140  # left reference abscissa of the lane construction
+REF_RIGHT = 480  # right reference abscissa of the lane construction
+LANE_GAP = 26  # smallest vertical separation between two lanes, in pixels
+Y_LO = 52
+Y_HI = 392
+
+MIN_MARGIN_PX = 2.0  # never sample an unresolved arrival ordering
+QUARANTINE_PX = 6.0  # runner-up arrival gap below which the scene is quarantined
+
+ARRIVAL_LO = 26.0
+ARRIVAL_HI = 406.0
+
+# Balanced cue profile: (the answer is the topmost drawn segment, the answer is
+# the steepest rising segment).  Each cheap cue therefore carries the answer at
+# the 1-in-4 chance rate of a four-way choice and never on its own.
+CUE_PROFILES = (
+    (False, False),
+    (False, False),
+    (False, True),
+    (True, False),
+)
+
+# Margin bands, so the dataset covers wide, ordinary and near-boundary scenes.
+MARGIN_BANDS = (
+    (MIN_MARGIN_PX, QUARANTINE_PX),
+    (QUARANTINE_PX, 14.0),
+    (14.0, 1.0e9),
+    (14.0, 1.0e9),
+    (14.0, 1.0e9),
+)
+
+
+def _sample_once(rng: random.Random) -> dict | None:
+    finish_x = rng.randrange(560, 621)
+
+    left = sorted(rng.sample(range(Y_LO, Y_HI + 1), 4))
+    right = sorted(rng.sample(range(Y_LO, Y_HI + 1), 4))
+    for a, b in zip(left, left[1:]):
+        if b - a < LANE_GAP:
+            return None
+    for a, b in zip(right, right[1:]):
+        if b - a < LANE_GAP:
+            return None
+
+    segments = []
+    for lane in range(4):
+        x0 = rng.randrange(REF_LEFT, REF_LEFT + 71)
+        x1 = rng.randrange(REF_RIGHT - 90, REF_RIGHT + 1)
+        if x1 - x0 < 200:
+            return None
+        span = float(REF_RIGHT - REF_LEFT)
+        slope = (right[lane] - left[lane]) / span
+        y0 = int(round(left[lane] + slope * (x0 - REF_LEFT)))
+        y1 = int(round(left[lane] + slope * (x1 - REF_LEFT)))
+        if y0 == y1 and x1 - x0 > 0:
+            # A perfectly flat drawn segment carries no slope to extend.
+            return None
+        segments.append([x0, y0, x1, y1])
+
+    # Non-crossing check on the drawn integer geometry itself: two straight
+    # segments keep their order over an interval exactly when they keep it at
+    # both ends of that interval.
+    for a in range(4):
+        for b in range(a + 1, 4):
+            lo = max(segments[a][0], segments[b][0])
+            hi = min(segments[a][2], segments[b][2])
+            if lo >= hi:
+                return None
+            da = _height_at(segments[a], lo) - _height_at(segments[b], lo)
+            db = _height_at(segments[a], hi) - _height_at(segments[b], hi)
+            if da * db <= 0.0 or min(abs(da), abs(db)) < LANE_GAP - 6:
+                return None
+
+    arrivals = [_height_at(seg, finish_x) for seg in segments]
+    if min(arrivals) < ARRIVAL_LO or max(arrivals) > ARRIVAL_HI:
+        return None
+    order = sorted(arrivals)
+    for first, second in zip(order, order[1:]):
+        if second - first < MIN_MARGIN_PX:
+            return None
+
+    decor = []
+    for _ in range(3):
+        decor.append(rng.randrange(60, 400))
+
+    colors = list(COLOR_NAMES)
+    rng.shuffle(colors)
+    return {
+        "finish_x": finish_x,
+        "segments": segments,
+        "lane_colors": colors,
+        "decor_rows": sorted(decor),
+    }
+
+
+def _height_at(segment: list[int], x: float) -> float:
+    """Height of the straight line through a segment's two drawn endpoints."""
+    x0, y0, x1, y1 = segment
+    return y0 + (y1 - y0) * (x - x0) / float(x1 - x0)
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic scene for ``seed``, rejection-sampled to a cue profile."""
+    rng = random.Random(seed)
+    wanted = CUE_PROFILES[rng.randrange(len(CUE_PROFILES))]
+    band = MARGIN_BANDS[rng.randrange(len(MARGIN_BANDS))]
+    for _ in range(60000):
+        scene = _sample_once(rng)
+        if scene is None:
+            continue
+        value = margin(scene)
+        if not band[0] <= value < band[1]:
+            continue
+        cues = cue_congruence(scene)
+        if (cues["topmost_drawn"], cues["steepest_rise"]) == wanted:
+            return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+def arrivals(scene: dict) -> list[float]:
+    """Row at which each lane's extended line meets the finish line."""
+    finish_x = scene["finish_x"]
+    return [_height_at(seg, finish_x) for seg in scene["segments"]]
+
+
+def _winning_lane(scene: dict) -> int:
+    values = arrivals(scene)
+    return min(range(len(values)), key=lambda lane: values[lane])
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour whose extended line meets the finish line nearest the top."""
+    return scene["lane_colors"][_winning_lane(scene)]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin: the top-two arrival gap, in pixels."""
+    values = sorted(arrivals(scene))
+    return float(values[1] - values[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def slopes(scene: dict) -> list[float]:
+    return [
+        (seg[3] - seg[1]) / float(seg[2] - seg[0]) for seg in scene["segments"]
+    ]
+
+
+def cue_congruence(scene: dict) -> dict:
+    """Whether each cheap local cue happens to agree with the answer."""
+    win = _winning_lane(scene)
+    segs = scene["segments"]
+    grad = slopes(scene)
+    return {
+        "topmost_drawn": win == min(range(4), key=lambda s: min(segs[s][1], segs[s][3])),
+        "highest_tip": win == min(range(4), key=lambda s: segs[s][3]),
+        "highest_start": win == min(range(4), key=lambda s: segs[s][1]),
+        "steepest_rise": win == min(range(4), key=lambda s: grad[s]),
+        "longest_segment": win == max(range(4), key=lambda s: segs[s][2] - segs[s][0]),
+        "closest_to_finish": win == max(range(4), key=lambda s: segs[s][2]),
+    }
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent alias exists; see candidate.json latent_alias.justification."""
+    return []
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    for row in scene["decor_rows"]:
+        x = 40
+        while x < 540:
+            draw.line([(x, row), (x + 9, row)], fill=DECOR, width=1)
+            x += 20
+
+    draw.line([(24, RAIL_Y), (WIDTH - 24, RAIL_Y)], fill=INK, width=LINE_WIDTH)
+    finish_x = scene["finish_x"]
+    draw.line([(finish_x, TOP_Y), (finish_x, RAIL_Y)], fill=INK, width=LINE_WIDTH)
+
+    for segment, name in zip(scene["segments"], scene["lane_colors"]):
+        x0, y0, x1, y1 = segment
+        draw.line([(x0, y0), (x1, y1)], fill=COLOR_RGB[name], width=SEG_WIDTH)
+    return image

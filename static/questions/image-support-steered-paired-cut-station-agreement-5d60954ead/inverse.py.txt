@@ -1,0 +1,149 @@
+"""Independent pixel-only inverse arm for Paired Cut-Station Agreement.
+
+This module deliberately imports no candidate renderer, scene, prompt,
+generator, verifier, or analytic-gold code.  It segments the two visible graph
+components and the two red station interiors, removes a disk around each red
+station from its graph ink, and compares residual connectivity.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+DARK_RGB = np.array((29, 50, 72), dtype=np.int32)
+RED_RGB = np.array((207, 55, 61), dtype=np.int32)
+PALE_RGB = np.array((222, 233, 240), dtype=np.int32)
+
+
+class OracleAbstention(ValueError):
+    """Raised when destructive or ambiguous pixels do not form two valid maps."""
+
+
+def _near(array: np.ndarray, color: np.ndarray, radius: float) -> np.ndarray:
+    # int32 avoids overflow when squaring channel differences near 255.
+    delta = array.astype(np.int32) - color
+    return np.sum(delta * delta, axis=2) <= radius * radius
+
+
+def _components(mask: np.ndarray, minimum_area: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    unseen = set(int(value) for value in np.flatnonzero(mask))
+    output: list[np.ndarray] = []
+    while unseen:
+        first = unseen.pop()
+        queue: deque[int] = deque([first])
+        indices = [first]
+        while queue:
+            value = queue.popleft()
+            y, x = divmod(value, width)
+            neighbors = []
+            if y:
+                neighbors.append(value - width)
+            if y + 1 < height:
+                neighbors.append(value + width)
+            if x:
+                neighbors.append(value - 1)
+            if x + 1 < width:
+                neighbors.append(value + 1)
+            for neighbor in neighbors:
+                if neighbor in unseen:
+                    unseen.remove(neighbor)
+                    queue.append(neighbor)
+                    indices.append(neighbor)
+        if len(indices) >= minimum_area:
+            ys, xs = np.divmod(np.asarray(indices, dtype=np.int64), width)
+            output.append(np.column_stack((ys, xs)))
+    return sorted(output, key=len, reverse=True)
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _bbox(component: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = component[:, 0], component[:, 1]
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _contains_with_pad(component: np.ndarray, point: tuple[float, float], pad: int) -> bool:
+    left, top, right, bottom = _bbox(component)
+    x, y = point
+    return left - pad <= x <= right + pad and top - pad <= y <= bottom + pad
+
+
+def _residual_connected(
+    dark_component: np.ndarray,
+    red_component: np.ndarray,
+    shape: tuple[int, int],
+) -> bool:
+    height, width = shape
+    red_x, red_y = _centroid(red_component)
+    red_radius = math.sqrt(len(red_component) / math.pi)
+    removal_radius = max(14.0, red_radius + 7.0)
+
+    mask = np.zeros((height, width), dtype=bool)
+    mask[dark_component[:, 0], dark_component[:, 1]] = True
+    y0 = max(0, int(math.floor(red_y - removal_radius - 1)))
+    y1 = min(height, int(math.ceil(red_y + removal_radius + 2)))
+    x0 = max(0, int(math.floor(red_x - removal_radius - 1)))
+    x1 = min(width, int(math.ceil(red_x + removal_radius + 2)))
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    disk = (xx - red_x) ** 2 + (yy - red_y) ** 2 <= removal_radius**2
+    mask[y0:y1, x0:x1][disk] = False
+
+    residual = _components(mask, minimum_area=120)
+    if len(residual) not in (1, 2):
+        raise OracleAbstention(
+            f"marked-station removal produced {len(residual)} substantial pieces"
+        )
+    return len(residual) == 1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    height, width = array.shape[:2]
+    if width < 320 or height < 240:
+        raise OracleAbstention("canvas is too small for two separated maps")
+
+    dark = _near(array, DARK_RGB, 72.0)
+    red = _near(array, RED_RGB, 58.0)
+    pale = _near(array, PALE_RGB, 9.0)
+
+    red_components = _components(red, minimum_area=90)
+    if len(red_components) != 2 or any(len(item) > 500 for item in red_components):
+        raise OracleAbstention("expected exactly two intact red station interiors")
+
+    pale_components = _components(pale, minimum_area=65)
+    if len(pale_components) != 12:
+        raise OracleAbstention("expected twelve intact unmarked station interiors")
+
+    graph_components = _components(dark, minimum_area=900)
+    if len(graph_components) != 2:
+        raise OracleAbstention("expected exactly two connected dark trail maps")
+    if any(len(item) < 3000 for item in graph_components):
+        raise OracleAbstention("a trail map is materially incomplete")
+
+    assignments: list[tuple[np.ndarray, np.ndarray]] = []
+    unused = set(range(2))
+    for graph in graph_components:
+        candidates = [
+            index
+            for index in unused
+            if _contains_with_pad(graph, _centroid(red_components[index]), pad=20)
+        ]
+        if len(candidates) != 1:
+            raise OracleAbstention("could not bind one red station to each trail map")
+        index = candidates[0]
+        unused.remove(index)
+        assignments.append((graph, red_components[index]))
+    if unused:
+        raise OracleAbstention("an unbound red station remains")
+
+    effects = [
+        _residual_connected(graph, marked, (height, width)) for graph, marked in assignments
+    ]
+    return "yes" if effects[0] == effects[1] else "no"

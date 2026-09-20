@@ -1,0 +1,116 @@
+"""Independent pixel-only inverse for the connected state-ribbon world."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+WIDTH = 512
+HEIGHT = 512
+SLAB_COLOR = np.array((205, 233, 236), dtype=np.float32)
+TOKEN_COLOR = np.array((231, 111, 81), dtype=np.float32)
+OP_COLORS = {
+    -1: np.array((244, 162, 97), dtype=np.float32),
+    0: np.array((123, 92, 172), dtype=np.float32),
+    1: np.array((42, 157, 143), dtype=np.float32),
+}
+LANE_LABELS = ("A", "B", "C")
+LANE_OFFSETS = (228, 298, 368)
+
+
+class PixelOracleError(ValueError):
+    """The raster does not expose a complete, unambiguous replay."""
+
+
+def _mask(array: np.ndarray, target: np.ndarray, tolerance: float) -> np.ndarray:
+    distance = np.linalg.norm(array.astype(np.float32) - target, axis=2)
+    return distance <= tolerance
+
+
+def _runs(active: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(active)
+    if len(indices) == 0:
+        return []
+    result: list[tuple[int, int]] = []
+    start = previous = int(indices[0])
+    for value in indices[1:]:
+        value = int(value)
+        if value > previous + 1:
+            result.append((start, previous))
+            start = value
+        previous = value
+    result.append((start, previous))
+    return [(start, end) for start, end in result if end - start + 1 >= 8]
+
+
+def _slab_bounds(array: np.ndarray) -> tuple[int, int, int, int]:
+    slab = _mask(array, SLAB_COLOR, 32.0)
+    ys, xs = np.where(slab)
+    if len(xs) < 100_000:
+        raise PixelOracleError("connected state slab is missing or materially erased")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    density = float(len(xs)) / float(width * height)
+    # Rails, the ring, labels, and nuisance marks intentionally punch visible
+    # holes in the slab.  The clean raster is ~0.771 dense; a destructive
+    # ablation of an interior support tile lowers this below 0.755.
+    if not (420 <= width <= 480 and 370 <= height <= 430 and density >= 0.755):
+        raise PixelOracleError("state slab boundary or interior is ambiguous")
+    return x0, y0, x1, y1
+
+
+def _initial_lane(array: np.ndarray, y0: int) -> int:
+    # Keep the token separate from the warm down-arrow palette; the two colors
+    # are close enough that a broad nearest-color threshold would merge them.
+    token = _mask(array, TOKEN_COLOR, 34.0)
+    ys, xs = np.where(token)
+    if len(xs) < 400:
+        raise PixelOracleError("ringed initial token is missing")
+    # The token color is unique and the centroid is independent of its radius.
+    center_y = float(ys.mean())
+    target = np.asarray([y0 + offset for offset in LANE_OFFSETS], dtype=np.float64)
+    distances = np.abs(target - center_y)
+    lane = int(np.argmin(distances))
+    if float(np.sort(distances)[1] - distances[lane]) < 18.0:
+        raise PixelOracleError("initial lane is not separated at pixel scale")
+    return lane
+
+
+def _operations(array: np.ndarray, y0: int) -> list[int]:
+    top, bottom = max(0, y0 + 58), min(HEIGHT, y0 + 184)
+    items: list[tuple[float, int]] = []
+    for operation, target in OP_COLORS.items():
+        mask = _mask(array, target, 72.0)
+        region = mask[top:bottom, :]
+        projection = region.sum(axis=0)
+        for start, end in _runs(projection >= 2):
+            window = region[:, start:end + 1]
+            columns = window.sum(axis=0).astype(np.float64)
+            center = float(np.average(np.arange(start, end + 1), weights=columns))
+            if int(window.sum()) < 80:
+                raise PixelOracleError("an operation glyph is too small")
+            items.append((center, operation))
+    items.sort()
+    if len(items) != 5:
+        raise PixelOracleError("the ordered operation sequence is incomplete")
+    centers = [item[0] for item in items]
+    if any(right - left < 34.0 for left, right in zip(centers, centers[1:])):
+        raise PixelOracleError("operation order is merged or ambiguous")
+    return [int(item[1]) for item in items]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the final lane using only RGB pixels and the public rules."""
+
+    if image.size != (WIDTH, HEIGHT):
+        raise PixelOracleError(f"unexpected raster size {image.size}")
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    _, y0, _, _ = _slab_bounds(array)
+    lane = _initial_lane(array, y0)
+    for operation in _operations(array, y0):
+        lane = (lane + operation) % 3
+    return LANE_LABELS[lane]

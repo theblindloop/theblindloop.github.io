@@ -1,0 +1,200 @@
+"""Independent PNG-only inverse arm for mediator-transplant scenes."""
+
+from __future__ import annotations
+
+from collections import Counter
+
+import numpy as np
+from PIL import Image
+
+WIDTH, HEIGHT = 960, 780
+INK, OFF, RED = (np.array(color, dtype=np.float64) for color in
+                 ((35, 40, 47), (255, 255, 255), (205, 54, 54)))
+GATE_COLORS = {
+    "and": np.array((48, 112, 190), dtype=np.float64),
+    "or": np.array((224, 148, 39), dtype=np.float64),
+    "xor": np.array((132, 76, 183), dtype=np.float64),
+}
+TOKEN_COLORS = tuple(np.array(color, dtype=np.float64) for color in (
+    (0, 150, 180), (0, 140, 70), (225, 100, 0), (190, 45, 135),
+    (45, 75, 180), (130, 80, 25), (210, 180, 20), (105, 55, 150),
+))
+ROW_Y, TOP_X0, CELL_STEP = (130, 225, 320, 415, 510), 84, 60
+CARD_BOXES = ((35, 625, 245, 755), (260, 625, 470, 755),
+              (485, 625, 695, 755), (710, 625, 920, 755))
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _patch(array: np.ndarray, x: int, y: int, radius: int = 4) -> np.ndarray:
+    pixels = array[y - radius:y + radius + 1, x - radius:x + radius + 1]
+    return np.median(pixels.reshape(-1, 3), axis=0)
+
+
+def _binary(array: np.ndarray, x: int, y: int) -> int:
+    rgb = _patch(array, x, y)
+    on_distance = float(np.linalg.norm(rgb - INK))
+    off_distance = float(np.linalg.norm(rgb - OFF))
+    if min(on_distance, off_distance) > 35 or abs(on_distance - off_distance) < 60:
+        raise OracleAbstention(f"unclear binary cell at {(x, y)}: {rgb.tolist()}")
+    return int(on_distance < off_distance)
+
+
+def _gate(array: np.ndarray, y: int) -> str:
+    rgb = _patch(array, 662, y, 5)
+    distances = {kind: float(np.linalg.norm(rgb - color)) for kind, color in GATE_COLORS.items()}
+    kind = min(distances, key=distances.get)  # type: ignore[arg-type]
+    if distances[kind] > 45:
+        raise OracleAbstention(f"unclear row rule at y={y}: {rgb.tolist()}")
+    return kind
+
+
+def _annulus(array: np.ndarray, x: int, y: int) -> np.ndarray:
+    crop = array[y - 31:y + 32, x - 31:x + 32].astype(np.float64)
+    yy, xx = np.ogrid[-31:32, -31:32]
+    mask = ((xx * xx + yy * yy) >= 21 * 21) & ((xx * xx + yy * yy) <= 30 * 30)
+    return crop[mask]
+
+
+def _color_count(pixels: np.ndarray, color: np.ndarray, tolerance: float = 58.0) -> int:
+    return int(np.count_nonzero(np.linalg.norm(pixels - color, axis=1) < tolerance))
+
+
+def _source_ring(array: np.ndarray, x: int, y: int) -> bool:
+    return _color_count(_annulus(array, x, y), RED) >= 100
+
+
+def _token_ring(array: np.ndarray, x: int, y: int) -> int | None:
+    pixels = _annulus(array, x, y)
+    counts = [_color_count(pixels, color) for color in TOKEN_COLORS]
+    best = max(range(len(counts)), key=counts.__getitem__)
+    ordered = sorted(counts, reverse=True)
+    if counts[best] < 100:
+        return None
+    if ordered[0] - ordered[1] < 45:
+        raise OracleAbstention(f"ambiguous mediator ring at {(x, y)}: {counts}")
+    return best
+
+
+def _card_token(array: np.ndarray, x: int, y: int) -> int:
+    crop = array[y - 19:y + 20, x - 19:x + 20].astype(np.float64).reshape(-1, 3)
+    counts = [_color_count(crop, color, 52.0) for color in TOKEN_COLORS]
+    best = max(range(len(counts)), key=counts.__getitem__)
+    ordered = sorted(counts, reverse=True)
+    if counts[best] < 500 or ordered[0] - ordered[1] < 250:
+        raise OracleAbstention(f"unclear card token at {(x, y)}: {counts}")
+    return best
+
+
+def _apply(kind: str, left: int, right: int) -> int:
+    if kind == "and":
+        return int(bool(left) and bool(right))
+    if kind == "or":
+        return int(bool(left) or bool(right))
+    if kind == "xor":
+        return int(bool(left) != bool(right))
+    raise OracleAbstention("unknown gate")
+
+
+def _next_row(row: list[int], kind: str) -> list[int]:
+    return [_apply(kind, row[index], row[index + 1]) for index in range(len(row) - 1)]
+
+
+def _run(top: list[int], gates: list[str]) -> list[list[int]]:
+    rows = [list(top)]
+    for kind in gates:
+        rows.append(_next_row(rows[-1], kind))
+    return rows
+
+
+def _transplant(top: list[int], gates: list[str], treated: list[list[int]],
+                bundle: tuple[tuple[int, int], tuple[int, int]]) -> list[list[int]]:
+    rows = [list(top)]
+    selected = set(bundle)
+    for row_index, kind in enumerate(gates, 1):
+        row = _next_row(rows[-1], kind)
+        for selected_row, selected_cell in selected:
+            if selected_row == row_index:
+                row[selected_cell] = treated[row_index][selected_cell]
+        rows.append(row)
+    return rows
+
+
+def decision_from_image(image: Image.Image) -> str:
+    raster = image.convert("RGB")
+    if raster.size != (WIDTH, HEIGHT):
+        raise OracleAbstention(f"unexpected canvas {raster.size}")
+    array = np.asarray(raster)
+    visible_rows: list[list[int]] = []
+    source_marks: list[bool] = []
+    mediator_by_token: dict[int, tuple[int, int]] = {}
+    for row_index, y in enumerate(ROW_Y):
+        x0 = TOP_X0 + row_index * (CELL_STEP // 2)
+        row = []
+        for cell_index in range(9 - row_index):
+            x = x0 + cell_index * CELL_STEP
+            row.append(_binary(array, x, y))
+            if row_index == 0:
+                source_marks.append(_source_ring(array, x, y))
+            elif row_index <= 3:
+                token = _token_ring(array, x, y)
+                if token is not None:
+                    if token in mediator_by_token:
+                        raise OracleAbstention(f"duplicate mediator token {token}")
+                    mediator_by_token[token] = (row_index, cell_index)
+        visible_rows.append(row)
+    if sum(source_marks) != 1:
+        raise OracleAbstention(f"found {sum(source_marks)} source rings")
+    marked = source_marks.index(True)
+    if not 1 <= marked <= 7:
+        raise OracleAbstention("source ring is not internal")
+    if not 6 <= len(mediator_by_token) <= len(TOKEN_COLORS):
+        raise OracleAbstention(f"found {len(mediator_by_token)} mediator tokens")
+    if set(mediator_by_token) != set(range(len(mediator_by_token))):
+        raise OracleAbstention(f"mediator token sequence has gaps: {sorted(mediator_by_token)}")
+    if any(row not in (2, 3) for row, _ in mediator_by_token.values()):
+        raise OracleAbstention("a mediator is outside rows 2 and 3")
+    gates = [_gate(array, ROW_Y[index]) for index in range(1, 5)]
+    factual = _run(visible_rows[0], gates)
+    if factual != visible_rows:
+        raise OracleAbstention("visible factual lattice contradicts its row rules")
+    treated_top = list(visible_rows[0])
+    treated_top[marked] ^= 1
+    treated = _run(treated_top, gates)
+    if sum(a != b for a, b in zip(factual[-1], treated[-1], strict=True)) < 2:
+        raise OracleAbstention("red flip has insufficient bottom effect")
+    if any(factual[row][cell] == treated[row][cell]
+           for row, cell in mediator_by_token.values()):
+        raise OracleAbstention("a named mediator does not change in the treated world")
+    bundles: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    bundle_tokens: list[tuple[int, int]] = []
+    for x0, y0, _x1, _y1 in CARD_BOXES:
+        tokens = (_card_token(array, x0 + 65, y0 + 88),
+                  _card_token(array, x0 + 145, y0 + 88))
+        if tokens[0] == tokens[1] or any(token not in mediator_by_token for token in tokens):
+            raise OracleAbstention(f"invalid card tokens {tokens}")
+        bundle_tokens.append(tokens)
+        bundle = (mediator_by_token[tokens[0]], mediator_by_token[tokens[1]])
+        if {bundle[0][0], bundle[1][0]} != {2, 3}:
+            raise OracleAbstention(f"card does not span mediator rows: {bundle}")
+        bundles.append(bundle)
+    if len(set(bundle_tokens)) != 4:
+        raise OracleAbstention("duplicate transplant card")
+    if len({first for first, _ in bundles}) < 3 or len({second for _, second in bundles}) < 3:
+        raise OracleAbstention("cards do not vary both mediator depths")
+    if max(Counter(point for bundle in bundles for point in bundle).values()) > 2:
+        raise OracleAbstention("one mediator dominates the cards")
+    outcomes = [_transplant(visible_rows[0], gates, treated, bundle)[-1]
+                for bundle in bundles]
+    matches = [index for index, outcome in enumerate(outcomes) if outcome == treated[-1]]
+    if len(matches) != 1:
+        raise OracleAbstention(f"expected one sufficient card, recovered {matches}")
+    wrong = [outcome for index, outcome in enumerate(outcomes) if index != matches[0]]
+    if len({tuple(outcome) for outcome in wrong}) != 3:
+        raise OracleAbstention("distractor outcomes are not distinct")
+    if any(sum(a != b for a, b in zip(outcome, treated[-1], strict=True)) < 2
+           for outcome in wrong):
+        raise OracleAbstention("a distractor is too close to the target bottom")
+    return f"card-{matches[0] + 1}"

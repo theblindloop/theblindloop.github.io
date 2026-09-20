@@ -1,0 +1,141 @@
+"""Scene-free pixel oracle for compare_swap_network.
+
+Receives only a rendered RGB image.  Imports no renderer, prompt, generator,
+verifier or gold code and never touches latent scene data.  It re-derives the
+lanes from the drawn bars, the rung stack and its marked ends from the drawn
+black rungs and orange squares, the queried lane from the drawn teal triangle,
+and then replays the comparator network on what it measured.
+"""
+
+from __future__ import annotations
+
+from PIL import Image
+
+_PALETTE = {
+    "red": (220, 40, 40),
+    "blue": (40, 70, 200),
+    "green": (30, 140, 60),
+    "purple": (140, 50, 170),
+    "black": (0, 0, 0),
+    "orange": (255, 150, 0),
+    "teal": (0, 150, 150),
+}
+_BARS = ("red", "blue", "green", "purple")
+_TOL2 = 55 * 55
+
+
+def _masks(img: Image.Image) -> dict:
+    w, h = img.size
+    px = img.load()
+    out = {k: [] for k in _PALETTE}
+    for y in range(h):
+        for x in range(w):
+            r, g, b = px[x, y][:3]
+            best, bd = None, _TOL2
+            for name, (pr, pg, pb) in _PALETTE.items():
+                d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
+                if d < bd:
+                    best, bd = name, d
+            if best is not None:
+                out[best].append((x, y))
+    return out
+
+
+def _components(pixels: list[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    remaining = set(pixels)
+    comps = []
+    while remaining:
+        start = remaining.pop()
+        stack, comp = [start], [start]
+        while stack:
+            x, y = stack.pop()
+            for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if (nx, ny) in remaining:
+                    remaining.discard((nx, ny))
+                    stack.append((nx, ny))
+                    comp.append((nx, ny))
+        comps.append(comp)
+    return comps
+
+
+def _bbox(comp):
+    xs = [p[0] for p in comp]
+    ys = [p[1] for p in comp]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    img = image.convert("RGB")
+    masks = _masks(img)
+
+    # --- bars: colour -> lane centre x and drawn height ----------------------
+    bars = {}
+    for name in _BARS:
+        comps = [c for c in _components(masks[name]) if len(c) >= 200]
+        if len(comps) != 1:
+            raise ValueError(f"expected exactly one {name} bar, saw {len(comps)}")
+        x0, y0, x1, y1 = _bbox(comps[0])
+        bars[name] = ((x0 + x1) / 2.0, y1 - y0 + 1)
+    lane_x = sorted(v[0] for v in bars.values())
+    if len(lane_x) != 4 or min(b - a for a, b in zip(lane_x, lane_x[1:])) < 30:
+        raise ValueError("lane centres are not resolvable")
+
+    def lane_of(x: float) -> int:
+        return min(range(4), key=lambda i: abs(lane_x[i] - x))
+
+    start = [None, None, None, None]
+    height = {}
+    for name, (cx, hgt) in bars.items():
+        start[lane_of(cx)] = name
+        height[name] = hgt
+    if any(v is None for v in start):
+        raise ValueError("two bars share a lane")
+
+    # --- rungs: black components spanning two lanes, ordered top to bottom ---
+    rungs = []
+    for comp in _components(masks["black"]):
+        if len(comp) < 60:
+            continue
+        x0, y0, x1, y1 = _bbox(comp)
+        if x1 - x0 < 40:
+            raise ValueError("a black mark does not span two lanes")
+        rungs.append({"y": (y0 + y1) / 2.0, "a": lane_of(x0), "b": lane_of(x1)})
+    if not rungs:
+        raise ValueError("no rungs found")
+    rungs.sort(key=lambda r: r["y"])
+
+    # --- orange squares: which end of each rung is the marked end ------------
+    squares = []
+    for comp in _components(masks["orange"]):
+        if len(comp) < 40:
+            continue
+        x0, y0, x1, y1 = _bbox(comp)
+        squares.append(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+    if len(squares) != len(rungs):
+        raise ValueError("marked ends and rungs do not correspond")
+    for rung in rungs:
+        near = min(squares, key=lambda s: abs(s[1] - rung["y"]))
+        if abs(near[1] - rung["y"]) > 12:
+            raise ValueError("a rung has no marked end")
+        squares.remove(near)
+        marked = lane_of(near[0])
+        if marked not in (rung["a"], rung["b"]):
+            raise ValueError("a marked end is not on its rung")
+        rung["marked"] = marked
+
+    # --- teal triangle: the queried lane -------------------------------------
+    tri = [c for c in _components(masks["teal"]) if len(c) >= 60]
+    if len(tri) != 1:
+        raise ValueError("expected exactly one query marker")
+    tx0, _, tx1, _ = _bbox(tri[0])
+    query = lane_of((tx0 + tx1) / 2.0)
+
+    # --- replay ---------------------------------------------------------------
+    lane = list(start)
+    for rung in rungs:
+        marked = rung["marked"]
+        other = rung["b"] if marked == rung["a"] else rung["a"]
+        if height[lane[marked]] < height[lane[other]]:
+            lane[marked], lane[other] = lane[other], lane[marked]
+    color = lane[query]
+    return f"{color}|start{start.index(color) + 1}"

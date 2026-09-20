@@ -1,0 +1,123 @@
+"""Independent pixel-only inverse for colored open-box gap directions.
+
+This module intentionally contains its own palette and geometry-free measurement
+code.  It receives only the final RGB image and never imports the renderer or
+any scene-bearing module.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+GAPS = ("UP", "RIGHT", "DOWN", "LEFT")
+COLORS = ("red", "blue", "green", "purple", "orange")
+PALETTE = np.asarray(
+    [
+        (220, 50, 47),
+        (37, 99, 235),
+        (22, 163, 74),
+        (147, 51, 234),
+        (234, 132, 15),
+    ],
+    dtype=np.int16,
+)
+COLOR_TOLERANCE_SQUARED = 85 * 85
+
+
+def _color_mask(pixels: np.ndarray, color_index: int) -> np.ndarray:
+    delta = pixels.astype(np.int32) - PALETTE[color_index].astype(np.int32)
+    distance = np.sum(delta * delta, axis=2)
+    nearest = np.argmin(
+        np.stack(
+            [np.sum((pixels.astype(np.int32) - palette.astype(np.int32)) ** 2, axis=2) for palette in PALETTE],
+            axis=0,
+        ),
+        axis=0,
+    )
+    return (nearest == color_index) & (distance < COLOR_TOLERANCE_SQUARED)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    """Keep the largest 8-connected colored component without external state."""
+
+    height, width = mask.shape
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return mask
+    pending = [(int(ys[0]), int(xs[0]))]
+    seen = set(pending)
+    best = []
+    while pending:
+        y, x = pending.pop()
+        component = [ (y, x) ]
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dx or dy):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and (ny, nx) not in seen:
+                    seen.add((ny, nx))
+                    pending.append((ny, nx))
+        # The flood stack above stores the frontier, so gather all connected
+        # pixels in a second small pass from the seed for a stable component.
+        # The mask is one object per color/panel; this fallback keeps all pixels
+        # if antialiasing split the core into multiple pieces.
+        if len(component) > len(best):
+            best = component
+    if len(seen) < 0.85 * len(xs):
+        return mask
+    result = np.zeros_like(mask)
+    for y, x in seen:
+        result[y, x] = True
+    return result
+
+
+def _gap_from_mask(mask: np.ndarray) -> str:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 100:
+        raise ValueError("colored component is missing or too small")
+    left, right = int(xs.min()), int(xs.max())
+    top, bottom = int(ys.min()), int(ys.max())
+    width = max(1, right - left + 1)
+    height = max(1, bottom - top + 1)
+    x_inner_left = left + int(0.27 * width)
+    x_inner_right = right - int(0.27 * width)
+    y_inner_top = top + int(0.27 * height)
+    y_inner_bottom = bottom - int(0.27 * height)
+    top_count = int(mask[top : top + max(1, int(0.34 * height)), x_inner_left : x_inner_right + 1].sum())
+    right_count = int(mask[y_inner_top : y_inner_bottom + 1, right - max(1, int(0.34 * width)) + 1 : right + 1].sum())
+    bottom_count = int(mask[bottom - max(1, int(0.34 * height)) + 1 : bottom + 1, x_inner_left : x_inner_right + 1].sum())
+    left_count = int(mask[y_inner_top : y_inner_bottom + 1, left : left + max(1, int(0.34 * width))].sum())
+    counts = np.asarray([top_count, right_count, bottom_count, left_count], dtype=np.int32)
+    absent = int(np.argmin(counts))
+    present = np.delete(counts, absent)
+    if counts[absent] > 0.45 * max(1, int(present.min())) or int(present.min()) < 40:
+        raise ValueError(f"gap side is ambiguous: {counts.tolist()}")
+    return GAPS[absent]
+
+
+def _panel_signature(pixels: np.ndarray, x0: int, x1: int) -> dict[str, str]:
+    crop = pixels[:, x0:x1]
+    signature = {}
+    for index, color in enumerate(COLORS):
+        mask = _color_mask(crop, index)
+        component = _largest_component(mask)
+        signature[color] = _gap_from_mask(component)
+    return signature
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover A/B solely from the three colored panel rasters."""
+
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    width = pixels.shape[1]
+    cuts = (0, width // 3, 2 * width // 3, width)
+    reference = _panel_signature(pixels, cuts[0], cuts[1])
+    candidate_a = _panel_signature(pixels, cuts[1], cuts[2])
+    candidate_b = _panel_signature(pixels, cuts[2], cuts[3])
+    score_a = sum(candidate_a[color] != gap for color, gap in reference.items())
+    score_b = sum(candidate_b[color] != gap for color, gap in reference.items())
+    if score_a == score_b:
+        raise ValueError("candidate signatures are tied")
+    return "A" if score_a < score_b else "B"

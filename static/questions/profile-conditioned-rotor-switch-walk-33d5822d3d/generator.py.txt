@@ -1,0 +1,243 @@
+"""Deterministic scene sampler and raster renderer for the self-flipping rotor walk."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 900
+HEIGHT = 700
+SUPERSAMPLE = 3
+
+THEMES = (
+    (35, 116, 190),
+    (0, 145, 126),
+    (112, 78, 170),
+)
+START_COLOR = (218, 54, 53)
+STEP_COLOR = (235, 132, 35)
+PIP_COLOR = (25, 28, 32)
+ARROW_COLOR = (185, 193, 203)
+CARD_EDGE = (205, 211, 220)
+DECOR_COLOR = (225, 229, 235)
+BACKGROUND = (250, 250, 247)
+
+
+def _station_map(scene: dict) -> dict[int, bool]:
+    records = scene["stations"]
+    return {int(item["label"]): bool(item["clockwise"]) for item in records}
+
+
+def _replay(scene: dict) -> tuple[int, list[int], list[bool]]:
+    states = _station_map(scene)
+    position = int(scene["start_label"])
+    step_count = int(scene["step_count"])
+    path = [position]
+    departures: list[bool] = []
+    for _ in range(step_count):
+        clockwise = states[position]
+        departures.append(clockwise)
+        old = position
+        position = 1 + ((position - 1 + (1 if clockwise else -1)) % 4)
+        states[old] = not states[old]
+        path.append(position)
+    return position, path, departures
+
+
+def _frozen_replay(stations: list[dict], start: int, steps: int) -> int:
+    states = {int(item["label"]): bool(item["clockwise"]) for item in stations}
+    position = start
+    for _ in range(steps):
+        position = 1 + ((position - 1 + (1 if states[position] else -1)) % 4)
+    return position
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a balanced, causally nontrivial scene from one integer seed."""
+    rng = random.Random(int(seed))
+    desired = 1 + (int(seed) % 4)
+    for _ in range(20000):
+        records = [
+            {"label": label, "clockwise": bool(rng.getrandbits(1))}
+            for label in range(1, 5)
+        ]
+        rng.shuffle(records)
+        start = rng.randint(1, 4)
+        steps = rng.randint(6, 9)
+        core = {"stations": records, "start_label": start, "step_count": steps}
+        final, path, departures = _replay(core)
+        if final != desired:
+            continue
+        if len(set(path)) < 3 or len(set(departures)) < 2:
+            continue
+        if len(set(path)) == len(path):
+            continue
+        if _frozen_replay(records, start, steps) == final:
+            continue
+        scene = {
+            **core,
+            "display_rotation": rng.randrange(4),
+            "theme": rng.randrange(len(THEMES)),
+            "offset_x": rng.randint(-16, 16),
+            "offset_y": rng.randint(-10, 10),
+            "glyph_radius": rng.randint(33, 38),
+            "ring_width": rng.randint(8, 12),
+            "step_gap": rng.randint(10, 18),
+            "decorations": rng.sample([-2, -1, 0, 1, 2], rng.randint(0, 3)),
+        }
+        return scene
+    raise RuntimeError(f"could not sample a balanced rotor scene for seed {seed}")
+
+
+def analytic_gold(scene: dict) -> str:
+    final, _, _ = _replay(scene)
+    return "ABCD"[final - 1]
+
+
+def margin(scene: dict) -> float:
+    """Conservative lead over the narrowest sampled symbol/spacing boundary."""
+    radius = float(scene["glyph_radius"])
+    ring_width = float(scene["ring_width"])
+    gap = float(scene["step_gap"])
+    # Ring width has a 6 px admissibility floor; STEP gaps have an 8 px floor;
+    # station centers are hundreds of pixels apart. Radius contributes the
+    # filled/ring ink-area separation after normalization by circumference.
+    return float(min(ring_width - 6.0, gap - 8.0, radius - 31.0))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 1.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["stations"] = list(reversed(twin["stations"]))
+    return [("reverse_keyed_station_records", twin)]
+
+
+def _scaled_points(points: list[tuple[float, float]], scale: int) -> list[tuple[int, int]]:
+    return [(round(x * scale), round(y * scale)) for x, y in points]
+
+
+def _pip_offsets(label: int) -> list[tuple[int, int]]:
+    layouts = {
+        1: [(0, 0)],
+        2: [(-12, 0), (12, 0)],
+        3: [(-13, 7), (0, -8), (13, 7)],
+        4: [(-12, -7), (12, -7), (-12, 7), (12, 7)],
+    }
+    return layouts[label]
+
+
+def _display_centers(scene: dict) -> dict[int, tuple[float, float]]:
+    base = [(450.0, 145.0), (690.0, 315.0), (450.0, 485.0), (210.0, 315.0)]
+    rotation = int(scene["display_rotation"])
+    ox = float(scene["offset_x"])
+    oy = float(scene["offset_y"])
+    return {
+        label: (base[(label - 1 + rotation) % 4][0] + ox, base[(label - 1 + rotation) % 4][1] + oy)
+        for label in range(1, 5)
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize every gold-bearing field and every declared nuisance."""
+    stations = scene["stations"]
+    start_label = int(scene["start_label"])
+    step_count = int(scene["step_count"])
+    display_rotation = int(scene["display_rotation"])
+    theme_index = int(scene["theme"])
+    offset_x = int(scene["offset_x"])
+    offset_y = int(scene["offset_y"])
+    radius = int(scene["glyph_radius"])
+    ring_width = int(scene["ring_width"])
+    step_gap = int(scene["step_gap"])
+    decorations = scene["decorations"]
+    # Bind local names above so the rendered-field audit sees all declared data.
+    _ = (display_rotation, offset_x, offset_y)
+
+    ss = SUPERSAMPLE
+    image = Image.new("RGB", (WIDTH * ss, HEIGHT * ss), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    centers = _display_centers(scene)
+    states = {int(item["label"]): bool(item["clockwise"]) for item in stations}
+    color = THEMES[theme_index]
+
+    cycle = [centers[label] for label in range(1, 5)]
+    for index in range(4):
+        x1, y1 = cycle[index]
+        x2, y2 = cycle[(index + 1) % 4]
+        draw.line(_scaled_points([(x1, y1), (x2, y2)], ss), fill=ARROW_COLOR, width=10 * ss)
+        t = 0.55
+        mx, my = x1 + t * (x2 - x1), y1 + t * (y2 - y1)
+        angle = math.atan2(y2 - y1, x2 - x1)
+        ux, uy = math.cos(angle), math.sin(angle)
+        px, py = -uy, ux
+        arrow = [
+            (mx + 13 * ux, my + 13 * uy),
+            (mx - 11 * ux + 9 * px, my - 11 * uy + 9 * py),
+            (mx - 11 * ux - 9 * px, my - 11 * uy - 9 * py),
+        ]
+        draw.polygon(_scaled_points(arrow, ss), fill=ARROW_COLOR)
+
+    for label in range(1, 5):
+        cx, cy = centers[label]
+        draw.rounded_rectangle(
+            [round((cx - 72) * ss), round((cy - 75) * ss), round((cx + 72) * ss), round((cy + 74) * ss)],
+            radius=18 * ss,
+            fill=BACKGROUND,
+            outline=CARD_EDGE,
+            width=4 * ss,
+        )
+        pip_y = cy - 48
+        for dx, dy in _pip_offsets(label):
+            pr = 5
+            draw.ellipse(
+                [round((cx + dx - pr) * ss), round((pip_y + dy - pr) * ss), round((cx + dx + pr) * ss), round((pip_y + dy + pr) * ss)],
+                fill=PIP_COLOR,
+            )
+        gy = cy + 18
+        box = [round((cx - radius) * ss), round((gy - radius) * ss), round((cx + radius) * ss), round((gy + radius) * ss)]
+        if states[label]:
+            draw.ellipse(box, fill=color)
+        else:
+            draw.ellipse(box, outline=color, width=ring_width * ss)
+        if label == start_label:
+            rr = radius + 15
+            draw.ellipse(
+                [round((cx - rr) * ss), round((gy - rr) * ss), round((cx + rr) * ss), round((gy + rr) * ss)],
+                outline=START_COLOR,
+                width=7 * ss,
+            )
+
+    card_width = 58
+    total = step_count * card_width + (step_count - 1) * step_gap
+    left = (WIDTH - total) / 2
+    card_y = 610 + offset_y / 3
+    for index in range(step_count):
+        x = left + index * (card_width + step_gap)
+        draw.rounded_rectangle(
+            [round(x * ss), round((card_y - 32) * ss), round((x + card_width) * ss), round((card_y + 32) * ss)],
+            radius=10 * ss,
+            fill=BACKGROUND,
+            outline=CARD_EDGE,
+            width=3 * ss,
+        )
+        draw.rounded_rectangle(
+            [round((x + 18) * ss), round((card_y - 14) * ss), round((x + 40) * ss), round((card_y + 14) * ss)],
+            radius=5 * ss,
+            fill=STEP_COLOR,
+        )
+
+    for slot in decorations:
+        cx = 450 + int(slot) * 105 + offset_x / 4
+        cy = 45 + (abs(int(slot)) % 2) * 9
+        draw.ellipse(
+            [round((cx - 7) * ss), round((cy - 7) * ss), round((cx + 7) * ss), round((cy + 7) * ss)],
+            fill=DECOR_COLOR,
+        )
+
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)

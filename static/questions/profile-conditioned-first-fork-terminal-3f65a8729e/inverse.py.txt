@@ -1,0 +1,194 @@
+"""Independent image-only graph oracle.
+
+This module intentionally shares no imports or scene access with renderer.py.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+COLORS = {
+    "green": np.array([43, 151, 91], dtype=np.int16),
+    "red": np.array([211, 69, 70], dtype=np.int16),
+    "blue": np.array([53, 103, 193], dtype=np.int16),
+    "gold": np.array([215, 153, 35], dtype=np.int16),
+}
+
+
+def _color_centers(image: Image.Image) -> dict[str, tuple[float, float]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    centers: dict[str, tuple[float, float]] = {}
+    for name, target in COLORS.items():
+        distance = np.max(np.abs(array - target), axis=2)
+        mask = distance < 38
+        ys, xs = np.where(mask)
+        if len(xs) < 40:
+            raise ValueError(f"missing marker {name}")
+        centers[name] = (float(xs.mean()), float(ys.mean()))
+    return centers
+
+
+def _thin(mask: np.ndarray) -> np.ndarray:
+    image = mask.copy().astype(bool)
+    for _ in range(80):
+        changed = False
+        for phase in (0, 1):
+            p2 = image[:-2, 1:-1]
+            p3 = image[:-2, 2:]
+            p4 = image[1:-1, 2:]
+            p5 = image[2:, 2:]
+            p6 = image[2:, 1:-1]
+            p7 = image[2:, :-2]
+            p8 = image[1:-1, :-2]
+            p9 = image[:-2, :-2]
+            center = image[1:-1, 1:-1]
+            neighbors = p2.astype(np.uint8) + p3 + p4 + p5 + p6 + p7 + p8 + p9
+            transitions = (
+                (~p2 & p3).astype(np.uint8)
+                + (~p3 & p4)
+                + (~p4 & p5)
+                + (~p5 & p6)
+                + (~p6 & p7)
+                + (~p7 & p8)
+                + (~p8 & p9)
+                + (~p9 & p2)
+            )
+            if phase == 0:
+                condition = (p2 & p4 & p6) | (p4 & p6 & p8)
+            else:
+                condition = (p2 & p4 & p8) | (p2 & p6 & p8)
+            deletions = center & (neighbors >= 2) & (neighbors <= 6) & (transitions == 1) & ~condition
+            if np.any(deletions):
+                image[1:-1, 1:-1][deletions] = False
+                changed = True
+        if not changed:
+            break
+    return image
+
+
+def _neighbors(index: np.ndarray, row: int, col: int) -> list[int]:
+    height, width = index.shape
+    result: list[int] = []
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if not dr and not dc:
+                continue
+            rr, cc = row + dr, col + dc
+            if 0 <= rr < height and 0 <= cc < width and index[rr, cc] >= 0:
+                result.append(int(index[rr, cc]))
+    return result
+
+
+def _nearest(point: tuple[float, float], coords: np.ndarray) -> int:
+    dx = coords[:, 1] - point[0]
+    dy = coords[:, 0] - point[1]
+    return int(np.argmin(dx * dx + dy * dy))
+
+
+def _component(start: int, blocked: set[int], adjacency: list[list[int]]) -> set[int]:
+    seen: set[int] = set()
+    queue = [start]
+    while queue:
+        node = queue.pop()
+        if node in blocked or node in seen:
+            continue
+        seen.add(node)
+        queue.extend(neighbor for neighbor in adjacency[node] if neighbor not in blocked and neighbor not in seen)
+    return seen
+
+
+def _fork_clusters(branch_nodes: set[int], adjacency: list[list[int]]) -> list[set[int]]:
+    remaining = set(branch_nodes)
+    clusters: list[set[int]] = []
+    while remaining:
+        seed = remaining.pop()
+        cluster = {seed}
+        queue = [seed]
+        while queue:
+            node = queue.pop()
+            for neighbor in adjacency[node]:
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    cluster.add(neighbor)
+                    queue.append(neighbor)
+        clusters.append(cluster)
+    return clusters
+
+
+def decision_from_image(image: Image.Image) -> str:
+    try:
+        centers = _color_centers(image)
+    except ValueError:
+        return "unknown"
+    small_image = image.convert("RGB").resize((image.width // 2, image.height // 2), Image.Resampling.BILINEAR)
+    array = np.asarray(small_image, dtype=np.int16)
+    route = (array[:, :, 0] < 105) & (array[:, :, 1] < 120) & (array[:, :, 2] < 140)
+    if int(route.sum()) < 100:
+        return "unknown"
+    skeleton = _thin(route)
+    coords = np.argwhere(skeleton)
+    if len(coords) < 80:
+        return "unknown"
+    index = np.full(skeleton.shape, -1, dtype=np.int32)
+    index[coords[:, 0], coords[:, 1]] = np.arange(len(coords), dtype=np.int32)
+    adjacency = [_neighbors(index, int(row), int(col)) for row, col in coords]
+
+    scale_centers = {name: (point[0] / 2.0, point[1] / 2.0) for name, point in centers.items()}
+    anchors = {name: _nearest(point, coords) for name, point in scale_centers.items()}
+    source = anchors["green"]
+    distance = {source: 0.0}
+    queue: list[tuple[float, int]] = [(0.0, source)]
+    while queue:
+        current_distance, node = queue.pop(0)
+        if current_distance != distance.get(node):
+            continue
+        row, col = coords[node]
+        for neighbor in adjacency[node]:
+            nr, nc = coords[neighbor]
+            weight = math.hypot(float(nr - row), float(nc - col))
+            candidate = current_distance + weight
+            if candidate < distance.get(neighbor, float("inf")):
+                distance[neighbor] = candidate
+                queue.append((candidate, neighbor))
+
+    degrees = {node: len(neighbors) for node, neighbors in enumerate(adjacency)}
+    branch_nodes = {node for node, degree in degrees.items() if degree >= 3 and node in distance}
+    if not branch_nodes:
+        return "unknown"
+    clusters = _fork_clusters(branch_nodes, adjacency)
+    first = min(clusters, key=lambda cluster: min(distance.get(node, float("inf")) for node in cluster))
+    blocked = set(first)
+    boundary: set[int] = set()
+    for node in first:
+        boundary.update(neighbor for neighbor in adjacency[node] if neighbor not in blocked)
+    terminal_anchors = {name: anchors[name] for name in ("red", "blue", "gold")}
+    counts: list[tuple[str, int]] = []
+    for start in boundary:
+        component = _component(start, blocked, adjacency)
+        labels = [name for name, anchor in terminal_anchors.items() if anchor in component]
+        if len(labels) == 1:
+            counts.append((labels[0], len(labels)))
+    if len(counts) != 3:
+        # Junction skeletons can have a one-pixel bridge through a thick hub.
+        # A second attempt removes a small neighborhood around the selected fork.
+        expanded = set(blocked)
+        for node in list(blocked):
+            expanded.update(adjacency[node])
+        boundary = set()
+        for node in expanded:
+            boundary.update(neighbor for neighbor in adjacency[node] if neighbor not in expanded)
+        counts = []
+        for start in boundary:
+            component = _component(start, expanded, adjacency)
+            labels = [name for name, anchor in terminal_anchors.items() if anchor in component]
+            if len(labels) == 1:
+                counts.append((labels[0], len(labels)))
+    # The single-leaf side is the only branch whose terminal component has one
+    # colored endpoint. In this construction the other first-fork component is
+    # the two-terminal trunk and is ignored.
+    singles = [label for label, count in counts if count == 1]
+    return singles[0] if len(singles) == 1 else "unknown"

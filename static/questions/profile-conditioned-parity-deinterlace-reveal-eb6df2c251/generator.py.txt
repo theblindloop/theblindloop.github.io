@@ -1,0 +1,149 @@
+"""parity_deinterlace_reveal: parity deinterlace glyph reveal world.
+
+Declared transform: deinterlace the image by reading only the even rows
+(equivalently, only the odd rows), discarding the other alternating phase.
+
+A single block glyph (the letter A or the letter B) is carried by a two-region
+luminance bias, but the bias is split across two alternating row-phases with
+OPPOSITE polarity and each phase uses an independent decorrelated speckle
+field. Even rows carry the glyph with the normal polarity (dark ink on light
+ground); odd rows carry the same glyph with the inverted polarity (light ink on
+dark ground). Viewed at full density these two phases average to a uniform
+mid-grey salt-and-pepper field, so the glyph is invisible without the declared
+operation. Only after deinterlacing -- subsampling the even rows -- is the
+coarse diagonal-band symbol recovered and its orientation read.
+
+Latent scene z = {seed_even, seed_odd, glyph, scale, pos_r, pos_c}.
+label = glyph.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "parity_deinterlace_reveal-0.1.0"
+
+W = 256
+H = 256
+
+GR = 9          # template rows
+GC = 7          # template cols
+
+Q_TOL = 0.15    # quarantine threshold on the analytic A/B correlation margin
+
+
+def template_array(glyph: str) -> np.ndarray:
+    """Block templates on a GR x GC grid.
+
+    A = a thick rising diagonal slash "/",
+    B = a thick falling diagonal slash "\\".
+    The three-cell-thick solid diagonal band preserves its orientation through
+    row decimation and coarse resampling.
+    """
+    grid = np.zeros((GR, GC), dtype=bool)
+    thickness = 1
+    for row in range(GR):
+        col_main = (GC - 1) * (GR - 1 - row) // (GR - 1)
+        for t in range(-thickness, thickness + 1):
+            c = col_main + t
+            if 0 <= c < GC:
+                if glyph == "A":
+                    grid[row, c] = True
+                else:
+                    grid[row, GC - 1 - c] = True
+    return grid
+
+
+GLYPH_MEAN = 60.0   # glyph-region luminance anchor (dark)
+BG_MEAN = 196.0     # background luminance anchor (light)
+SWING = 70.0        # half-width of uniform per-pixel speckle amplitude
+
+
+def build_scene(seed_even, seed_odd, glyph, scale, pos_r, pos_c) -> dict:
+    return {
+        "seed_even": int(seed_even),
+        "seed_odd": int(seed_odd),
+        "glyph": glyph,
+        "scale": int(scale),
+        "pos_r": int(pos_r),
+        "pos_c": int(pos_c),
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+    glyph = "A" if rng.integers(0, 2) else "B"
+    scale = int(rng.choice([12, 14, 16]))
+    glyph_h = GR * scale
+    glyph_w = GC * scale
+    max_r = H - glyph_h - 24
+    max_c = W - glyph_w - 24
+    if max_r <= 0 or max_c <= 0:
+        max_r = max_c = 1
+    pos_r = int(rng.integers(18, max(max_r, 19)))
+    pos_c = int(rng.integers(18, max(max_c, 19)))
+    return build_scene(seed_even=int(seed) ^ 0xA5A5, seed_odd=int(seed) | 0x5A5A,
+                       glyph=glyph, scale=scale, pos_r=pos_r, pos_c=pos_c)
+
+
+def glyph_mask(scene: dict) -> np.ndarray:
+    scale = int(scene.get("scale", 14))
+    row0 = int(scene.get("pos_r", 18))
+    col0 = int(scene.get("pos_c", 18))
+    cells = template_array(scene["glyph"])
+    block = np.repeat(np.repeat(cells, scale, axis=0), scale, axis=1)
+    mask = np.zeros((H, W), dtype=bool)
+    r1 = min(H, row0 + block.shape[0])
+    c1 = min(W, col0 + block.shape[1])
+    mask[row0:r1, col0:c1] = block[: r1 - row0, : c1 - col0]
+    return mask
+
+
+def render(scene: dict) -> Image.Image:
+    scene = dict(scene)
+    rng_even = np.random.default_rng(int(scene.get("seed_even", 0)) & 0xFFFFFFFF)
+    rng_odd = np.random.default_rng(int(scene.get("seed_odd", 0)) & 0xFFFFFFFF)
+    ink = glyph_mask(scene)
+    rows, _ = ink.shape
+    avg_base = (GLYPH_MEAN + BG_MEAN) / 2.0
+    # Fill with the uniform mid-grey average; then adjust each row by its own
+    # bipolar offset so that consecutive rows cancel on averaging.
+    arr = np.full((rows, W), avg_base, dtype=np.float64)
+    noise_even = rng_even.uniform(-SWING, SWING, size=(rows, W))
+    noise_odd = rng_odd.uniform(-SWING, SWING, size=(rows, W))
+    even_rows = np.arange(rows) % 2 == 0
+    odd_rows = np.arange(rows) % 2 == 1
+    # Even rows: normal polarity (glyph dark, ground light).
+    offset = np.where(ink, (GLYPH_MEAN - BG_MEAN) / 2.0, (BG_MEAN - GLYPH_MEAN) / 2.0)
+    arr[even_rows] += offset[even_rows] + noise_even[even_rows]
+    # Odd rows: inverted polarity (glyph light, ground dark).
+    arr[odd_rows] += -offset[odd_rows] + noise_odd[odd_rows]
+    rgb = np.clip(np.stack([arr, arr, arr], axis=-1), 0, 255)
+    return Image.fromarray(rgb.astype(np.uint8), "RGB")
+
+
+def margin(scene: dict) -> float:
+    chosen = template_array(scene["glyph"])
+    other = template_array("B" if scene["glyph"] == "A" else "A")
+    c_filled = int(chosen.sum())
+    o_filled = int(other.sum())
+    corr_chosen = float((chosen & chosen).sum()) / max(1, c_filled)
+    corr_other = float((chosen & other).sum()) / max(1, o_filled)
+    return round(corr_chosen - corr_other, 6)
+
+
+def analytic_gold(scene: dict) -> str:
+    return scene["glyph"]
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < Q_TOL
+
+
+def latent_symmetries(scene: dict):
+    """not_applicable: the two decorrelated speckle seeds, the answer glyph, the
+    block scale and the placement row and column each directly change rendered
+    pixels, and both alternating phases are explicit and visible, so the
+    latent-to-raster map is injective and declared empty."""
+    return iter(())

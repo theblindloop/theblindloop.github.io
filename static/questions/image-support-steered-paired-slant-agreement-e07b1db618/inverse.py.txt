@@ -1,0 +1,197 @@
+"""Independent final-PNG inverse arm for Paired Slant Agreement Reveal.
+
+This module deliberately duplicates the public visual specification. It locates
+cyan frames and magenta corner fiducials, rectifies both card rasters, estimates
+the diagonal orientation in every cell, compares paired orientations, and
+reports the Hamming runner-up margin. It receives no latent scene data.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+GRID_N = 6
+CELL = 14
+GRID_ORIGIN = 14
+CARD_SIZE = 112
+
+_TEMPLATE_ROWS: dict[str, tuple[str, ...]] = {
+    "h": (
+        "100001",
+        "100001",
+        "111111",
+        "111111",
+        "100001",
+        "100001",
+    ),
+    "diamond": (
+        "001100",
+        "011110",
+        "110011",
+        "110011",
+        "011110",
+        "001100",
+    ),
+    "box": (
+        "111111",
+        "100001",
+        "100001",
+        "100001",
+        "100001",
+        "111111",
+    ),
+}
+
+
+class OracleError(ValueError):
+    """The visible raster lacks an unambiguous declared-transform reading."""
+
+
+@dataclass(frozen=True)
+class Component:
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    area: int
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return ((self.x0 + self.x1 - 1) / 2.0, (self.y0 + self.y1 - 1) / 2.0)
+
+
+def _components(mask: np.ndarray) -> list[Component]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[Component] = []
+    for y_value, x_value in np.argwhere(mask):
+        y = int(y_value)
+        x = int(x_value)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        area = 0
+        x0 = x1 = x
+        y0 = y1 = y
+        while stack:
+            cy, cx = stack.pop()
+            area += 1
+            x0 = min(x0, cx)
+            x1 = max(x1, cx)
+            y0 = min(y0, cy)
+            y1 = max(y1, cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        output.append(Component(x0, y0, x1 + 1, y1 + 1, area))
+    return output
+
+
+def _find_frames_and_markers(array: np.ndarray) -> tuple[list[Component], list[Component]]:
+    red = array[:, :, 0]
+    green = array[:, :, 1]
+    blue = array[:, :, 2]
+    cyan = (red < 80) & (green > 120) & (blue > 130)
+    magenta = (red > 170) & (green < 100) & (blue > 110)
+    frames = [
+        item
+        for item in _components(cyan)
+        if item.area > 700
+        and 106 <= item.x1 - item.x0 <= 116
+        and 106 <= item.y1 - item.y0 <= 116
+    ]
+    markers = [item for item in _components(magenta) if item.area >= 80]
+    if len(frames) != 2:
+        raise OracleError(f"expected two intact cyan card frames, found {len(frames)}")
+    if len(markers) != 2:
+        raise OracleError(f"expected two magenta corner fiducials, found {len(markers)}")
+    return sorted(frames, key=lambda item: item.x0), markers
+
+
+def _rotation_from_marker(frame: Component, markers: list[Component]) -> int:
+    candidates = []
+    for marker in markers:
+        mx, my = marker.center
+        if frame.x0 - 3 <= mx <= frame.x1 + 3 and frame.y0 - 3 <= my <= frame.y1 + 3:
+            candidates.append(marker)
+    if len(candidates) != 1:
+        raise OracleError("each card frame must contain exactly one corner fiducial")
+    mx, my = candidates[0].center
+    fx, fy = frame.center
+    left = mx < fx
+    top = my < fy
+    if left and top:
+        return 0
+    if left and not top:
+        return 1
+    if not left and not top:
+        return 2
+    return 3
+
+
+def _read_card(array: np.ndarray, frame: Component, markers: list[Component]) -> np.ndarray:
+    if frame.x1 - frame.x0 != CARD_SIZE or frame.y1 - frame.y0 != CARD_SIZE:
+        raise OracleError("card frame extent is not the declared 112 pixels")
+    crop = array[frame.y0 : frame.y1, frame.x0 : frame.x1]
+    turns = _rotation_from_marker(frame, markers)
+    canonical = np.rot90(crop, -turns)
+    field = np.zeros((GRID_N, GRID_N), dtype=bool)
+    yy, xx = np.mgrid[0:CELL, 0:CELL]
+    back_band = np.abs(xx - yy) <= 2
+    slash_band = np.abs((xx + yy) - (CELL - 1)) <= 2
+    for row in range(GRID_N):
+        for col in range(GRID_N):
+            x0 = GRID_ORIGIN + col * CELL
+            y0 = GRID_ORIGIN + row * CELL
+            cell = canonical[y0 : y0 + CELL, x0 : x0 + CELL]
+            luminance = cell.astype(np.int16).mean(axis=2)
+            dark = luminance < 120
+            ink_count = int(dark.sum())
+            if not 20 <= ink_count <= 48:
+                raise OracleError(f"cell ({row},{col}) has malformed stroke ink {ink_count}")
+            back_score = int(np.count_nonzero(dark & back_band))
+            slash_score = int(np.count_nonzero(dark & slash_band))
+            if abs(back_score - slash_score) < 12:
+                raise OracleError(f"cell ({row},{col}) has ambiguous stroke orientation")
+            field[row, col] = back_score > slash_score
+    if int(field.sum()) != 18:
+        raise OracleError("a stitch card is not orientation-balanced (18 of each slant required)")
+    return field
+
+
+def _template(name: str) -> np.ndarray:
+    return np.asarray([[value == "1" for value in row] for row in _TEMPLATE_ROWS[name]], dtype=bool)
+
+
+def measure_from_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise OracleError("expected an RGB raster")
+    frames, markers = _find_frames_and_markers(array)
+    fields = [_read_card(array, frame, markers) for frame in frames]
+    agreement = fields[0] == fields[1]
+    if int(agreement.sum()) != 20:
+        raise OracleError("agreement result must contain twenty dark cells")
+    distances = {
+        name: int(np.count_nonzero(agreement != _template(name))) for name in _TEMPLATE_ROWS
+    }
+    ordered = sorted(distances.items(), key=lambda item: (item[1], item[0]))
+    margin = ordered[1][1] - ordered[0][1]
+    if margin <= 0:
+        raise OracleError("template decision is tied")
+    return {
+        "decision": ordered[0][0],
+        "margin": float(margin),
+        "distances": distances,
+        "agreement_ink": int(agreement.sum()),
+        "card_backslash_counts": [int(field.sum()) for field in fields],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure_from_image(image)["decision"])

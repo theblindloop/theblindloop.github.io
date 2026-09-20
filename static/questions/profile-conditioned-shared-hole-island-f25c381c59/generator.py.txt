@@ -1,0 +1,208 @@
+"""Deterministic sampler and Pillow renderer for shared hole ownership."""
+
+from __future__ import annotations
+
+import copy
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+CANVAS = 512
+GRID_N = 3
+CENTERS = (96, 256, 416)
+OUTER_HALF = 43
+INNER_HALF = 27
+BACKGROUND = "#ffffff"
+DARK = "#17191d"
+GREEN_SHADES = ("#159f5a", "#238f55", "#1cab68")
+PURPLE_SHADES = ("#8a4db2", "#7650ae", "#9950a8")
+
+
+def _all_grid_edges() -> list[tuple[int, int]]:
+    edges: list[tuple[int, int]] = []
+    for row in range(GRID_N):
+        for col in range(GRID_N):
+            node = row * GRID_N + col
+            if col + 1 < GRID_N:
+                edges.append((node, node + 1))
+            if row + 1 < GRID_N:
+                edges.append((node, node + GRID_N))
+    return edges
+
+
+ALL_GRID_EDGES = tuple(_all_grid_edges())
+
+
+def _canonical_edge(edge: list[int] | tuple[int, int]) -> tuple[int, int]:
+    left, right = int(edge[0]), int(edge[1])
+    return (left, right) if left < right else (right, left)
+
+
+class _Dsu:
+    def __init__(self) -> None:
+        self.parent = list(range(GRID_N * GRID_N))
+
+    def find(self, item: int) -> int:
+        while self.parent[item] != item:
+            self.parent[item] = self.parent[self.parent[item]]
+            item = self.parent[item]
+        return item
+
+    def union(self, left: int, right: int) -> bool:
+        a, b = self.find(left), self.find(right)
+        if a == b:
+            return False
+        self.parent[b] = a
+        return True
+
+
+def _node_components(edges: list[list[int]] | list[tuple[int, int]]) -> list[list[int]]:
+    adjacency = {node: [] for node in range(GRID_N * GRID_N)}
+    for raw in edges:
+        left, right = _canonical_edge(raw)
+        adjacency[left].append(right)
+        adjacency[right].append(left)
+    unseen = set(adjacency)
+    groups: list[list[int]] = []
+    while unseen:
+        start = min(unseen)
+        unseen.remove(start)
+        queue = deque([start])
+        group = [start]
+        while queue:
+            node = queue.popleft()
+            for neighbor in adjacency[node]:
+                if neighbor in unseen:
+                    unseen.remove(neighbor)
+                    queue.append(neighbor)
+                    group.append(neighbor)
+        groups.append(sorted(group))
+    return groups
+
+
+def _owner_ids(scene: dict) -> tuple[int, int]:
+    groups = _node_components(scene["edges"])
+    owner = {node: index for index, group in enumerate(groups) for node in group}
+    by_role = {str(marker["role"]): owner[int(marker["node"])] for marker in scene["markers"]}
+    return by_role["green"], by_role["purple"]
+
+
+def _spanning_tree(rng: random.Random) -> list[tuple[int, int]]:
+    choices = list(ALL_GRID_EDGES)
+    rng.shuffle(choices)
+    dsu = _Dsu()
+    tree: list[tuple[int, int]] = []
+    for edge in choices:
+        if dsu.union(*edge):
+            tree.append(edge)
+    if len(tree) != GRID_N * GRID_N - 1:
+        raise RuntimeError("grid spanning-tree construction failed")
+    return tree
+
+
+def _target_yes(seed: int) -> bool:
+    return int(seed) % 2 == 0
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample two equal-ink dark islands containing nine visible holes."""
+
+    rng = random.Random(int(seed))
+    target_yes = _target_yes(seed)
+    for _ in range(1000):
+        tree = _spanning_tree(rng)
+        cut_candidates: list[tuple[tuple[int, int], list[list[int]]]] = []
+        for cut in tree:
+            remaining = [edge for edge in tree if edge != cut]
+            groups = _node_components(remaining)
+            if len(groups) == 2 and min(map(len, groups)) >= 3:
+                cut_candidates.append((cut, groups))
+        if not cut_candidates:
+            continue
+        selected_cut, groups = rng.choice(cut_candidates)
+        edges = [list(edge) for edge in tree if edge != selected_cut]
+        if target_yes:
+            eligible = [group for group in groups if len(group) >= 2]
+            green_node, purple_node = rng.sample(rng.choice(eligible), 2)
+        else:
+            green_node = rng.choice(groups[0])
+            purple_node = rng.choice(groups[1])
+        markers = [
+            {"role": "green", "node": green_node, "color": rng.choice(GREEN_SHADES)},
+            {"role": "purple", "node": purple_node, "color": rng.choice(PURPLE_SHADES)},
+        ]
+        rng.shuffle(markers)
+        scene = {
+            "edges": edges,
+            "markers": markers,
+            # Consecutive yes/no seeds share each nuisance setting exactly.
+            "wall_width": (12, 14, 16)[(int(seed) // 2) % 3],
+            "marker_radius": (12, 14, 16)[(int(seed) // 6) % 3],
+        }
+        if (analytic_gold(scene) == "yes") == target_yes:
+            return scene
+    raise RuntimeError(f"could not sample scene for seed {seed}")
+
+
+def _center(node: int) -> tuple[int, int]:
+    row, col = divmod(int(node), GRID_N)
+    return CENTERS[col], CENTERS[row]
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (CANVAS, CANVAS), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    width = int(scene["wall_width"])
+    half = width // 2
+    for raw in scene["edges"]:
+        left, right = _canonical_edge(raw)
+        x0, y0 = _center(left)
+        x1, y1 = _center(right)
+        if y0 == y1:
+            draw.rectangle(
+                (min(x0, x1) + OUTER_HALF - 1, y0 - half,
+                 max(x0, x1) - OUTER_HALF + 1, y0 + half - 1),
+                fill=DARK,
+            )
+        else:
+            draw.rectangle(
+                (x0 - half, min(y0, y1) + OUTER_HALF - 1,
+                 x0 + half - 1, max(y0, y1) - OUTER_HALF + 1),
+                fill=DARK,
+            )
+    for node in range(GRID_N * GRID_N):
+        x, y = _center(node)
+        draw.rectangle((x - OUTER_HALF, y - OUTER_HALF, x + OUTER_HALF, y + OUTER_HALF), fill=DARK)
+        draw.rectangle((x - INNER_HALF, y - INNER_HALF, x + INNER_HALF, y + INNER_HALF), fill=BACKGROUND)
+    for marker in scene["markers"]:
+        x, y = _center(int(marker["node"]))
+        radius = int(scene["marker_radius"])
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=str(marker["color"]))
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    left, right = _owner_ids(scene)
+    return "yes" if left == right else "no"
+
+
+def margin(scene: dict) -> float:
+    """Minimum number of visible joining-bar edits needed to flip the answer."""
+
+    return 1.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    return int(scene["wall_width"]) < 10 or int(scene["marker_radius"]) < 10
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["edges"] = [[edge[1], edge[0]] for edge in reversed(twin["edges"])]
+    twin["markers"] = list(reversed(twin["markers"]))
+    return [("serialization_order", twin)]
+
+
+def raster_clearance(scene: dict) -> float:
+    return float(min(int(scene["wall_width"]) / 2, INNER_HALF - int(scene["marker_radius"])))

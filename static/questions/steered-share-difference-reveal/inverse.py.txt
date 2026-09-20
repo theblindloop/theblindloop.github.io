@@ -1,0 +1,190 @@
+"""Independent pixel-only arm for the paired-share difference reveal world.
+
+It receives one RGB raster and nothing else. It locates the visible fiducials
+(the black chip borders), rectifies each chip's 5x5 cell lattice from its border
+box, reads each cell's tone against the two tone clusters that the chips
+themselves expose, executes the declared difference of the two chips, and
+classifies the resulting 5x5 mask against the declared glyph alphabet with a
+runner-up margin. Anything ambiguous returns the abstention token.
+
+This module imports no renderer, prompt, generator, verifier or gold code, and
+accepts no latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "share_difference_reveal-oracle-0.2.0"
+ABSTAIN = "undetermined"
+
+_FRAME_DARK = np.asarray((18.0, 18.0, 22.0))
+_FRAME_TOLERANCE = 60.0
+
+_CELLS = 5
+_MIN_SIDE = 40
+_MAX_SIDE = 50
+_MIN_TONE_SEPARATION = 12.0
+_MAX_CLUSTER_SPREAD = 6.0
+_MIN_GLYPH_MARGIN = 4
+_CELL_INSET_DIVISOR = 4
+
+_TEMPLATE_ART = {
+    "plus": ("..#..", "..#..", "#####", "..#..", "..#.."),
+    "ex": ("#...#", ".#.#.", "..#..", ".#.#.", "#...#"),
+    "tee": ("#####", "..#..", "..#..", "..#..", "..#.."),
+    "ell": ("#....", "#....", "#....", "#....", "#####"),
+}
+
+
+def _templates() -> dict[str, tuple[int, ...]]:
+    built: dict[str, tuple[int, ...]] = {}
+    for name, art in _TEMPLATE_ART.items():
+        if len(art) != _CELLS or any(len(row) != _CELLS for row in art):
+            raise ValueError("glyph template is not a 5 by 5 mask")
+        built[name] = tuple(1 if char == "#" else 0 for row in art for char in row)
+    return built
+
+
+TEMPLATES = _templates()
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[list[tuple[int, int]]] = []
+    for start in np.argwhere(mask):
+        origin = (int(start[0]), int(start[1]))
+        if seen[origin]:
+            continue
+        seen[origin] = True
+        stack = [origin]
+        group = []
+        while stack:
+            y, x = stack.pop()
+            group.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width:
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        groups.append(group)
+        if len(groups) > 24:
+            break
+    return groups
+
+
+def _frame_boxes(array: np.ndarray) -> list[tuple[int, int, int]]:
+    delta = np.linalg.norm(array.astype(np.float32) - _FRAME_DARK.astype(np.float32), axis=2)
+    mask = delta <= _FRAME_TOLERANCE
+    boxes: list[tuple[int, int, int]] = []
+    for group in _components(mask):
+        ys = [point[0] for point in group]
+        xs = [point[1] for point in group]
+        y0, y1 = min(ys), max(ys)
+        x0, x1 = min(xs), max(xs)
+        side = y1 - y0 + 1
+        if side != x1 - x0 + 1:
+            continue
+        if not _MIN_SIDE <= side <= _MAX_SIDE:
+            continue
+        # A chip border is a hollow ring: its own area must be a thin shell.
+        if not 0.15 <= len(group) / float(side * side) <= 0.55:
+            continue
+        if mask[y0 + side // 2, x0 + side // 2]:
+            continue
+        boxes.append((y0, x0, side))
+    boxes.sort()
+    return boxes
+
+
+def _frame_thickness(mask: np.ndarray, box: tuple[int, int, int]) -> int | None:
+    y0, x0, side = box
+    column = x0 + side // 2
+    thickness = 0
+    while thickness < side and mask[y0 + thickness, column]:
+        thickness += 1
+    if not 1 <= thickness <= 5:
+        return None
+    interior = side - 2 * thickness
+    if interior <= 0 or interior % _CELLS:
+        return None
+    return thickness
+
+
+def _chip_cell_colors(array: np.ndarray, box: tuple[int, int, int], thickness: int):
+    y0, x0, side = box
+    interior = side - 2 * thickness
+    cell = interior // _CELLS
+    inset = max(1, cell // _CELL_INSET_DIVISOR)
+    colors = []
+    for row in range(_CELLS):
+        for col in range(_CELLS):
+            cy = y0 + thickness + row * cell
+            cx = x0 + thickness + col * cell
+            patch = array[cy + inset : cy + cell - inset, cx + inset : cx + cell - inset]
+            if patch.size == 0:
+                return None
+            values = patch.reshape(-1, 3).astype(np.float32)
+            spread = float((values.max(axis=0) - values.min(axis=0)).max())
+            if spread > 2.0:
+                return None  # a cell must be one flat rendered tone
+            colors.append(values.mean(axis=0))
+    return colors
+
+
+def _luma(color) -> float:
+    return float(0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        return ABSTAIN
+    boxes = _frame_boxes(array)
+    if len(boxes) != 2:
+        return ABSTAIN
+
+    delta = np.linalg.norm(array.astype(np.float32) - _FRAME_DARK.astype(np.float32), axis=2)
+    frame_mask = delta <= _FRAME_TOLERANCE
+
+    chips = []
+    for box in boxes:
+        thickness = _frame_thickness(frame_mask, box)
+        if thickness is None:
+            return ABSTAIN
+        colors = _chip_cell_colors(array, box, thickness)
+        if colors is None:
+            return ABSTAIN
+        chips.append(colors)
+
+    lumas = [_luma(color) for chip in chips for color in chip]
+    order = sorted(lumas)
+    gaps = [(order[index + 1] - order[index], index) for index in range(len(order) - 1)]
+    best_gap, split = max(gaps)
+    if best_gap < _MIN_TONE_SEPARATION:
+        return ABSTAIN
+    low = order[: split + 1]
+    high = order[split + 1 :]
+    if not low or not high:
+        return ABSTAIN
+    if (low[-1] - low[0]) > _MAX_CLUSTER_SPREAD or (high[-1] - high[0]) > _MAX_CLUSTER_SPREAD:
+        return ABSTAIN
+    threshold = (low[-1] + high[0]) / 2.0
+
+    bits = [tuple(1 if _luma(color) < threshold else 0 for color in chip) for chip in chips]
+    mask = tuple(a ^ b for a, b in zip(bits[0], bits[1]))
+
+    scores = sorted(
+        ((sum(1 for a, b in zip(mask, template) if a == b), name)
+         for name, template in TEMPLATES.items()),
+        reverse=True,
+    )
+    best_score, best_name = scores[0]
+    runner_up = scores[1][0]
+    if best_score != len(mask):
+        return ABSTAIN
+    if best_score - runner_up < _MIN_GLYPH_MARGIN:
+        return ABSTAIN
+    return best_name

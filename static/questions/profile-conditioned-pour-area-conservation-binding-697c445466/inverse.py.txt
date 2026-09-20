@@ -1,0 +1,155 @@
+"""Independent pixel-only oracle.
+
+This module receives a rendered RGB image and the public question contract and
+nothing else. It imports no renderer, prompt, generator, verifier, or gold code,
+and it never sees a latent scene. It rediscovers every constant it needs from
+the image itself:
+
+1. the background is the most common colour;
+2. the four liquid colours are the chromatic colours (they are the only ones
+   with appreciable saturation), and each is named by its nearest primary;
+3. the tube fill is the achromatic non-background colour whose pixels decompose
+   into exactly four solid rectangles of one common width, which is precisely
+   the "four tubes of the same width, all filled in the same gray" rule;
+4. the marker is the darkest achromatic colour, and the tube it sits above is
+   the one whose column span contains its horizontal centroid;
+5. the answer is the liquid colour whose pixel area is closest to the marked
+   tube's pixel area, which is the conserved-area rule stated in the question.
+
+If any of that visible evidence is missing - no marker, no four equal-width gray
+columns, fewer than two liquid colours - the oracle returns "abstain" rather
+than guessing a colour from the constrained answer set.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_PROTOTYPES = {
+    "red": (255, 0, 0),
+    "blue": (0, 0, 255),
+    "green": (0, 160, 0),
+    "orange": (255, 165, 0),
+}
+_SATURATION_CUT = 60
+
+
+def _unique_colours(array: np.ndarray) -> list[tuple[tuple[int, int, int], int]]:
+    flat = array.reshape(-1, 3).astype(np.int64)
+    keys = flat[:, 0] * 65536 + flat[:, 1] * 256 + flat[:, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    out = []
+    for key, count in zip(values.tolist(), counts.tolist()):
+        out.append((((key >> 16) & 255, (key >> 8) & 255, key & 255), int(count)))
+    out.sort(key=lambda item: -item[1])
+    return out
+
+
+def _column_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    columns = np.flatnonzero(mask.any(axis=0)).tolist()
+    if not columns:
+        return []
+    runs = []
+    start = previous = columns[0]
+    for column in columns[1:]:
+        if column == previous + 1:
+            previous = column
+            continue
+        runs.append((start, previous))
+        start = previous = column
+    runs.append((start, previous))
+    return runs
+
+
+def _is_solid_rectangle(mask: np.ndarray, x0: int, x1: int) -> bool:
+    block = mask[:, x0 : x1 + 1]
+    rows = np.flatnonzero(block.any(axis=1))
+    if rows.size == 0:
+        return False
+    height = int(rows[-1] - rows[0] + 1)
+    return int(block.sum()) == height * (x1 - x0 + 1)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return red, blue, green, or orange from the pixels alone."""
+    array = np.asarray(image.convert("RGB"))
+    palette = _unique_colours(array)
+    if not palette:
+        return "abstain"
+    background = palette[0][0]
+
+    chromatic: list[tuple[tuple[int, int, int], int]] = []
+    achromatic: list[tuple[tuple[int, int, int], int]] = []
+    for colour, count in palette:
+        if colour == background:
+            continue
+        if max(colour) - min(colour) >= _SATURATION_CUT:
+            chromatic.append((colour, count))
+        else:
+            achromatic.append((colour, count))
+    if len(chromatic) < 2 or not achromatic:
+        return "abstain"
+
+    areas: dict[str, int] = {}
+    for colour, count in chromatic:
+        name = min(
+            _PROTOTYPES,
+            key=lambda key: sum(
+                (int(colour[i]) - _PROTOTYPES[key][i]) ** 2 for i in range(3)
+            ),
+        )
+        areas[name] = areas.get(name, 0) + count
+    if not areas:
+        return "abstain"
+
+    tubes: list[tuple[int, int, int]] = []
+    fill_colour = None
+    for colour, _count in achromatic:
+        mask = np.all(array == np.array(colour, dtype=array.dtype), axis=-1)
+        runs = _column_runs(mask)
+        if len(runs) != 4:
+            continue
+        if not all(_is_solid_rectangle(mask, x0, x1) for x0, x1 in runs):
+            continue
+        widths = {x1 - x0 + 1 for x0, x1 in runs}
+        if len(widths) != 1:
+            continue
+        found = []
+        for x0, x1 in runs:
+            found.append((x0, x1, int(mask[:, x0 : x1 + 1].sum())))
+        tubes = found
+        fill_colour = colour
+        tube_width = widths.pop()
+        break
+    if len(tubes) != 4 or fill_colour is None:
+        return "abstain"
+
+    fill_mask = np.all(array == np.array(fill_colour, dtype=array.dtype), axis=-1)
+    tube_top = int(np.flatnonzero(fill_mask.any(axis=1))[0])
+
+    # The marker is the one compact blob that sits wholly above the tubes and is
+    # narrower than two tube widths, which excludes the panel divider and the
+    # container walls.
+    marker_x = None
+    for colour, _count in achromatic:
+        if colour == fill_colour:
+            continue
+        mask = np.all(array == np.array(colour, dtype=array.dtype), axis=-1)
+        runs = _column_runs(mask)
+        if len(runs) != 1:
+            continue
+        x0, x1 = runs[0]
+        if x1 - x0 + 1 >= 2 * tube_width:
+            continue
+        rows = np.flatnonzero(mask.any(axis=1))
+        if int(rows[-1]) >= tube_top:
+            continue
+        marker_x = (x0 + x1) / 2.0
+        break
+    if marker_x is None:
+        return "abstain"
+
+    marked = min(tubes, key=lambda tube: abs((tube[0] + tube[1]) / 2.0 - marker_x))
+    target_area = marked[2]
+    return min(areas, key=lambda name: (abs(areas[name] - target_area), name))

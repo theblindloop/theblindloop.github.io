@@ -1,0 +1,121 @@
+"""Independent image-only inverse arm for the circular gauges.
+
+The implementation segments only the final raster, extracts the visible center
+pins and target ticks, and measures polar angles. It has no access to latent
+parameters or analytic code.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+
+PALETTE = {
+    "blue": np.array((31, 119, 180), dtype=np.int16),
+    "orange": np.array((255, 127, 14), dtype=np.int16),
+    "green": np.array((44, 160, 44), dtype=np.int16),
+}
+TICK = np.array((202, 35, 150), dtype=np.int16)
+INK = np.array((30, 34, 40), dtype=np.int16)
+
+
+def _mask(rgb: np.ndarray, target: np.ndarray, tolerance: float = 55.0) -> np.ndarray:
+    delta = rgb.astype(np.int32) - target.astype(np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 12) -> list[np.ndarray]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    height, width = mask.shape
+    found: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            yy, xx = queue.popleft()
+            pixels.append((yy, xx))
+            for ny, nx in ((yy - 1, xx), (yy + 1, xx), (yy, xx - 1), (yy, xx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            found.append(np.asarray(pixels, dtype=float))
+    return found
+
+
+def _center_pins(rgb: np.ndarray) -> list[tuple[float, float]]:
+    candidates = []
+    for component in _components(_mask(rgb, INK, 48.0), minimum=45):
+        ys, xs = component[:, 0], component[:, 1]
+        width = xs.max() - xs.min() + 1
+        height = ys.max() - ys.min() + 1
+        if 9 <= width <= 18 and 9 <= height <= 18 and abs(width - height) <= 3:
+            candidates.append((float(xs.mean()), float(ys.mean())))
+    if len(candidates) != 3:
+        raise ValueError(f"expected three visible center pins, found {len(candidates)}")
+    return candidates
+
+
+def _clockwise_angle(cx: float, cy: float, x: float, y: float) -> float:
+    return math.degrees(math.atan2(x - cx, cy - y)) % 360.0
+
+
+def _cyclic_gap(a: float, b: float) -> float:
+    delta = abs(a - b) % 360.0
+    return min(delta, 360.0 - delta)
+
+
+def decision_from_image(image) -> str:
+    rgb = np.asarray(image.convert("RGB"))
+    centers = _center_pins(rgb)
+    tick_components = _components(_mask(rgb, TICK), minimum=35)
+    if len(tick_components) != 3:
+        raise ValueError(f"expected three magenta target ticks, found {len(tick_components)}")
+
+    gaps: dict[str, float] = {}
+    used_centers: set[int] = set()
+    used_ticks: set[int] = set()
+    for name, value in PALETTE.items():
+        ys, xs = np.nonzero(_mask(rgb, value))
+        if len(xs) < 180:
+            raise ValueError(f"missing or too-short {name} gauge arc")
+        mean_x, mean_y = float(xs.mean()), float(ys.mean())
+        center_index = min(
+            range(len(centers)),
+            key=lambda i: (centers[i][0] - mean_x) ** 2 + (centers[i][1] - mean_y) ** 2,
+        )
+        if center_index in used_centers:
+            raise ValueError("two colored arcs mapped to one gauge center")
+        used_centers.add(center_index)
+        cx, cy = centers[center_index]
+
+        angles = np.array([_clockwise_angle(cx, cy, x, y) for x, y in zip(xs, ys)])
+        # The start cap straddles 0 degrees. Discard that tiny wraparound tail;
+        # sampled endpoints stay well below 340 degrees.
+        usable = angles[angles < 338.0]
+        if len(usable) < 150:
+            raise ValueError("colored arc has insufficient angular support")
+        fill_angle = float(np.percentile(usable, 99.4))
+
+        tick_index = min(
+            range(len(tick_components)),
+            key=lambda i: (
+                tick_components[i][:, 1].mean() - cx
+            ) ** 2 + (tick_components[i][:, 0].mean() - cy) ** 2,
+        )
+        if tick_index in used_ticks:
+            raise ValueError("two colored arcs mapped to one target tick")
+        used_ticks.add(tick_index)
+        tick = tick_components[tick_index]
+        tx, ty = float(tick[:, 1].mean()), float(tick[:, 0].mean())
+        target_angle = _clockwise_angle(cx, cy, tx, ty)
+        gaps[name] = _cyclic_gap(fill_angle, target_angle)
+
+    if len(gaps) != 3:
+        raise ValueError("incomplete gauge recovery")
+    return min(gaps, key=gaps.get)

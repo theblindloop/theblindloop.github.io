@@ -1,0 +1,139 @@
+"""Independent image-only oracle for marked-face shared-wall adjacency."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if seen[y, x]:
+            continue
+        queue = [(y, x)]
+        seen[y, x] = True
+        values: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.pop()
+            values.append((cy, cx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+                ny, nx = cy + dy, cx + dx
+                if (
+                    0 <= ny < height
+                    and 0 <= nx < width
+                    and mask[ny, nx]
+                    and not seen[ny, nx]
+                ):
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(values) >= minimum:
+            found.append(np.asarray(values, dtype=np.int32))
+    return found
+
+
+def _colored_mask(array: np.ndarray) -> np.ndarray:
+    values = array.astype(np.int16)
+    high = values.max(axis=2)
+    low = values.min(axis=2)
+    return (high - low >= 55) & (high >= 100) & (low <= 240)
+
+
+def _white_mask(array: np.ndarray) -> np.ndarray:
+    values = array.astype(np.int16)
+    return (values.min(axis=2) >= 242) & ((values.max(axis=2) - values.min(axis=2)) <= 22)
+
+
+def _enclosed_faces(white: np.ndarray, minimum: int = 160) -> list[np.ndarray]:
+    """Flood-fill the crop boundary, then keep bounded white face components."""
+
+    height, width = white.shape
+    outside = np.zeros_like(white, dtype=bool)
+    queue: deque[tuple[int, int]] = deque()
+    for x in range(width):
+        for y in (0, height - 1):
+            if white[y, x] and not outside[y, x]:
+                outside[y, x] = True
+                queue.append((y, x))
+    for y in range(height):
+        for x in (0, width - 1):
+            if white[y, x] and not outside[y, x]:
+                outside[y, x] = True
+                queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and white[ny, nx] and not outside[ny, nx]:
+                outside[ny, nx] = True
+                queue.append((ny, nx))
+    return _components(white & ~outside, minimum=minimum)
+
+
+def _bbox(component: np.ndarray) -> tuple[int, int, int, int]:
+    ys = component[:, 0]
+    xs = component[:, 1]
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _overlap(a0: int, a1: int, b0: int, b1: int) -> int:
+    return max(0, min(a1, b1) - max(a0, b0) + 1)
+
+
+def _shares_full_wall(first: np.ndarray, second: np.ndarray) -> bool:
+    ax0, ay0, ax1, ay1 = _bbox(first)
+    bx0, by0, bx1, by1 = _bbox(second)
+    overlap_x = _overlap(ax0, ax1, bx0, bx1)
+    overlap_y = _overlap(ay0, ay1, by0, by1)
+    gap_x = max(0, max(ax0, bx0) - min(ax1, bx1) - 1)
+    gap_y = max(0, max(ay0, by0) - min(ay1, by1) - 1)
+    min_width = min(ax1 - ax0 + 1, bx1 - bx0 + 1)
+    min_height = min(ay1 - ay0 + 1, by1 - by0 + 1)
+    # Adjacent faces have a long overlap on one axis and only the dark wall
+    # thickness on the other. Diagonal faces have gaps on both axes.
+    horizontal = overlap_y >= int(0.55 * min_height) and gap_x <= 18 and gap_y <= 3
+    vertical = overlap_x >= int(0.55 * min_width) and gap_y <= 18 and gap_x <= 3
+    return bool(horizontal or vertical)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the marked face pair and its shared-wall relation from pixels only."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    colored = _colored_mask(array)
+    markers = _components(colored, minimum=80)
+    if len(markers) != 2:
+        raise ValueError(f"expected two colored chamber marks, found {len(markers)}")
+    marker_centers = [np.mean(component, axis=0) for component in markers]
+    center_y = int(round(float(np.mean([center[0] for center in marker_centers]))))
+    center_x = int(round(float(np.mean([center[1] for center in marker_centers]))))
+    # A marker may occupy an outer cell, so the crop must extend beyond the
+    # marker pair by more than one half-cell to retain the complete frame.
+    half = 180
+    height, width = array.shape[:2]
+    y0 = max(0, center_y - half)
+    y1 = min(height, center_y + half + 1)
+    x0 = max(0, center_x - half)
+    x1 = min(width, center_x + half + 1)
+    crop = array[y0:y1, x0:x1]
+    faces = _enclosed_faces(_white_mask(crop))
+    if len(faces) != 4:
+        raise ValueError(f"expected four enclosed white faces, found {len(faces)}")
+
+    local_centers = [np.asarray([center[0] - y0, center[1] - x0]) for center in marker_centers]
+    face_centers = [np.mean(face, axis=0) for face in faces]
+    assignments = []
+    for marker in local_centers:
+        distances = [float(np.linalg.norm(marker - face_center)) for face_center in face_centers]
+        assignments.append(int(np.argmin(distances)))
+    if assignments[0] == assignments[1]:
+        raise ValueError("both colored marks mapped to one face")
+    first = faces[assignments[0]]
+    second = faces[assignments[1]]
+    return "adjacent" if _shares_full_wall(first, second) else "diagonal"

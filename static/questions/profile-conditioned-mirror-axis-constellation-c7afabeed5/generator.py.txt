@@ -1,0 +1,322 @@
+"""Renderer and analytic side of the mirror-axis constellation world.
+
+The stored scene contains gray point coordinates in a local coordinate system.
+The only label-bearing field is ``axis_index`` (mapped to a visible color by
+``candidate_colors``).  Rendering rotates the whole local scene, draws three
+equally long colored candidate axes, and then draws the gray disks on top.  The
+analytic score is used only for margins and sampling rejection; the analytic
+answer itself is deliberately just the declared axis identity.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+
+RENDERER_VERSION = "mirror_axis_constellation-0.1.0"
+CANVAS = (512, 512)
+BACKGROUND = (250, 250, 248)
+POINT_INK = (72, 80, 92)
+PALETTE = {
+    "red": (214, 62, 70),
+    "blue": (58, 108, 218),
+    "green": (46, 158, 98),
+}
+
+# A scene with less than this top-two score gap is a finite-resolution boundary
+# case.  The sampler rejects such scenes for the public dataset and the flag is
+# retained in every manifest row for explicit quarantine accounting.
+QUARANTINE_MARGIN = 14.0
+LINE_HALF_LENGTH = 194.0
+LINE_WIDTH = 5.5
+
+
+def _canonical_degrees(value: float) -> float:
+    """Quantize the public rotation so a +360 degree latent alias is exact."""
+
+    return round(float(value) % 360.0, 6)
+
+
+def _angle_separation(a: float, b: float) -> float:
+    """Smallest separation between unoriented lines, in degrees."""
+
+    delta = (float(a) - float(b)) % 180.0
+    return min(delta, 180.0 - delta)
+
+
+def _unit_vectors(angle_degrees: float) -> tuple[tuple[float, float], tuple[float, float]]:
+    radians = math.radians(float(angle_degrees))
+    tangent = (math.cos(radians), math.sin(radians))
+    normal = (-tangent[1], tangent[0])
+    return tangent, normal
+
+
+def _line_parameters(angle_degrees: float, offset: float) -> tuple[tuple[float, float], float]:
+    """Return a unit normal n and signed equation n dot p = c."""
+
+    _, normal = _unit_vectors(angle_degrees)
+    return normal, float(offset)
+
+
+def _reflect_points(
+    points: list[tuple[float, float]],
+    angle_degrees: float,
+    offset: float,
+) -> tuple[float, list[float]]:
+    """Score how well an unordered point set reproduces under reflection."""
+
+    if len(points) < 2:
+        return float("inf"), []
+    normal, constant = _line_parameters(angle_degrees, offset)
+    reflected: list[tuple[float, float]] = []
+    for x, y in points:
+        signed = normal[0] * x + normal[1] * y - constant
+        reflected.append((x - 2.0 * signed * normal[0], y - 2.0 * signed * normal[1]))
+
+    distances: list[float] = []
+    for index, (rx, ry) in enumerate(reflected):
+        all_distances = sorted(
+            math.hypot(rx - ox, ry - oy) for ox, oy in points
+        )
+        self_distance = math.hypot(rx - points[index][0], ry - points[index][1])
+        # A point may match itself only when it really lies on the tested axis.
+        # Otherwise use the next point, preventing a line that merely passes
+        # through many unrelated dots from looking globally symmetric.
+        if self_distance > 5.0 and len(all_distances) > 1:
+            distances.append(all_distances[1] if all_distances[0] <= self_distance + 1e-9 else all_distances[0])
+        else:
+            distances.append(all_distances[0])
+    return sum(distances) / len(distances), distances
+
+
+def _score_candidates(scene: dict) -> list[float]:
+    points = [(float(x), float(y)) for x, y in scene["points"]]
+    return [
+        _reflect_points(points, float(angle), float(offset))[0]
+        for angle, offset in zip(scene["candidate_angles"], scene["candidate_offsets"])
+    ]
+
+
+def _latent_points_for_axis(
+    rng: random.Random,
+    angle: float,
+    offset: float,
+    point_radius: float,
+) -> list[list[float]]:
+    """Create paired points around one axis, plus anchors and asymmetric noise."""
+
+    tangent, normal = _unit_vectors(angle)
+    points: list[tuple[float, float]] = []
+    minimum_spacing = 2.0 * point_radius + 5.0
+
+    def is_clear(candidate: tuple[float, float]) -> bool:
+        return all(math.dist(candidate, existing) >= minimum_spacing for existing in points)
+
+    # Exact reflected pairs make the global evidence strong while the random
+    # along-axis positions prevent a fixed template from carrying the answer.
+    for _ in range(9):
+        for _attempt in range(500):
+            along = rng.uniform(-126.0, 126.0)
+            separation = rng.uniform(27.0, 74.0)
+            common_shift = rng.uniform(-2.5, 2.5)
+            midpoint = (
+                tangent[0] * along + normal[0] * offset + tangent[0] * common_shift,
+                tangent[1] * along + normal[1] * offset + tangent[1] * common_shift,
+            )
+            first = (
+                midpoint[0] + normal[0] * separation,
+                midpoint[1] + normal[1] * separation,
+            )
+            second = (
+                midpoint[0] - normal[0] * separation,
+                midpoint[1] - normal[1] * separation,
+            )
+            if (
+                math.hypot(*first) <= 188.0
+                and math.hypot(*second) <= 188.0
+                and is_clear(first)
+                and is_clear(second)
+            ):
+                points.extend((first, second))
+                break
+        else:
+            raise RuntimeError("could not place a reflected point pair")
+
+    # Three points on the axis make the boundary visible, but their positions
+    # vary and they are drawn as ordinary gray disks, not as a hidden code.
+    for along in (-92.0, -18.0, 82.0):
+        anchor = (tangent[0] * along + normal[0] * offset, tangent[1] * along + normal[1] * offset)
+        if is_clear(anchor):
+            points.append(anchor)
+
+    # A few unpaired marks ensure the task is not solved by recognizing a clean
+    # bilateral template.  They are kept away from the true line and other dots.
+    for _ in range(3):
+        for _attempt in range(1000):
+            candidate = (rng.uniform(-155.0, 155.0), rng.uniform(-155.0, 155.0))
+            line_distance = abs(normal[0] * candidate[0] + normal[1] * candidate[1] - offset)
+            if (
+                math.hypot(*candidate) <= 185.0
+                and line_distance >= 18.0
+                and is_clear(candidate)
+            ):
+                points.append(candidate)
+                break
+        else:
+            raise RuntimeError("could not place a distractor point")
+
+    rng.shuffle(points)
+    return [[round(x, 5), round(y, 5)] for x, y in points]
+
+
+def _sample_candidate_angles(rng: random.Random) -> list[float]:
+    angles: list[float] = []
+    while len(angles) < 3:
+        proposal = rng.uniform(0.0, 180.0)
+        if all(_angle_separation(proposal, prior) >= 30.0 for prior in angles):
+            angles.append(round(proposal, 5))
+    return angles
+
+
+def _sample_candidate_offsets(rng: random.Random, axis_index: int) -> list[float]:
+    offsets = [0.0, 0.0, 0.0]
+    offsets[axis_index] = round(rng.uniform(-30.0, 30.0), 5)
+    for index in range(3):
+        if index == axis_index:
+            continue
+        for _ in range(100):
+            proposal = rng.uniform(-88.0, 88.0)
+            if abs(proposal - offsets[axis_index]) >= 28.0:
+                offsets[index] = round(proposal, 5)
+                break
+        else:
+            offsets[index] = round(70.0 if index != axis_index else offsets[axis_index], 5)
+    return offsets
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a deterministic, balanced, high-margin scene."""
+
+    rng = random.Random(int(seed))
+    axis_index = int(seed) % 3
+    for _attempt in range(400):
+        axis_angle = round(rng.uniform(0.0, 360.0), 5)
+        candidate_angles = _sample_candidate_angles(rng)
+        candidate_offsets = _sample_candidate_offsets(rng, axis_index)
+        point_radius = round(rng.uniform(6.0, 8.0), 3)
+        points = _latent_points_for_axis(
+            rng,
+            candidate_angles[axis_index],
+            candidate_offsets[axis_index],
+            point_radius,
+        )
+        colors = ["red", "blue", "green"]
+        rng.shuffle(colors)
+        scene = {
+            "axis_index": axis_index,
+            "axis_angle": axis_angle,
+            "candidate_angles": candidate_angles,
+            "candidate_offsets": candidate_offsets,
+            "candidate_colors": colors,
+            "points": points,
+            "point_radius": point_radius,
+            "background": list(BACKGROUND),
+            "width": CANVAS[0],
+            "height": CANVAS[1],
+        }
+        scores = _score_candidates(scene)
+        ordered = sorted(range(3), key=lambda index: scores[index])
+        if ordered[0] == axis_index and scores[ordered[1]] - scores[ordered[0]] >= QUARANTINE_MARGIN:
+            return scene
+    raise RuntimeError("failed to sample a high-margin mirror-axis scene")
+
+
+def _transform_local(point: tuple[float, float], angle: float, width: int, height: int) -> tuple[float, float]:
+    radians = math.radians(_canonical_degrees(angle))
+    cosine, sine = math.cos(radians), math.sin(radians)
+    x, y = point
+    return (
+        width / 2.0 + cosine * x - sine * y,
+        height / 2.0 + sine * x + cosine * y,
+    )
+
+
+def _line_endpoints(angle: float, offset: float, half_length: float) -> tuple[tuple[float, float], tuple[float, float]]:
+    tangent, normal = _unit_vectors(angle)
+    center = (normal[0] * offset, normal[1] * offset)
+    first = (center[0] - tangent[0] * half_length, center[1] - tangent[1] * half_length)
+    second = (center[0] + tangent[0] * half_length, center[1] + tangent[1] * half_length)
+    return first, second
+
+
+def render(scene: dict) -> Image.Image:
+    """Render the final RGB pixels from a scene dictionary."""
+
+    width = int(scene["width"])
+    height = int(scene["height"])
+    scale = 4
+    background = tuple(int(value) for value in scene["background"])
+    image = Image.new("RGB", (width * scale, height * scale), background)
+    draw = ImageDraw.Draw(image)
+
+    selected = int(scene["axis_index"])
+    colors = list(scene["candidate_colors"])
+    if not 0 <= selected < len(colors) or colors[selected] not in PALETTE:
+        raise ValueError("invalid selected candidate color")
+    rotation = float(scene["axis_angle"])
+
+    # All line widths, lengths, and draw order are public and equal across the
+    # three colors; dots are painted after them so evidence remains segmentable.
+    for angle, offset, color_name in zip(
+        scene["candidate_angles"], scene["candidate_offsets"], colors
+    ):
+        start, end = _line_endpoints(float(angle), float(offset), LINE_HALF_LENGTH)
+        p0 = _transform_local(start, rotation, width, height)
+        p1 = _transform_local(end, rotation, width, height)
+        draw.line(
+            [(round(p0[0] * scale), round(p0[1] * scale)), (round(p1[0] * scale), round(p1[1] * scale))],
+            fill=PALETTE[color_name],
+            width=max(1, round(LINE_WIDTH * scale)),
+        )
+
+    radius = float(scene["point_radius"])
+    for x, y in scene["points"]:
+        center = _transform_local((float(x), float(y)), rotation, width, height)
+        box = (
+            round((center[0] - radius) * scale),
+            round((center[1] - radius) * scale),
+            round((center[0] + radius) * scale),
+            round((center[1] + radius) * scale),
+        )
+        draw.ellipse(box, fill=POINT_INK)
+
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return the selected visible line color from the declared label fields."""
+
+    return str(scene["candidate_colors"][int(scene["axis_index"])])
+
+
+def margin(scene: dict) -> float:
+    """Return the analytic top-two global reflection-score gap."""
+
+    scores = sorted(_score_candidates(scene))
+    return float(scores[1] - scores[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Exercise a nontrivial render-invariant 360-degree rotation alias."""
+
+    twin = dict(scene)
+    twin["axis_angle"] = float(scene["axis_angle"]) + 360.0
+    return [("full_turn_rotation", twin)]

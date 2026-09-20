@@ -1,0 +1,122 @@
+"""Independent pixel-only inverse arm for maximum inter-token separation.
+
+Receives only the final PNG. From the raster alone it:
+  1. locates every red token and every green token by colour segmentation;
+  2. groups the tokens by their horizontal position into the four ordered
+     panels (each panel should contain exactly one red and one green token);
+  3. reads each panel's red and green slot indices from their centroid x;
+  4. computes the absolute slot difference per panel and reports the maximum
+     separation that ever occurs across the whole sequence.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+RED = (215, 60, 60)
+GREEN = (40, 180, 90)
+N_PANELS = 4
+N_SLOTS = 6
+START_X = 30
+OP_STEP = 275
+PANEL_W = 260
+RAIL_PAD = 38
+SLOT_W = (PANEL_W - 2 * RAIL_PAD) / N_SLOTS
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected red/green token structure."""
+
+
+def _mask(arr: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    return (arr[:, :, 0] == color[0]) & (arr[:, :, 1] == color[1]) & (arr[:, :, 2] == color[2])
+
+
+def _components(mask: np.ndarray, min_size: int = 20) -> list[np.ndarray]:
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= min_size:
+            comps.append(points)
+    return comps
+
+
+def _centroid(points: list[tuple[int, int]]) -> tuple[float, float]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return float(np.mean(xs)), float(np.mean(ys))
+
+
+def _slot_of(cx: float, panel_left: int) -> int:
+    rail_left = panel_left + RAIL_PAD
+    slot = int((cx - rail_left) / SLOT_W)
+    if not (0 <= slot < N_SLOTS):
+        raise UnreadableImageError(f"token slot {slot} outside track")
+    return slot
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    red_points = _components(_mask(arr, RED))
+    green_points = _components(_mask(arr, GREEN))
+    if not red_points or not green_points:
+        raise UnreadableImageError("no tokens found")
+
+    red_by_panel: dict[int, float] = {}
+    for comp in red_points:
+        cx, _ = _centroid(comp)
+        p = int((cx - START_X) // OP_STEP)
+        if not (0 <= p < N_PANELS):
+            raise UnreadableImageError(f"red token outside panels (panel {p})")
+        if p in red_by_panel:
+            raise UnreadableImageError("multiple red tokens in one panel")
+        red_by_panel[p] = cx
+    green_by_panel: dict[int, float] = {}
+    for comp in green_points:
+        cx, _ = _centroid(comp)
+        p = int((cx - START_X) // OP_STEP)
+        if not (0 <= p < N_PANELS):
+            raise UnreadableImageError(f"green token outside panels (panel {p})")
+        if p in green_by_panel:
+            raise UnreadableImageError("multiple green tokens in one panel")
+        green_by_panel[p] = cx
+
+    if set(red_by_panel) or set(green_by_panel):
+        expected = set(range(N_PANELS))
+        if set(red_by_panel) != expected or set(green_by_panel) != expected:
+            raise UnreadableImageError("token panel coverage is incomplete")
+
+    best = 0
+    for p in range(N_PANELS):
+        panel_left = START_X + p * OP_STEP
+        red_slot = _slot_of(red_by_panel[p], panel_left)
+        green_slot = _slot_of(green_by_panel[p], panel_left)
+        best = max(best, abs(red_slot - green_slot))
+    return str(best)

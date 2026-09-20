@@ -1,0 +1,143 @@
+"""Independent pixel-only inverse arm for the noncrossing-chords search.
+
+The three stroke inks are encoded by independent subtractive RGB channels.  A
+crossing therefore blends visibly while each complete centerline remains
+recoverable from one channel of the final raster.  This module has no access to
+latent geometry or rendering code.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+_LABELS = "ABCD"
+
+
+def _runs(values: np.ndarray, minimum_length: int) -> list[tuple[int, int]]:
+    padded = np.pad(values.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    starts = np.flatnonzero(changes == 1)
+    stops = np.flatnonzero(changes == -1)
+    return [(int(a), int(b)) for a, b in zip(starts, stops, strict=True) if b - a >= minimum_length]
+
+
+def _panel_boxes(array: np.ndarray) -> list[tuple[int, int, int, int]]:
+    low = array.min(axis=2)
+    high = array.max(axis=2)
+    neutral_card = (low >= 240) & (high <= 250) & ((high - low) <= 2)
+    h, w = neutral_card.shape
+    xruns = _runs(neutral_card.sum(axis=0) > 0.30 * h, max(70, w // 7))
+    # A nearly horizontal stroke can remove a long neutral run on the same row
+    # in both cards.  The low projection floor still excludes the white canvas
+    # while preventing such visible ink from truncating a detected card.
+    yruns = _runs(neutral_card.sum(axis=1) > 0.25 * w, max(55, h // 8))
+    if len(xruns) != 2 or len(yruns) != 2:
+        raise ValueError(f"could not enumerate four panel cards: x={xruns}, y={yruns}")
+    return [(x0, y0, x1, y1) for y0, y1 in yruns for x0, x1 in xruns]
+
+
+def _fit_stroke(array: np.ndarray, box: tuple[int, int, int, int], channel: int) -> dict:
+    x0, y0, x1, y1 = box
+    # Header labels and card borders are neutral ink and are excluded before the
+    # channel mask is measured.
+    xa, xb = x0 + 17, x1 - 17
+    ya, yb = y0 + 41, y1 - 12
+    sub = array[ya:yb, xa:xb, channel]
+    ys, xs = np.nonzero(sub < 172)
+    if len(xs) < 430:
+        raise ValueError(f"panel stroke channel {channel} has only {len(xs)} pixels")
+    points = np.column_stack((xs + xa + 0.5, ys + ya + 0.5)).astype(np.float64)
+    center = points.mean(axis=0)
+    centered = points - center
+    covariance = centered.T @ centered / len(points)
+    values, vectors = np.linalg.eigh(covariance)
+    if values[-1] < 14.0 * max(values[0], 1e-9):
+        raise ValueError(f"channel {channel} is not a thin straight stroke")
+    direction = vectors[:, -1]
+    projection = centered @ direction
+    lo, hi = np.percentile(projection, (0.7, 99.3))
+    if hi - lo < 80.0:
+        raise ValueError(f"channel {channel} stroke is too short")
+    p1 = center + lo * direction
+    p2 = center + hi * direction
+    return {"p1": tuple(p1), "p2": tuple(p2)}
+
+
+def _crossing(first: dict, second: dict) -> tuple[bool, float]:
+    a, b = first["p1"], first["p2"]
+    c, d = second["p1"], second["p2"]
+    rx, ry = b[0] - a[0], b[1] - a[1]
+    sx, sy = d[0] - c[0], d[1] - c[1]
+    denominator = rx * sy - ry * sx
+    if abs(denominator) < 1e-8:
+        return False, 0.0
+    qx, qy = c[0] - a[0], c[1] - a[1]
+    t = (qx * sy - qy * sx) / denominator
+    u = (qx * ry - qy * rx) / denominator
+    if 0.0 < t < 1.0 and 0.0 < u < 1.0:
+        la, lb = math.hypot(rx, ry), math.hypot(sx, sy)
+        sine = abs(denominator) / max(la * lb, 1e-9)
+        return True, min(t, 1 - t, u, 1 - u) * min(la, lb) * sine
+    return False, 0.0
+
+
+def _point_to_segment(point: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    wx, wy = point[0] - a[0], point[1] - a[1]
+    denominator = vx * vx + vy * vy
+    t = 0.0 if denominator == 0 else max(0.0, min(1.0, (wx * vx + wy * vy) / denominator))
+    nearest = (a[0] + t * vx, a[1] + t * vy)
+    return math.hypot(point[0] - nearest[0], point[1] - nearest[1])
+
+
+def _pair_score(first: dict, second: dict) -> float:
+    crosses, robustness = _crossing(first, second)
+    if crosses:
+        return -robustness
+    a, b, c, d = first["p1"], first["p2"], second["p1"], second["p2"]
+    distance = min(
+        _point_to_segment(a, c, d),
+        _point_to_segment(b, c, d),
+        _point_to_segment(c, a, b),
+        _point_to_segment(d, a, b),
+    )
+    return distance - 10.0
+
+
+def analyze_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    boxes = _panel_boxes(array)
+    panel_scores: list[float] = []
+    crossing_counts: list[int] = []
+    for box in boxes:
+        strokes = [_fit_stroke(array, box, channel) for channel in range(3)]
+        pair_data = [
+            (_crossing(strokes[i], strokes[j])[0], _pair_score(strokes[i], strokes[j]))
+            for i in range(3)
+            for j in range(i + 1, 3)
+        ]
+        crossing_counts.append(sum(int(crosses) for crosses, _ in pair_data))
+        panel_scores.append(min(score for _, score in pair_data))
+    winners = [index for index, count in enumerate(crossing_counts) if count == 0]
+    if len(winners) != 1:
+        raise ValueError(f"pixel arm requires one zero-crossing panel, found {winners}")
+    winner = winners[0]
+    ordered = sorted(panel_scores, reverse=True)
+    runner_gap = float(ordered[0] - ordered[1])
+    if panel_scores[winner] <= 3.0 or runner_gap <= 8.0:
+        raise ValueError(
+            f"ambiguous raster: winner score={panel_scores[winner]:.2f}, gap={runner_gap:.2f}"
+        )
+    return {
+        "decision": _LABELS[winner],
+        "panel_scores": panel_scores,
+        "crossing_counts": crossing_counts,
+        "runner_up_margin": runner_gap,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

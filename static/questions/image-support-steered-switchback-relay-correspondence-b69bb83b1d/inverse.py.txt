@@ -1,0 +1,140 @@
+"""Independent image-only inverse arm for Switchback Relay.
+
+This module intentionally duplicates the public palette numerically and recovers
+all state from raster masks.  It imports no renderer, latent scene, prompt, or
+verification code.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_ROUTE = np.asarray((35, 71, 105), dtype=np.int16)
+_RED = np.asarray((202, 52, 55), dtype=np.int16)
+_TAGS = {
+    "amber": np.asarray((232, 164, 38), dtype=np.int16),
+    "cyan": np.asarray((31, 174, 190), dtype=np.int16),
+    "violet": np.asarray((139, 88, 181), dtype=np.int16),
+}
+
+
+def _near(array: np.ndarray, color: np.ndarray, tolerance: float = 8.0) -> np.ndarray:
+    delta = array.astype(np.int32) - color.astype(np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    unseen = {tuple(map(int, point)) for point in np.argwhere(mask)}
+    output: list[np.ndarray] = []
+    while unseen:
+        origin = unseen.pop()
+        queue = deque([origin])
+        points = [origin]
+        while queue:
+            y, x = queue.popleft()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                ny, nx = neighbor
+                if 0 <= ny < height and 0 <= nx < width and neighbor in unseen:
+                    unseen.remove(neighbor)
+                    queue.append(neighbor)
+                    points.append(neighbor)
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _shape_name(component: np.ndarray) -> str:
+    ys = component[:, 0]
+    xs = component[:, 1]
+    box_area = int(xs.max() - xs.min() + 1) * int(ys.max() - ys.min() + 1)
+    fill = len(component) / float(box_area)
+    if fill < 0.68:
+        return "triangle"
+    if fill < 0.90:
+        return "circle"
+    return "square"
+
+
+def _require_route(array: np.ndarray, anchors: list[tuple[float, float]]) -> np.ndarray:
+    route_components = _components(_near(array, _ROUTE), minimum=20)
+    if len(route_components) != 1:
+        raise ValueError("the dark route is not one connected trace")
+    route = route_components[0]
+    height, width = array.shape[:2]
+    xspan = int(route[:, 1].max() - route[:, 1].min())
+    yspan = int(route[:, 0].max() - route[:, 0].min())
+    if xspan < 0.76 * width or yspan < 0.76 * height or len(route) < 1800:
+        raise ValueError("the route does not visibly span START to FINISH")
+    for x, y in anchors:
+        distance2 = (route[:, 1] - x) ** 2 + (route[:, 0] - y) ** 2
+        if float(distance2.min()) > 20.0**2:
+            raise ValueError("a start or finish slot is detached from the route")
+    return route
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    height, width = array.shape[:2]
+    if width < 256 or height < 256:
+        raise ValueError("canvas is too small")
+
+    # Recover the three black start glyphs from connected component geometry.
+    black = np.max(array, axis=2) < 60
+    black[:, int(width * 0.22) :] = False
+    shape_components = _components(black, minimum=100)
+    if len(shape_components) != 3:
+        raise ValueError("expected three unique start glyphs")
+    shape_components.sort(key=lambda part: _centroid(part)[1])
+    start_order = [_shape_name(part) for part in shape_components]
+    if sorted(start_order) != ["circle", "square", "triangle"]:
+        raise ValueError("start glyph identities are ambiguous")
+    start_anchors = [_centroid(part) for part in shape_components]
+
+    # Each terminal palette color must form one unambiguous tag; vertical order
+    # binds the tag names to the three output slots.
+    tagged: list[tuple[float, str, tuple[float, float]]] = []
+    for name, color in _TAGS.items():
+        parts = _components(_near(array, color), minimum=150)
+        if len(parts) != 1:
+            raise ValueError(f"expected one {name} finish tag")
+        center = _centroid(parts[0])
+        if center[0] < width * 0.80:
+            raise ValueError("finish tag is outside the terminal bank")
+        tagged.append((center[1], name, center))
+    tagged.sort()
+    finish_colors = [item[1] for item in tagged]
+    finish_anchors = [item[2] for item in tagged]
+
+    # Route integrity is checked after extracting endpoint parts so destructive
+    # removal anywhere along the single carrier causes abstention.
+    _require_route(array, start_anchors + finish_anchors)
+
+    # Recover bead cardinality per checkpoint, group locally in x, and read the
+    # groups from the visually declared upper-left to lower-right direction.
+    bead_parts = _components(_near(array, _RED), minimum=35)
+    centers = sorted((_centroid(part) for part in bead_parts), key=lambda point: point[0])
+    groups: list[list[tuple[float, float]]] = []
+    for center in centers:
+        if not groups or center[0] - max(point[0] for point in groups[-1]) > 22.0:
+            groups.append([center])
+        else:
+            groups[-1].append(center)
+    if len(groups) != 5 or any(len(group) not in (1, 2) for group in groups):
+        raise ValueError("checkpoint bead groups are not five clean unary/binary codes")
+    gates = [len(group) for group in groups]
+
+    slots = list(start_order)
+    for code in gates:
+        if code == 1:
+            slots[0], slots[1] = slots[1], slots[0]
+        else:
+            slots[1], slots[2] = slots[2], slots[1]
+    return finish_colors[slots.index("circle")]

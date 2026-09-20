@@ -1,0 +1,312 @@
+"""Forward arm for tessera_permute_relay.
+
+Two framed panels sit side by side inside one middle band of the canvas.
+
+* The left panel is a rule table.  Its top row carries three dot glyphs (one,
+  two or three black dots), one glyph per column.  Below it four rows each
+  begin with a coloured disc -- the row's own colour -- followed by three more
+  coloured discs, one under each glyph column.  Reading the table is a lookup:
+  current colour selects the row, the applied glyph selects the column, and the
+  disc found there is the new current colour.
+* The right panel is a program.  A single coloured disc inside a heavy black
+  ring gives the starting colour, and four stacked cells below it each hold one
+  dot glyph.  The glyphs are applied from the top cell downwards.
+
+The decision is the colour held after the fourth glyph.  The three transition
+columns are pairwise discordant permutations of the four colours (they are the
+non-identity columns of a Latin square), so from any current colour the three
+glyphs lead to three different colours: every single step is decisive, and the
+answer cannot be produced without binding both panels together.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "tessera_permute_relay-renderer-0.1.0"
+
+CANVAS = 960
+BACKGROUND = (247, 247, 244)
+INK = (26, 26, 26)
+DECOR = (222, 222, 218)
+
+COLOUR_NAMES = ("red", "amber", "green", "blue")
+COLOUR_RGB = {
+    "red": (203, 45, 45),
+    "amber": (222, 160, 24),
+    "green": (34, 138, 62),
+    "blue": (46, 82, 198),
+}
+
+# Panel geometry.  The safe ink window of the middle band is x in [156, 804]
+# and y in [396, 686]; both panels stay strictly inside it.
+PANEL_W = 160
+PANEL_H = 280
+TABLE_X_RANGE = (156, 164)
+TAPE_X_RANGE = (636, 644)
+PANEL_Y_RANGE = (396, 406)
+
+TABLE_COLS = 4
+TABLE_ROWS = 5
+CELL_W = PANEL_W // TABLE_COLS
+CELL_H = PANEL_H // TABLE_ROWS
+
+TAPE_HEAD_H = 76
+TAPE_STEP_H = (PANEL_H - TAPE_HEAD_H) // 4
+
+CHIP_R = 14
+START_CHIP_R = 15
+RING_R = 25
+RING_W = 3
+PIP_R = 5
+FRAME_W = 3
+GRID_W = 2
+
+STEPS = 4
+QUARANTINE_CLEARANCE = 2.0
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _latin_square(rng: random.Random) -> list[list[int]]:
+    """Random Latin square of order four over indices 0..3."""
+    while True:
+        rows: list[list[int]] = []
+        for _ in range(4):
+            for _attempt in range(400):
+                candidate = [0, 1, 2, 3]
+                rng.shuffle(candidate)
+                if all(
+                    all(candidate[c] != row[c] for row in rows) for c in range(4)
+                ):
+                    rows.append(candidate)
+                    break
+            else:
+                break
+        if len(rows) == 4:
+            return rows
+
+
+def _sample_table(rng: random.Random) -> dict:
+    """Row labels plus three pairwise discordant transition columns."""
+    square = _latin_square(rng)
+    order = list(COLOUR_NAMES)
+    rng.shuffle(order)
+    # Column 0 of the Latin square labels the rows; the other three columns are
+    # the transitions.  Latin-ness makes every transition fixed-point free with
+    # respect to its row label and makes the three columns pairwise discordant.
+    labels = [order[square[i][0]] for i in range(4)]
+    columns = []
+    for c in (1, 2, 3):
+        columns.append({labels[i]: order[square[i][c]] for i in range(4)})
+    column_order = [0, 1, 2]
+    rng.shuffle(column_order)
+    columns = [columns[i] for i in column_order]
+    row_order = list(range(4))
+    rng.shuffle(row_order)
+    labels = [labels[i] for i in row_order]
+    glyphs = [1, 2, 3]
+    rng.shuffle(glyphs)
+    grid = [[columns[c][labels[r]] for c in range(3)] for r in range(4)]
+    return {"row_labels": labels, "column_glyphs": glyphs, "grid": grid}
+
+
+def _replay_table(table: dict, start: str, tape: list[int]) -> list[str]:
+    trail = [start]
+    state = start
+    for glyph in tape:
+        column = table["column_glyphs"].index(glyph)
+        row = table["row_labels"].index(state)
+        state = table["grid"][row][column]
+        trail.append(state)
+    return trail
+
+
+def _decor(rng: random.Random, blocked: list[tuple[int, int, int, int]]) -> list[dict]:
+    items: list[dict] = []
+    attempts = 0
+    while len(items) < 14 and attempts < 400:
+        attempts += 1
+        kind = rng.choice(("disc", "box", "bar"))
+        size = rng.randint(16, 44)
+        x = rng.randint(14, CANVAS - 14 - size)
+        y = rng.randint(14, CANVAS - 14 - size)
+        box = (x, y, x + size, y + size)
+        if any(
+            box[0] < bx1 + 26
+            and box[2] > bx0 - 26
+            and box[1] < by1 + 26
+            and box[3] > by0 - 26
+            for bx0, by0, bx1, by1 in blocked
+        ):
+            continue
+        items.append({"kind": kind, "box": list(box)})
+    return items
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic scene sample with a balanced, counterbalanced answer."""
+    rng = random.Random(seed)
+    target = COLOUR_NAMES[seed % 4]
+    # One scene in eight is deliberately allowed to finish on its own starting
+    # colour; those rows are quarantined so the copy-the-ring shortcut never
+    # pays on a headline scene.
+    want_same = seed % 8 == 5
+    pip_gap = 13 + (seed % 5)
+
+    for _ in range(20000):
+        table = _sample_table(rng)
+        start = rng.choice(COLOUR_NAMES)
+        tape = [rng.choice((1, 2, 3)) for _ in range(STEPS)]
+        if len(set(tape)) < 2:
+            continue
+        trail = _replay_table(table, start, tape)
+        if trail[-1] != target:
+            continue
+        if (trail[-1] == start) != want_same:
+            continue
+        break
+    else:  # pragma: no cover - the rejection loop always succeeds in practice
+        raise RuntimeError("could not sample a balanced scene")
+
+    table_x = rng.randint(*TABLE_X_RANGE)
+    tape_x = rng.randint(*TAPE_X_RANGE)
+    table_y = rng.randint(*PANEL_Y_RANGE)
+    tape_y = rng.randint(*PANEL_Y_RANGE)
+    blocked = [
+        (table_x, table_y, table_x + PANEL_W, table_y + PANEL_H),
+        (tape_x, tape_y, tape_x + PANEL_W, tape_y + PANEL_H),
+    ]
+    return {
+        "canvas": CANVAS,
+        "table_x": table_x,
+        "table_y": table_y,
+        "tape_x": tape_x,
+        "tape_y": tape_y,
+        "row_labels": table["row_labels"],
+        "column_glyphs": table["column_glyphs"],
+        "grid": table["grid"],
+        "start": start,
+        "tape": tape,
+        "pip_r": PIP_R,
+        "pip_gap": pip_gap,
+        "decor": _decor(rng, blocked),
+    }
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _pips(draw: ImageDraw.ImageDraw, cx: int, cy: int, count: int, scene: dict, vertical: bool) -> None:
+    radius = scene["pip_r"]
+    gap = scene["pip_gap"]
+    offset = -(count - 1) * gap / 2.0
+    for index in range(count):
+        shift = offset + index * gap
+        px = cx if vertical else cx + shift
+        py = cy + shift if vertical else cy
+        draw.ellipse(
+            (px - radius, py - radius, px + radius, py + radius), fill=INK
+        )
+
+
+def _disc(draw: ImageDraw.ImageDraw, cx: float, cy: float, radius: int, colour) -> None:
+    draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=colour)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (scene["canvas"], scene["canvas"]), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    for item in scene["decor"]:
+        x0, y0, x1, y1 = item["box"]
+        if item["kind"] == "disc":
+            draw.ellipse((x0, y0, x1, y1), fill=DECOR)
+        elif item["kind"] == "box":
+            draw.rectangle((x0, y0, x1, y1), outline=DECOR, width=3)
+        else:
+            draw.rectangle((x0, y0 + (y1 - y0) // 2, x1, y0 + (y1 - y0) // 2 + 4), fill=DECOR)
+
+    # --- rule table -------------------------------------------------------
+    tx, ty = scene["table_x"], scene["table_y"]
+    draw.rectangle((tx, ty, tx + PANEL_W, ty + PANEL_H), outline=INK, width=FRAME_W)
+    for col in range(1, TABLE_COLS):
+        x = tx + col * CELL_W
+        draw.rectangle((x - GRID_W // 2, ty, x + GRID_W // 2, ty + PANEL_H), fill=INK)
+    for row in range(1, TABLE_ROWS):
+        y = ty + row * CELL_H
+        draw.rectangle((tx, y - GRID_W // 2, tx + PANEL_W, y + GRID_W // 2), fill=INK)
+
+    for col in range(3):
+        cx = tx + (col + 1) * CELL_W + CELL_W // 2
+        cy = ty + CELL_H // 2
+        _pips(draw, cx, cy, scene["column_glyphs"][col], scene, vertical=True)
+    for row in range(4):
+        cy = ty + (row + 1) * CELL_H + CELL_H // 2
+        _disc(draw, tx + CELL_W // 2, cy, CHIP_R, COLOUR_RGB[scene["row_labels"][row]])
+        for col in range(3):
+            cx = tx + (col + 1) * CELL_W + CELL_W // 2
+            _disc(draw, cx, cy, CHIP_R, COLOUR_RGB[scene["grid"][row][col]])
+
+    # --- program ----------------------------------------------------------
+    px, py = scene["tape_x"], scene["tape_y"]
+    draw.rectangle((px, py, px + PANEL_W, py + PANEL_H), outline=INK, width=FRAME_W)
+    head_cx = px + PANEL_W // 2
+    head_cy = py + TAPE_HEAD_H // 2
+    draw.ellipse(
+        (head_cx - RING_R, head_cy - RING_R, head_cx + RING_R, head_cy + RING_R),
+        outline=INK,
+        width=RING_W,
+    )
+    _disc(draw, head_cx, head_cy, START_CHIP_R, COLOUR_RGB[scene["start"]])
+    for step in range(STEPS):
+        y = py + TAPE_HEAD_H + step * TAPE_STEP_H
+        draw.rectangle((px, y - GRID_W // 2, px + PANEL_W, y + GRID_W // 2), fill=INK)
+        _pips(draw, head_cx, y + TAPE_STEP_H // 2, scene["tape"][step], scene, vertical=False)
+
+    return image
+
+
+# --------------------------------------------------------------------------
+# analytic side
+# --------------------------------------------------------------------------
+def _replay(scene: dict) -> dict:
+    trail = _replay_table(
+        {
+            "row_labels": scene["row_labels"],
+            "column_glyphs": scene["column_glyphs"],
+            "grid": scene["grid"],
+        },
+        scene["start"],
+        list(scene["tape"]),
+    )
+    return {"trail": trail, "final_colour": trail[-1]}
+
+
+def analytic_gold(scene: dict) -> str:
+    return _replay(scene)["final_colour"]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up margin as the clearance that separates two adjacent dots.
+
+    Every step is decisive, so the smallest visual change that flips the answer
+    is a misread dot count: two neighbouring dots merging into one blob, or one
+    dot splitting.  The clearance in pixels between adjacent dots is therefore
+    the distance to the nearest answer-changing misreading.
+    """
+    return float(scene["pip_gap"] - 2 * scene["pip_r"])
+
+
+def is_quarantined(scene: dict) -> bool:
+    if margin(scene) < QUARANTINE_CLEARANCE:
+        return True
+    return _replay(scene)["final_colour"] == scene["start"]
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: every sampled field is painted into the raster."""
+    return []

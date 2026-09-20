@@ -1,0 +1,186 @@
+"""Pixel-only inverse arm for the triad tally consensus search world.
+
+The oracle receives a rasterised page and nothing else. It segments the ink,
+requires every mark to be one identical filled square, groups squares into
+tallies by their spacing, groups tallies into two-by-two blocks by their much
+larger separation, reads the four block positions in a fixed order, and reports
+the unique position whose square count is shared by every block that is present
+together with the runner-up spread.
+
+The grouping thresholds are expressed in units of the measured square side, so
+the arm never reads renderer state, latent parameters or analytic gold. Any
+number of blocks is accepted: with fewer than three blocks the consensus is not
+unique and the arm abstains, which is the honest outcome when part of the page
+is missing.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "triad_tally_consensus_search-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+WORDS = ("upper-left", "upper-right", "lower-left", "lower-right")
+
+INK_DISTANCE = 40.0       # city-block colour distance from the modal background
+TALLY_LINK = 2.6          # square sides: squares closer than this share a tally
+BLOCK_LINK = 29.0         # square sides: tallies closer than this share a block
+
+
+def _ink_mask(image: "Image.Image"):
+    frame = np.asarray(image.convert("RGB"), dtype=np.int32)
+    packed = (frame[:, :, 0] << 16) | (frame[:, :, 1] << 8) | frame[:, :, 2]
+    values, counts = np.unique(packed.reshape(-1), return_counts=True)
+    background = int(values[int(np.argmax(counts))])
+    bgr = np.array(
+        [(background >> 16) & 255, (background >> 8) & 255, background & 255],
+        dtype=np.int32,
+    )
+    distance = np.abs(frame - bgr).sum(axis=2)
+    return distance > INK_DISTANCE
+
+
+def _components(mask) -> list:
+    points = np.argwhere(mask)
+    if points.size == 0:
+        return []
+    pending = {(int(y), int(x)) for y, x in points}
+    out = []
+    while pending:
+        start = pending.pop()
+        stack = [start]
+        blob = [start]
+        while stack:
+            y, x = stack.pop()
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if (ny, nx) in pending:
+                    pending.discard((ny, nx))
+                    stack.append((ny, nx))
+                    blob.append((ny, nx))
+        out.append(blob)
+    return out
+
+
+def _squares(mask):
+    """Every ink component must be one identical filled square."""
+
+    squares = []
+    side = None
+    for blob in _components(mask):
+        ys = [point[0] for point in blob]
+        xs = [point[1] for point in blob]
+        height = max(ys) - min(ys) + 1
+        width = max(xs) - min(xs) + 1
+        if height != width or len(blob) != height * width or height < 3:
+            return None, None
+        if side is None:
+            side = height
+        elif height != side:
+            return None, None
+        squares.append((min(xs) + (width - 1) / 2.0, min(ys) + (height - 1) / 2.0))
+    if not squares:
+        return None, None
+    return squares, float(side)
+
+
+def _link(points: list, limit: float) -> list:
+    """Single-linkage grouping under the Chebyshev distance."""
+
+    parent = list(range(len(points)))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for left in range(len(points)):
+        for right in range(left + 1, len(points)):
+            gap = max(
+                abs(points[left][0] - points[right][0]),
+                abs(points[left][1] - points[right][1]),
+            )
+            if gap < limit:
+                a, b = find(left), find(right)
+                if a != b:
+                    parent[a] = b
+    groups: dict = {}
+    for index in range(len(points)):
+        groups.setdefault(find(index), []).append(index)
+    return list(groups.values())
+
+
+def measure_from_image(image: "Image.Image"):
+    """Read the block positions and the consensus, or return None."""
+
+    squares, side = _squares(_ink_mask(image))
+    if squares is None:
+        return None
+
+    tallies = []
+    for group in _link(squares, TALLY_LINK * side):
+        members = sorted(squares[index] for index in group)
+        rows = {round(point[1], 1) for point in members}
+        if len(rows) != 1:
+            return None
+        for first, second in zip(members, members[1:]):
+            if abs((second[0] - first[0]) - 2 * side) > 1.0:
+                return None
+        centre_x = sum(point[0] for point in members) / len(members)
+        tallies.append((centre_x, members[0][1], len(members)))
+    if len(tallies) < 4:
+        return None
+
+    blocks = []
+    for group in _link([(item[0], item[1]) for item in tallies], BLOCK_LINK * side):
+        cells = [tallies[index] for index in group]
+        if len(cells) != 4:
+            return None
+        levels = sorted({round(cell[1], 1) for cell in cells})
+        if len(levels) != 2:
+            return None
+        slots = [0] * 4
+        ordered = []
+        for level_index, level in enumerate(levels):
+            row = sorted(
+                (cell for cell in cells if abs(cell[1] - level) < 0.5),
+                key=lambda cell: cell[0],
+            )
+            if len(row) != 2:
+                return None
+            ordered.extend((level_index * 2 + column, cell[2]) for column, cell in enumerate(row))
+        for slot, count in ordered:
+            slots[slot] = count
+        blocks.append(slots)
+    if not blocks:
+        return None
+
+    spreads = [
+        max(block[slot] for block in blocks) - min(block[slot] for block in blocks)
+        for slot in range(4)
+    ]
+    agreeing = [slot for slot, value in enumerate(spreads) if value == 0]
+    if len(agreeing) != 1:
+        return None
+    runner_up = min(value for value in spreads if value > 0)
+    if runner_up <= 0:
+        return None
+    return {
+        "block_count": len(blocks),
+        "counts": blocks,
+        "spreads": spreads,
+        "decision": WORDS[agreeing[0]],
+        "best_gap": 0.0,
+        "pixel_margin": float(runner_up),
+    }
+
+
+def decision_from_image(image: "Image.Image") -> str:
+    """Pixel-only decision, or ``abstain`` when the consensus is not unique."""
+
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    return report["decision"]

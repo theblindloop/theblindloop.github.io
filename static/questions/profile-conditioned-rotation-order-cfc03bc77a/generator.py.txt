@@ -1,0 +1,198 @@
+"""Deterministic latent-scene sampling and RGB rendering for rotation_order.
+
+A scene is a rosette: twelve identical dots that are k exact rotated copies of a
+random motif about a marked centre, for k in {2, 3, 4, 6}. The dot count, the
+dot size, the colours and the total ink are sampled independently of k, so the
+answer lives only in the global rotational organisation of the whole dot set.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "rotation_order-renderer-0.1.0"
+
+WIDTH = 620
+HEIGHT = 620
+N_DOTS = 12
+K_VALUES = (2, 3, 4, 6)
+SUPERSAMPLE = 3
+CROSS_ARM = 18
+CROSS_HALF_THICKNESS = 2
+
+MIN_RADIUS = 84.0
+MAX_RADIUS = 248.0
+BORDER = 22.0
+MIN_MARGIN_PX = 12.0  # rejection floor for the runner-up mismatch
+QUARANTINE_PX = 18.0  # below this the runner-up order is not safely separated
+
+
+def _rotate(point: tuple[float, float], centre: tuple[float, float], angle: float):
+    dx = point[0] - centre[0]
+    dy = point[1] - centre[1]
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    return (centre[0] + dx * cos_a - dy * sin_a, centre[1] + dx * sin_a + dy * cos_a)
+
+
+def _mismatch(points: list, centre: tuple[float, float], order: int) -> float:
+    """Largest distance from a rotated dot to the nearest original dot, in px."""
+    angle = 2.0 * math.pi / order
+    worst = 0.0
+    for point in points:
+        moved = _rotate(point, centre, angle)
+        best = min(math.dist(moved, other) for other in points)
+        worst = max(worst, best)
+    return worst
+
+
+def _largest_order(points: list, centre: tuple[float, float]) -> int:
+    """Largest k in K_VALUES whose 360/k rotation maps the dot set onto itself."""
+    orders = [k for k in K_VALUES if _mismatch(points, centre, k) <= 1e-6]
+    return max(orders) if orders else 1
+
+
+def _runner_up(points: list, centre: tuple[float, float], order: int) -> float:
+    """Smallest mismatch over the orders that are *not* symmetries of the set."""
+    others = [k for k in K_VALUES if order % k != 0]
+    return min(_mismatch(points, centre, k) for k in others) if others else float("inf")
+
+
+def _motif(rng: random.Random, k: int, centre: tuple[float, float], phase: float) -> list:
+    wedge = 2.0 * math.pi / k
+    seeds = [
+        (rng.uniform(MIN_RADIUS, MAX_RADIUS), phase + rng.uniform(0.0, wedge))
+        for _ in range(N_DOTS // k)
+    ]
+    points = []
+    for copy in range(k):
+        offset = copy * wedge
+        for radius, angle in seeds:
+            points.append(
+                (
+                    centre[0] + radius * math.cos(angle + offset),
+                    centre[1] + radius * math.sin(angle + offset),
+                )
+            )
+    return points
+
+
+def _acceptable(points: list, centre: tuple[float, float], k: int, dot_radius: float) -> bool:
+    clearance = 3.2 * dot_radius + 8.0
+    for index, point in enumerate(points):
+        if not (BORDER + dot_radius <= point[0] <= WIDTH - BORDER - dot_radius):
+            return False
+        if not (BORDER + dot_radius <= point[1] <= HEIGHT - BORDER - dot_radius):
+            return False
+        if math.dist(point, centre) < CROSS_ARM + dot_radius + 12.0:
+            return False
+        for other in points[index + 1 :]:
+            if math.dist(point, other) < clearance:
+                return False
+    if _largest_order(points, centre) != k:
+        return False
+    return _runner_up(points, centre, k) >= MIN_MARGIN_PX
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from an integer seed."""
+    rng = random.Random(seed)
+    k = K_VALUES[seed % len(K_VALUES)]
+    background = tuple(rng.randint(234, 249) for _ in range(3))
+    while True:
+        dot_color = (rng.randint(0, 210), rng.randint(0, 210), rng.randint(0, 210))
+        if max(dot_color) < 120 or min(dot_color) < 25:
+            continue
+        if max(abs(a - b) for a, b in zip(dot_color, background)) >= 90:
+            break
+    dot_radius = float(rng.randint(8, 12))
+    centre = (
+        float(rng.randint(WIDTH // 2 - 30, WIDTH // 2 + 30)) + 0.5,
+        float(rng.randint(HEIGHT // 2 - 30, HEIGHT // 2 + 30)) + 0.5,
+    )
+    for _ in range(4000):
+        points = _motif(rng, k, centre, rng.uniform(0.0, 2.0 * math.pi))
+        if _acceptable(points, centre, k, dot_radius):
+            break
+    else:  # pragma: no cover - the rejection sampler always succeeds in practice
+        raise RuntimeError(f"could not sample a rosette for seed {seed}")
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "bg_color": list(background),
+        "dot_color": list(dot_color),
+        "cross_color": [18, 18, 22],
+        "dot_radius": dot_radius,
+        "cross_arm": CROSS_ARM,
+        "centre": [centre[0], centre[1]],
+        "dots": [[point[0], point[1]] for point in points],
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Paint the scene: supersampled dots plus a crisp near-black centre cross."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    radius = float(scene["dot_radius"])
+    scale = SUPERSAMPLE
+    canvas = Image.new("RGB", (width * scale, height * scale), tuple(scene["bg_color"]))
+    brush = ImageDraw.Draw(canvas)
+    for dot in scene["dots"]:
+        x = float(dot[0])
+        y = float(dot[1])
+        brush.ellipse(
+            [
+                round((x - radius) * scale),
+                round((y - radius) * scale),
+                round((x + radius) * scale) - 1,
+                round((y + radius) * scale) - 1,
+            ],
+            fill=tuple(scene["dot_color"]),
+        )
+    image = canvas.resize((width, height), Image.BOX)
+    marker = ImageDraw.Draw(image)
+    arm = int(scene["cross_arm"])
+    column = int(float(scene["centre"][0]) - 0.5)
+    row = int(float(scene["centre"][1]) - 0.5)
+    colour = tuple(scene["cross_color"])
+    marker.rectangle(
+        [column - arm, row - CROSS_HALF_THICKNESS, column + arm, row + CROSS_HALF_THICKNESS],
+        fill=colour,
+    )
+    marker.rectangle(
+        [column - CROSS_HALF_THICKNESS, row - arm, column + CROSS_HALF_THICKNESS, row + arm],
+        fill=colour,
+    )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    """Largest rotational order of the dot set about the marked centre."""
+    dots = [(float(dot[0]), float(dot[1])) for dot in scene["dots"]]
+    centre = scene["centre"]
+    return str(_largest_order(dots, (float(centre[0]), float(centre[1]))))
+
+
+def margin(scene: dict) -> float:
+    """One-sided margin: mismatch of the closest non-symmetric rotation, in px."""
+    dots = [(float(dot[0]), float(dot[1])) for dot in scene["dots"]]
+    centre = (float(scene["centre"][0]), float(scene["centre"][1]))
+    return float(_runner_up(dots, centre, int(analytic_gold(scene))))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Flag scenes whose runner-up rotation is not clearly separated."""
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Pixel-identical relabelings of the unordered, identically painted dot set."""
+    dots = list(scene["dots"])
+    rotated = dict(scene)
+    rotated["dots"] = dots[3:] + dots[:3]
+    reversed_scene = dict(scene)
+    reversed_scene["dots"] = list(reversed(dots))
+    return [("dot_list_rotation", rotated), ("dot_list_reversal", reversed_scene)]

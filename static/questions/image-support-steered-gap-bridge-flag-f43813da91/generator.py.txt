@@ -1,0 +1,387 @@
+"""Scene sampler, raster renderer and analytic gold for gap_bridge_flag.
+
+One dark-green pad sits inside a medium-sized area of the canvas. Three arms of
+small equal-sized gray stones leave the pad, one arm per coloured flag. Two
+stones (or a stone and the pad, or a stone and a flag) count as linked only when
+the clear white gap between them is narrower than a stone is wide. Exactly one
+arm is interrupted by a single too-wide gap, so exactly one flag is cut off from
+the pad while the other two stay reachable. The analytic gold is the colour of
+the cut-off flag, which forces every arm to be checked.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import statistics
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "gap_bridge_flag-renderer-0.1.0"
+
+WIDTH = 640
+HEIGHT = 640
+BACKGROUND = (255, 255, 255)
+STONE_COLOR = (62, 62, 70)
+HUB_COLOR = (24, 124, 52)
+FLAG_COLORS = {
+    "orange": (236, 124, 24),
+    "purple": (126, 52, 170),
+    "blue": (32, 96, 208),
+}
+FLAG_ORDER = ("orange", "purple", "blue")
+
+STONE_SIZE = 12
+HUB_SIZE = 22
+FLAG_SIZE = 18
+
+_MIN_MARGIN_PX = 1.0
+_MIN_CLEAR_GAP_PX = 2.0
+_QUARANTINE_MARGIN_PX = 3.0
+_QUARANTINE_GAP_PX = 2.0
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+def _rect(node: dict) -> tuple[int, int, int, int]:
+    """Inclusive pixel extent of a painted square."""
+
+    size = int(node["size"])
+    x0 = int(node["x"])
+    y0 = int(node["y"])
+    return x0, y0, x0 + size - 1, y0 + size - 1
+
+
+def clear_gap(a: dict, b: dict) -> float:
+    """Number of clear pixels separating two painted squares."""
+
+    ax0, ay0, ax1, ay1 = _rect(a)
+    bx0, by0, bx1, by1 = _rect(b)
+    dx = max(0, bx0 - ax1 - 1, ax0 - bx1 - 1)
+    dy = max(0, by0 - ay1 - 1, ay0 - by1 - 1)
+    return math.hypot(float(dx), float(dy))
+
+
+def _center(node: dict) -> tuple[float, float]:
+    return node["x"] + node["size"] / 2.0, node["y"] + node["size"] / 2.0
+
+
+def square(triple: list) -> dict:
+    """Expand a stored ``[x, y, size]`` square into its geometry record."""
+
+    return {"x": int(triple[0]), "y": int(triple[1]), "size": int(triple[2])}
+
+
+def nodes_of(scene: dict) -> list[dict]:
+    """Every painted square of a scene, tagged by role, in stored order."""
+
+    out = []
+    for x, y, size, kind in zip(scene["x"], scene["y"], scene["size"], scene["kind"]):
+        node = {"x": int(x), "y": int(y), "size": int(size)}
+        if kind == "pad":
+            node.update(role="hub", color="green")
+        elif kind == "stone":
+            node.update(role="stone", color="gray")
+        else:
+            node.update(role="flag", color=str(kind))
+        out.append(node)
+    return out
+
+
+def hub_square(scene: dict) -> dict:
+    """The pad square, for diagnostics and tests (never used by the gold)."""
+
+    return next(node for node in nodes_of(scene) if node["role"] == "hub")
+
+
+def _place(prev: dict, size: int, cx: float, cy: float, ux: float, uy: float,
+           target: float) -> tuple[dict, float, float]:
+    """Put a square of side ``size`` along (ux, uy) at the requested clear gap."""
+
+    best = None
+    step = 1.0
+    d = float(size)
+    while d <= 6.0 * size + 60.0:
+        nx = cx + ux * d
+        ny = cy + uy * d
+        node = {
+            "x": int(round(nx - size / 2.0)),
+            "y": int(round(ny - size / 2.0)),
+            "size": int(size),
+        }
+        err = abs(clear_gap(prev, node) - target)
+        if best is None or err < best[0]:
+            best = (err, node)
+        d += step
+    node = best[1]
+    ncx, ncy = _center(node)
+    return node, ncx, ncy
+
+
+def _in_box(node: dict, box: dict) -> bool:
+    x0, y0, x1, y1 = _rect(node)
+    return (
+        x0 >= box["x"]
+        and y0 >= box["y"]
+        and x1 <= box["x"] + box["side"]
+        and y1 <= box["y"] + box["side"]
+    )
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _attempt(rng: random.Random) -> dict | None:
+    side = rng.randint(280, 330)
+    box = {
+        "x": rng.randint(24, WIDTH - 24 - side),
+        "y": rng.randint(24, HEIGHT - 24 - side),
+        "side": side,
+    }
+    cx = box["x"] + side / 2.0 + rng.uniform(-18.0, 18.0)
+    cy = box["y"] + side / 2.0 + rng.uniform(-18.0, 18.0)
+    hub = {
+        "x": int(round(cx - HUB_SIZE / 2.0)),
+        "y": int(round(cy - HUB_SIZE / 2.0)),
+        "size": HUB_SIZE,
+    }
+    hub_cx, hub_cy = _center(hub)
+
+    colors = list(FLAG_ORDER)
+    rng.shuffle(colors)
+    cut_color = rng.choice(FLAG_ORDER)
+    base = rng.uniform(0.0, 2.0 * math.pi)
+
+    chains: list[dict] = []
+    for index, color in enumerate(colors):
+        theta = base + 2.0 * math.pi * index / 3.0 + rng.uniform(-0.22, 0.22)
+        bend = rng.uniform(0.26, 0.70) * rng.choice((-1.0, 1.0))
+        n_stones = rng.randint(3, 5)
+        bend_at = rng.randint(1, n_stones - 1)
+        broken_at = rng.randint(0, n_stones - 1) if color == cut_color else None
+
+        prev = hub
+        pcx, pcy = hub_cx, hub_cy
+        stones: list[dict] = []
+        ok = True
+        for step in range(n_stones):
+            direction = theta + (bend if step >= bend_at else 0.0)
+            ux, uy = math.cos(direction), math.sin(direction)
+            if step == broken_at:
+                target = rng.uniform(1.04, 1.28) * STONE_SIZE if rng.random() < 0.06 \
+                    else rng.uniform(1.32, 2.10) * STONE_SIZE
+            else:
+                target = rng.uniform(0.72, 0.94) * STONE_SIZE if rng.random() < 0.04 \
+                    else rng.uniform(0.30, 0.66) * STONE_SIZE
+            node, pcx, pcy = _place(prev, STONE_SIZE, pcx, pcy, ux, uy, target)
+            if not _in_box(node, box):
+                ok = False
+                break
+            stones.append(node)
+            prev = node
+        if not ok:
+            return None
+        direction = theta + bend
+        ux, uy = math.cos(direction), math.sin(direction)
+        target = rng.uniform(0.30, 0.66) * STONE_SIZE
+        flag, _, _ = _place(prev, FLAG_SIZE, pcx, pcy, ux, uy, target)
+        if not _in_box(flag, box):
+            return None
+        chains.append({"color": color, "stones": stones, "flag": flag})
+
+    placed = [hub]
+    for chain in chains:
+        placed.extend(chain["stones"])
+        placed.append(chain["flag"])
+
+    # loose decoy stones, far enough from every chain to link with nothing
+    decoys: list[dict] = []
+    for _ in range(rng.randint(2, 4)):
+        for _try in range(90):
+            cand = {
+                "x": rng.randint(box["x"], box["x"] + side - STONE_SIZE),
+                "y": rng.randint(box["y"], box["y"] + side - STONE_SIZE),
+                "size": STONE_SIZE,
+            }
+            if all(clear_gap(cand, other) >= 2.2 * STONE_SIZE
+                   for other in placed + decoys):
+                decoys.append(cand)
+                break
+
+    squares = [(hub, "pad")]
+    for chain in chains:
+        squares.extend((stone, "stone") for stone in chain["stones"])
+    for chain in chains:
+        squares.append((chain["flag"], chain["color"]))
+    squares.extend((stone, "stone") for stone in decoys)
+
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "stone_size": STONE_SIZE,
+        "box": box,
+        "x": [int(node["x"]) for node, _ in squares],
+        "y": [int(node["y"]) for node, _ in squares],
+        "size": [int(node["size"]) for node, _ in squares],
+        "kind": [kind for _, kind in squares],
+        "runs": [
+            {
+                "color": chain["color"],
+                "stones": [[s["x"], s["y"], s["size"]] for s in chain["stones"]],
+                "flag": [chain["flag"]["x"], chain["flag"]["y"], chain["flag"]["size"]],
+            }
+            for chain in chains
+        ],
+    }
+
+
+def _structural_ok(scene: dict) -> bool:
+    nodes = nodes_of(scene)
+    gaps = []
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            gaps.append(clear_gap(nodes[i], nodes[j]))
+    if min(gaps) < _MIN_CLEAR_GAP_PX:
+        return False
+    if min(abs(g - STONE_SIZE) for g in gaps) < _MIN_MARGIN_PX:
+        return False
+    return analytic_gold(scene) in FLAG_ORDER
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one accepted scene."""
+
+    rng = random.Random(seed * 7919 + 13)
+    for _ in range(4000):
+        scene = _attempt(rng)
+        if scene is None:
+            continue
+        if _structural_ok(scene):
+            return scene
+    raise RuntimeError(f"no acceptable scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine
+# --------------------------------------------------------------------------
+def link_threshold(nodes: list[dict]) -> float:
+    """Common stone width, read back from the squares that get painted."""
+
+    sides = [float(node["size"]) for node in nodes if node["role"] == "stone"]
+    if not sides:
+        return 0.0
+    return float(statistics.median(sides))
+
+
+def _reachable(nodes: list[dict], threshold: float) -> set[int]:
+    hubs = [i for i, node in enumerate(nodes) if node["role"] == "hub"]
+    if len(hubs) != 1:
+        return set()
+    seen = {hubs[0]}
+    stack = [hubs[0]]
+    while stack:
+        cur = stack.pop()
+        for index, node in enumerate(nodes):
+            if index in seen:
+                continue
+            if clear_gap(nodes[cur], node) < threshold:
+                seen.add(index)
+                stack.append(index)
+    return seen
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour of the single flag the green pad cannot reach under the gap rule."""
+
+    nodes = nodes_of(scene)
+    seen = _reachable(nodes, link_threshold(nodes))
+    reached = {nodes[i]["color"] for i in seen if nodes[i]["role"] == "flag"}
+    present = {node["color"] for node in nodes if node["role"] == "flag"}
+    cut = sorted(present - reached)
+    if len(cut) != 1 or len(present) != 3:
+        return "ambiguous"
+    return cut[0]
+
+
+def margin(scene: dict) -> float:
+    """Pixels of slack to the nearest gap-versus-stone-width boundary."""
+
+    nodes = nodes_of(scene)
+    threshold = link_threshold(nodes)
+    worst = None
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            slack = abs(clear_gap(nodes[i], nodes[j]) - threshold)
+            if worst is None or slack < worst:
+                worst = slack
+    return float(round(worst, 6))
+
+
+def min_clear_gap(scene: dict) -> float:
+    """Smallest clear separation between any two painted squares."""
+
+    nodes = nodes_of(scene)
+    worst = None
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            gap = clear_gap(nodes[i], nodes[j])
+            if worst is None or gap < worst:
+                worst = gap
+    return float(round(worst, 6))
+
+
+def is_quarantined(scene: dict) -> bool:
+    if analytic_gold(scene) not in FLAG_ORDER:
+        return True
+    if margin(scene) < _QUARANTINE_MARGIN_PX:
+        return True
+    return min_clear_gap(scene) < _QUARANTINE_GAP_PX
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Latent rewrites that keep the raster byte-identical and the gold fixed."""
+
+    keys = ("x", "y", "size", "kind")
+    count = len(scene["x"])
+
+    reversed_order = dict(scene)
+    for key in keys:
+        reversed_order[key] = list(reversed(scene[key]))
+
+    rotated = dict(scene)
+    shift = count // 2
+    for key in keys:
+        rotated[key] = list(scene[key][shift:]) + list(scene[key][:shift])
+
+    runs_reversed = dict(scene)
+    runs_reversed["runs"] = list(reversed(scene["runs"]))
+
+    return [
+        ("square_paint_order_reversed", reversed_order),
+        ("square_paint_order_rotated", rotated),
+        ("run_record_order_reversed", runs_reversed),
+    ]
+
+
+# --------------------------------------------------------------------------
+# raster
+# --------------------------------------------------------------------------
+def _draw_square(draw: ImageDraw.ImageDraw, node: dict, color: tuple[int, int, int]) -> None:
+    x0, y0, x1, y1 = _rect(node)
+    draw.rectangle([x0, y0, x1, y1], fill=color)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for x, y, size, kind in zip(scene["x"], scene["y"], scene["size"], scene["kind"]):
+        node = {"x": int(x), "y": int(y), "size": int(size)}
+        if kind == "pad":
+            color = HUB_COLOR
+        elif kind == "stone":
+            color = STONE_COLOR
+        else:
+            color = FLAG_COLORS[kind]
+        _draw_square(draw, node, color)
+    return image

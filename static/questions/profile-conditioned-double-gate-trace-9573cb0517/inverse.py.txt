@@ -1,0 +1,127 @@
+"""Independent image-only inverse arm.
+
+The oracle segments endpoint disks and colored rings from RGB pixels, repairs
+the small ring occlusions in the dark stroke mask, flood-fills the route joined
+to the green endpoint, and counts only ring centers reached by that component.
+It has no access to renderer state, latent scenes, manifests, or filenames.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_PALETTE = {
+    "red": (218, 55, 50),
+    "blue": (43, 104, 190),
+    "orange": (238, 137, 24),
+    "green": (42, 154, 88),
+    "purple": (132, 75, 180),
+}
+_GATE_COLORS = ("red", "blue", "orange")
+
+
+def _color_mask(array: np.ndarray, rgb: tuple[int, int, int], radius: float = 62.0) -> np.ndarray:
+    delta = array.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int32) < radius * radius
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[tuple[float, float, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    results: list[tuple[float, float, int]] = []
+    for y0, x0 in np.argwhere(mask):
+        y0 = int(y0)
+        x0 = int(x0)
+        if seen[y0, x0]:
+            continue
+        queue = [(y0, x0)]
+        seen[y0, x0] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.pop()
+            pixels.append((y, x))
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            ys = np.fromiter((p[0] for p in pixels), dtype=np.float64)
+            xs = np.fromiter((p[1] for p in pixels), dtype=np.float64)
+            results.append((float(xs.mean()), float(ys.mean()), len(pixels)))
+    return results
+
+
+def _paint_disk(mask: np.ndarray, cx: float, cy: float, radius: int) -> None:
+    height, width = mask.shape
+    x0 = max(0, int(round(cx)) - radius)
+    x1 = min(width, int(round(cx)) + radius + 1)
+    y0 = max(0, int(round(cy)) - radius)
+    y1 = min(height, int(round(cy)) + radius + 1)
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    mask[y0:y1, x0:x1] |= (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
+
+
+def _flood(mask: np.ndarray, start_x: float, start_y: float) -> np.ndarray:
+    height, width = mask.shape
+    sx, sy = int(round(start_x)), int(round(start_y))
+    if not (0 <= sx < width and 0 <= sy < height and mask[sy, sx]):
+        raise ValueError("green endpoint is not attached to a reconstructed route")
+    visited = np.zeros_like(mask, dtype=bool)
+    queue: deque[tuple[int, int]] = deque([(sy, sx)])
+    visited[sy, sx] = True
+    while queue:
+        y, x = queue.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+    return visited
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+    if array.shape[0] < 300 or array.shape[1] < 500:
+        raise ValueError("image is too small for this world")
+
+    endpoints = {}
+    for name in ("green", "purple"):
+        found = _components(_color_mask(array, _PALETTE[name]), minimum=180)
+        if len(found) != 1:
+            raise ValueError(f"expected one {name} endpoint, found {len(found)}")
+        endpoints[name] = found[0]
+
+    gate_centers: dict[str, list[tuple[float, float]]] = {}
+    for color in _GATE_COLORS:
+        found = _components(_color_mask(array, _PALETTE[color]), minimum=55)
+        if len(found) != 6:
+            raise ValueError(f"expected six globally balanced {color} rings, found {len(found)}")
+        gate_centers[color] = [(x, y) for x, y, _ in found]
+
+    dark = np.max(array, axis=2) < 105
+    route_mask = dark.copy()
+    for centers in gate_centers.values():
+        for x, y in centers:
+            _paint_disk(route_mask, x, y, 15)
+    for name in ("green", "purple"):
+        _paint_disk(route_mask, endpoints[name][0], endpoints[name][1], 18)
+
+    reached = _flood(route_mask, endpoints["green"][0], endpoints["green"][1])
+    finish_x, finish_y, _ = endpoints["purple"]
+    if not reached[int(round(finish_y)), int(round(finish_x))]:
+        raise ValueError("green START does not connect to purple FINISH")
+
+    counts = {}
+    for color, centers in gate_centers.items():
+        counts[color] = sum(
+            bool(reached[int(round(y)), int(round(x))]) for x, y in centers
+        )
+    if sorted(counts.values()) != [1, 2, 3]:
+        raise ValueError(f"route-local gate counts are ambiguous: {counts}")
+    winners = [color for color, count in counts.items() if count == 2]
+    if len(winners) != 1:
+        raise ValueError(f"no unique twice-crossed gate color: {counts}")
+    return winners[0]

@@ -1,0 +1,121 @@
+"""Independent image-only inverse for mirror-then-slide stamp matching.
+
+This module intentionally repeats only raster constants and basic measurement
+logic.  It receives a PNG, segments the guide colors, estimates the dashed axis
+and arrow endpoints, applies the two visible operations to source-mask pixels,
+and chooses the target mask with the largest overlap.  It never receives or
+imports a latent scene.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 1020
+HEIGHT = 740
+PANEL_W = 480
+PANEL_H = 340
+MARGIN_X = 20
+MARGIN_Y = 20
+GAP_X = 20
+GAP_Y = 20
+
+SOURCE = (30, 66, 105)
+TARGET_FILL = (255, 244, 216)
+AXIS = (105, 78, 151)
+TAIL_CORE = (180, 235, 220)
+HEAD_CORE = (4, 66, 67)
+
+
+def _origin(slot: int) -> tuple[int, int]:
+    return (MARGIN_X + (slot % 2) * (PANEL_W + GAP_X), MARGIN_Y + (slot // 2) * (PANEL_H + GAP_Y))
+
+
+def _exact(arr: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    return np.all(arr == np.asarray(color, dtype=np.uint8), axis=2)
+
+
+def _points(mask: np.ndarray) -> np.ndarray:
+    y, x = np.nonzero(mask)
+    if len(x) == 0:
+        raise ValueError("empty raster component")
+    return np.column_stack((x.astype(np.float64), y.astype(np.float64)))
+
+
+def _axis(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    pts = _points(mask)
+    center = pts.mean(axis=0)
+    centered = pts - center
+    covariance = centered.T @ centered
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    norm = np.linalg.norm(direction)
+    return center, direction / (norm or 1.0)
+
+
+def _center(mask: np.ndarray) -> np.ndarray:
+    return _points(mask).mean(axis=0)
+
+
+def _transformed_mask(source: np.ndarray, axis_center: np.ndarray, axis_direction: np.ndarray, move: np.ndarray) -> set[tuple[int, int]]:
+    pts = _points(source)
+    direction = axis_direction / (np.linalg.norm(axis_direction) or 1.0)
+    relative = pts - axis_center
+    reflected = 2.0 * (relative @ direction)[:, None] * direction[None, :] - relative
+    result = reflected + axis_center + move
+    rounded = np.rint(result).astype(np.int32)
+    height, width = source.shape
+    inside = (
+        (rounded[:, 0] >= 0)
+        & (rounded[:, 0] < width)
+        & (rounded[:, 1] >= 0)
+        & (rounded[:, 1] < height)
+    )
+    return {(int(x), int(y)) for x, y in rounded[inside]}
+
+
+def _overlap_score(predicted: set[tuple[int, int]], target: np.ndarray) -> float:
+    actual = {(int(x), int(y)) for x, y in np.column_stack(np.nonzero(target))[:, ::-1]}
+    intersection = len(predicted & actual)
+    union = len(predicted | actual)
+    if not union:
+        return -1.0
+    return intersection / union
+
+
+def _panel_score(arr: np.ndarray, slot: int) -> float:
+    x0, y0 = _origin(slot)
+    crop = arr[y0 : y0 + PANEL_H + 1, x0 : x0 + PANEL_W + 1]
+    source = _exact(crop, SOURCE)
+    target = _exact(crop, TARGET_FILL)
+    axis = _exact(crop, AXIS)
+    tail = _exact(crop, TAIL_CORE)
+    head = _exact(crop, HEAD_CORE)
+    if source.sum() < 500 or target.sum() < 500 or axis.sum() < 80 or tail.sum() < 20 or head.sum() < 20:
+        raise ValueError("missing panel component")
+    axis_center, axis_direction = _axis(axis)
+    move = _center(head) - _center(tail)
+    predicted = _transformed_mask(source, axis_center, axis_direction, move)
+    target_center = _center(target)
+    predicted_center = np.asarray(
+        [sum(point[0] for point in predicted) / len(predicted), sum(point[1] for point in predicted) / len(predicted)]
+    )
+    iou = _overlap_score(predicted, target)
+    center_error = float(np.linalg.norm(predicted_center - target_center))
+    # IoU captures the whole silhouette; the small centroid term stabilizes
+    # near-matches whose areas happen to overlap by chance.
+    return iou - 0.0015 * center_error
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the selected tile using only the supplied raster."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape[:2] != (HEIGHT, WIDTH):
+        raise ValueError(f"unexpected image size {arr.shape[:2]}")
+    scores = [_panel_score(arr, slot) for slot in range(4)]
+    winner = max(range(4), key=lambda index: scores[index])
+    return f"tile-{chr(65 + winner)}"

@@ -1,0 +1,122 @@
+"""Independent image-only inverse for the exact enclosure-depth question.
+
+This module receives only the final RGB image. It segments colored marker
+components and dark ring components, fits a circle independently to every ring,
+and compares marker centroids with the fitted circles. It does not import any
+candidate renderer, prompt, generator, verifier, or analytic label code.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "red": (211, 66, 72),
+    "green": (54, 157, 93),
+    "blue": (68, 105, 198),
+    "orange": (224, 132, 46),
+}
+REFERENCE = "green"
+CANDIDATES = ("red", "blue", "orange")
+MIN_RING_AREA = 180
+MIN_MARKER_AREA = 35
+BOUNDARY_TOLERANCE = 7.0
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    """Return pixel coordinates for 8-connected foreground components."""
+
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask & ~seen)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            row, col = queue.pop()
+            points.append((row, col))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not dx and not dy:
+                        continue
+                    nr, nc = row + dy, col + dx
+                    if 0 <= nr < height and 0 <= nc < width and mask[nr, nc] and not seen[nr, nc]:
+                        seen[nr, nc] = True
+                        queue.append((nr, nc))
+        if len(points) >= minimum:
+            components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _marker_centers(image: Image.Image) -> dict[str, tuple[float, float]]:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.float64)
+    names = tuple(PALETTE)
+    palette = np.asarray([PALETTE[name] for name in names], dtype=np.float64)
+    distances = np.sqrt(((pixels[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=3))
+    nearest = np.argmin(distances, axis=2)
+    nearest_distance = np.min(distances, axis=2)
+    centers: dict[str, tuple[float, float]] = {}
+    for index, name in enumerate(names):
+        components = _components((nearest == index) & (nearest_distance <= 110.0), MIN_MARKER_AREA)
+        if not components:
+            raise ValueError(f"marker color {name} was not visible")
+        component = max(components, key=len)
+        centers[name] = (float(component[:, 1].mean()), float(component[:, 0].mean()))
+    return centers
+
+
+def _ring_circles(image: Image.Image) -> list[tuple[float, float, float]]:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.float64)
+    grayscale = pixels.mean(axis=2)
+    chroma = pixels.max(axis=2) - pixels.min(axis=2)
+    dark_mask = (grayscale < 145.0) & (chroma < 24.0)
+    components = _components(dark_mask, MIN_RING_AREA)
+    circles: list[tuple[float, float, float]] = []
+    for component in components:
+        y = component[:, 0]
+        x = component[:, 1]
+        if len(component) < 25:
+            continue
+        matrix = np.column_stack((2.0 * x, 2.0 * y, np.ones(len(component))))
+        values = x * x + y * y
+        try:
+            cx, cy, constant = np.linalg.lstsq(matrix, values, rcond=None)[0]
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("ring circle fit was singular") from exc
+        radius_squared = float(constant + cx * cx + cy * cy)
+        if radius_squared <= 0.0:
+            continue
+        radius = math.sqrt(radius_squared)
+        if 20.0 < radius < 300.0:
+            circles.append((float(cx), float(cy), radius))
+    circles.sort(key=lambda circle: circle[2])
+    if not 3 <= len(circles) <= 4:
+        raise ValueError(f"expected three or four dark rings, found {len(circles)}")
+    if any(circles[index + 1][2] - circles[index][2] < 20.0 for index in range(len(circles) - 1)):
+        raise ValueError("ring fits are too close to distinguish")
+    return circles
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the unique candidate marker with the reference's exact depth."""
+
+    centers = _marker_centers(image)
+    circles = _ring_circles(image)
+    depths: dict[str, int] = {}
+    for color, (x, y) in centers.items():
+        distances = [math.hypot(x - cx, y - cy) for cx, cy, _radius in circles]
+        clearances = [abs(distance - radius) for distance, (_cx, _cy, radius) in zip(distances, circles)]
+        if min(clearances) < BOUNDARY_TOLERANCE:
+            raise ValueError(f"marker {color} is too close to a ring boundary")
+        depths[color] = sum(distance < radius for distance, (_cx, _cy, radius) in zip(distances, circles))
+    matches = [color for color in CANDIDATES if depths[color] == depths[REFERENCE]]
+    if len(matches) != 1:
+        raise ValueError(f"ambiguous recovered enclosure depths: {depths}")
+    return matches[0]

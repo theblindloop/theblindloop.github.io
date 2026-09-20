@@ -1,0 +1,257 @@
+"""Sealed-cavity census world: how many chambers are walled off from outside?
+
+A rectangular plate of one flat colour is cut with four round chambers.  Some
+chambers are joined to each other, or straight out to the edge of the plate, by
+narrow straight channels of the same white as the paper.  A channel can be
+interrupted by a short bar of plate colour that crosses it completely.  A
+chamber is *sealed* when no white path leads from it to the white outside the
+plate.  The decision is how many of the four chambers are sealed.
+
+All geometry is integer pixels and Pillow draws without antialiasing, so the
+raster is an exact function of the latent scene.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS = 512
+BACKGROUND = (255, 255, 255)
+PLATE_COLORS = [
+    (74, 88, 112),
+    (96, 84, 68),
+    (70, 96, 86),
+    (104, 76, 96),
+    (86, 86, 86),
+]
+QUARANTINE_MARGIN = 8.0
+
+# Chamber order is cyclic: 0 top-left, 1 top-right, 2 bottom-right, 3 bottom-left.
+_RING = ((0, 1), (1, 2), (2, 3), (3, 0))
+_OUTWARD = {0: ("up", "left"), 1: ("up", "right"), 2: ("down", "right"), 3: ("down", "left")}
+
+
+# --------------------------------------------------------------------------- sampling
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed) * 7919 + 13)
+    plate_margin = rng.randint(40, 56)
+    inset = rng.randint(96, 112)
+    plate = [plate_margin, plate_margin, CANVAS - plate_margin, CANVAS - plate_margin]
+    cx0, cx1 = plate[0] + inset, plate[2] - inset
+    cy0, cy1 = plate[1] + inset, plate[3] - inset
+    centers = [(cx0, cy0), (cx1, cy0), (cx1, cy1), (cx0, cy1)]
+    chambers = [
+        {"cx": cx, "cy": cy, "r": rng.randint(30, 40)} for cx, cy in centers
+    ]
+
+    target = rng.choice([0, 1, 1, 2, 2, 3, 3, 4])
+    channels: list[dict] = []
+    for _ in range(600):
+        channels = _sample_channels(rng, chambers)
+        if _sealed_count(chambers, channels) == target:
+            break
+    # near-boundary scenes: shrink one visible clearance to just above zero
+    if channels and rng.random() < 0.18:
+        idx = rng.randrange(len(channels))
+        chan = channels[idx]
+        if chan["plug"] is not None and rng.random() < 0.5:
+            chan["plug"]["length"] = rng.randint(3, 6)
+        else:
+            chan["width"] = rng.randint(4, 7) | 1
+
+    return {
+        "canvas": CANVAS,
+        "background": list(BACKGROUND),
+        "plate": plate,
+        "plate_color": list(PLATE_COLORS[rng.randrange(len(PLATE_COLORS))]),
+        "chambers": chambers,
+        "channels": channels,
+    }
+
+
+def _sample_channels(rng: random.Random, chambers: list[dict]) -> list[dict]:
+    channels: list[dict] = []
+    for a, b in _RING:
+        if rng.random() < 0.55:
+            channels.append(
+                {
+                    "kind": "link",
+                    "a": a,
+                    "b": b,
+                    "width": rng.randint(9, 13) | 1,
+                    "plug": _sample_plug(rng, 0.45),
+                }
+            )
+    for index in range(4):
+        if rng.random() < 0.5:
+            channels.append(
+                {
+                    "kind": "exit",
+                    "a": index,
+                    "dir": rng.choice(_OUTWARD[index]),
+                    "width": rng.randint(9, 13) | 1,
+                    "plug": _sample_plug(rng, 0.5),
+                }
+            )
+    rng.shuffle(channels)
+    return channels
+
+
+def _sample_plug(rng: random.Random, probability: float) -> dict | None:
+    if rng.random() >= probability:
+        return None
+    return {"length": rng.randint(15, 26), "offset_permille": rng.randint(250, 750)}
+
+
+# --------------------------------------------------------------------------- geometry
+def _span(scene: dict, chan: dict) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Endpoints of a channel centreline: (start at chamber centre, end)."""
+    chambers = scene["chambers"]
+    a = chambers[chan["a"]]
+    start = (a["cx"], a["cy"])
+    if chan["kind"] == "link":
+        b = chambers[chan["b"]]
+        return start, (b["cx"], b["cy"])
+    plate = scene["plate"]
+    direction = chan["dir"]
+    if direction == "up":
+        return start, (a["cx"], plate[1] - 9)
+    if direction == "down":
+        return start, (a["cx"], plate[3] + 9)
+    if direction == "left":
+        return start, (plate[0] - 9, a["cy"])
+    return start, (plate[2] + 9, a["cy"])
+
+
+def _free_interval(scene: dict, chan: dict) -> tuple[int, int]:
+    """Along-channel interval, measured from the first centre, where a plug may sit."""
+    (x0, y0), (x1, y1) = _span(scene, chan)
+    length = abs(x1 - x0) + abs(y1 - y0)
+    lo = scene["chambers"][chan["a"]]["r"] + 8
+    if chan["kind"] == "link":
+        hi = length - scene["chambers"][chan["b"]]["r"] - 8
+    else:
+        hi = length - 15
+    return lo, hi
+
+
+def _plug_rect(scene: dict, chan: dict) -> list[int]:
+    plug = chan["plug"]
+    (x0, y0), (x1, y1) = _span(scene, chan)
+    lo, hi = _free_interval(scene, chan)
+    glen = plug["length"]
+    usable = max(hi - lo - glen, 0)
+    start = lo + usable * plug["offset_permille"] // 1000
+    half = chan["width"] // 2 + 5
+    step_x = (x1 > x0) - (x1 < x0)
+    step_y = (y1 > y0) - (y1 < y0)
+    if step_x:
+        left = x0 + step_x * start
+        right = left + step_x * glen
+        return [min(left, right), y0 - half, max(left, right), y0 + half]
+    top = y0 + step_y * start
+    bottom = top + step_y * glen
+    return [x0 - half, min(top, bottom), x0 + half, max(top, bottom)]
+
+
+# --------------------------------------------------------------------------- rendering
+def render(scene: dict) -> Image.Image:
+    size = int(scene["canvas"])
+    image = Image.new("RGB", (size, size), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    plate_color = tuple(scene["plate_color"])
+    white = tuple(scene["background"])
+    px0, py0, px1, py1 = scene["plate"]
+    draw.rectangle([px0, py0, px1, py1], fill=plate_color)
+
+    for chan in scene["channels"]:
+        (x0, y0), (x1, y1) = _span(scene, chan)
+        half = chan["width"] // 2
+        draw.rectangle(
+            [min(x0, x1) - (half if y0 == y1 else 0), min(y0, y1) - (half if x0 == x1 else 0),
+             max(x0, x1) + (half if y0 == y1 else 0), max(y0, y1) + (half if x0 == x1 else 0)],
+            fill=white,
+        )
+    for chamber in scene["chambers"]:
+        cx, cy, r = chamber["cx"], chamber["cy"], chamber["r"]
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=white)
+    for chan in scene["channels"]:
+        if chan["plug"] is not None:
+            draw.rectangle(_plug_rect(scene, chan), fill=plate_color)
+    return image
+
+
+# --------------------------------------------------------------------------- gold
+def _sealed_count(chambers: list[dict], channels: list[dict]) -> int:
+    parent = {index: index for index in range(len(chambers))}
+    parent["OUT"] = "OUT"
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(one, two):
+        ra, rb = find(one), find(two)
+        if ra != rb:
+            parent[ra] = rb
+
+    for chan in channels:
+        if chan["plug"] is not None:
+            continue
+        union(chan["a"], chan["b"] if chan["kind"] == "link" else "OUT")
+    outside = find("OUT")
+    return sum(1 for index in range(len(chambers)) if find(index) != outside)
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(_sealed_count(scene["chambers"], scene["channels"]))
+
+
+def margin(scene: dict) -> float:
+    """Smallest visible clearance whose collapse can change the sealed census."""
+    clearances: list[float] = []
+    plate = scene["plate"]
+    for chamber in scene["chambers"]:
+        clearances.append(float(min(chamber["cx"] - plate[0], chamber["cy"] - plate[1],
+                                    plate[2] - chamber["cx"], plate[3] - chamber["cy"])
+                                - chamber["r"]))
+    for a, b in _RING:
+        ca, cb = scene["chambers"][a], scene["chambers"][b]
+        gap = abs(ca["cx"] - cb["cx"]) + abs(ca["cy"] - cb["cy"]) - ca["r"] - cb["r"]
+        clearances.append(float(gap))
+    for chan in scene["channels"]:
+        clearances.append(float(chan["width"]))
+        if chan["plug"] is not None:
+            clearances.append(float(chan["plug"]["length"]))
+    return float(min(clearances))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabelings of the latent scene that must preserve gold."""
+    twins: list[tuple[str, dict]] = []
+
+    reordered = dict(scene)
+    reordered["channels"] = list(reversed(scene["channels"]))
+    twins.append(("channel_list_reversal", reordered))
+
+    permutation = [2, 3, 0, 1]  # rotate the cyclic chamber labels by two positions
+    inverse = {old: new for new, old in enumerate(permutation)}
+    relabeled = dict(scene)
+    relabeled["chambers"] = [scene["chambers"][old] for old in permutation]
+    relabeled["channels"] = []
+    for chan in scene["channels"]:
+        twin = dict(chan)
+        twin["a"] = inverse[chan["a"]]
+        if chan["kind"] == "link":
+            twin["b"] = inverse[chan["b"]]
+        relabeled["channels"].append(twin)
+    twins.append(("chamber_relabeling", relabeled))
+    return twins

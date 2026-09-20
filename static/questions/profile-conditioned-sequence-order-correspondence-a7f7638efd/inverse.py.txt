@@ -1,0 +1,146 @@
+"""Independent pixel-only inverse arm for the sequence-order world.
+
+Receives ONLY the final rasterized PNG and the public question contract (the
+visual spec). It never imports the renderer, prompt, generator, verifier, or
+analytic-gold code, and never reads scene data.
+
+Public visual spec (this file's own specification):
+
+  * the top panel holds one ``reference`` row of four square colored tiles at a
+    fixed left-to-right order;
+  * a horizontal dark divider separates it from a column of three ``candidate``
+    rows A (top), B (middle), C (bottom), each holding the same four tile
+    colors in a different left-to-right order;
+  * the task: decide which candidate row has the exact same left-to-right color
+    order as the reference.
+
+The oracle recovers, from pixels alone: the divider, each tile's color and
+centroid, the reference row's color order, each candidate row's color order, and
+finally which candidate's order equals the reference's.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "sequence_order_correspondence-oracle-0.1.0"
+
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (235, 40, 40),
+    "green": (0, 170, 70),
+    "blue": (40, 60, 235),
+    "orange": (245, 140, 20),
+}
+_BACKGROUND_THRESH = 200.0
+_EDGE_MAX = 120.0
+MIN_TILE_PX = 1200
+_COLOR_DIST = 60.0
+
+
+def _colored_mask(arr: np.ndarray) -> np.ndarray:
+    rgbs = np.array(list(PALETTE.values()), dtype=np.float32)
+    d = np.linalg.norm(arr[..., None, :] - rgbs[None, None, :, :], axis=-1)
+    return d.min(axis=-1) < _COLOR_DIST
+
+
+def _nearest_color(rgb) -> str:
+    best = None
+    best_d = None
+    for name, c in PALETTE.items():
+        d = float(np.linalg.norm(np.asarray(rgb, dtype=float) - np.asarray(c, dtype=float)))
+        if best_d is None or d < best_d:
+            best_d = d
+            best = name
+    return best
+
+
+def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    comps = []
+    for y in range(h):
+        for x in range(w):
+            if mask[y, x] and not visited[y, x]:
+                queue = deque([(x, y)])
+                visited[y, x] = True
+                cur = []
+                while queue:
+                    cx, cy = queue.popleft()
+                    cur.append((cx, cy))
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < w and 0 <= ny < h and mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            queue.append((nx, ny))
+                comps.append(np.array(cur, dtype=np.float32))
+    return comps
+
+
+def _extract_tiles(arr: np.ndarray, ymin: int, ymax: int) -> list[dict]:
+    sub = arr[ymin:ymax]
+    mask = _colored_mask(sub)
+    comps = [c for c in _connected_components(mask) if len(c) >= MIN_TILE_PX]
+    tiles = []
+    for comp in comps:
+        comp = np.column_stack([comp[:, 0], comp[:, 1] + ymin])
+        cx, cy = comp.mean(axis=0)
+        xs = comp[:, 0].astype(int)
+        ys = comp[:, 1].astype(int)
+        colors = arr[ys, xs]
+        mean_color = colors.mean(axis=0)
+        color = _nearest_color(mean_color)
+        tiles.append({"color": color, "x": float(cx), "y": float(cy)})
+    return tiles
+
+
+def _order_of(tiles: list[dict]) -> list[str]:
+    return [t["color"] for t in sorted(tiles, key=lambda t: t["x"])]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.float32)
+    h, w = arr.shape[:2]
+
+    dark = arr.max(axis=2) < _EDGE_MAX
+    line_counts = dark.sum(axis=1)
+    grid = line_counts > 0.45 * w
+    rows = np.where(grid)[0]
+    if rows.size == 0:
+        raise ValueError("no divider line found")
+    divider_mid = int(round(float(rows.mean())))
+
+    ref_tiles = _extract_tiles(arr, 0, divider_mid)
+    if len(ref_tiles) != 4:
+        raise ValueError(f"reference row: expected 4 tiles, got {len(ref_tiles)}")
+    ref_order = _order_of(ref_tiles)
+
+    cand_tiles = _extract_tiles(arr, divider_mid, h)
+    if len(cand_tiles) != 12:
+        raise ValueError(f"expected 12 candidate tiles, got {len(cand_tiles)}")
+
+    cand_tiles.sort(key=lambda t: t["y"])
+    rows_list: list[list[dict]] = []
+    for tile in cand_tiles:
+        if rows_list and abs(tile["y"] - rows_list[-1][0]["y"]) < 90.0:
+            rows_list[-1].append(tile)
+        else:
+            rows_list.append([tile])
+    if len(rows_list) != 3:
+        raise ValueError(f"expected 3 candidate rows, got {len(rows_list)}")
+    for row in rows_list:
+        if len(row) != 4:
+            raise ValueError(f"candidate row: expected 4 tiles, got {len(row)}")
+
+    for label, row in zip("ABC", rows_list, strict=True):
+        if _order_of(row) == ref_order:
+            return label
+    raise ValueError("no candidate row matched the reference order")
+
+
+if __name__ == "__main__":
+    import sys
+    img = Image.open(sys.argv[1]).convert("RGB")
+    print(decision_from_image(img))

@@ -1,0 +1,216 @@
+"""Renderer for the ``keyboard_black_group`` question world.
+
+A stretch of stylised piano keyboard is painted on white paper. The dark
+rectangles standing on the keyboard are the black keys; they are laid out in
+groups. Inside a group neighbouring black keys are separated by a narrow white
+gap ``gap_in``; neighbouring groups are separated by a wide gap ``gap_out``
+which the sampler keeps at least three times ``gap_in``. The answer is the
+number of black keys in the leftmost group.
+
+The canonical prior ("black keys come in groups of two and three, and the
+leftmost group of a keyboard picture is a group of two") is recorded for
+analysis only. It never feeds the analytic gold: the gold is the painted
+leftmost group size, sampled uniformly over 1..4 from the scene seed.
+
+Determinism: every drawing coordinate is an integer and every shape is an
+axis-aligned rectangle drawn with Pillow, so the raster is byte-identical for a
+given scene on any machine, with no antialiasing anywhere.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "keyboard_black_group-renderer-0.1.0"
+
+# -- fixed page decoration (never indicates the answer) -----------------------
+BACKGROUND = (255, 255, 255)
+FRAME_COLOR = (170, 170, 190)
+TICK_COLOR = (150, 150, 150)
+KEY_OUTLINE = (140, 140, 140)
+
+# White key surfaces: light, never dark enough to be read as ink.
+WHITE_KEY_FILLS = ((255, 255, 255), (250, 248, 240), (247, 247, 250))
+
+# Black key inks: every channel stays far below the oracle's darkness cut.
+BLACK_KEY_INKS = (
+    (18, 18, 20),
+    (24, 24, 62),
+    (44, 16, 16),
+    (14, 44, 30),
+)
+
+CANVAS_HEIGHT = 340
+FRAME_INSET = 16
+KEYBOARD_TOP = 96
+WHITE_KEY_HEIGHT = 186
+SIDE_PAD = 46
+
+# Quarantine band: the visible separation margin, in pixels, between a
+# within-group gap and a between-group gap.
+QUARANTINE_MARGIN_PX = 14.0
+
+_N_GROUPS = 4
+_TOTAL_KEYS_CHOICES = (8, 9, 10, 11)
+
+
+def _partition(rng: random.Random, remaining: int, n_groups: int) -> list[int]:
+    """Sizes in 1..4 for the non-leftmost groups, summing to ``remaining``."""
+    for _ in range(400):
+        sizes = [rng.randint(1, 4) for _ in range(n_groups)]
+        if sum(sizes) == remaining:
+            return sizes
+    # Deterministic fallback: fill greedily (only reachable if the rejection
+    # sampler is unlucky; the sums used here are always feasible).
+    sizes = [1] * n_groups
+    i = 0
+    while sum(sizes) < remaining:
+        sizes[i % n_groups] = min(4, sizes[i % n_groups] + 1)
+        i += 1
+    return sizes
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic latent scene.
+
+    ``left_group`` (the gold) is ``1 + seed % 4``: it is a pure function of the
+    seed and independent of every geometric field, so any contiguous block of
+    scene seeds is exactly balanced over the four answer classes and the
+    canonical two-key class is a 1-in-4 minority.
+    """
+    rng = random.Random(seed * 7919 + 13)
+
+    left_group = 1 + seed % 4
+    total_keys = rng.choice(_TOTAL_KEYS_CHOICES)
+    if total_keys - left_group < _N_GROUPS - 1:
+        total_keys = left_group + _N_GROUPS - 1
+    group_sizes = [left_group] + _partition(rng, total_keys - left_group, _N_GROUPS - 1)
+
+    black_w = rng.randint(18, 30)
+    gap_in = rng.randint(10, 22)
+    gap_out = int(round(gap_in * (3.0 + rng.random() * 1.2)))
+    black_h = rng.randint(92, 118)
+    white_key_w = rng.randint(46, 64)
+    pad_left = SIDE_PAD + rng.randint(0, 26)
+    pad_right = SIDE_PAD + rng.randint(0, 26)
+
+    n_keys = sum(group_sizes)
+    span = n_keys * black_w
+    span += (n_keys - len(group_sizes)) * gap_in
+    span += (len(group_sizes) - 1) * gap_out
+
+    x0 = FRAME_INSET + 14 + pad_left
+    kb_width = span + pad_left + pad_right
+    width = x0 - pad_left + kb_width + 14 + FRAME_INSET
+    n_white = max(4, int(round(kb_width / white_key_w)))
+
+    return {
+        "width": int(width),
+        "height": int(CANVAS_HEIGHT),
+        "x0": int(x0),
+        "kb_left": int(x0 - pad_left),
+        "kb_width": int(kb_width),
+        "n_white": int(n_white),
+        "white_fill": list(WHITE_KEY_FILLS[seed % len(WHITE_KEY_FILLS)]),
+        "black_ink": list(BLACK_KEY_INKS[rng.randrange(len(BLACK_KEY_INKS))]),
+        "black_w": int(black_w),
+        "black_h": int(black_h),
+        "gap_in": int(gap_in),
+        "gap_out": int(gap_out),
+        "group_sizes": [int(s) for s in group_sizes],
+        "decor": [int(rng.randint(10, 22)) for _ in range(4)],
+    }
+
+
+def black_key_boxes(scene: dict) -> list[tuple[int, int, int, int]]:
+    """Absolute pixel rectangles (x0, y0, x1, y1) of every black key."""
+    boxes: list[tuple[int, int, int, int]] = []
+    x = int(scene["x0"])
+    top = KEYBOARD_TOP
+    bottom = top + int(scene["black_h"])
+    for gi, size in enumerate(scene["group_sizes"]):
+        for ki in range(int(size)):
+            boxes.append((x, top, x + int(scene["black_w"]), bottom))
+            x += int(scene["black_w"])
+            if ki < int(size) - 1:
+                x += int(scene["gap_in"])
+        if gi < len(scene["group_sizes"]) - 1:
+            x += int(scene["gap_out"])
+    return boxes
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BACKGROUND)
+    d = ImageDraw.Draw(img)
+
+    w, h = int(scene["width"]), int(scene["height"])
+    d.rectangle([FRAME_INSET, FRAME_INSET, w - 1 - FRAME_INSET, h - 1 - FRAME_INSET],
+                outline=FRAME_COLOR, width=3)
+    t0, t1, t2, t3 = (int(v) for v in scene["decor"])
+    d.line([FRAME_INSET + 6, FRAME_INSET + 6, FRAME_INSET + 6 + t0, FRAME_INSET + 6],
+           fill=TICK_COLOR, width=3)
+    d.line([w - 7 - FRAME_INSET - t1, FRAME_INSET + 6, w - 7 - FRAME_INSET, FRAME_INSET + 6],
+           fill=TICK_COLOR, width=3)
+    d.line([FRAME_INSET + 6, h - 7 - FRAME_INSET, FRAME_INSET + 6 + t2, h - 7 - FRAME_INSET],
+           fill=TICK_COLOR, width=3)
+    d.line([w - 7 - FRAME_INSET - t3, h - 7 - FRAME_INSET, w - 7 - FRAME_INSET,
+            h - 7 - FRAME_INSET], fill=TICK_COLOR, width=3)
+
+    kb_l = int(scene["kb_left"])
+    kb_r = kb_l + int(scene["kb_width"])
+    kb_t = KEYBOARD_TOP
+    kb_b = kb_t + WHITE_KEY_HEIGHT
+    d.rectangle([kb_l, kb_t, kb_r, kb_b], fill=tuple(scene["white_fill"]),
+                outline=KEY_OUTLINE, width=3)
+    n_white = int(scene["n_white"])
+    for i in range(1, n_white):
+        x = kb_l + int(round(i * (kb_r - kb_l) / n_white))
+        d.line([x, kb_t, x, kb_b], fill=KEY_OUTLINE, width=2)
+
+    ink = tuple(scene["black_ink"])
+    for bx0, by0, bx1, by1 in black_key_boxes(scene):
+        d.rectangle([bx0, by0, bx1, by1], fill=ink)
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Number of black keys in the leftmost group, as a decimal string."""
+    return str(int(scene["group_sizes"][0]))
+
+
+def margin(scene: dict) -> float:
+    """Visible separation margin in pixels.
+
+    The declared reading rule is "a between-group gap is at least twice as wide
+    as any within-group gap". The margin is how many pixels of white page the
+    widest within-group gap would still have to grow, doubled, before the
+    narrowest between-group gap stopped satisfying that rule:
+    ``gap_out - 2 * gap_in``. It collapses to zero exactly when the grouping
+    stops being readable.
+    """
+    return float(int(scene["gap_out"]) - 2 * int(scene["gap_in"]))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN_PX
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases are declared: every scene field is painted."""
+    return []
+
+
+def scene_targets(scene: dict) -> dict[str, Any]:
+    boxes = black_key_boxes(scene)
+    return {
+        "left_group": int(scene["group_sizes"][0]),
+        "total_black_keys": int(sum(scene["group_sizes"])),
+        "n_groups": len(scene["group_sizes"]),
+        "gap_in": int(scene["gap_in"]),
+        "gap_out": int(scene["gap_out"]),
+        "ink_pixels": int(len(boxes) * int(scene["black_w"]) * int(scene["black_h"])),
+        "margin": margin(scene),
+    }

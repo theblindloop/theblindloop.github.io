@@ -1,0 +1,185 @@
+"""Independent image-only inverse for the bilateral difference tile."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 256
+HEIGHT = 256
+OUTER_SIZE = 144
+INNER_SIZE = 120
+INNER_MARGIN = 12
+GRID_ROWS = 8
+GRID_COLS = 12
+OUTPUT_COLS = 6
+CELL_WIDTH = 10
+CELL_HEIGHT = 15
+
+LOOP = (
+    (0, 1, 1, 1, 1, 0),
+    (1, 0, 0, 0, 0, 1),
+    (1, 0, 0, 0, 0, 1),
+    (0, 1, 1, 1, 1, 0),
+    (1, 0, 0, 0, 0, 1),
+    (1, 0, 0, 0, 0, 1),
+    (0, 1, 1, 1, 1, 0),
+    (0, 0, 0, 0, 0, 0),
+)
+ARROW = (
+    (0, 0, 0, 1, 0, 0),
+    (0, 0, 1, 1, 1, 0),
+    (0, 1, 1, 1, 1, 1),
+    (1, 1, 1, 1, 1, 1),
+    (0, 0, 0, 1, 0, 0),
+    (0, 0, 0, 1, 0, 0),
+    (0, 0, 0, 1, 0, 0),
+    (0, 0, 0, 1, 1, 0),
+)
+
+
+def _background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:3].reshape(-1, 3),
+            array[-3:].reshape(-1, 3),
+            array[:, :3].reshape(-1, 3),
+            array[:, -3:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    return np.median(border, axis=0).astype(np.uint8)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            component.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    if len(best) < 2000:
+        raise ValueError("no frame-sized connected tile found")
+    return np.asarray(best, dtype=np.int32)
+
+
+def _foreground(array: np.ndarray, background: np.ndarray) -> np.ndarray:
+    distance = np.linalg.norm(array.astype(np.float32) - background.astype(np.float32), axis=2)
+    return distance > 10.0
+
+
+def _origins(low: int, high: int, limit: int) -> tuple[int, ...]:
+    values = {
+        int(low),
+        int(high - OUTER_SIZE + 1),
+        int(round((low + high - OUTER_SIZE + 1) / 2.0)),
+    }
+    return tuple(sorted(value for value in values if 0 <= value <= limit - OUTER_SIZE))
+
+
+def _locate_tile(mask: np.ndarray) -> tuple[int, int, np.ndarray]:
+    component = _largest_component(mask)
+    ys = component[:, 0]
+    xs = component[:, 1]
+    x_values = _origins(int(xs.min()), int(xs.max()), WIDTH)
+    y_values = _origins(int(ys.min()), int(ys.max()), HEIGHT)
+    if not x_values or not y_values:
+        raise ValueError("tile bounding box is outside the canvas")
+    best: tuple[float, int, int] | None = None
+    for y0 in y_values:
+        for x0 in x_values:
+            region = mask[y0 : y0 + OUTER_SIZE, x0 : x0 + OUTER_SIZE]
+            score = float(region.mean())
+            candidate = (score, -abs(x0 - int(xs.min())), -abs(y0 - int(ys.min())))
+            if best is None or candidate > best:
+                best = (candidate[0], x0, y0)
+    assert best is not None
+    _, x0, y0 = best
+    outer = mask[y0 : y0 + OUTER_SIZE, x0 : x0 + OUTER_SIZE]
+    if float(outer.mean()) < 0.70:
+        raise ValueError("tile foreground coverage is incomplete")
+    return x0, y0, outer
+
+
+def _check_inner_coverage(mask: np.ndarray, x0: int, y0: int) -> None:
+    inner = mask[
+        y0 + INNER_MARGIN : y0 + INNER_MARGIN + INNER_SIZE,
+        x0 + INNER_MARGIN : x0 + INNER_MARGIN + INNER_SIZE,
+    ]
+    if inner.shape != (INNER_SIZE, INNER_SIZE):
+        raise ValueError("tile interior is clipped")
+    for row in range(GRID_ROWS):
+        for col in range(GRID_COLS):
+            block = inner[
+                row * CELL_HEIGHT : (row + 1) * CELL_HEIGHT,
+                col * CELL_WIDTH : (col + 1) * CELL_WIDTH,
+            ]
+            if float(block.mean()) < 0.82:
+                raise ValueError("tile interior coverage is ambiguous")
+
+
+def _hamming(code: tuple[tuple[int, ...], ...], template: tuple[tuple[int, ...], ...]) -> int:
+    return sum(
+        int(value) != int(expected)
+        for code_row, template_row in zip(code, template)
+        for value, expected in zip(code_row, template_row)
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the symbol using only the final raster and the declared transform."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    background = _background(array)
+    mask = _foreground(array, background)
+    x0, y0, _ = _locate_tile(mask)
+    _check_inner_coverage(mask, x0, y0)
+    tile = array[
+        y0 + INNER_MARGIN : y0 + INNER_MARGIN + INNER_SIZE,
+        x0 + INNER_MARGIN : x0 + INNER_MARGIN + INNER_SIZE,
+    ]
+    code: list[tuple[int, ...]] = []
+    for row in range(GRID_ROWS):
+        values: list[int] = []
+        for pair in range(OUTPUT_COLS):
+            top = row * CELL_HEIGHT
+            bottom = (row + 1) * CELL_HEIGHT
+            left_a = pair * CELL_WIDTH
+            right_a = (pair + 1) * CELL_WIDTH
+            left_b = (GRID_COLS - 1 - pair) * CELL_WIDTH
+            right_b = left_b + CELL_WIDTH
+            first = tile[top:bottom, left_a:right_a].astype(np.int16)
+            second = tile[top:bottom, left_b:right_b].astype(np.int16)
+            difference = float(np.abs(first - second).mean())
+            if abs(difference - 30.0) < 1.0:
+                raise ValueError("mirror difference is on the declared threshold")
+            values.append(1 if difference >= 30.0 else 0)
+        code.append(tuple(values))
+    candidate = tuple(code)
+    distance_a = _hamming(candidate, LOOP)
+    distance_b = _hamming(candidate, ARROW)
+    if distance_a == distance_b:
+        raise ValueError("difference grid is exactly between the two symbols")
+    return "A" if distance_a < distance_b else "B"

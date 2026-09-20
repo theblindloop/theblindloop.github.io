@@ -1,0 +1,170 @@
+"""Independent pixel-only oracle for ``chain_walk_rank``.
+
+Input: the final PNG only.  This module never imports the renderer, prompts,
+generator, verifier or analytic gold, and never receives latent scene data.  It
+re-derives the decision from the raster by segmenting ink, isolating the bead
+blobs, identifying the oversized start bead, and then measuring *geodesic*
+distance through the connected ink (cord plus beads) to order the beads along the
+route.  Any perceptual ambiguity -- wrong blob count, an unconvincing start bead,
+an unreachable bead, two beads at comparable route distance, or a target bead
+sitting on the vertical midline -- abstains.
+
+Erasing any part of the chain therefore removes a bead blob or disconnects the
+route, and the oracle abstains or reports a different colour: the whole traced
+cord is decisive support.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "chain_walk_rank-oracle-0.1.0"
+ABSTAIN = "unknown"
+
+# The public colour alphabet of the question contract (not renderer state).
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (214, 32, 42),
+    "orange": (240, 140, 10),
+    "yellow": (238, 222, 45),
+    "green": (30, 158, 64),
+    "blue": (40, 90, 220),
+    "indigo": (78, 20, 140),
+    "violet": (176, 60, 206),
+}
+_WHITE = (255, 255, 255)
+_DARK = (24, 24, 24)
+
+MIN_BEAD_AREA = 260  # px; smallest legible bead core is r ~ 12 -> ~450 px
+BEAD_TOL = 45  # max RGB distance from a palette colour for saturated bead ink
+N_BEADS = 5
+TARGET_STEP = 3
+START_AREA_RATIO = 1.35  # the start bead must be clearly the largest blob
+MIN_RANK_GAP = 14.0  # px of route distance between consecutive beads
+MIN_SIDE_PX = 3.0
+
+
+def _components(mask: np.ndarray) -> list[list[int]]:
+    h, w = mask.shape
+    flat = mask.reshape(-1)
+    seen = np.zeros(flat.shape, dtype=bool)
+    out: list[list[int]] = []
+    for s in np.flatnonzero(flat):
+        s = int(s)
+        if seen[s]:
+            continue
+        seen[s] = True
+        stack = [s]
+        px: list[int] = []
+        while stack:
+            p = stack.pop()
+            px.append(p)
+            y, x = divmod(p, w)
+            if x > 0 and flat[p - 1] and not seen[p - 1]:
+                seen[p - 1] = True
+                stack.append(p - 1)
+            if x < w - 1 and flat[p + 1] and not seen[p + 1]:
+                seen[p + 1] = True
+                stack.append(p + 1)
+            if y > 0 and flat[p - w] and not seen[p - w]:
+                seen[p - w] = True
+                stack.append(p - w)
+            if y < h - 1 and flat[p + w] and not seen[p + w]:
+                seen[p + w] = True
+                stack.append(p + w)
+        out.append(px)
+    return out
+
+
+def _geodesic(ink: np.ndarray, seeds: list[int]) -> np.ndarray:
+    """4-connected BFS distance (px) inside the ink mask from a seed pixel set."""
+    h, w = ink.shape
+    flat = ink.reshape(-1)
+    dist = np.full(flat.shape, -1.0)
+    q: deque[int] = deque()
+    for s in seeds:
+        if flat[s] and dist[s] < 0:
+            dist[s] = 0.0
+            q.append(s)
+    while q:
+        p = q.popleft()
+        d = dist[p] + 1.0
+        y, x = divmod(p, w)
+        if x > 0 and flat[p - 1] and dist[p - 1] < 0:
+            dist[p - 1] = d
+            q.append(p - 1)
+        if x < w - 1 and flat[p + 1] and dist[p + 1] < 0:
+            dist[p + 1] = d
+            q.append(p + 1)
+        if y > 0 and flat[p - w] and dist[p - w] < 0:
+            dist[p - w] = d
+            q.append(p - w)
+        if y < h - 1 and flat[p + w] and dist[p + w] < 0:
+            dist[p + w] = d
+            q.append(p + w)
+    return dist
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover ``"<colour>|<side>"`` from the raster alone, or ``ABSTAIN``."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int32)
+    h, w, _ = arr.shape
+
+    refs = [_WHITE, _DARK] + [PALETTE[k] for k in PALETTE]
+    names = [None, None] + list(PALETTE)
+    d2 = np.stack(
+        [((arr - np.array(c, dtype=np.int32)) ** 2).sum(axis=2) for c in refs], axis=0
+    )
+    nearest = d2.argmin(axis=0)
+
+    ink = nearest != 0
+    # A bead body is *saturated* palette ink.  Antialiased cord/bead blends drift
+    # far from every palette colour, so excluding them keeps neighbouring beads
+    # from fusing into one blob through the cord that joins them.
+    bead_mask = (nearest >= 2) & (d2.min(axis=0) <= BEAD_TOL**2)
+    comps = [c for c in _components(bead_mask) if len(c) >= MIN_BEAD_AREA]
+    if len(comps) != N_BEADS:
+        return ABSTAIN
+
+    flat_near = nearest.reshape(-1)
+    info = []
+    for px in comps:
+        idx = np.array(px)
+        vals, counts = np.unique(flat_near[idx], return_counts=True)
+        name = names[int(vals[counts.argmax()])]
+        if name is None:
+            return ABSTAIN
+        ys, xs = np.divmod(idx, w)
+        info.append(
+            {"px": px, "area": len(px), "color": name, "cx": float(xs.mean()), "cy": float(ys.mean())}
+        )
+
+    order_by_area = sorted(info, key=lambda b: -b["area"])
+    if order_by_area[0]["area"] < START_AREA_RATIO * order_by_area[1]["area"]:
+        return ABSTAIN
+    start = order_by_area[0]
+
+    dist = _geodesic(ink, start["px"])
+    ranked = []
+    for b in info:
+        if b is start:
+            continue
+        vals = dist[np.array(b["px"])]
+        vals = vals[vals >= 0]
+        if vals.size == 0:
+            return ABSTAIN
+        ranked.append((float(vals.min()), b))
+    if len(ranked) != N_BEADS - 1:
+        return ABSTAIN
+    ranked.sort(key=lambda t: t[0])
+    for i in range(len(ranked) - 1):
+        if ranked[i + 1][0] - ranked[i][0] < MIN_RANK_GAP:
+            return ABSTAIN
+
+    target = ranked[TARGET_STEP - 1][1]
+    if abs(target["cx"] - w / 2.0) < MIN_SIDE_PX:
+        return ABSTAIN
+    side = "left" if target["cx"] < w / 2.0 else "right"
+    return f"{target['color']}|{side}"

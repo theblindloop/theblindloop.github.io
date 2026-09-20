@@ -1,0 +1,136 @@
+"""Independent raster-only inverse arm for Shuffle Echo Correspondence.
+
+This module intentionally contains its own palette, component extraction, and
+shape classifier. It receives one PIL image and has no access to latent fields.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+@dataclass(frozen=True)
+class Component:
+    area: int
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    cx: float
+    cy: float
+
+    @property
+    def fill_ratio(self) -> float:
+        return self.area / float((self.x1 - self.x0 + 1) * (self.y1 - self.y0 + 1))
+
+
+PALETTE = {
+    "amber": np.array((242, 169, 0), dtype=np.int16),
+    "cyan": np.array((0, 166, 214), dtype=np.int16),
+    "violet": np.array((139, 92, 246), dtype=np.int16),
+}
+
+
+def _components(mask: np.ndarray, minimum_area: int = 40) -> list[Component]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    output: list[Component] = []
+    for raw_y, raw_x in np.argwhere(mask):
+        y, x = int(raw_y), int(raw_x)
+        if visited[y, x]:
+            continue
+        visited[y, x] = True
+        stack = [(y, x)]
+        xs: list[int] = []
+        ys: list[int] = []
+        while stack:
+            cy, cx = stack.pop()
+            xs.append(cx)
+            ys.append(cy)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(xs) >= minimum_area:
+            output.append(
+                Component(
+                    area=len(xs),
+                    x0=min(xs),
+                    y0=min(ys),
+                    x1=max(xs),
+                    y1=max(ys),
+                    cx=float(sum(xs)) / len(xs),
+                    cy=float(sum(ys)) / len(ys),
+                )
+            )
+    return output
+
+
+def _shape(component: Component) -> str:
+    ratio = component.fill_ratio
+    if ratio < 0.66:
+        return "triangle"
+    if ratio < 0.90:
+        return "circle"
+    return "square"
+
+
+def _black_shape_groups(array: np.ndarray) -> tuple[list[Component], list[Component]]:
+    black = np.all(array < 75, axis=2)
+    parts = sorted(_components(black), key=lambda item: item.cx)
+    if len(parts) != 6:
+        raise ValueError(f"expected six black shape components, found {len(parts)}")
+    gaps = [parts[index + 1].cx - parts[index].cx for index in range(5)]
+    split = int(np.argmax(gaps)) + 1
+    before, after = parts[:split], parts[split:]
+    if len(before) != 3 or len(after) != 3:
+        raise ValueError("black shapes do not form two complete three-part cards")
+    if set(map(_shape, before)) != {"circle", "square", "triangle"}:
+        raise ValueError("left card does not contain one of each shape")
+    if set(map(_shape, after)) != {"circle", "square", "triangle"}:
+        raise ValueError("right card does not contain one of each shape")
+    return sorted(before, key=lambda item: item.cx), sorted(after, key=lambda item: item.cx)
+
+
+def _color_row(array: np.ndarray) -> list[str]:
+    found: list[tuple[float, str]] = []
+    # int32 prevents squared RGB deltas from overflowing (255**2 > int16).
+    signed = array.astype(np.int32)
+    for name, rgb in PALETTE.items():
+        distance2 = np.sum((signed - rgb.astype(np.int32)) ** 2, axis=2)
+        parts = _components(distance2 < 100, minimum_area=80)
+        if len(parts) != 1:
+            raise ValueError(f"expected one intact {name} disk, found {len(parts)}")
+        found.append((parts[0].cx, name))
+    found.sort()
+    if len({round(x, 3) for x, _ in found}) != 3:
+        raise ValueError("color disks do not occupy distinct source slots")
+    return [name for _, name in found]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    # Discover the puzzle from pixels, then ignore the intentionally blank
+    # canvas around it. This is translation-invariant and keeps destructive
+    # ablation probes inexpensive without consulting any expected coordinate.
+    foreground = np.any(array < 248, axis=2)
+    points = np.argwhere(foreground)
+    if not len(points):
+        raise ValueError("image contains no visible puzzle")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    pad = 4
+    array = array[
+        max(0, int(y0) - pad) : min(array.shape[0], int(y1) + pad + 1),
+        max(0, int(x0) - pad) : min(array.shape[1], int(x1) + pad + 1),
+    ]
+    before, after = _black_shape_groups(array)
+    colors = _color_row(array)
+    target_shape = _shape(after[0])
+    matches = [index for index, part in enumerate(before) if _shape(part) == target_shape]
+    if len(matches) != 1:
+        raise ValueError("target shape has no unique source correspondence")
+    return colors[matches[0]]

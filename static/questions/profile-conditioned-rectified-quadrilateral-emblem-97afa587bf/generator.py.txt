@@ -1,0 +1,247 @@
+"""Deterministic projective quadrilateral renderer for the candidate world."""
+
+from __future__ import annotations
+
+import copy
+import math
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+WIDTH = 720
+HEIGHT = 560
+TILE = 240
+SYMBOLS = ("diamond", "hourglass", "chevron", "crown")
+MARK_COLORS = (
+    (220, 63, 76),
+    (42, 118, 210),
+    (226, 166, 42),
+    (134, 77, 185),
+)
+BACKGROUND = (247, 247, 244)
+EDGE_COLOR = (91, 98, 108)
+
+
+def _rng(seed: int, salt: int) -> np.random.Generator:
+    value = (int(seed) * 1_000_003 + salt * 97_531 + 0x9E3779B9) & 0xFFFFFFFF
+    return np.random.default_rng(value)
+
+
+def _quad_for(seed: int) -> list[list[float]]:
+    rng = _rng(seed, 11)
+    base = np.array(
+        [
+            [112.0, 104.0],
+            [598.0, 76.0],
+            [636.0, 458.0],
+            [82.0, 438.0],
+        ],
+        dtype=np.float64,
+    )
+    jitter = np.array(
+        [
+            [rng.uniform(-28.0, 28.0), rng.uniform(-18.0, 22.0)],
+            [rng.uniform(-30.0, 25.0), rng.uniform(-20.0, 20.0)],
+            [rng.uniform(-24.0, 24.0), rng.uniform(-24.0, 22.0)],
+            [rng.uniform(-24.0, 26.0), rng.uniform(-22.0, 24.0)],
+        ]
+    )
+    quad = base + jitter
+    quad[:, 0] = np.clip(quad[:, 0], 54.0, WIDTH - 54.0)
+    quad[:, 1] = np.clip(quad[:, 1], 48.0, HEIGHT - 46.0)
+    return [[round(float(x), 4), round(float(y), 4)] for x, y in quad]
+
+
+def _homography(source: np.ndarray, destination: np.ndarray) -> np.ndarray:
+    rows: list[list[float]] = []
+    values: list[float] = []
+    for (x, y), (u, v) in zip(source, destination):
+        rows.append([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y])
+        values.append(float(u))
+        rows.append([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y])
+        values.append(float(v))
+    matrix = np.asarray(rows, dtype=np.float64)
+    vector = np.asarray(values, dtype=np.float64)
+    solution = np.linalg.solve(matrix, vector)
+    return np.array(
+        [
+            [solution[0], solution[1], solution[2]],
+            [solution[3], solution[4], solution[5]],
+            [solution[6], solution[7], 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _segments(symbol: str) -> tuple[tuple[tuple[float, float], tuple[float, float]], ...]:
+    if symbol == "diamond":
+        points = ((48.0, 120.0), (120.0, 48.0), (192.0, 120.0), (120.0, 192.0), (48.0, 120.0))
+        return tuple(zip(points[:-1], points[1:]))
+    if symbol == "hourglass":
+        points = (
+            (52.0, 54.0),
+            (188.0, 54.0),
+            (120.0, 120.0),
+            (188.0, 186.0),
+            (52.0, 186.0),
+            (120.0, 120.0),
+            (52.0, 54.0),
+        )
+        return tuple(zip(points[:-1], points[1:]))
+    if symbol == "chevron":
+        points = ((48.0, 66.0), (120.0, 174.0), (192.0, 66.0))
+        return tuple(zip(points[:-1], points[1:]))
+    if symbol == "crown":
+        points = (
+            (44.0, 180.0),
+            (44.0, 74.0),
+            (88.0, 132.0),
+            (120.0, 54.0),
+            (152.0, 132.0),
+            (196.0, 74.0),
+            (196.0, 180.0),
+            (44.0, 180.0),
+        )
+        return tuple(zip(points[:-1], points[1:]))
+    raise ValueError(f"unknown symbol {symbol!r}")
+
+
+def _mask_at(x: np.ndarray, y: np.ndarray, symbol: str, dx: float, dy: float, scale: float) -> np.ndarray:
+    """Return a smooth-edged union of the symbol's equal-width strokes."""
+
+    closest = np.full(x.shape, np.inf, dtype=np.float64)
+    for (ax, ay), (bx, by) in _segments(symbol):
+        ax = 120.0 + scale * (ax - 120.0) + dx
+        ay = 120.0 + scale * (ay - 120.0) + dy
+        bx = 120.0 + scale * (bx - 120.0) + dx
+        by = 120.0 + scale * (by - 120.0) + dy
+        vx = bx - ax
+        vy = by - ay
+        denominator = vx * vx + vy * vy
+        t = ((x - ax) * vx + (y - ay) * vy) / denominator
+        t = np.clip(t, 0.0, 1.0)
+        px = ax + t * vx
+        py = ay + t * vy
+        closest = np.minimum(closest, np.hypot(x - px, y - py))
+    return closest <= 5.8
+
+
+def _symbol_area(symbol: str) -> int:
+    axis = np.arange(TILE, dtype=np.float64) + 0.5
+    xx, yy = np.meshgrid(axis, axis)
+    return int(_mask_at(xx, yy, symbol, 0.0, 0.0, 1.0).sum())
+
+
+_AREA_REFERENCE = float(np.mean([_symbol_area(name) for name in SYMBOLS]))
+
+
+def _patch(scene: dict) -> np.ndarray:
+    axis = np.arange(TILE, dtype=np.float64) + 0.5
+    u, v = np.meshgrid(axis, axis)
+    carrier_phase = float(scene["texture_phase"]) % 8.0
+    cell_u = np.floor((u + carrier_phase) / 4.0).astype(np.int64)
+    cell_v = np.floor((v + carrier_phase) / 4.0).astype(np.int64)
+    carrier = np.where(((cell_u + cell_v) & 1) == 0, -1.0, 1.0)
+    gray = np.full((TILE, TILE), float(scene["base_level"]), dtype=np.float64)
+    gray += float(scene["texture_amplitude"]) * carrier
+    symbol = str(scene["symbol"])
+    mask = _mask_at(
+        u,
+        v,
+        symbol,
+        float(scene["symbol_dx"]),
+        float(scene["symbol_dy"]),
+        float(scene["symbol_scale"]),
+    )
+    strength = float(scene["signal_strength"])
+    normalizer = _AREA_REFERENCE / float(_symbol_area(symbol))
+    gray[mask] -= strength * normalizer
+    return np.clip(gray, 0.0, 255.0)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a scene with answer-independent nuisance streams."""
+
+    seed = int(seed)
+    symbol_rng = _rng(seed, 23)
+    texture_rng = _rng(seed, 31)
+    signal_rng = _rng(seed, 37)
+    placement_rng = _rng(seed, 41)
+    palette_rng = _rng(seed, 43)
+    symbol = SYMBOLS[int(symbol_rng.integers(0, len(SYMBOLS)))]
+    phase = int(texture_rng.integers(0, 8))
+    texture_amplitude = float(texture_rng.choice(np.array([24.0, 28.0, 32.0, 36.0])))
+    signal_strength = float(signal_rng.choice(np.array([34.0, 44.0, 54.0, 64.0, 74.0])))
+    base_level = float(signal_rng.choice(np.array([222.0, 226.0, 230.0, 234.0])))
+    dx = float(placement_rng.uniform(-14.0, 14.0))
+    dy = float(placement_rng.uniform(-14.0, 14.0))
+    scale = float(placement_rng.uniform(0.91, 1.07))
+    permutation = [int(value) for value in palette_rng.permutation(4)]
+    return {
+        "seed": seed,
+        "symbol": symbol,
+        "quad": _quad_for(seed),
+        "palette_perm": permutation,
+        "texture_phase": phase,
+        "texture_amplitude": texture_amplitude,
+        "signal_strength": signal_strength,
+        "base_level": base_level,
+        "symbol_dx": dx,
+        "symbol_dy": dy,
+        "symbol_scale": scale,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    patch = _patch(scene)
+    source = np.array(
+        [[0.0, 0.0], [TILE - 1.0, 0.0], [TILE - 1.0, TILE - 1.0], [0.0, TILE - 1.0]],
+        dtype=np.float64,
+    )
+    destination = np.asarray(scene["quad"], dtype=np.float64)
+    forward = _homography(source, destination)
+    mapping = np.linalg.inv(forward)
+    yy, xx = np.indices((HEIGHT, WIDTH), dtype=np.float64)
+    denominator = mapping[2, 0] * xx + mapping[2, 1] * yy + mapping[2, 2]
+    u = (mapping[0, 0] * xx + mapping[0, 1] * yy + mapping[0, 2]) / denominator
+    v = (mapping[1, 0] * xx + mapping[1, 1] * yy + mapping[1, 2]) / denominator
+    valid = (u >= 0.0) & (u < TILE) & (v >= 0.0) & (v < TILE)
+    canvas = np.empty((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    canvas[:, :] = np.asarray(BACKGROUND, dtype=np.uint8)
+    canvas[valid] = np.rint(patch[np.clip(v[valid].astype(int), 0, TILE - 1), np.clip(u[valid].astype(int), 0, TILE - 1)]).astype(np.uint8)[:, None]
+    image = Image.fromarray(canvas, mode="RGB")
+    draw = ImageDraw.Draw(image)
+    points = [tuple(float(value) for value in point) for point in destination]
+    draw.line(points + [points[0]], fill=EDGE_COLOR, width=3, joint="curve")
+    permutation = list(scene["palette_perm"])
+    radius = 11
+    for point, palette_index in zip(points, permutation):
+        x, y = point
+        draw.ellipse(
+            (int(round(x)) - radius, int(round(y)) - radius, int(round(x)) + radius, int(round(y)) + radius),
+            fill=MARK_COLORS[int(palette_index)],
+            outline=(255, 255, 255),
+            width=2,
+        )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return scene["symbol"]
+
+
+def margin(scene: dict) -> float:
+    signal = float(scene["signal_strength"])
+    carrier = float(scene["texture_amplitude"])
+    return round(signal - 0.55 * carrier - 16.0, 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 12.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["texture_phase"] = int(scene["texture_phase"]) + 8
+    return [("one_carrier_period", twin)]

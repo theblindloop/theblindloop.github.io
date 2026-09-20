@@ -1,0 +1,155 @@
+"""Independent image-only inverse for the medial-thickness question.
+
+This module deliberately reconstructs panel masks from RGB pixels and does not
+import the renderer, prompt, generator, verifier, or analytic-gold code.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+COLORS = ("red", "blue", "green")
+PALETTE = np.asarray(
+    (
+        (218, 72, 78),
+        (58, 112, 214),
+        (48, 158, 103),
+    ),
+    dtype=np.float32,
+)
+PEAK_SEPARATION = 22.0
+PEAK_DEPTH_FRACTION = 0.42
+
+
+def _panel_geometry(width: int, height: int) -> list[tuple[int, int, int, int]]:
+    sx = width / 900.0
+    sy = height / 360.0
+    return [
+        (round(left * sx), round(50 * sy), round((left + 260) * sx), round(310 * sy))
+        for left in (28, 320, 612)
+    ]
+
+
+def _mask_for_color(crop: np.ndarray, color_index: int) -> np.ndarray:
+    distances = np.sqrt(np.sum((crop[:, :, None, :] - PALETTE[None, None, :, :]) ** 2, axis=3))
+    ink_distance = distances[:, :, color_index]
+    nearest_index = np.argmin(distances, axis=2)
+    white_distance = np.sqrt(np.sum((crop - 255.0) ** 2, axis=2))
+    # Nearest-palette classification retains antialiased interior edges while
+    # excluding the pale frame and the white panel background.
+    return (nearest_index == color_index) & (ink_distance < white_distance) & (ink_distance < 205.0)
+
+
+def _chamfer_distance(mask: np.ndarray) -> np.ndarray:
+    """Two-pass 8-neighbour distance to the exterior, measured in pixels."""
+
+    height, width = mask.shape
+    infinity = 1.0e6
+    distance = np.where(mask, infinity, 0.0).astype(np.float32)
+    diagonal = math.sqrt(2.0)
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x]:
+                continue
+            best = distance[y, x]
+            if y:
+                best = min(best, distance[y - 1, x] + 1.0)
+                if x:
+                    best = min(best, distance[y - 1, x - 1] + diagonal)
+                if x + 1 < width:
+                    best = min(best, distance[y - 1, x + 1] + diagonal)
+            if x:
+                best = min(best, distance[y, x - 1] + 1.0)
+            distance[y, x] = best
+    for y in range(height - 1, -1, -1):
+        for x in range(width - 1, -1, -1):
+            if not mask[y, x]:
+                continue
+            best = distance[y, x]
+            if y + 1 < height:
+                best = min(best, distance[y + 1, x] + 1.0)
+                if x:
+                    best = min(best, distance[y + 1, x - 1] + diagonal)
+                if x + 1 < width:
+                    best = min(best, distance[y + 1, x + 1] + diagonal)
+            if x + 1 < width:
+                best = min(best, distance[y, x + 1] + 1.0)
+            distance[y, x] = best
+    return distance
+
+
+def _dominant_peak_count(mask: np.ndarray) -> int:
+    if int(mask.sum()) < 150:
+        return 0
+    distance = _chamfer_distance(mask)
+    deepest = float(distance[mask].max())
+    if not math.isfinite(deepest) or deepest <= 2.0:
+        return 0
+    threshold = max(4.0, deepest * PEAK_DEPTH_FRACTION)
+    candidate = mask & (distance >= threshold)
+    # Keep only regional maxima of the distance field.  The previous step's
+    # depth cutoff alone would retain an entire broad interior plateau and turn
+    # it into many pseudo-peaks under non-maximum suppression.
+    padded = np.pad(distance, 1, mode="constant", constant_values=0.0)
+    local_max = candidate.copy()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            neighbour = padded[1 + dy:1 + dy + distance.shape[0], 1 + dx:1 + dx + distance.shape[1]]
+            local_max &= distance >= neighbour
+    ys, xs = np.nonzero(local_max)
+    if len(ys) == 0:
+        return 0
+    values = distance[ys, xs]
+    order = np.argsort(-values, kind="stable")
+    peaks: list[tuple[float, float]] = []
+    for index in order:
+        point = (float(xs[index]), float(ys[index]))
+        if all(math.dist(point, old) >= PEAK_SEPARATION for old in peaks):
+            peaks.append(point)
+            if len(peaks) >= 6:
+                break
+    return len(peaks)
+
+
+def _one_peak_score(mask: np.ndarray) -> float:
+    count = _dominant_peak_count(mask)
+    if count == 1:
+        return 1.0
+    if count == 0:
+        return -1.0
+    return 0.0
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Classify only the final RGB raster, returning a visible color name."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("expected an RGB image")
+    scores: list[float] = []
+    for left, top, right, bottom in _panel_geometry(rgb.shape[1], rgb.shape[0]):
+        crop = rgb[top:bottom, left:right]
+        color_scores = []
+        for color_index in range(len(COLORS)):
+            color_scores.append(float(_mask_for_color(crop, color_index).sum()))
+        color_index = int(np.argmax(color_scores))
+        mask = _mask_for_color(crop, color_index)
+        scores.append(_one_peak_score(mask))
+    if max(scores) < 0.0:
+        raise ValueError("no stable colored silhouette was recovered")
+    winner = max(range(3), key=lambda index: (scores[index], -index))
+    # The image layout assigns each panel's visible color independently; recover
+    # that color from its strongest palette match rather than from any scene data.
+    left_color_names: list[str] = []
+    for left, top, right, bottom in _panel_geometry(rgb.shape[1], rgb.shape[0]):
+        crop = rgb[top:bottom, left:right]
+        counts = [int(_mask_for_color(crop, i).sum()) for i in range(len(COLORS))]
+        if max(counts) < 150:
+            raise ValueError("colored panel is missing")
+        left_color_names.append(COLORS[int(np.argmax(counts))])
+    return left_color_names[winner]

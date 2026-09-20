@@ -1,0 +1,144 @@
+"""Independent pixel-only inverse for stack-to-pip correspondence.
+
+The inverse discovers colored card frames, extracts dark connected components,
+binds each component to one of three visible compartments, and compares the
+ordered count signatures.  It imports no world or analytic module and receives
+only the final raster.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+FRAME_RGB = {
+    "reference": np.array((190, 50, 150), dtype=np.int16),
+    "red": np.array((218, 68, 73), dtype=np.int16),
+    "green": np.array((43, 157, 104), dtype=np.int16),
+    "blue": np.array((54, 105, 204), dtype=np.int16),
+}
+COLORS = ("red", "green", "blue")
+
+
+def _color_box(arr: np.ndarray, rgb: np.ndarray) -> tuple[int, int, int, int]:
+    distance = np.linalg.norm(arr.astype(np.int16) - rgb, axis=2)
+    ys, xs = np.nonzero(distance < 24)
+    if len(xs) < 1600:
+        raise ValueError("a required colored card frame is missing")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if not (300 <= width <= 460 and 210 <= height <= 320):
+        raise ValueError(f"colored frame has implausible bounds {(width, height)}")
+    return x0, y0, x1, y1
+
+
+def _components(mask: np.ndarray) -> list[dict[str, float]]:
+    height, width = mask.shape
+    remaining = set(np.flatnonzero(mask).tolist())
+    found: list[dict[str, float]] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        x0 = x1 = start % width
+        y0 = y1 = start // width
+        sum_x = 0.0
+        sum_y = 0.0
+        count = 0
+        while stack:
+            value = stack.pop()
+            y, x = divmod(value, width)
+            count += 1
+            sum_x += x
+            sum_y += y
+            x0, x1 = min(x0, x), max(x1, x)
+            y0, y1 = min(y0, y), max(y1, y)
+            for other in (value - 1, value + 1, value - width, value + width):
+                if other in remaining:
+                    oy, ox = divmod(other, width)
+                    if abs(oy - y) + abs(ox - x) == 1:
+                        remaining.remove(other)
+                        stack.append(other)
+        found.append(
+            {
+                "x": sum_x / count,
+                "y": sum_y / count,
+                "x0": float(x0),
+                "y0": float(y0),
+                "x1": float(x1),
+                "y1": float(y1),
+                "area": float(count),
+            }
+        )
+    return found
+
+
+def _signature(
+    arr: np.ndarray,
+    box: tuple[int, int, int, int],
+    *,
+    reference: bool,
+) -> tuple[int, int, int]:
+    x0, y0, x1, y1 = box
+    inset = 13
+    crop = arr[y0 + inset : y1 - inset + 1, x0 + inset : x1 - inset + 1]
+    dark = np.max(crop, axis=2) < 92
+    raw = _components(dark)
+    marks = [item for item in raw if 170 <= item["area"] <= 760]
+    speckle = sum(item["area"] for item in raw if item["area"] < 170)
+    if speckle > 90:
+        raise ValueError("too much unexplained dark ink inside a card")
+    counts = [0, 0, 0]
+    crop_width = crop.shape[1]
+    for mark in marks:
+        width = mark["x1"] - mark["x0"] + 1
+        height = mark["y1"] - mark["y0"] + 1
+        if not (15 <= width <= 29 and 15 <= height <= 29):
+            raise ValueError("a mark is not a resolvable square or pip")
+        fill = mark["area"] / (width * height)
+        if reference and fill < 0.88:
+            raise ValueError("the magenta card must visibly contain square blocks")
+        if not reference and fill > 0.86:
+            raise ValueError("candidate cards must visibly contain round pips")
+        group = min(2, int(3 * mark["x"] / crop_width))
+        counts[group] += 1
+    if any(not 1 <= count <= 5 for count in counts):
+        raise ValueError(f"each compartment must expose one to five marks: {counts}")
+    return tuple(counts)
+
+
+def _measure(image: Image.Image) -> tuple[str, dict]:
+    arr = np.asarray(image.convert("RGB"))
+    boxes = {name: _color_box(arr, rgb) for name, rgb in FRAME_RGB.items()}
+    signatures = {
+        name: _signature(arr, box, reference=(name == "reference"))
+        for name, box in boxes.items()
+    }
+    reference = signatures["reference"]
+    if len(set(reference)) != 3:
+        raise ValueError("reference counts must be distinct")
+    candidate_signatures = {color: signatures[color] for color in COLORS}
+    if any(sorted(signature) != sorted(reference) for signature in candidate_signatures.values()):
+        raise ValueError("candidate count multisets do not all match the reference")
+    scores = {
+        color: sum(left == right for left, right in zip(reference, signature))
+        for color, signature in candidate_signatures.items()
+    }
+    ranked = sorted(COLORS, key=lambda color: (-scores[color], color))
+    gap = scores[ranked[0]] - scores[ranked[1]]
+    if scores[ranked[0]] != 3 or gap < 2:
+        raise ValueError(f"ordered signature match is ambiguous: {scores}")
+    return ranked[0], {
+        "reference_signature": list(reference),
+        "candidate_signatures": {key: list(value) for key, value in candidate_signatures.items()},
+        "candidate_scores": scores,
+        "runner_up_gap_compartments": float(gap),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return red, green, or blue from the final pixels alone."""
+    return _measure(image)[0]
+

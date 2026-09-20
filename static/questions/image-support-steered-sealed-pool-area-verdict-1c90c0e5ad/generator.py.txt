@@ -1,0 +1,358 @@
+"""Scene sampler, renderer and analytic gold for `sealed_pool_area_verdict`.
+
+One dark reef of medium span carries white pools. Some pools are shut in by reef
+ink; others are notches that open onto the page. The decision compares the white
+area of the single biggest shut pool with the summed area of the other shut
+pools. Every quantity is grid quantised, so raster areas are exact.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS = 420
+CELL = 20
+GRID = 9
+REEF_PX = CELL * GRID
+REEF_DARK = (18, 18, 22)
+PAPER = (255, 255, 255)
+
+DECOR_COLORS = (
+    (170, 170, 176),
+    (72, 112, 205),
+    (236, 152, 62),
+    (214, 82, 84),
+    (96, 176, 112),
+)
+
+_SHUT_SHAPES = {
+    1: ((1, 1),),
+    2: ((1, 2), (2, 1)),
+    3: ((1, 3), (3, 1)),
+    4: ((2, 2), (1, 4), (4, 1)),
+    5: ((1, 5), (5, 1)),
+    6: ((2, 3), (3, 2)),
+}
+
+# Size multisets grouped by (pool count, total shut area). Every group holds both
+# classes, so neither the number of shut pools nor their summed area carries any
+# signal, and every listed multiset decides by exactly one grid cell of area.
+_SIZE_GROUPS = {
+    (3, 5): {"biggest": ((3, 1, 1),), "others": ((2, 2, 1),)},
+    (3, 7): {"biggest": ((4, 2, 1),), "others": ((3, 2, 2),)},
+    (3, 9): {"biggest": ((5, 3, 1),), "others": ((4, 3, 2),)},
+    (3, 11): {"biggest": ((6, 3, 2),), "others": ((5, 4, 2), (5, 3, 3))},
+    (4, 7): {"biggest": ((4, 1, 1, 1),), "others": ((3, 2, 1, 1),)},
+    (4, 9): {"biggest": ((5, 2, 1, 1),), "others": ((4, 2, 2, 1),)},
+    (4, 11): {
+        "biggest": ((6, 2, 2, 1), (6, 3, 1, 1)),
+        "others": ((5, 4, 1, 1), (5, 3, 2, 1), (5, 2, 2, 2)),
+    },
+}
+_SPREAD_CELLS = 5
+
+
+def _blank_cells() -> list[list[str]]:
+    return [["#"] * GRID for _ in range(GRID)]
+
+
+def _rect_cells(rect: tuple[int, int, int, int]) -> list[tuple[int, int]]:
+    col, row, wide, high = rect
+    return [(row + dy, col + dx) for dy in range(high) for dx in range(wide)]
+
+
+def _far_enough(rect: tuple[int, int, int, int], taken: set[tuple[int, int]]) -> bool:
+    """No new cell may sit within Chebyshev distance one of an existing pool."""
+    for row, col in _rect_cells(rect):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if (row + dy, col + dx) in taken:
+                    return False
+    return True
+
+
+def _place_shut(rng: random.Random, sizes, taken: set[tuple[int, int]]):
+    placed = []
+    for size in sizes:
+        shapes = list(_SHUT_SHAPES[size])
+        rng.shuffle(shapes)
+        spot = None
+        for _ in range(500):
+            wide, high = shapes[rng.randrange(len(shapes))]
+            if wide > GRID - 2 or high > GRID - 2:
+                continue
+            col = rng.randint(1, GRID - 1 - wide)
+            row = rng.randint(1, GRID - 1 - high)
+            rect = (col, row, wide, high)
+            if _far_enough(rect, taken):
+                spot = rect
+                break
+        if spot is None:
+            return None
+        placed.append(spot)
+        taken.update(_rect_cells(spot))
+    return placed
+
+
+def _place_bays(rng: random.Random, count: int, taken: set[tuple[int, int]]):
+    placed = []
+    for _ in range(count):
+        spot = None
+        for _ in range(400):
+            wide = rng.randint(1, 3)
+            deep = rng.randint(1, 3)
+            side = rng.choice(("top", "bottom", "left", "right"))
+            if side in ("top", "bottom"):
+                col = rng.randint(0, GRID - wide)
+                row = 0 if side == "top" else GRID - deep
+                rect = (col, row, wide, deep)
+            else:
+                row = rng.randint(0, GRID - wide)
+                col = 0 if side == "left" else GRID - deep
+                rect = (col, row, deep, wide)
+            if _far_enough(rect, taken):
+                spot = rect
+                break
+        if spot is None:
+            continue
+        placed.append(spot)
+        taken.update(_rect_cells(spot))
+    return placed
+
+
+def _pool_report(cells) -> dict:
+    """Group carved cells into pools and split them by contact with the page."""
+    carved = {(r, c) for r in range(len(cells)) for c in range(len(cells[r])) if cells[r][c] == "."}
+    seen = set()
+    shut, open_ = [], []
+    for start in sorted(carved):
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        group = []
+        touches = False
+        while stack:
+            row, col = stack.pop()
+            group.append((row, col))
+            if row in (0, len(cells) - 1) or col in (0, len(cells[0]) - 1):
+                touches = True
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nxt = (row + dy, col + dx)
+                if nxt in carved and nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        (open_ if touches else shut).append(len(group))
+    return {"shut": sorted(shut, reverse=True), "open": sorted(open_, reverse=True)}
+
+
+def _reef_connected(cells) -> bool:
+    dark = {(r, c) for r in range(len(cells)) for c in range(len(cells[r])) if cells[r][c] == "#"}
+    if not dark:
+        return False
+    start = min(dark)
+    seen = {start}
+    stack = [start]
+    while stack:
+        row, col = stack.pop()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nxt = (row + dy, col + dx)
+            if nxt in dark and nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return len(seen) == len(dark)
+
+
+def _verdict(shut) -> str:
+    if len(shut) < 2:
+        return "biggest"
+    return "biggest" if shut[0] > sum(shut[1:]) else "others"
+
+
+def _gap_cells(shut) -> float:
+    if not shut:
+        return 0.0
+    return float(abs(shut[0] - sum(shut[1:])))
+
+
+def _decorations(rng: random.Random, origin) -> list[dict]:
+    ox, oy = origin
+    keep_out = (ox - 16, oy - 16, ox + REEF_PX + 16, oy + REEF_PX + 16)
+    items: list[dict] = []
+    wanted = rng.randint(3, 5)
+    for _ in range(wanted * 12):
+        if len(items) >= wanted:
+            break
+        wide = rng.randint(14, 40)
+        high = rng.randint(14, 40)
+        left = rng.randint(8, CANVAS - 8 - wide)
+        top = rng.randint(8, CANVAS - 8 - high)
+        box = (left, top, left + wide, top + high)
+        if box[0] < keep_out[2] and keep_out[0] < box[2] and box[1] < keep_out[3] and keep_out[1] < box[3]:
+            continue
+        clash = False
+        for other in items:
+            ob = other["box"]
+            if box[0] - 10 < ob[2] and ob[0] - 10 < box[2] and box[1] - 10 < ob[3] and ob[1] - 10 < box[3]:
+                clash = True
+                break
+        if clash:
+            continue
+        items.append(
+            {
+                "shape": rng.choice(("disk", "square", "bar")),
+                "box": list(box),
+                "color": list(DECOR_COLORS[rng.randrange(len(DECOR_COLORS))]),
+            }
+        )
+    return items
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random((int(seed) * 7919 + 104729) % (2**31))
+    target = "biggest" if rng.random() < 0.5 else "others"
+    groups = sorted(_SIZE_GROUPS)
+    for _ in range(400):
+        group = _SIZE_GROUPS[groups[rng.randrange(len(groups))]][target]
+        sizes = list(group[rng.randrange(len(group))])
+        rng.shuffle(sizes)
+        taken: set[tuple[int, int]] = set()
+        shut_rects = _place_shut(rng, sizes, taken)
+        if shut_rects is None:
+            continue
+        shut_cells = [cell for rect in shut_rects for cell in _rect_cells(rect)]
+        rows = [cell[0] for cell in shut_cells]
+        cols = [cell[1] for cell in shut_cells]
+        if max(rows) - min(rows) + 1 < _SPREAD_CELLS or max(cols) - min(cols) + 1 < _SPREAD_CELLS:
+            continue
+        bay_rects = _place_bays(rng, rng.randint(1, 3), taken)
+        if not bay_rects:
+            continue
+        cells = _blank_cells()
+        for rect in shut_rects + bay_rects:
+            for row, col in _rect_cells(rect):
+                cells[row][col] = "."
+        if not _reef_connected(cells):
+            continue
+        report = _pool_report(cells)
+        if sorted(report["shut"], reverse=True) != sorted(sizes, reverse=True):
+            continue
+        if len(report["open"]) != len(bay_rects):
+            continue
+        if _verdict(report["shut"]) != target:
+            continue
+        if _gap_cells(report["shut"]) != 1.0:
+            continue
+        origin = (
+            rng.randint(30, CANVAS - REEF_PX - 30),
+            rng.randint(30, CANVAS - REEF_PX - 30),
+        )
+        decorations = _decorations(rng, origin)
+        if len(decorations) < 3:
+            continue
+        naive = sorted(report["shut"] + report["open"], reverse=True)
+        return {
+            "canvas": CANVAS,
+            "cell_px": CELL,
+            "grid": GRID,
+            "origin": [origin[0], origin[1]],
+            "cells": ["".join(row) for row in cells],
+            "shut_rects": [list(rect) for rect in shut_rects],
+            "bay_rects": [list(rect) for rect in bay_rects],
+            "decorations": decorations,
+            "diagnostics": {
+                "shut_areas_cells": report["shut"],
+                "open_areas_cells": report["open"],
+                "dark_cells": sum(row.count("#") for row in ["".join(r) for r in cells]),
+                "gap_cells": _gap_cells(report["shut"]),
+                "naive_with_open_notches": _verdict(naive),
+                "biggest_open_beats_biggest_shut": bool(
+                    report["open"] and report["open"][0] > report["shut"][0]
+                ),
+            },
+        }
+    raise RuntimeError(f"sampling failed for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    canvas = int(scene["canvas"])
+    cell = int(scene["cell_px"])
+    grid = int(scene["grid"])
+    ox, oy = int(scene["origin"][0]), int(scene["origin"][1])
+    cells = scene["cells"]
+    decorations = scene["decorations"]
+    shut_rects = scene["shut_rects"]
+    bay_rects = scene["bay_rects"]
+
+    image = Image.new("RGB", (canvas, canvas), PAPER)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(
+        (ox, oy, ox + cell * grid - 1, oy + cell * grid - 1),
+        fill=REEF_DARK,
+    )
+    for row in range(grid):
+        for col in range(grid):
+            if cells[row][col] == ".":
+                left = ox + col * cell
+                top = oy + row * cell
+                draw.rectangle((left, top, left + cell - 1, top + cell - 1), fill=PAPER)
+    for item in decorations:
+        left, top, right, bottom = (int(value) for value in item["box"])
+        color = tuple(int(value) for value in item["color"])
+        if item["shape"] == "disk":
+            draw.ellipse((left, top, right - 1, bottom - 1), fill=color)
+        elif item["shape"] == "bar":
+            mid = (top + bottom) // 2
+            draw.rectangle((left, mid - 5, right - 1, mid + 5), fill=color)
+        else:
+            draw.rectangle((left, top, right - 1, bottom - 1), fill=color)
+    # Recorded pool rectangles are aliases of the carved cell map; the loop below
+    # keeps them inside the rendered path without altering any pixel.
+    for rect in list(shut_rects) + list(bay_rects):
+        if len(rect) != 4:
+            raise ValueError("pool rectangles must have four entries")
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    cells = scene["cells"]
+    return _verdict(_pool_report(cells)["shut"])
+
+
+def margin(scene: dict) -> float:
+    cells = scene["cells"]
+    cell = int(scene["cell_px"])
+    return _gap_cells(_pool_report(cells)["shut"]) * float(cell * cell)
+
+
+def is_quarantined(scene: dict) -> bool:
+    cells = scene["cells"]
+    cell = int(scene["cell_px"])
+    report = _pool_report(cells)
+    if len(report["shut"]) < 2:
+        return True
+    if margin(scene) < 0.5 * cell * cell:
+        return True
+    return cell < 12
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twins: list[tuple[str, dict]] = []
+
+    decor_swap = dict(scene)
+    decor_swap["decorations"] = list(reversed(scene["decorations"]))
+    twins.append(("decoration_draw_order_reversed", decor_swap))
+
+    pool_swap = dict(scene)
+    pool_swap["shut_rects"] = list(reversed(scene["shut_rects"]))
+    pool_swap["bay_rects"] = list(reversed(scene["bay_rects"]))
+    twins.append(("recorded_pool_list_order_reversed", pool_swap))
+
+    relabel = dict(scene)
+    notes = dict(scene["diagnostics"])
+    notes["naive_with_open_notches"] = "scrambled"
+    relabel["diagnostics"] = notes
+    twins.append(("diagnostic_notes_scrambled", relabel))
+    return twins

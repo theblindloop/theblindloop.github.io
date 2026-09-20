@@ -1,0 +1,226 @@
+"""Deterministic bendprint scene sampler and raster renderer."""
+
+from __future__ import annotations
+
+import copy
+import itertools
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 1024
+HEIGHT = 512
+BACKGROUND = (248, 247, 243)
+REFERENCE = (28, 31, 36)
+PANEL = (188, 190, 188)
+ORNAMENT = (226, 225, 219)
+COLORS = {
+    "amber": (224, 137, 26),
+    "cyan": (20, 151, 181),
+    "violet": (139, 82, 190),
+}
+COLOR_NAMES = tuple(COLORS)
+PANEL_SIZE = 36
+PANEL_GAP = 2
+
+
+def _all_patterns() -> list[tuple[int, ...]]:
+    """Equal-count, equal-transition paths; cheap total-ink cues are balanced."""
+    output = []
+    for bits in itertools.product((-1, 1), repeat=9):
+        transitions = sum(left != right for left, right in zip(bits, bits[1:]))
+        if bits[0] == -1 and bits[-1] == 1 and bits.count(1) == 4 and transitions == 5:
+            output.append(bits)
+    return output
+
+
+PATTERNS = _all_patterns()
+
+
+def _reference_patterns() -> list[tuple[int, ...]]:
+    """Keep references with at least two exact-ink alternative sequences."""
+    counts = {pattern: int(_pattern_mask(pattern).sum()) for pattern in PATTERNS}
+    return [
+        pattern
+        for pattern in PATTERNS
+        if sum(other != pattern and counts[other] == counts[pattern] for other in PATTERNS) >= 2
+    ]
+
+
+def _pattern_mask(bits: list[int] | tuple[int, ...]) -> np.ndarray:
+    """Draw one connected, hard-edged zigzag as a boolean bitmap."""
+    image = Image.new("1", (31, 31), 0)
+    draw = ImageDraw.Draw(image)
+    points = [(3 + 3 * index, 15 + 6 * int(bit)) for index, bit in enumerate(bits)]
+    draw.line(points, fill=1, width=3, joint="curve")
+    return np.asarray(image, dtype=np.uint8).astype(bool)
+
+
+def _trim(mask: np.ndarray) -> np.ndarray:
+    ys, xs = np.where(mask)
+    if not len(xs):
+        return mask[:0, :0]
+    return mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+
+
+def _transform(mask: np.ndarray, code: int) -> np.ndarray:
+    value = mask
+    code = int(code) % 8
+    if code >= 4:
+        value = np.fliplr(value)
+    return np.rot90(value, code % 4).copy()
+
+
+def _variants(mask: np.ndarray) -> list[np.ndarray]:
+    variants = []
+    for code in range(8):
+        candidate = _trim(_transform(mask, code))
+        if not any(candidate.shape == old.shape and np.array_equal(candidate, old) for old in variants):
+            variants.append(candidate)
+    return variants
+
+
+def _center_pad(mask: np.ndarray, height: int, width: int) -> np.ndarray:
+    output = np.zeros((height, width), dtype=bool)
+    y = (height - mask.shape[0]) // 2
+    x = (width - mask.shape[1]) // 2
+    output[y : y + mask.shape[0], x : x + mask.shape[1]] = mask
+    return output
+
+
+def _iou(left: np.ndarray, right: np.ndarray) -> float:
+    height = max(left.shape[0], right.shape[0])
+    width = max(left.shape[1], right.shape[1])
+    a = _center_pad(left, height, width)
+    b = _center_pad(right, height, width)
+    union = np.logical_or(a, b).sum()
+    return float(np.logical_and(a, b).sum() / union) if union else 0.0
+
+
+def _shape_similarity(left_bits: list[int], right_bits: list[int]) -> float:
+    left = _trim(_pattern_mask(left_bits))
+    return max(_iou(left, variant) for variant in _variants(_pattern_mask(right_bits)))
+
+
+def _canonical(bits: list[int] | tuple[int, ...]) -> tuple[int, ...]:
+    raw = tuple(int(value) for value in bits)
+    forms = (raw, raw[::-1], tuple(-value for value in raw), tuple(-value for value in raw[::-1]))
+    return min(forms)
+
+
+REFERENCE_PATTERNS = _reference_patterns()
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    reference = list(REFERENCE_PATTERNS[rng.randrange(len(REFERENCE_PATTERNS))])
+    matching_color = COLOR_NAMES[int(seed) % len(COLOR_NAMES)]
+
+    distractor_pool = []
+    reference_ink = int(_pattern_mask(reference).sum())
+    for pattern in PATTERNS:
+        candidate = list(pattern)
+        similarity = _shape_similarity(reference, candidate)
+        if (
+            _canonical(candidate) != _canonical(reference)
+            and int(_pattern_mask(candidate).sum()) == reference_ink
+            and similarity <= 0.88
+        ):
+            distractor_pool.append(candidate)
+    if len(distractor_pool) < 2:
+        raise RuntimeError("insufficient separated bendprint distractors")
+    rng.shuffle(distractor_pool)
+
+    candidate_bits: dict[str, list[int]] = {}
+    distractors = iter(distractor_pool[:2])
+    for color in COLOR_NAMES:
+        candidate_bits[color] = list(reference) if color == matching_color else list(next(distractors))
+
+    panel_order = ["reference", *COLOR_NAMES]
+    rng.shuffle(panel_order)
+    transform_codes = {name: rng.randrange(8) for name in panel_order}
+    grid_x = rng.randrange(2, 6)
+    grid_y = rng.randrange(2, 6)
+    grid_center = [grid_x * (WIDTH // 8) + WIDTH // 16, grid_y * (HEIGHT // 8) + HEIGHT // 16]
+
+    ornaments = []
+    while len(ornaments) < 6:
+        x = rng.randrange(32, WIDTH - 32)
+        y = rng.randrange(24, HEIGHT - 24)
+        if abs(x - grid_center[0]) > 180 or abs(y - grid_center[1]) > 100:
+            ornaments.append([x, y])
+
+    return {
+        "reference_bits": reference,
+        "candidate_bits": candidate_bits,
+        "transform_codes": transform_codes,
+        "panel_order": panel_order,
+        "grid_center": grid_center,
+        "ornaments": ornaments,
+    }
+
+
+def _paste_mask(image: Image.Image, mask: np.ndarray, center: tuple[int, int], color: tuple[int, int, int]) -> None:
+    ys, xs = np.where(mask)
+    x0 = int(center[0] - mask.shape[1] // 2)
+    y0 = int(center[1] - mask.shape[0] // 2)
+    pixels = image.load()
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        pixels[x0 + x, y0 + y] = color
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for x, y in scene["ornaments"]:
+        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=ORNAMENT)
+
+    center_x, center_y = (int(value) for value in scene["grid_center"])
+    order = list(scene["panel_order"])
+    cluster_width = len(order) * PANEL_SIZE + (len(order) - 1) * PANEL_GAP
+    left = center_x - cluster_width // 2
+    for slot, name in enumerate(order):
+        x0 = left + slot * (PANEL_SIZE + PANEL_GAP)
+        y0 = center_y - PANEL_SIZE // 2
+        draw.rectangle((x0, y0, x0 + PANEL_SIZE - 1, y0 + PANEL_SIZE - 1), outline=PANEL, width=1)
+        bits = scene["reference_bits"] if name == "reference" else scene["candidate_bits"][name]
+        mask = _transform(_pattern_mask(bits), int(scene["transform_codes"][name]))
+        ink = REFERENCE if name == "reference" else COLORS[name]
+        _paste_mask(image, mask, (x0 + PANEL_SIZE // 2, center_y), ink)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    reference = _canonical(scene["reference_bits"])
+    matches = [
+        color
+        for color, bits in scene["candidate_bits"].items()
+        if _canonical(bits) == reference
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one matching bendprint, found {matches}")
+    return matches[0]
+
+
+def margin(scene: dict) -> float:
+    reference = scene["reference_bits"]
+    winner = analytic_gold(scene)
+    runner = max(
+        _shape_similarity(reference, bits)
+        for color, bits in scene["candidate_bits"].items()
+        if color != winner
+    )
+    return 1.0 - runner
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 0.08
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["transform_codes"] = {
+        name: int(code) + 8 for name, code in scene["transform_codes"].items()
+    }
+    return [("dihedral_code_period_plus_eight", twin)]

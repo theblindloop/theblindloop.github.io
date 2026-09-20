@@ -1,0 +1,166 @@
+"""Independent pixel-only inverse for the connected bead chain."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+# This fixed palette is the only visual prior used by the inverse. It mirrors
+# the public renderer palette, but the inverse never imports or calls it.
+_PALETTE = np.asarray(
+    [
+        (250, 247, 240),  # background
+        (30, 67, 102),  # route and rack
+        (222, 126, 24),  # stations
+        (125, 78, 158),  # finish
+        (201, 65, 69),  # red bead
+        (25, 132, 82),  # green bead
+        (48, 102, 177),  # blue bead
+        (155, 164, 172),  # distractor
+    ],
+    dtype=np.float32,
+)
+_COLORS = ("red", "green", "blue")
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    distances = ((array[:, :, None, :] - _PALETTE[None, None, :, :]) ** 2).sum(axis=3)
+    return distances.argmin(axis=2)
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(points) >= minimum:
+            components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _centroid(component: np.ndarray) -> tuple[int, int]:
+    y, x = np.rint(component.mean(axis=0)).astype(int)
+    return int(y), int(x)
+
+
+def _distance_map(mask: np.ndarray, seeds: np.ndarray) -> np.ndarray:
+    distances = np.full(mask.shape, -1, dtype=np.int32)
+    queue: deque[tuple[int, int]] = deque()
+    for y, x in seeds:
+        y, x = int(y), int(x)
+        if mask[y, x] and distances[y, x] < 0:
+            distances[y, x] = 0
+            queue.append((y, x))
+    height, width = mask.shape
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                ny, nx = y + dy, x + dx
+                if (
+                    0 <= ny < height
+                    and 0 <= nx < width
+                    and mask[ny, nx]
+                    and distances[ny, nx] < 0
+                ):
+                    distances[ny, nx] = distances[y, x] + 1
+                    queue.append((ny, nx))
+    return distances
+
+
+def _station_operation(component: np.ndarray) -> int:
+    """Infer triangle orientation from its centroid relative to its bbox."""
+    ys = component[:, 0].astype(float)
+    xs = component[:, 1].astype(float)
+    bbox_center_x = (float(xs.min()) + float(xs.max())) / 2.0
+    skew = float(xs.mean() - bbox_center_x)
+    if abs(skew) < 0.4:
+        raise ValueError("station orientation is ambiguous")
+    # A left-pointing triangle has its broad base on the right, hence a
+    # positive centroid skew. Operation 0 swaps the top pair.
+    return 0 if skew > 0.0 else 1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover initial order, station order, and adjacent swaps from pixels."""
+    labels = _labels(image)
+    station_mask = labels == 2
+    finish_mask = labels == 3
+    traversable = np.isin(labels, (1, 2, 3))
+
+    stations = _components(station_mask, minimum=20)
+    finishes = _components(finish_mask, minimum=25)
+    trace_parts = _components(traversable, minimum=120)
+    if len(stations) != 6:
+        raise ValueError("expected six separate triangular stations")
+    if len(finishes) != 1:
+        raise ValueError("finish marker is missing or merged")
+    if len(trace_parts) != 1:
+        raise ValueError("connected trace is missing or broken")
+
+    trace = trace_parts[0]
+    min_x = int(trace[:, 1].min())
+    start_seeds = trace[trace[:, 1] == min_x]
+    distances = _distance_map(traversable, start_seeds)
+    if np.any(distances[trace[:, 0], trace[:, 1]] < 0):
+        raise ValueError("trace contains unreachable pixels")
+    finish_centroid = _centroid(finishes[0])
+    if finish_centroid[1] <= min_x:
+        raise ValueError("finish endpoint is unresolved")
+
+    ordered: list[tuple[int, np.ndarray]] = []
+    for component in stations:
+        component_distances = distances[component[:, 0], component[:, 1]]
+        if np.any(component_distances < 0):
+            raise ValueError("station is not on the connected trace")
+        ordered.append((int(component_distances.min()), component))
+    ordered.sort(key=lambda item: item[0])
+    if any(right[0] - left[0] < 2 for left, right in zip(ordered, ordered[1:])):
+        raise ValueError("station order is unresolved")
+
+    bead_order: list[tuple[int, str]] = []
+    for index, color in enumerate(_COLORS, start=4):
+        parts = _components(labels == index, minimum=30)
+        if len(parts) != 1:
+            raise ValueError(f"{color} bead is missing or duplicated")
+        bead_order.append((_centroid(parts[0])[0], color))
+    bead_order.sort(key=lambda item: item[0])
+    if [row[0] for row in bead_order] != sorted(row[0] for row in bead_order):
+        raise ValueError("initial bead order is ambiguous")
+    order = [color for _, color in bead_order]
+
+    for _, component in ordered:
+        operation = _station_operation(component)
+        if operation == 0:
+            order[0], order[1] = order[1], order[0]
+        else:
+            order[1], order[2] = order[2], order[1]
+    return order[-1]

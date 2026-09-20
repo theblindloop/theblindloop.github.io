@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import itertools
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "red": np.array((216, 69, 64), dtype=np.float32),
+    "blue": np.array((50, 113, 210), dtype=np.float32),
+    "yellow": np.array((226, 173, 35), dtype=np.float32),
+}
+SCREEN_RGB = np.array((213, 217, 223), dtype=np.float32)
+TEAL_RGB = np.array((16, 151, 153), dtype=np.float32)
+MIN_MARGIN = 0.40
+
+
+@dataclass(frozen=True)
+class Track:
+    center_y: float
+    slope: float
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(values)
+    if indices.size == 0:
+        return []
+    cuts = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.r_[0, cuts + 1]
+    ends = np.r_[cuts, len(indices) - 1]
+    return [(int(indices[a]), int(indices[b])) for a, b in zip(starts, ends)]
+
+
+def _screen_bounds(arr: np.ndarray) -> list[tuple[int, int]]:
+    distance = np.linalg.norm(arr.astype(np.float32) - SCREEN_RGB, axis=2)
+    mask = distance < 28.0
+    columns = mask.sum(axis=0) > arr.shape[0] * 0.45
+    bounds = [(a, b) for a, b in _runs(columns) if b - a > 35]
+    if len(bounds) != 2:
+        raise ValueError(f"expected two occluding screens, found {len(bounds)}")
+    return bounds
+
+
+def _row_centers(column: np.ndarray) -> list[float]:
+    groups = [(a, b) for a, b in _runs(column) if b - a + 1 >= 3]
+    return [(a + b) / 2.0 for a, b in groups]
+
+
+def _tracks(mask: np.ndarray, xs: range, center_x: float) -> list[Track]:
+    samples: list[tuple[float, list[float]]] = []
+    for x in xs:
+        centers = _row_centers(mask[35:-35, x])
+        centers = [value + 35.0 for value in centers]
+        if len(centers) == 3:
+            samples.append((float(x), sorted(centers)))
+    if len(samples) < 7:
+        raise ValueError("insufficient visible tangent evidence")
+    x_values = np.array([item[0] for item in samples], dtype=np.float64)
+    result = []
+    for rank in range(3):
+        y_values = np.array([item[1][rank] for item in samples], dtype=np.float64)
+        slope, intercept = np.polyfit(x_values, y_values, 1)
+        result.append(Track(float(slope * center_x + intercept), float(slope)))
+    return result
+
+
+def _match(left: list[Track], right: list[Track]) -> tuple[list[int], float, float]:
+    ranked = []
+    for assignment in itertools.permutations(range(3)):
+        cost = sum(
+            abs(left[i].center_y - right[j].center_y) / 24.0
+            + 3.0 * abs(left[i].slope - right[j].slope)
+            for i, j in enumerate(assignment)
+        )
+        ranked.append((float(cost), list(assignment)))
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1], ranked[0][0], ranked[1][0] - ranked[0][0]
+
+
+def _colored_terminals(arr: np.ndarray) -> list[str]:
+    cropped = arr[:, int(arr.shape[1] * 0.90) :, :].astype(np.float32)
+    found = []
+    for name, rgb in PALETTE.items():
+        mask = np.linalg.norm(cropped - rgb, axis=2) < 45.0
+        ys, xs = np.nonzero(mask)
+        if len(xs) < 80:
+            raise ValueError(f"missing {name} terminal")
+        found.append((float(ys.mean()), name))
+    found.sort()
+    return [name for _, name in found]
+
+
+def continuation_diagnostics(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"))
+    screen_bounds = _screen_bounds(arr)
+    black = (arr.max(axis=2) < 95) & ((arr.max(axis=2) - arr.min(axis=2)) < 35)
+    mappings = []
+    gaps = []
+    best_costs = []
+    for left_edge, right_edge in screen_bounds:
+        center_x = (left_edge + right_edge) / 2.0
+        left_tracks = _tracks(black, range(max(1, left_edge - 18), left_edge - 3), center_x)
+        right_tracks = _tracks(black, range(right_edge + 4, min(arr.shape[1] - 1, right_edge + 19)), center_x)
+        mapping, best, gap = _match(left_tracks, right_tracks)
+        mappings.append(mapping)
+        gaps.append(gap)
+        best_costs.append(best)
+
+    teal_distance = np.linalg.norm(arr.astype(np.float32) - TEAL_RGB, axis=2)
+    teal_y, teal_x = np.nonzero(teal_distance < 45.0)
+    if len(teal_x) < 30:
+        raise ValueError("missing teal source marker")
+    marker_y = float(teal_y.mean())
+    start_column = black[:, 60:90].any(axis=1)
+    lane_centers = [(a + b) / 2.0 for a, b in _runs(start_column) if b - a + 1 >= 3]
+    if len(lane_centers) != 3:
+        raise ValueError("cannot recover three source lanes")
+    start_lane = int(np.argmin([abs(y - marker_y) for y in lane_centers]))
+    terminal_lane = start_lane
+    for mapping in mappings:
+        terminal_lane = mapping[terminal_lane]
+    terminal_colors = _colored_terminals(arr)
+    return {
+        "decision": terminal_colors[terminal_lane],
+        "margin": float(min(gaps)),
+        "screen_gaps": gaps,
+        "best_costs": best_costs,
+        "mappings": mappings,
+        "start_lane": start_lane,
+        "terminal_lane": terminal_lane,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    try:
+        diagnostics = continuation_diagnostics(image)
+    except (ValueError, IndexError, np.linalg.LinAlgError):
+        return "abstain"
+    if diagnostics["margin"] < MIN_MARGIN:
+        return "abstain"
+    return str(diagnostics["decision"])

@@ -1,0 +1,209 @@
+"""Pixel-only decision arm for hatch_conjunction_panel.
+
+The arm receives one rasterized image and nothing else. It segments coloured
+ink by saturation, isolates the lone key figure above the row of panels, splits
+the row into its five panels and each panel into its four figures by empty-ink
+gaps, then measures two visible attributes per figure: the translation-aligned
+overlap of its filled outline with the key's outline, and the direction of its
+interior stripes. The reported panel is the one holding the figure that agrees
+with the key on both attributes; near-tied scenes abstain.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+AMBIGUOUS = "ambiguous"
+PANELS = 5
+SATURATION = 40
+MAX_SHIFT = 6
+EROSION = 4
+QUARANTINE_MARGIN = 0.07
+DIRECTIONS = (0, 45, 90, 135)
+# stripe direction -> pixel shift (dy, dx) that runs *along* the stripes
+_ALONG = {0: (0, 1), 90: (1, 0), 45: (-1, 1), 135: (1, 1)}
+
+
+def _ink(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB")).astype(np.int16)
+    return (array.max(axis=2) - array.min(axis=2)) >= SATURATION
+
+
+def _bands(flags: np.ndarray) -> list:
+    out = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            out.append((start, index))
+            start = None
+    if start is not None:
+        out.append((start, len(flags)))
+    return out
+
+
+def _split_by_largest_gaps(bands: list, groups: int) -> list:
+    """Group consecutive column bands into `groups` clusters at the widest gaps."""
+    if len(bands) < groups:
+        return []
+    gaps = sorted(
+        range(1, len(bands)),
+        key=lambda i: bands[i][0] - bands[i - 1][1],
+        reverse=True,
+    )
+    cuts = sorted(gaps[: groups - 1])
+    out = []
+    start = 0
+    for cut in cuts + [len(bands)]:
+        out.append(bands[start:cut])
+        start = cut
+    return out
+
+
+def _fill_silhouette(mask: np.ndarray) -> np.ndarray:
+    """Filled outline: everything not reachable from the border through gaps."""
+    height, width = mask.shape
+    padded = np.zeros((height + 2, width + 2), dtype=bool)
+    padded[1:-1, 1:-1] = mask
+    outside = np.zeros_like(padded)
+    stack = [(0, 0)]
+    outside[0, 0] = True
+    while stack:
+        y, x = stack.pop()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < padded.shape[0] and 0 <= nx < padded.shape[1]:
+                if not outside[ny, nx] and not padded[ny, nx]:
+                    outside[ny, nx] = True
+                    stack.append((ny, nx))
+    return (~outside)[1:-1, 1:-1]
+
+
+def _erode(mask: np.ndarray, rounds: int) -> np.ndarray:
+    out = mask
+    for _ in range(rounds):
+        shrunk = out.copy()
+        shrunk[1:, :] &= out[:-1, :]
+        shrunk[:-1, :] &= out[1:, :]
+        shrunk[:, 1:] &= out[:, :-1]
+        shrunk[:, :-1] &= out[:, 1:]
+        out = shrunk
+    return out
+
+
+def _stripe_direction(ink: np.ndarray, body: np.ndarray) -> int:
+    """Direction whose along-stripe shift disturbs the interior ink least."""
+    interior = _erode(body, EROSION)
+    if np.count_nonzero(interior) < 40:
+        interior = body
+    best_dir, best_cost = None, None
+    for direction in DIRECTIONS:
+        dy, dx = _ALONG[direction]
+        shifted_ink = np.roll(np.roll(ink, dy, axis=0), dx, axis=1)
+        valid = interior & np.roll(np.roll(interior, dy, axis=0), dx, axis=1)
+        total = np.count_nonzero(valid)
+        if not total:
+            continue
+        cost = np.count_nonzero((ink != shifted_ink) & valid) / total
+        if best_cost is None or cost < best_cost:
+            best_dir, best_cost = direction, cost
+    return best_dir if best_dir is not None else DIRECTIONS[0]
+
+
+def _direction_agreement(first: int, second: int) -> float:
+    delta = abs(int(first) - int(second)) % 180
+    delta = min(delta, 180 - delta)
+    return 1.0 - delta / 90.0
+
+
+def _overlap(first: np.ndarray, second: np.ndarray) -> float:
+    """Best translation-aligned intersection over union of two silhouettes."""
+    height = max(first.shape[0], second.shape[0]) + 2 * MAX_SHIFT + 2
+    width = max(first.shape[1], second.shape[1]) + 2 * MAX_SHIFT + 2
+    def place(mask, dy=0, dx=0):
+        canvas = np.zeros((height, width), dtype=bool)
+        top = (height - mask.shape[0]) // 2 + dy
+        left = (width - mask.shape[1]) // 2 + dx
+        canvas[top : top + mask.shape[0], left : left + mask.shape[1]] = mask
+        return canvas
+    fixed = place(first)
+    best = 0.0
+    for dy in range(-MAX_SHIFT, MAX_SHIFT + 1):
+        for dx in range(-MAX_SHIFT, MAX_SHIFT + 1):
+            moved = place(second, dy, dx)
+            union = np.count_nonzero(fixed | moved)
+            if union:
+                best = max(best, np.count_nonzero(fixed & moved) / union)
+    return best
+
+
+def _crop(ink: np.ndarray, rows: tuple, cols: tuple) -> np.ndarray:
+    tile = ink[rows[0] : rows[1], cols[0] : cols[1]]
+    row_flags = tile.any(axis=1)
+    col_flags = tile.any(axis=0)
+    r0, r1 = int(np.argmax(row_flags)), len(row_flags) - int(np.argmax(row_flags[::-1]))
+    c0, c1 = int(np.argmax(col_flags)), len(col_flags) - int(np.argmax(col_flags[::-1]))
+    return tile[r0:r1, c0:c1]
+
+
+def _figures(ink: np.ndarray) -> tuple:
+    """Key tile plus, for each of the five panels, the tiles of its figures."""
+    row_bands = _bands(ink.any(axis=1))
+    if len(row_bands) < 2:
+        return None, []
+    key_rows, panel_rows = row_bands[0], row_bands[1:]
+    key_cols = _bands(ink[key_rows[0] : key_rows[1]].any(axis=0))
+    if len(key_cols) != 1:
+        return None, []
+    key_tile = _crop(ink, key_rows, key_cols[0])
+
+    lower = np.zeros_like(ink)
+    for start, end in panel_rows:
+        lower[start:end] = ink[start:end]
+    column_bands = _bands(lower.any(axis=0))
+    clusters = _split_by_largest_gaps(column_bands, PANELS)
+    if len(clusters) != PANELS:
+        return None, []
+
+    panels = []
+    for cluster in clusters:
+        left = cluster[0][0]
+        right = cluster[-1][1]
+        tiles = []
+        for rows in panel_rows:
+            strip = np.zeros_like(ink)
+            strip[rows[0] : rows[1], left:right] = ink[rows[0] : rows[1], left:right]
+            for cols in _bands(strip.any(axis=0)):
+                tiles.append(_crop(strip, rows, cols))
+        panels.append(tiles)
+    return key_tile, panels
+
+
+def decision_from_image(image: Image.Image) -> str:
+    ink = _ink(image)
+    key_tile, panels = _figures(ink)
+    if key_tile is None or len(panels) != PANELS:
+        return AMBIGUOUS
+    if any(len(tiles) < 2 for tiles in panels):
+        return AMBIGUOUS
+
+    key_body = _fill_silhouette(key_tile)
+    key_direction = _stripe_direction(key_tile, key_body)
+
+    scores = []
+    for tiles in panels:
+        best = 0.0
+        for tile in tiles:
+            body = _fill_silhouette(tile)
+            score = 0.5 * _overlap(body, key_body) + 0.5 * _direction_agreement(
+                _stripe_direction(tile, body), key_direction
+            )
+            best = max(best, score)
+        scores.append(best)
+
+    order = sorted(range(PANELS), key=lambda i: -scores[i])
+    if scores[order[0]] - scores[order[1]] < QUARANTINE_MARGIN:
+        return AMBIGUOUS
+    return f"panel-{order[0] + 1}"

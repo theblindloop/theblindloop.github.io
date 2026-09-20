@@ -1,0 +1,160 @@
+"""Independent pixel-only inverse for the complementary stencil.
+
+This module intentionally repeats only the public visual constants and its own
+shape templates. It receives a final RGB image, segments colored fiducials,
+recovers each plate's visible crop, applies the declared pixelwise maximum, and
+classifies the normalized recovered mask.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+ROLE_COLORS = (
+    (220, 45, 45),
+    (35, 105, 220),
+    (30, 160, 92),
+    (184, 56, 184),
+)
+MARKER_GAP = 8
+MARKER_SIZE = 16
+_RESAMPLE = getattr(Image, "Resampling", Image).BILINEAR
+_LABELS = ("ring", "cross", "diamond", "zigzag")
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, tuple[int, int, int, int]]]:
+    remaining = mask.copy()
+    height, width = remaining.shape
+    found: list[tuple[int, tuple[int, int, int, int]]] = []
+    while True:
+        locations = np.argwhere(remaining)
+        if len(locations) == 0:
+            break
+        sy, sx = (int(locations[0, 0]), int(locations[0, 1]))
+        remaining[sy, sx] = False
+        queue: deque[tuple[int, int]] = deque([(sy, sx)])
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and remaining[ny, nx]:
+                    remaining[ny, nx] = False
+                    queue.append((ny, nx))
+        ys = [item[0] for item in pixels]
+        xs = [item[1] for item in pixels]
+        found.append((len(pixels), (min(xs), min(ys), max(xs) + 1, max(ys) + 1)))
+    return found
+
+
+def _plate_from_group(group: list[tuple[int, tuple[int, int, int, int]]], size: tuple[int, int]) -> np.ndarray:
+    if len(group) != 4:
+        raise ValueError("each colored fiducial group must contain four marks")
+    boxes = [box for _, box in group]
+    mid_x = sum((box[0] + box[2]) / 2.0 for box in boxes) / 4.0
+    mid_y = sum((box[1] + box[3]) / 2.0 for box in boxes) / 4.0
+    left = [box for box in boxes if (box[0] + box[2]) / 2.0 < mid_x]
+    right = [box for box in boxes if (box[0] + box[2]) / 2.0 >= mid_x]
+    top = [box for box in boxes if (box[1] + box[3]) / 2.0 < mid_y]
+    bottom = [box for box in boxes if (box[1] + box[3]) / 2.0 >= mid_y]
+    if len(left) != 2 or len(right) != 2 or len(top) != 2 or len(bottom) != 2:
+        raise ValueError("fiducials do not form a four-corner rectangle")
+    x = max(box[2] for box in left) + MARKER_GAP
+    y = max(box[3] for box in top) + MARKER_GAP
+    right_edge = min(box[0] for box in right) - MARKER_GAP
+    bottom_edge = min(box[1] for box in bottom) - MARKER_GAP
+    side = min(right_edge - x, bottom_edge - y)
+    if side < 64 or side != right_edge - x or side != bottom_edge - y:
+        raise ValueError("corner marks do not enclose a square raster")
+    width, height = size
+    if x < 0 or y < 0 or x + side > width or y + side > height:
+        raise ValueError("recovered plate lies outside the image")
+    return np.asarray((x, y, side), dtype=np.int32)
+
+
+def _find_plates(image: Image.Image) -> list[np.ndarray]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    groups: list[list[tuple[int, tuple[int, int, int, int]]]] = []
+    for color in ROLE_COLORS:
+        distance = np.sqrt(np.sum((arr - np.asarray(color, dtype=np.float32)) ** 2, axis=2))
+        comps = [(area, box) for area, box in _components(distance < 18.0) if 150 <= area <= 350]
+        if len(comps) == 4:
+            groups.append(comps)
+    if len(groups) != 2:
+        raise ValueError(f"expected two four-mark plate groups, found {len(groups)}")
+    size = (image.width, image.height)
+    plates = [_plate_from_group(group, size) for group in groups]
+    if plates[0][2] != plates[1][2]:
+        raise ValueError("plate sizes disagree")
+    return plates
+
+
+def _glyph_template(label: str, size: int = 160) -> np.ndarray:
+    image = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(image)
+    width = 18
+
+    def point(u: float, v: float) -> tuple[int, int]:
+        return int(round(u * size)), int(round(v * size))
+
+    if label == "ring":
+        draw.ellipse((point(0.20, 0.20), point(0.80, 0.80)), outline=255, width=width)
+    elif label == "cross":
+        draw.line([point(0.18, 0.50), point(0.82, 0.50)], fill=255, width=width)
+        draw.line([point(0.50, 0.18), point(0.50, 0.82)], fill=255, width=width)
+    elif label == "diamond":
+        points = [point(0.50, 0.16), point(0.84, 0.50), point(0.50, 0.84), point(0.16, 0.50)]
+        draw.line(points + [points[0]], fill=255, width=width, joint="curve")
+    elif label == "zigzag":
+        points = [point(0.16, 0.68), point(0.33, 0.32), point(0.50, 0.68), point(0.67, 0.32), point(0.84, 0.68)]
+        draw.line(points, fill=255, width=width, joint="curve")
+    else:
+        raise ValueError(label)
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _normalize_mask(mask: np.ndarray, side: int = 96) -> np.ndarray:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 20:
+        raise ValueError("recovered stencil contains too little dark evidence")
+    cropped = mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+    image = Image.fromarray(np.uint8(cropped) * 255, mode="L")
+    return np.asarray(image.resize((side, side), _RESAMPLE), dtype=np.float32) / 255.0
+
+
+def _template_patch(label: str, side: int = 96) -> np.ndarray:
+    template = _glyph_template(label)
+    return _normalize_mask(template > 0.35, side=side)
+
+
+def _classify(recovered: np.ndarray) -> str:
+    values = recovered.astype(np.float32)
+    low = float(values.min())
+    high = float(np.percentile(values, 99.0))
+    threshold = (low + high) / 2.0
+    mask = values < threshold
+    patch = _normalize_mask(mask)
+    scores = {
+        label: float(np.mean((patch - _template_patch(label)) ** 2)) for label in _LABELS
+    }
+    ordered = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    best, runner_up = ordered[0], ordered[1]
+    if runner_up[1] - best[1] < 0.005:
+        raise ValueError("stencil symbol is ambiguous")
+    return best[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return only the symbol recovered from the final PNG pixels."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    plates = _find_plates(image)
+    crops = []
+    for x, y, side in plates:
+        gray = arr[int(y) : int(y + side), int(x) : int(x + side), 0]
+        crops.append(gray)
+    recovered = np.maximum(crops[0], crops[1])
+    return _classify(recovered)

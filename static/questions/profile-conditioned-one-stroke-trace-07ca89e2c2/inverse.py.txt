@@ -1,0 +1,151 @@
+"""Pixel-only inverse arm for the one-stroke trace world.
+
+Receives a rasterised PNG and nothing else: no latent scene, no renderer state,
+no analytic gold.  It segments hub ink and wire ink by colour, rebuilds the
+hub/wire incidence graph from connected components, splits it into the three
+drawn networks and reports which network has an Eulerian trail.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Dict, List, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+
+WIRE_REFERENCE = (106, 106, 114)
+HUB_REFERENCE = (30, 30, 36)
+COLOR_TOLERANCE = 26
+MIN_HUB_AREA = 60
+MIN_WIRE_AREA = 40
+INCIDENCE_SLACK = 9.0
+SLOT_NAMES = ("left", "centre", "right")
+ABSTAIN = "abstain"
+
+
+def _mask(pixels: np.ndarray, reference: Sequence[int]) -> np.ndarray:
+    delta = np.abs(pixels.astype(np.int16) - np.array(reference, dtype=np.int16))
+    return delta.max(axis=2) <= COLOR_TOLERANCE
+
+
+def _label(mask: np.ndarray) -> List[np.ndarray]:
+    """Run-based union-find labelling with 8-connectivity; returns pixel index arrays."""
+    height, width = mask.shape
+    parent: List[int] = []
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    previous: List[Tuple[int, int, int]] = []
+    runs: List[Tuple[int, int, int, int]] = []
+    for y in range(height):
+        row = mask[y]
+        if not row.any():
+            previous = []
+            continue
+        indices = np.flatnonzero(row)
+        breaks = np.flatnonzero(np.diff(indices) > 1)
+        starts = np.concatenate(([indices[0]], indices[breaks + 1]))
+        ends = np.concatenate((indices[breaks], [indices[-1]]))
+        current: List[Tuple[int, int, int]] = []
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            label = len(parent)
+            parent.append(label)
+            runs.append((y, start, end, label))
+            for pstart, pend, plabel in previous:
+                if start - 1 <= pend and end + 1 >= pstart:
+                    union(label, plabel)
+            current.append((start, end, label))
+        previous = current
+
+    groups: Dict[int, List[Tuple[int, int, int]]] = {}
+    for y, start, end, label in runs:
+        groups.setdefault(find(label), []).append((y, start, end))
+
+    components: List[np.ndarray] = []
+    for spans in groups.values():
+        xs: List[np.ndarray] = []
+        ys: List[np.ndarray] = []
+        for y, start, end in spans:
+            span = np.arange(start, end + 1)
+            xs.append(span)
+            ys.append(np.full(span.shape, y))
+        components.append(np.stack([np.concatenate(ys), np.concatenate(xs)], axis=1))
+    return components
+
+
+def _graph_components(count: int, edges: Sequence[Tuple[int, int]]) -> List[List[int]]:
+    parent = list(range(count))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    buckets: Dict[int, List[int]] = {}
+    for node in range(count):
+        buckets.setdefault(find(node), []).append(node)
+    return list(buckets.values())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    pixels = np.asarray(image.convert("RGB"))
+
+    hub_blobs = [blob for blob in _label(_mask(pixels, HUB_REFERENCE)) if len(blob) >= MIN_HUB_AREA]
+    wire_blobs = [
+        blob for blob in _label(_mask(pixels, WIRE_REFERENCE)) if len(blob) >= MIN_WIRE_AREA
+    ]
+    if len(hub_blobs) < 6 or not wire_blobs:
+        return ABSTAIN
+
+    centers = np.array([blob.mean(axis=0)[::-1] for blob in hub_blobs])  # (x, y)
+    radii = np.array([math.sqrt(len(blob) / math.pi) for blob in hub_blobs])
+
+    edges: List[Tuple[int, int]] = []
+    for blob in wire_blobs:
+        points = blob[:, ::-1].astype(np.float64)  # (x, y)
+        touching: List[int] = []
+        for index, center in enumerate(centers):
+            distance = np.hypot(points[:, 0] - center[0], points[:, 1] - center[1]).min()
+            if distance <= radii[index] + INCIDENCE_SLACK:
+                touching.append(index)
+        if len(touching) != 2:
+            return ABSTAIN
+        edges.append((touching[0], touching[1]))
+
+    degree = [0] * len(centers)
+    for a, b in edges:
+        if a == b:
+            return ABSTAIN
+        degree[a] += 1
+        degree[b] += 1
+    if any(value == 0 for value in degree):
+        return ABSTAIN
+
+    groups = _graph_components(len(centers), edges)
+    if len(groups) != 3:
+        return ABSTAIN
+    groups.sort(key=lambda members: float(np.mean(centers[members, 0])))
+
+    traceable = []
+    for slot, members in enumerate(groups):
+        odd = sum(1 for node in members if degree[node] % 2 == 1)
+        if odd in (0, 2):
+            traceable.append(SLOT_NAMES[slot])
+    if len(traceable) != 1:
+        return ABSTAIN
+    return traceable[0]

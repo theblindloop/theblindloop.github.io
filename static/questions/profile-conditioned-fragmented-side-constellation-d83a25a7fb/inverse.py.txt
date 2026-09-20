@@ -1,0 +1,139 @@
+"""Independent pixel-only inverse for fragmented polygon supports.
+
+This module receives one PIL image. It thresholds dark ink, reconstructs each
+dash as a connected component, fits its principal line by PCA, groups dashes
+that lie on the same infinite line, and classifies only the group count.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+SIDE_OPTIONS = (3, 4, 5, 6)
+EXPECTED_DASHES = 60
+
+
+def _dark_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    luminance = 0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]
+    return luminance < 135.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    components: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        queue = deque([(int(y0), int(x0))])
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((x, y))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= 8:
+            components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _line_feature(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    center = points.mean(axis=0)
+    centered = points - center
+    covariance = centered.T @ centered / max(1, len(points))
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    direction = direction / np.linalg.norm(direction)
+    residual = float(math.sqrt(max(float(np.min(values)), 0.0)))
+    return center, direction, residual
+
+
+def _angle_distance(a: np.ndarray, b: np.ndarray) -> float:
+    return math.acos(min(1.0, abs(float(np.dot(a, b)))))
+
+
+def _same_support(
+    left: tuple[np.ndarray, np.ndarray, float],
+    right: tuple[np.ndarray, np.ndarray, float],
+) -> bool:
+    c1, d1, _ = left
+    c2, d2, _ = right
+    # Individual short dashes have quantized PCA angles. Twenty degrees is
+    # generous to that raster error yet far below the 60-degree minimum turn.
+    if _angle_distance(d1, d2) > math.radians(20.0):
+        return False
+    delta = c2 - c1
+    distance1 = abs(float(delta[0] * d1[1] - delta[1] * d1[0]))
+    distance2 = abs(float(delta[0] * d2[1] - delta[1] * d2[0]))
+    return max(distance1, distance2) <= 4.0
+
+
+def _support_groups(features: list[tuple[np.ndarray, np.ndarray, float]]) -> list[list[int]]:
+    count = len(features)
+    neighbors = [set() for _ in range(count)]
+    for left in range(count):
+        for right in range(left + 1, count):
+            if _same_support(features[left], features[right]):
+                neighbors[left].add(right)
+                neighbors[right].add(left)
+    groups: list[list[int]] = []
+    unseen = set(range(count))
+    while unseen:
+        start = min(unseen)
+        stack = [start]
+        unseen.remove(start)
+        group = []
+        while stack:
+            current = stack.pop()
+            group.append(current)
+            for nxt in sorted(neighbors[current]):
+                if nxt in unseen:
+                    unseen.remove(nxt)
+                    stack.append(nxt)
+        groups.append(sorted(group))
+    return groups
+
+
+def analyze(image: Image.Image) -> dict:
+    components = _components(_dark_mask(image))
+    if not 56 <= len(components) <= 64:
+        raise ValueError(f"expected about {EXPECTED_DASHES} dash components, found {len(components)}")
+    features = [_line_feature(points) for points in components]
+    if any(residual > 2.5 for _, _, residual in features):
+        raise ValueError("a dark component is not a line-like dash")
+    groups = _support_groups(features)
+    support_count = len(groups)
+    if support_count not in SIDE_OPTIONS:
+        raise ValueError(f"ambiguous support count {support_count}")
+    expected_group_size = EXPECTED_DASHES / support_count
+    group_deviation = max(abs(len(group) - expected_group_size) for group in groups)
+    if group_deviation > 1.0:
+        raise ValueError("support groups do not form a balanced regular-polygon trace")
+    scores = {str(option): float(abs(support_count - option)) for option in SIDE_OPTIONS}
+    ranked = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    runner_up_margin = ranked[1][1] - ranked[0][1]
+    return {
+        "decision": str(support_count),
+        "dash_count": len(components),
+        "support_count": support_count,
+        "group_sizes": sorted(len(group) for group in groups),
+        "scores": scores,
+        "runner_up_margin": float(runner_up_margin),
+        "max_line_residual": round(max(value[2] for value in features), 6),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return analyze(image)["decision"]

@@ -1,0 +1,147 @@
+"""Independent pixel-only inverse arm for the cyclic phase-orientation register.
+
+Receives only the final PNG. From the raster alone it:
+  1. segments the panel frames by their gray border color;
+  2. recovers panel order (left to right);
+  3. reads each panel's arrow-head color and resolves its direction from the
+     head centroid relative to the panel center;
+  4. reads each inter-panel operator glyph by its fill color (red circle =
+     rotate clockwise +1, blue square = rotate counterclockwise -1);
+  5. composes the sequence from the marked start orientation and returns the
+     final state (modulo the closed 4-direction loop).
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+INK = (0, 0, 0)
+CW_COLOR = (210, 40, 40)
+CCW_COLOR = (40, 60, 210)
+RING_MARK = (240, 150, 20)
+BORDER = (200, 200, 200)
+HEAD_COLOR = (170, 40, 170)
+
+PALETTE = [BG, INK, CW_COLOR, CCW_COLOR, RING_MARK, BORDER, HEAD_COLOR]
+_BG, _INK, _CW, _CCW, _RING, _BRD, _HEAD = range(7)
+MIN_PANELS = 4
+WINDOW = 4
+DIR_VECS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+DIR_LABELS = ["east", "south", "west", "north"]
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected panel structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """8-connected components of a boolean mask; returns pixel coordinate lists."""
+    visited = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.nonzero(mask)
+    comps = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if visited[y, x]:
+            continue
+        points = []
+        queue = deque([(y, x)])
+        visited[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < mask.shape[0]
+                        and 0 <= nx < mask.shape[1]
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        comps.append(points)
+    return comps
+
+
+def _bbox(points) -> tuple[int, int, int, int]:
+    ys = [p[0] for p in points]
+    xs = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _direction(labels: np.ndarray, cx: int, cy: int, box) -> int:
+    x0, y0, x1, y1 = box
+    # Restrict the arrow-head search to the current panel frame (plus a small
+    # margin) so other panels' heads do not pollute this panel's centroid.
+    sy0 = max(0, y0 - 2)
+    sy1 = min(labels.shape[0], y1 + 3)
+    sx0 = max(0, x0 - 2)
+    sx1 = min(labels.shape[1], x1 + 3)
+    ys, xs = np.nonzero(labels[sy0:sy1, sx0:sx1] == _HEAD)
+    ys = ys + sy0
+    xs = xs + sx0
+    if len(xs) < 3:
+        raise UnreadableImageError("no arrow head component found within panel")
+    hy = int(round(ys.mean()))
+    hx = int(round(xs.mean()))
+    dx = hx - cx
+    dy = hy - cy
+    if abs(dx) >= abs(dy):
+        return 0 if dx > 0 else 2
+    return 1 if dy > 0 else 3
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+
+    frames = []
+    for points in _components(labels == _BRD):
+        if len(points) < 40:
+            continue
+        frames.append(_bbox(points))
+    frames.sort(key=lambda box: box[0])  # left-to-right panel order
+    if len(frames) < MIN_PANELS:
+        raise UnreadableImageError(f"found {len(frames)} panels; expected >= {MIN_PANELS}")
+
+    centers = [((x0 + x1) // 2, (y0 + y1) // 2) for (x0, y0, x1, y1) in frames]
+    directions = [_direction(labels, cx, cy, box) for (cx, cy), box in zip(centers, frames)]
+
+    ops = []
+    for i in range(len(frames) - 1):
+        _, _, rx, _ = frames[i]
+        lx, _, _, _ = frames[i + 1]
+        x0 = max(0, rx + 1)
+        x1 = min(labels.shape[1], lx)
+        y0 = max(0, centers[i][1] - 30)
+        y1 = min(labels.shape[0], centers[i][1] + 30)
+        region = labels[y0:y1, x0:x1]
+        red = int((region == _CW).sum())
+        blue = int((region == _CCW).sum())
+        ops.append(1 if red > blue else -1)
+    if len(ops) < len(directions) - 1:
+        raise UnreadableImageError("not enough operator glyphs detected")
+
+    composed = directions[0]
+    final_drawn = directions[-1]
+    for op in ops:
+        composed = (composed + op) % 4
+    if composed != final_drawn:
+        raise UnreadableImageError("operator composition disagrees with drawn final arrow")
+    return DIR_LABELS[composed]

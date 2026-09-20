@@ -1,0 +1,209 @@
+"""Deterministic renderer and analytic arm for One-Tile Fault Line.
+
+Each scene is a compact 24-cell polyomino drawn as equal outlined square tiles.
+The two answer classes are controlled to share a 6x6 extent, one enclosed grid
+hole, the same tile count, perimeter, and degree histogram.  They differ only
+in whether their side-adjacency graph has an articulation vertex.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import deque
+
+from PIL import Image, ImageDraw
+
+WIDTH = 384
+HEIGHT = 384
+GRID_SIDE = 6
+OUTLINE_WIDTH = 2
+MIN_CELL_SIZE = 24
+BACKGROUND = [250, 249, 245]
+DECORATION_COLOR = [207, 213, 213]
+PALETTES = (
+    ([18, 126, 133], [21, 52, 61]),
+    ([24, 112, 143], [25, 48, 67]),
+    ([22, 145, 126], [25, 58, 58]),
+)
+
+# All eight templates have 24 cells, all six rows and columns, one grid hole,
+# minimum degree two, and degree multiset 2x12, 3x10, 4x2.  The first bank has
+# no articulation vertex; the second bank has one or two.
+ROBUST_TEMPLATES = (
+    ((0, 1), (0, 2), (1, 1), (1, 2), (1, 4), (1, 5), (2, 0), (2, 1),
+     (2, 2), (2, 3), (2, 4), (2, 5), (3, 0), (3, 3), (3, 4), (3, 5),
+     (4, 0), (4, 3), (4, 4), (4, 5), (5, 0), (5, 1), (5, 2), (5, 3)),
+    ((0, 3), (0, 4), (0, 5), (1, 3), (1, 5), (2, 1), (2, 2), (2, 3),
+     (2, 5), (3, 1), (3, 2), (3, 5), (4, 0), (4, 1), (4, 2), (4, 3),
+     (4, 4), (4, 5), (5, 0), (5, 1), (5, 2), (5, 3), (5, 4), (5, 5)),
+    ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (1, 3), (1, 4),
+     (2, 0), (2, 1), (2, 3), (2, 4), (3, 0), (3, 3), (3, 4), (3, 5),
+     (4, 0), (4, 2), (4, 3), (4, 4), (4, 5), (5, 0), (5, 1), (5, 2)),
+    ((0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (1, 3), (1, 4), (2, 0),
+     (2, 1), (2, 3), (2, 4), (3, 0), (3, 1), (3, 4), (3, 5), (4, 1),
+     (4, 3), (4, 4), (4, 5), (5, 1), (5, 2), (5, 3), (5, 4), (5, 5)),
+)
+
+ARTICULATION_TEMPLATES = (
+    ((0, 4), (0, 5), (1, 2), (1, 3), (1, 4), (1, 5), (2, 1), (2, 2),
+     (2, 4), (2, 5), (3, 1), (3, 2), (3, 3), (3, 4), (4, 0), (4, 1),
+     (4, 3), (4, 4), (4, 5), (5, 0), (5, 1), (5, 3), (5, 4), (5, 5)),
+    ((0, 4), (0, 5), (1, 1), (1, 2), (1, 4), (1, 5), (2, 1), (2, 2),
+     (2, 3), (2, 4), (3, 1), (3, 4), (3, 5), (4, 0), (4, 1), (4, 2),
+     (4, 3), (4, 4), (4, 5), (5, 0), (5, 1), (5, 2), (5, 3), (5, 4)),
+    ((0, 4), (0, 5), (1, 2), (1, 3), (1, 4), (1, 5), (2, 0), (2, 1),
+     (2, 2), (2, 3), (2, 4), (3, 0), (3, 1), (3, 4), (4, 0), (4, 1),
+     (4, 2), (4, 4), (4, 5), (5, 1), (5, 2), (5, 3), (5, 4), (5, 5)),
+    ((0, 0), (0, 1), (0, 4), (0, 5), (1, 0), (1, 1), (1, 3), (1, 4),
+     (1, 5), (2, 0), (2, 1), (2, 3), (2, 5), (3, 1), (3, 2), (3, 3),
+     (3, 4), (3, 5), (4, 1), (4, 2), (4, 3), (4, 4), (5, 1), (5, 2)),
+)
+
+
+def _rng(seed: int, salt: int) -> random.Random:
+    return random.Random((int(seed) * 0x9E3779B1 + salt) & 0xFFFFFFFF)
+
+
+def _dihedral(cells: tuple[tuple[int, int], ...], code: int) -> list[list[int]]:
+    points = list(cells)
+    if code >= 4:
+        points = [(row, GRID_SIDE - 1 - col) for row, col in points]
+    for _ in range(code % 4):
+        points = [(col, GRID_SIDE - 1 - row) for row, col in points]
+    return [[row, col] for row, col in sorted(points)]
+
+
+def _connected(cells: set[tuple[int, int]], removed: tuple[int, int] | None = None) -> bool:
+    remaining = set(cells)
+    if removed is not None:
+        remaining.discard(removed)
+    if not remaining:
+        return True
+    start = next(iter(remaining))
+    seen = {start}
+    queue: deque[tuple[int, int]] = deque([start])
+    while queue:
+        row, col = queue.popleft()
+        for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if neighbor in remaining and neighbor not in seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+    return len(seen) == len(remaining)
+
+
+def _articulation_cells(raw_cells: list[list[int]]) -> list[tuple[int, int]]:
+    cells = {(int(row), int(col)) for row, col in raw_cells}
+    if not _connected(cells):
+        return []
+    return sorted(cell for cell in cells if not _connected(cells, cell))
+
+
+def sample_scene(seed: int) -> dict:
+    """Return a balanced scene with class-independent visible nuisances."""
+
+    has_cut = bool(int(seed) & 1)
+    shape_rng = _rng(seed, 0xA341316C)
+    style_rng = _rng(seed, 0xC8013EA4)
+    position_rng = _rng(seed, 0xAD90777D)
+    decoration_rng = _rng(seed, 0x7E95761E)
+    bank = ARTICULATION_TEMPLATES if has_cut else ROBUST_TEMPLATES
+    cells = _dihedral(bank[shape_rng.randrange(len(bank))], style_rng.randrange(8))
+    cell_size = (26, 28, 30)[style_rng.randrange(3)]
+    mosaic_size = GRID_SIDE * cell_size
+    origin_x = position_rng.randint(40, WIDTH - mosaic_size - 40)
+    origin_y = position_rng.randint(40, HEIGHT - mosaic_size - 40)
+    tile_color, line_color = PALETTES[style_rng.randrange(len(PALETTES))]
+
+    decorations: list[list[int | str]] = []
+    target_count = 5 + decoration_rng.randrange(3)
+    for _ in range(target_count * 60):
+        if len(decorations) >= target_count:
+            break
+        kind = "disk" if decoration_rng.randrange(2) else "square"
+        size = decoration_rng.randint(7, 12)
+        x = decoration_rng.randint(14, WIDTH - size - 15)
+        y = decoration_rng.randint(14, HEIGHT - size - 15)
+        if not (
+            x + size < origin_x - 18
+            or x > origin_x + mosaic_size + 18
+            or y + size < origin_y - 18
+            or y > origin_y + mosaic_size + 18
+        ):
+            continue
+        decorations.append([kind, x, y, size])
+    if len(decorations) != target_count:
+        raise RuntimeError("could not place remote decorations")
+
+    return {
+        "cells": cells,
+        "origin": [origin_x, origin_y],
+        "cell_size": cell_size,
+        "tile_color": list(tile_color),
+        "line_color": list(line_color),
+        "background": list(BACKGROUND),
+        "decoration_color": list(DECORATION_COLOR),
+        "decorations": decorations,
+        "width": WIDTH,
+        "height": HEIGHT,
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Render every public scene field without embedding answer metadata."""
+
+    width = int(scene["width"])
+    height = int(scene["height"])
+    background = tuple(int(value) for value in scene["background"])
+    tile_color = tuple(int(value) for value in scene["tile_color"])
+    line_color = tuple(int(value) for value in scene["line_color"])
+    decoration_color = tuple(int(value) for value in scene["decoration_color"])
+    origin_x, origin_y = (int(value) for value in scene["origin"])
+    cell_size = int(scene["cell_size"])
+    cells = [[int(value) for value in pair] for pair in scene["cells"]]
+
+    image = Image.new("RGB", (width, height), background)
+    draw = ImageDraw.Draw(image)
+    for kind, x, y, size in scene["decorations"]:
+        box = (int(x), int(y), int(x) + int(size), int(y) + int(size))
+        if kind == "disk":
+            draw.ellipse(box, fill=decoration_color)
+        elif kind == "square":
+            draw.rectangle(box, fill=decoration_color)
+        else:
+            raise ValueError(f"unknown decoration {kind!r}")
+
+    for row, col in cells:
+        x0 = origin_x + col * cell_size
+        y0 = origin_y + row * cell_size
+        draw.rectangle(
+            (x0, y0, x0 + cell_size - 1, y0 + cell_size - 1),
+            fill=tile_color,
+            outline=line_color,
+            width=OUTLINE_WIDTH,
+        )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return "yes" if _articulation_cells(scene["cells"]) else "no"
+
+
+def margin(scene: dict) -> float:
+    """Pixel clearance between opposite visible sides of a tile interior."""
+
+    return float(int(scene["cell_size"]) - 2 * OUTLINE_WIDTH)
+
+
+def is_quarantined(scene: dict) -> bool:
+    cells = {(int(row), int(col)) for row, col in scene["cells"]}
+    return (
+        int(scene["cell_size"]) < MIN_CELL_SIZE
+        or len(cells) != 24
+        or not _connected(cells)
+        or any(not (0 <= row < GRID_SIDE and 0 <= col < GRID_SIDE) for row, col in cells)
+    )
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    # All stored nuisance values affect pixels, so no pixel-identical alias is declared.
+    return []

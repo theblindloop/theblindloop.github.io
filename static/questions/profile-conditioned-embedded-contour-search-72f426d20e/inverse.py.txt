@@ -1,0 +1,109 @@
+"""Independent PNG-only inverse arm for exact-contour search.
+
+The implementation knows only the public palette/role contract. It discovers
+the orange reference and all four navy candidate components, crops each to its
+own visible bounds (translation normalization), scores every binary contour,
+and requires a unique winner with a runner-up mismatch margin.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_ORANGE = np.array((224, 110, 35), dtype=np.int16)
+_NAVY = np.array((23, 74, 116), dtype=np.int16)
+_LABELS = ("A", "B", "C", "D")
+_COLOR_TOLERANCE = 12
+_MIN_COMPONENT_PIXELS = 180
+_MIN_RUNNER_UP_GAP = 20
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _color_mask(array: np.ndarray, color: np.ndarray) -> np.ndarray:
+    # int32 avoids overflow when squared (255**2 exceeds signed int16).
+    delta = array.astype(np.int32) - color.astype(np.int32)
+    return np.sqrt(np.sum(delta * delta, axis=2)) <= _COLOR_TOLERANCE
+
+
+def _components(mask: np.ndarray):
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        pixels = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) >= _MIN_COMPONENT_PIXELS:
+            found.append(np.asarray(pixels, dtype=np.int32))
+    return found
+
+
+def _component_crop(component: np.ndarray) -> np.ndarray:
+    y0, x0 = component.min(axis=0)
+    y1, x1 = component.max(axis=0)
+    crop = np.zeros((int(y1 - y0 + 1), int(x1 - x0 + 1)), dtype=bool)
+    crop[component[:, 0] - y0, component[:, 1] - x0] = True
+    return crop
+
+
+def _centroid(component: np.ndarray):
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _panel_order(components):
+    if len(components) != 4:
+        raise OracleAbstention(f"expected four navy contour components, found {len(components)}")
+    by_y = sorted(components, key=lambda item: _centroid(item)[1])
+    upper = sorted(by_y[:2], key=lambda item: _centroid(item)[0])
+    lower = sorted(by_y[2:], key=lambda item: _centroid(item)[0])
+    return upper + lower
+
+
+def _mismatch(left: np.ndarray, right: np.ndarray) -> int:
+    height = max(left.shape[0], right.shape[0])
+    width = max(left.shape[1], right.shape[1])
+    a = np.zeros((height, width), dtype=bool)
+    b = np.zeros((height, width), dtype=bool)
+    a[: left.shape[0], : left.shape[1]] = left
+    b[: right.shape[0], : right.shape[1]] = right
+    return int(np.count_nonzero(a ^ b))
+
+
+def measure_candidates(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"))
+    references = _components(_color_mask(array, _ORANGE))
+    if len(references) != 1:
+        raise OracleAbstention(f"expected one orange reference contour, found {len(references)}")
+    candidates = _panel_order(_components(_color_mask(array, _NAVY)))
+    reference_crop = _component_crop(references[0])
+    scores = [_mismatch(reference_crop, _component_crop(component)) for component in candidates]
+    ordering = sorted(range(4), key=lambda index: (scores[index], index))
+    best, runner_up = ordering[0], ordering[1]
+    gap = scores[runner_up] - scores[best]
+    if scores.count(scores[best]) != 1 or gap < _MIN_RUNNER_UP_GAP:
+        raise OracleAbstention(f"ambiguous contour match: scores={scores}, runner_up_gap={gap}")
+    return {
+        "decision": _LABELS[best],
+        "mismatch_scores": dict(zip(_LABELS, scores, strict=True)),
+        "runner_up_gap_pixels": int(gap),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure_candidates(image)["decision"])

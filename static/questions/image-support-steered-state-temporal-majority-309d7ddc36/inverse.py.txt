@@ -1,0 +1,129 @@
+"""Independent pixel-only inverse for tracked-state majority scenes."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 512
+HEIGHT = 512
+CARD_W = 62
+CARD_H = 112
+PANEL_SLOTS = ((145, 118), (220, 118), (295, 118), (180, 285), (255, 285))
+ROW_OFFSETS = (36, 56, 76, 96)
+CARD_FILL = np.asarray((246, 248, 250), dtype=np.int16)
+BORDER = np.asarray((40, 48, 62), dtype=np.int16)
+RING = np.asarray((226, 44, 145), dtype=np.uint8)
+
+DIGITS = {
+    1: ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    2: ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    3: ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    4: ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    5: ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+}
+
+
+class PixelParseError(ValueError):
+    """The raster does not expose one unambiguous temporal replay."""
+
+
+def _dark(rgb: np.ndarray) -> bool:
+    return bool(int(rgb.max()) < 170)
+
+
+def _read_number(array: np.ndarray, x: int, y: int) -> int:
+    observed = []
+    x0, y0 = x + 8, y + 5
+    for row in range(7):
+        for col in range(5):
+            observed.append(_dark(array[y0 + row * 2 + 1, x0 + col * 2 + 1]))
+    best_number = None
+    best_score = -1
+    for number, pattern in DIGITS.items():
+        expected = [value == "1" for line in pattern for value in line]
+        score = sum(actual == want for actual, want in zip(observed, expected, strict=True))
+        if score > best_score:
+            best_number, best_score = number, score
+    if best_number is None or best_score < 32:
+        raise PixelParseError(f"snapshot number at {(x, y)} is unreadable")
+    return int(best_number)
+
+
+def _check_card(array: np.ndarray, x: int, y: int) -> None:
+    edges = np.concatenate(
+        tuple(
+            part.reshape(-1, 3)
+            for part in (
+                array[y : y + 2, x : x + CARD_W],
+                array[y + CARD_H - 2 : y + CARD_H, x : x + CARD_W],
+                array[y : y + CARD_H, x : x + 2],
+                array[y : y + CARD_H, x + CARD_W - 2 : x + CARD_W],
+            )
+        ),
+        axis=0,
+    )
+    dark = np.max(edges.astype(np.int16), axis=1) < 150
+    if int(dark.sum()) < 170:
+        raise PixelParseError("snapshot card border is incomplete")
+
+
+def _ring_score(array: np.ndarray, cx: int, cy: int) -> int:
+    crop = array[cy - 16 : cy + 17, cx - 16 : cx + 17]
+    mask = np.all(crop == RING, axis=2)
+    yy, xx = np.indices(mask.shape)
+    distance = np.hypot(xx - 16, yy - 16)
+    return int((mask & (distance >= 10.0) & (distance <= 15.0)).sum())
+
+
+def _read_shape(array: np.ndarray, cx: int, cy: int) -> str:
+    crop = array[cy - 10 : cy + 11, cx - 10 : cx + 11].astype(np.int16)
+    delta = np.linalg.norm(crop - CARD_FILL, axis=2)
+    mask = delta > 45.0
+    area = int(mask.sum())
+    widths = mask.sum(axis=1)
+    max_width = int(widths.max()) if len(widths) else 0
+    if area < 125 or max_width < 12:
+        raise PixelParseError("state glyph is missing or merged")
+    if max_width >= 19:
+        return "diamond"
+    if max_width <= 18:
+        return "circle"
+    raise PixelParseError("state glyph shape is ambiguous")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the majority state from the PNG alone."""
+    image = image.convert("RGB")
+    if image.size != (WIDTH, HEIGHT):
+        raise PixelParseError(f"unexpected raster size {image.size}")
+    array = np.asarray(image, dtype=np.uint8)
+
+    numbered_slots: dict[int, int] = {}
+    for slot_index, (x, y) in enumerate(PANEL_SLOTS):
+        _check_card(array, x, y)
+        number = _read_number(array, x, y)
+        if number in numbered_slots:
+            raise PixelParseError("snapshot numbers are duplicated")
+        numbered_slots[number] = slot_index
+    if set(numbered_slots) != {1, 2, 3, 4, 5}:
+        raise PixelParseError("snapshot numbers are incomplete")
+
+    first_slot = numbered_slots[1]
+    first_x, first_y = PANEL_SLOTS[first_slot]
+    cx = first_x + 39
+    ring_scores = [_ring_score(array, cx, first_y + offset) for offset in ROW_OFFSETS]
+    ring_rows = [row for row, score in enumerate(ring_scores) if score >= 30]
+    if len(ring_rows) != 1:
+        raise PixelParseError("initial tracking ring is missing or ambiguous")
+    tracked_row = ring_rows[0]
+
+    circle_count = 0
+    for number in (1, 2, 3, 4, 5):
+        x, y = PANEL_SLOTS[numbered_slots[number]]
+        shape = _read_shape(array, x + 39, y + ROW_OFFSETS[tracked_row])
+        circle_count += int(shape == "circle")
+    diamond_count = 5 - circle_count
+    if circle_count == diamond_count:
+        raise PixelParseError("temporal majority is tied")
+    return "circle" if circle_count > diamond_count else "diamond"

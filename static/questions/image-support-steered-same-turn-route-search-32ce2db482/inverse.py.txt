@@ -1,0 +1,149 @@
+"""Independent image-only tracer for same-turn route search."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BLACK = np.array((34, 38, 43), dtype=np.int16)
+CYAN = np.array((0, 170, 190), dtype=np.int16)
+COLORS = {
+    "red": np.array((214, 58, 63), dtype=np.int16),
+    "gold": np.array((222, 159, 24), dtype=np.int16),
+    "violet": np.array((132, 82, 190), dtype=np.int16),
+    "green": np.array((42, 151, 91), dtype=np.int16),
+}
+
+
+def _mask(arr: np.ndarray, color: np.ndarray, tolerance: int = 8) -> np.ndarray:
+    return np.max(np.abs(arr.astype(np.int16) - color), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    found: list[np.ndarray] = []
+    height, width = mask.shape
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            yy, xx = queue.popleft()
+            points.append((yy, xx))
+            for dy, dx in ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)):
+                ny, nx = yy + dy, xx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            found.append(np.asarray(points, dtype=np.float64))
+    return found
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _distance(component: np.ndarray, point: tuple[float, float]) -> float:
+    x, y = point
+    return float(np.sqrt(((component[:, 1] - x) ** 2 + (component[:, 0] - y) ** 2).min()))
+
+
+def _pixel_path(component: np.ndarray, start: tuple[float, float], end: tuple[float, float]) -> np.ndarray:
+    pixels = {(int(y), int(x)) for y, x in component}
+    def nearest(point: tuple[float, float]) -> tuple[int, int]:
+        x, y = point
+        return min(pixels, key=lambda p: (p[1] - x) ** 2 + (p[0] - y) ** 2)
+    source, target = nearest(start), nearest(end)
+    queue = deque([source])
+    parent = {source: None}
+    while queue:
+        current = queue.popleft()
+        if current == target:
+            break
+        y, x = current
+        for nxt in ((y-1,x),(y+1,x),(y,x-1),(y,x+1),(y-1,x-1),(y-1,x+1),(y+1,x-1),(y+1,x+1)):
+            if nxt in pixels and nxt not in parent:
+                parent[nxt] = current
+                queue.append(nxt)
+    if target not in parent:
+        raise ValueError("disconnected route")
+    path = []
+    point = target
+    while point is not None:
+        path.append((float(point[1]), float(point[0])))
+        point = parent[point]
+    path.reverse()
+    return np.asarray(path, dtype=np.float64)
+
+
+def _rdp(points: np.ndarray, epsilon: float) -> np.ndarray:
+    if len(points) <= 2:
+        return points
+    a, b = points[0], points[-1]
+    vector = b - a
+    norm = float(np.linalg.norm(vector))
+    distances = np.linalg.norm(points - a, axis=1) if norm == 0 else np.abs(vector[0] * (points[:,1]-a[1]) - vector[1] * (points[:,0]-a[0])) / norm
+    index = int(np.argmax(distances))
+    if float(distances[index]) <= epsilon:
+        return np.asarray([a, b])
+    left = _rdp(points[:index+1], epsilon)
+    right = _rdp(points[index:], epsilon)
+    return np.vstack((left[:-1], right))
+
+
+def _turn_signs(component: np.ndarray, start: tuple[float, float], end: tuple[float, float]) -> list[int]:
+    path = _pixel_path(component, start, end)
+    simplified = _rdp(path, 1.05)
+    if len(simplified) != 6:
+        simplified = _rdp(path, 1.55)
+    if len(simplified) != 6:
+        raise ValueError(f"route has {len(simplified)-1} recoverable runs")
+    vectors = np.diff(simplified, axis=0)
+    if float(np.min(np.linalg.norm(vectors, axis=1))) < 20:
+        raise ValueError("degenerate run")
+    signs = []
+    for first, second in zip(vectors, vectors[1:]):
+        cross = float(first[0] * second[1] - first[1] * second[0])
+        dot = float(first @ second)
+        if abs(cross) < 0.8 * float(np.linalg.norm(first) * np.linalg.norm(second)) or abs(dot) > 0.2 * float(np.linalg.norm(first) * np.linalg.norm(second)):
+            raise ValueError("corner is not square")
+        signs.append(1 if cross > 0 else -1)
+    return signs
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    routes = _components(_mask(arr, BLACK), minimum=120)
+    starts = [_centroid(c) for c in _components(_mask(arr, CYAN), minimum=40)]
+    if not routes or not starts:
+        raise ValueError("no recoverable routes or starts")
+    scores: list[tuple[int, str]] = []
+    used: set[int] = set()
+    for name, rgb in COLORS.items():
+        terminals = _components(_mask(arr, rgb), minimum=40)
+        if len(terminals) != 1:
+            continue
+        endpoint = _centroid(terminals[0])
+        distances = [_distance(route, endpoint) for route in routes]
+        route_index = int(np.argmin(distances))
+        if distances[route_index] > 10 or route_index in used:
+            continue
+        used.add(route_index)
+        start_distances = [_distance(routes[route_index], point) for point in starts]
+        start_index = int(np.argmin(start_distances))
+        if start_distances[start_index] > 10:
+            continue
+        try:
+            signs = _turn_signs(routes[route_index], starts[start_index], endpoint)
+        except ValueError:
+            continue
+        scores.append((max(signs.count(1), signs.count(-1)), name))
+    scores.sort(reverse=True)
+    if not scores or scores[0][0] != 4 or (len(scores) > 1 and scores[1][0] >= 4):
+        raise ValueError(f"no unique same-turn route: {scores}")
+    return scores[0][1]

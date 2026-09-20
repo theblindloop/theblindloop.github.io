@@ -1,0 +1,116 @@
+"""Independent pixel-only inverse for cable winding."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+COLORS = {
+    "background": (248, 247, 243),
+    "cable": (47, 55, 64),
+    "hub": (12, 15, 18),
+    "green": (24, 157, 91),
+    "orange": (230, 126, 34),
+    "purple": (137, 78, 193),
+    "blue": (39, 112, 205),
+}
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    # int32 avoids overflow when three squared 8-bit channel differences add.
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    palette = np.asarray(list(COLORS.values()), dtype=np.int32)
+    distance = ((array[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=3)
+    return distance.argmin(axis=2)
+
+
+def _components(mask: np.ndarray, minimum: int = 12) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        pixels = []
+        while queue:
+            py, px = queue.popleft()
+            pixels.append((py, px))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == dx == 0:
+                        continue
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            groups.append(np.asarray(pixels, dtype=np.float64))
+    return groups
+
+
+def _centroid(component: np.ndarray) -> np.ndarray:
+    # Components store y,x; return x,y.
+    return component.mean(axis=0)[::-1]
+
+
+def _winding_from_pixels(component: np.ndarray, hub: np.ndarray) -> float:
+    xy = component[:, ::-1]
+    radius = np.hypot(xy[:, 0] - hub[0], xy[:, 1] - hub[1])
+    angle = np.arctan2(xy[:, 1] - hub[1], xy[:, 0] - hub[0])
+    # Radius grows monotonically from ring to square. Circular means in narrow
+    # radial bins therefore recover the ordered centerline without skeletonizing.
+    bins = np.arange(math.floor(radius.min()) + 2, math.ceil(radius.max()) - 1, 1.0)
+    means = []
+    for lo in bins:
+        chosen = angle[(radius >= lo) & (radius < lo + 1.0)]
+        if len(chosen) >= 4:
+            means.append(math.atan2(float(np.sin(chosen).mean()), float(np.cos(chosen).mean())))
+    if len(means) < 10:
+        raise ValueError("cable has too little recoverable radial extent")
+    unwrapped = np.unwrap(np.asarray(means))
+    # Trim edge bins partially occluded by endpoint markers.
+    trim = min(2, max(0, len(unwrapped) // 8))
+    if trim:
+        unwrapped = unwrapped[trim:-trim]
+    return float(unwrapped[-1] - unwrapped[0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    labels = _labels(image)
+    names = list(COLORS)
+    hub_parts = _components(labels == names.index("hub"), minimum=100)
+    if not hub_parts:
+        raise ValueError("black hub not found")
+    hub = _centroid(max(hub_parts, key=len))
+
+    cables = [part for part in _components(labels == names.index("cable"), minimum=350)]
+    if len(cables) != 3:
+        raise ValueError(f"expected three cable components, found {len(cables)}")
+    errors = [abs(_winding_from_pixels(part, hub) + 2.0 * math.pi) for part in cables]
+    winner = int(np.argmin(errors))
+    if sorted(errors)[1] - sorted(errors)[0] < 0.45:
+        raise ValueError("ambiguous winding decision")
+
+    terminal_centers = {}
+    for name in ("orange", "purple", "blue"):
+        parts = _components(labels == names.index(name), minimum=80)
+        if len(parts) != 1:
+            raise ValueError(f"expected one {name} terminal")
+        terminal_centers[name] = _centroid(parts[0])
+    cable_xy = cables[winner][:, ::-1]
+    # The terminal is the colored marker with the smallest distance to any
+    # pixel of the winning component. This binds trace identity to visible ink.
+    distance_by_color = {
+        name: float(np.min(np.hypot(cable_xy[:, 0] - center[0], cable_xy[:, 1] - center[1])))
+        for name, center in terminal_centers.items()
+    }
+    answer = min(distance_by_color, key=distance_by_color.get)
+    ordered = sorted(distance_by_color.values())
+    if ordered[1] - ordered[0] < 8.0:
+        raise ValueError("ambiguous terminal binding")
+    return answer

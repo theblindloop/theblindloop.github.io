@@ -1,0 +1,284 @@
+"""Enclosure-depth comparison world renderer.
+
+A set of k closed black ring loops, all concentric about a shared center, is
+drawn on a white canvas. Two colored dot markers (green and red) appear in the
+white regions that the rings partition.
+
+The "enclosure depth" of a dot is the number of closed loops that enclose it
+(the number of rings with radius strictly larger than the dot's distance from
+the shared center). The question asks which of the two colored dots is enclosed
+by MORE of the closed loops, i.e. which dot sits in the white region of greater
+nesting depth.
+
+Decision: the color of the dot that is enclosed by the greater number of rings.
+
+The scene is a plain dict so the verifier's AST reachability audit is free of
+side effects.
+
+    z = {
+        "width": 400,
+        "height": 400,
+        "background": "white",
+        "rings":   [[cx, cy, r], ...],       # concentric black ring loops (cx,cy shared)
+        "ring_width": 10.0,
+        "dots":    [{"color": "green", "x": .., "y": ..},
+                    {"color": "red",   "x": .., "y": ..}],
+        "dot_radius": 8.0,
+    }
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections.abc import Iterator
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "enclosure_depth_compare-0.4.0"
+
+BLACK = (20, 20, 20)
+GREEN = (0, 128, 0)
+RED = (230, 40, 40)
+WHITE = (255, 255, 255)
+
+RING_WIDTH = 10.0
+RING_HALF = RING_WIDTH / 2.0
+DOT_RADIUS = 8.0
+MIN_R = 36.0               # innermost ring radius
+GAP_MIN = 28.0             # minimum gap between consecutive ring radii
+GAP_MAX = 46.0
+MAX_R_CAP = 150.0
+DOT_CLEAR = 9.0            # dot centroid must clear every ring rim by this many px
+DOT_SEP = 24.0             # min center distance between any two dots
+CANVAS_MARGIN = 18.0
+QUARANTINE_MIN = 6.0       # below this the depth-comparison decision is fragile
+MAX_RINGS = 5
+RING_EST_TOL = 4.0        # pixel-oracle radius/center estimation tolerance
+
+
+def _inside_canvas(x: float, y: float, width: int, height: int) -> bool:
+    return (
+        CANVAS_MARGIN < x < width - CANVAS_MARGIN
+        and CANVAS_MARGIN < y < height - CANVAS_MARGIN
+    )
+
+
+def _depth(dist: float, radii: list[float]) -> int:
+    return sum(1 for r in radii if r > dist)
+
+
+def _clearance(dot: dict, rings: list[list[float]]) -> float:
+    """Min over every (dot, ring) of the radial distance from the dot's centroid
+    to the ring's outer bounding circle, minus a small tolerance for the
+    pixel-oracle's radius estimate. A negative value means the dot is effectively
+    on the rim and is automatically quarantined."""
+    best: float = float("inf")
+    for (cx, cy, r) in rings:
+        d = math.hypot(dot["x"] - cx, dot["y"] - cy)
+        best = min(best, abs(d - r) - RING_EST_TOL)
+    return best
+
+
+def _usable_bands(radii: list[float]) -> list[dict]:
+    """Radial bands available for dots, each with a distinct nesting depth and
+    clipped so a dot placed inside is >= DOT_CLEAR from every ring rim."""
+    r = sorted(radii)
+    k = len(r)
+    bands: list[dict] = []
+    inner_lo = 0.0
+    inner_hi = r[0] - RING_HALF - DOT_CLEAR
+    if inner_hi > inner_lo + 1.0:
+        bands.append({"lo": inner_lo, "hi": inner_hi, "depth": k})
+    for i in range(k - 1):
+        lo = r[i] + RING_HALF + DOT_CLEAR
+        hi = r[i + 1] - RING_HALF - DOT_CLEAR
+        if hi > lo + 1.0:
+            mid = (lo + hi) / 2.0
+            bands.append({"lo": lo, "hi": hi, "depth": _depth(mid, r)})
+    out_lo = r[-1] + RING_HALF + DOT_CLEAR
+    out_hi = MAX_R_CAP + 40.0
+    if out_hi > out_lo + 1.0:
+        bands.append({"lo": out_lo, "hi": out_hi, "depth": 0})
+    return bands
+
+
+def _place_in_band(
+    rng: random.Random,
+    cx: float,
+    cy: float,
+    band: dict,
+    existing: list[dict],
+    width: int,
+    height: int,
+) -> dict | None:
+    (lo, hi) = (band["lo"], band["hi"])
+    if hi < lo:
+        return None
+    for _ in range(600):
+        dist = rng.uniform(lo, hi)
+        angle = rng.uniform(0.0, 2.0 * math.pi)
+        x = cx + dist * math.cos(angle)
+        y = cy + dist * math.sin(angle)
+        if not _inside_canvas(x, y, width, height):
+            continue
+        if any(math.hypot(x - o["x"], y - o["y"]) < DOT_SEP for o in existing):
+            continue
+        return {"x": x, "y": y}
+    return None
+
+
+def sample_scene(
+    rng: random.Random,
+    width: int = 400,
+    height: int = 400,
+) -> dict:
+    """Sample two dots whose depths differ, in concentric rings."""
+    cx = width / 2.0
+    cy = height / 2.0
+
+    k = int(rng.randint(3, MAX_RINGS))
+    radii: list[float] = []
+    r = rng.uniform(MIN_R, MIN_R + 8.0)
+    radii.append(r)
+    for _ in range(k - 1):
+        r += rng.uniform(GAP_MIN, GAP_MAX)
+        radii.append(r)
+    if radii[-1] > MAX_R_CAP:
+        radii[-1] = MAX_R_CAP
+
+    rings = [[cx, cy, rad] for rad in radii]
+
+    bands = _usable_bands(radii)
+    if len(bands) < 2:
+        bands = [
+            {"lo": 0.0, "hi": radii[0] - RING_HALF - DOT_CLEAR, "depth": k},
+            {"lo": radii[-1] + RING_HALF + DOT_CLEAR, "hi": MAX_R_CAP + 20.0, "depth": 0},
+        ]
+
+    ai = int(rng.randrange(len(bands)))
+    bi = int(rng.randrange(len(bands)))
+    while bi == ai:
+        bi = int(rng.randrange(len(bands)))
+    band_a = bands[ai]
+    band_b = bands[bi]
+    deeper_band = band_a if band_a["depth"] > band_b["depth"] else band_b
+    shallower_band = band_b if band_a["depth"] > band_b["depth"] else band_a
+
+    if rng.random() < 0.5:
+        green_band, red_band = deeper_band, shallower_band
+    else:
+        green_band, red_band = shallower_band, deeper_band
+
+    dots: list[dict] = []
+    for color, band in (("green", green_band), ("red", red_band)):
+        placed = None
+        for _ in range(50):
+            placed = _place_in_band(rng, cx, cy, band, dots, width, height)
+            if placed is not None:
+                break
+        if placed is None:
+            placed = {"x": cx + (band["lo"] + 1.0) * math.cos(0.3), "y": cy + (band["lo"] + 1.0) * math.sin(0.3)}
+        placed["color"] = color
+        dots.append(placed)
+
+    return {
+        "width": width,
+        "height": height,
+        "background": "white",
+        "rings": rings,
+        "ring_width": RING_WIDTH,
+        "dots": dots,
+        "dot_radius": DOT_RADIUS,
+    }
+
+
+def _dot_by_color(scene: dict, color: str) -> dict:
+    for dot in scene["dots"]:
+        if dot["color"] == color:
+            return dot
+    raise KeyError(color)
+
+
+def render(scene: dict, supersample: int = 4) -> Image.Image:
+    """Render I = R(z). Deterministic pure function of the scene dict."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    background = scene["background"]
+    rings = scene["rings"]
+    dots = scene["dots"]
+    ring_w = float(scene.get("ring_width", RING_WIDTH))
+    dot_r = float(scene.get("dot_radius", DOT_RADIUS))
+
+    ss = supersample
+    img = Image.new("RGB", (width * ss, height * ss), background)
+    draw = ImageDraw.Draw(img)
+    for (cx, cy, r) in sorted(rings, key=lambda ring: -float(ring[2])):
+        draw.ellipse(
+            [(cx - r) * ss, (cy - r) * ss, (cx + r) * ss, (cy + r) * ss],
+            fill=BLACK,
+        )
+        draw.ellipse(
+            [(cx - (r - ring_w)) * ss, (cy - (r - ring_w)) * ss,
+             (cx + (r - ring_w)) * ss, (cy + (r - ring_w)) * ss],
+            fill=background,
+        )
+    for dot in dots:
+        col = GREEN if dot["color"] == "green" else RED
+        draw.ellipse(
+            [(dot["x"] - dot_r) * ss, (dot["y"] - dot_r) * ss,
+             (dot["x"] + dot_r) * ss, (dot["y"] + dot_r) * ss],
+            fill=col,
+        )
+    if ss > 1:
+        img = img.resize((width, height), Image.LANCZOS)
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return the color of the dot enclosed by more rings (greater depth)."""
+    cx = float(scene["rings"][0][0])
+    cy = float(scene["rings"][0][1])
+    radii = [float(ring[2]) for ring in scene["rings"]]
+
+    def depth(dot: dict) -> int:
+        d = math.hypot(dot["x"] - cx, dot["y"] - cy)
+        return _depth(d, radii)
+
+    names = ("green", "red")
+    d0 = depth(_dot_by_color(scene, names[0]))
+    d1 = depth(_dot_by_color(scene, names[1]))
+    if d0 == d1:
+        return names[0]
+    return names[0] if d0 > d1 else names[1]
+
+
+def margin(scene: dict) -> float:
+    """Robustness margin: the minimum clearance of any dot from a ring rim
+    (the decision depends only on which side of each rim each dot lies)."""
+    rings = scene["rings"]
+    best: float = float("inf")
+    for dot in scene["dots"]:
+        best = min(best, _clearance(dot, rings))
+    for i in range(len(scene["dots"])):
+        for j in range(i + 1, len(scene["dots"])):
+            a = scene["dots"][i]
+            b = scene["dots"][j]
+            best = min(best, math.hypot(a["x"] - b["x"], a["y"] - b["y"]) - 2.0 * DOT_RADIUS)
+    return float(best)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine scenes where a dot sits too close to a ring rim or overlapping
+    another dot, so the depth comparison could flip at pixel scale."""
+    return margin(scene) < QUARANTINE_MIN
+
+
+def latent_symmetries(scene: dict) -> Iterator[dict]:
+    """No nontrivial render symmetry: every ring radius and every dot coordinate
+    directly changes the picture. Swapping the green and red label is a
+    label-transforming relabel, not a pixel-identical transform, and it flips
+    the answer, so it is not a declared label-preserving symmetry. Declared
+    not_applicable.
+    """
+    return iter(())

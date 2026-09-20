@@ -1,0 +1,148 @@
+"""Independent pixel-only inverse for the connected stained graph slab.
+
+The inverse knows only the public raster contract: a large dark carrier, three
+fixed relative cards, five-by-five colored fields, and clockwise candidate
+rotation. It never imports the renderer or receives scene data.
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+import math
+
+import numpy as np
+from PIL import Image
+
+_FRAME = np.asarray((28, 48, 65), dtype=np.float32)
+_CARD = np.asarray((241, 237, 224), dtype=np.float32)
+_BACKGROUND = np.asarray((246, 243, 236), dtype=np.float32)
+_AMBER = np.asarray((236, 166, 54), dtype=np.float32)
+_VIOLET = np.asarray((177, 109, 198), dtype=np.float32)
+
+_WIDTH, _HEIGHT = 960, 640
+_BOARD_W, _BOARD_H = 880, 500
+_GRID = 5
+_CELL = 42
+_CARD_W, _CARD_H = 250, 360
+_CARD_RELS = {"R": (26, 82), "A": (315, 82), "B": (604, 82)}
+_GRID_REL = (20, 86)
+_TOL = 64.0
+_MIN_DARK_PIXELS = 169_000
+
+
+def _near(pixel: np.ndarray, color: np.ndarray, tolerance: float = _TOL) -> bool:
+    return bool(np.linalg.norm(pixel.astype(np.float32) - color) < tolerance)
+
+
+def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise ValueError("connected carrier is missing")
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _locate_board(array: np.ndarray) -> tuple[int, int, int]:
+    dark = np.linalg.norm(array - _FRAME, axis=2) < 70.0
+    x0, y0, x1, y1 = _bbox(dark)
+    if not (870 <= x1 - x0 + 1 <= 890 and 490 <= y1 - y0 + 1 <= 510):
+        raise ValueError("dark carrier has unexpected dimensions")
+    count = int(dark[y0:y1 + 1, x0:x1 + 1].sum())
+    # The carrier is deliberately a visible high-fill object. This guard also
+    # makes destructive ablation of its interior an explicit abstention.
+    if count < _MIN_DARK_PIXELS:
+        raise ValueError("connected carrier is materially incomplete")
+    # Check public carrier points across its broad footprint, not one local
+    # corner. Rounded corners are avoided by the chosen offsets.
+    for rx in (18, _BOARD_W // 2, _BOARD_W - 18):
+        for ry in (18, 58, _BOARD_H - 40, _BOARD_H - 18):
+            if not _near(array[y0 + ry, x0 + rx], _FRAME, 76.0):
+                raise ValueError("carrier evidence is incomplete")
+    return x0, y0, count
+
+
+def _rotate_cw(grid: list[list[tuple[int, int, int]]]) -> list[list[tuple[int, int, int]]]:
+    return [list(row) for row in zip(*grid[::-1])]
+
+
+def _edge_counter(grid: list[list[tuple[int, int, int]]]) -> Counter[tuple[str, tuple[int, int, int], tuple[int, int, int]]]:
+    edges: Counter[tuple[str, tuple[int, int, int], tuple[int, int, int]]] = Counter()
+    for row in range(_GRID):
+        for col in range(_GRID):
+            if col + 1 < _GRID:
+                edges[("E", grid[row][col], grid[row][col + 1])] += 1
+            if row + 1 < _GRID:
+                edges[("S", grid[row][col], grid[row + 1][col])] += 1
+    return edges
+
+
+def _graph_error(left: Counter, right: Counter) -> int:
+    keys = set(left) | set(right)
+    return int(sum(abs(int(left.get(key, 0)) - int(right.get(key, 0))) for key in keys))
+
+
+def _read_field(array: np.ndarray, x0: int, y0: int, *, candidate: bool) -> tuple[list[list[tuple[int, int, int]]], str | None]:
+    x = x0
+    y = y0
+    # Multiple plain card samples make card loss under ablation an abstention,
+    # while avoiding all labels, badges, and graph cells.
+    for rx, ry in ((12, 60), (CARD_W_SAFE - 12, 60), (12, 322), (CARD_W_SAFE - 12, 322)):
+        if not _near(array[y + ry, x + rx], _CARD, 78.0):
+            raise ValueError("field card is missing")
+    gx, gy = x + _GRID_REL[0], y + _GRID_REL[1]
+    grid: list[list[tuple[int, int, int]]] = []
+    for row in range(_GRID):
+        values: list[tuple[int, int, int]] = []
+        for col in range(_GRID):
+            px = gx + col * _CELL + _CELL // 2
+            py = gy + row * _CELL + _CELL // 2
+            pixel = tuple(int(value) for value in array[py, px])
+            if _near(np.asarray(pixel), _CARD, 78.0) or _near(np.asarray(pixel), _FRAME, 78.0) or _near(np.asarray(pixel), _BACKGROUND, 78.0):
+                raise ValueError("colored cell center is unreadable")
+            values.append(pixel)
+        grid.append(values)
+    counts = Counter(pixel for row in grid for pixel in row)
+    if len(counts) != _GRID or sorted(counts.values()) != [_GRID] * _GRID:
+        raise ValueError("field does not expose five connected color parts")
+    badge: str | None = None
+    if candidate:
+        badge_pixel = array[y + 29, x + _CARD_W - 31]
+        amber_distance = float(np.linalg.norm(badge_pixel - _AMBER))
+        violet_distance = float(np.linalg.norm(badge_pixel - _VIOLET))
+        if min(amber_distance, violet_distance) >= 82.0:
+            raise ValueError("candidate badge is unreadable")
+        badge = "amber" if amber_distance < violet_distance else "violet"
+    return grid, badge
+
+
+CARD_W_SAFE = _CARD_W
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the winning visible badge color using only the supplied PNG."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.shape != (_HEIGHT, _WIDTH, 3):
+        raise ValueError("unexpected raster dimensions")
+    x0, y0, _ = _locate_board(array)
+    reference, _ = _read_field(
+        array,
+        x0 + _CARD_RELS["R"][0],
+        y0 + _CARD_RELS["R"][1],
+        candidate=False,
+    )
+    candidates = {}
+    for slot in ("A", "B"):
+        relx, rely = _CARD_RELS[slot]
+        candidates[slot] = _read_field(array, x0 + relx, y0 + rely, candidate=True)
+    reference_edges = _edge_counter(reference)
+    errors = {
+        slot: _graph_error(reference_edges, _edge_counter(_rotate_cw(candidates[slot][0])))
+        for slot in ("A", "B")
+    }
+    if errors["A"] == errors["B"]:
+        raise ValueError("direction-aware graph correspondence is ambiguous")
+    winner = "A" if errors["A"] < errors["B"] else "B"
+    badge = candidates[winner][1]
+    if badge is None:
+        raise ValueError("winning badge is missing")
+    return badge

@@ -1,0 +1,136 @@
+"""Independent pixel-only inverse for normalized box-whisker asymmetry."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+PANELS = ((36, 460), (500, 924))
+ROI_Y = (135, 315)
+MIN_COMPONENT_AREA = 180
+MIN_DECISION_MARGIN = 0.018
+
+
+def _color_mask(rgb: np.ndarray) -> np.ndarray:
+    values = rgb.astype(np.int16)
+    spread = values.max(axis=2) - values.min(axis=2)
+    # Colored glyphs are saturated; the dark labels, frame, axis, and tick text
+    # are intentionally excluded by this mask.
+    return (spread > 48) & (values.max(axis=2) > 105) & (values.min(axis=2) < 205)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int, int]] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(int(y), int(x))])
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) > len(best):
+            best = pixels
+    if len(best) < MIN_COMPONENT_AREA:
+        raise ValueError("colored box plot component is missing or too small")
+    component = np.zeros_like(mask, dtype=bool)
+    ys, xs = zip(*best)
+    component[np.asarray(ys), np.asarray(xs)] = True
+    return component
+
+
+def _longest_run(values: np.ndarray) -> tuple[int, int]:
+    best_start = best_end = -1
+    start = None
+    for index, value in enumerate(values.tolist() + [False]):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            if index - start > best_end - best_start:
+                best_start, best_end = start, index - 1
+            start = None
+    return best_start, best_end
+
+
+def _box_body_run(values: np.ndarray) -> tuple[int, int]:
+    """Join the two high-ink halves split by the dark median stroke."""
+
+    runs: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(values.tolist() + [False]):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            if index - start >= 10:
+                runs.append((start, index - 1))
+            start = None
+    if not runs:
+        return -1, -1
+    best = max(runs, key=lambda run: run[1] - run[0])
+    best_score = -1
+    for first in runs:
+        for second in runs:
+            if second[0] <= first[0]:
+                continue
+            gap = second[0] - first[1] - 1
+            if gap <= 14:
+                score = (first[1] - first[0] + 1) + (second[1] - second[0] + 1)
+                if score > best_score:
+                    best_score = score
+                    best = (first[0], second[1])
+    return best
+
+
+def _recover_panel(rgb: np.ndarray, panel: tuple[int, int]) -> tuple[float, float, float, float]:
+    left, right = panel
+    y0, y1 = ROI_Y
+    crop = _color_mask(rgb[y0:y1, left:right])
+    component = _largest_component(crop)
+    ys, xs = np.nonzero(component)
+    if len(xs) == 0:
+        raise ValueError("colored component is empty")
+    counts = np.bincount(xs, minlength=right - left)
+    min_x = float(xs.min() + left)
+    max_x = float(xs.max() + left)
+    threshold = max(16, int(float(counts.max()) * 0.35))
+    box_start, box_end = _box_body_run(counts >= threshold)
+    if box_start < 0 or box_end - box_start < 34:
+        raise ValueError("box body is not a stable colored run")
+    q1 = float(box_start + left)
+    q3 = float(box_end + left)
+    total = max_x - min_x
+    if total < 120.0 or q3 - q1 < 30.0:
+        raise ValueError("box plot span is too short")
+    if q1 - min_x < 13.0 or max_x - q3 < 13.0:
+        raise ValueError("whisker is too short to measure")
+    return min_x, q1, q3, max_x
+
+
+def _stat(points: tuple[float, float, float, float]) -> float:
+    minimum, q1, q3, maximum = points
+    return abs((q1 - minimum) - (maximum - q3)) / (maximum - minimum)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover both four-breakpoint tail statistics from the final PNG only."""
+
+    rgb = np.asarray(image.convert("RGB"))
+    a_value = _stat(_recover_panel(rgb, PANELS[0]))
+    b_value = _stat(_recover_panel(rgb, PANELS[1]))
+    if abs(a_value - b_value) < MIN_DECISION_MARGIN:
+        raise ValueError("normalized whisker asymmetries are too close to classify")
+    return "A" if a_value > b_value else "B"

@@ -1,0 +1,209 @@
+"""Deterministic connected-dot contour renderer for a global-shape question."""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+
+RENDERER_VERSION = "constellation_outline-0.1.0"
+CANVAS = (320, 240)
+BACKGROUND = (249, 247, 241)
+SHAPES = ("circle", "triangle", "diamond")
+PALETTE = (
+    (25, 75, 96),
+    (105, 43, 87),
+    (42, 105, 76),
+    (133, 69, 30),
+    (56, 62, 126),
+    (105, 78, 34),
+)
+NODE_COUNT = 12
+TARGET_PERIMETER = 2.0 * math.pi
+SUPERSAMPLE = 4
+
+
+def _vertices(label: str) -> list[tuple[float, float]]:
+    if label == "circle":
+        return [
+            (
+                math.cos(-math.pi / 2.0 + 2.0 * math.pi * index / NODE_COUNT),
+                math.sin(-math.pi / 2.0 + 2.0 * math.pi * index / NODE_COUNT),
+            )
+            for index in range(NODE_COUNT)
+        ]
+    if label == "triangle":
+        return [
+            (0.0, -1.0),
+            (math.sqrt(3.0) / 2.0, 0.5),
+            (-math.sqrt(3.0) / 2.0, 0.5),
+        ]
+    if label == "diamond":
+        return [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)]
+    raise ValueError(f"unknown shape {label!r}")
+
+
+def _perimeter(vertices: list[tuple[float, float]]) -> float:
+    return sum(
+        math.hypot(
+            vertices[(index + 1) % len(vertices)][0] - vertices[index][0],
+            vertices[(index + 1) % len(vertices)][1] - vertices[index][1],
+        )
+        for index in range(len(vertices))
+    )
+
+
+def _resample_closed(vertices: list[tuple[float, float]], count: int) -> list[tuple[float, float]]:
+    scale = TARGET_PERIMETER / _perimeter(vertices)
+    scaled = [(x * scale, y * scale) for x, y in vertices]
+    edge_lengths = [
+        math.hypot(
+            scaled[(index + 1) % len(scaled)][0] - scaled[index][0],
+            scaled[(index + 1) % len(scaled)][1] - scaled[index][1],
+        )
+        for index in range(len(scaled))
+    ]
+    total = sum(edge_lengths)
+    points: list[tuple[float, float]] = []
+    edge = 0
+    walked = 0.0
+    for index in range(count):
+        target = total * index / count
+        while edge < len(scaled) - 1 and target > walked + edge_lengths[edge]:
+            walked += edge_lengths[edge]
+            edge += 1
+        start = scaled[edge]
+        end = scaled[(edge + 1) % len(scaled)]
+        length = edge_lengths[edge]
+        fraction = 0.0 if length <= 1e-12 else (target - walked) / length
+        points.append(
+            (
+                start[0] + fraction * (end[0] - start[0]),
+                start[1] + fraction * (end[1] - start[1]),
+            )
+        )
+    return points
+
+
+def _target_points(scene: dict) -> list[tuple[float, float]]:
+    label = str(scene["shape_label"])
+    base = _resample_closed(_vertices(label), NODE_COUNT)
+    angle = float(scene["rotation"])
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    scale = float(scene["scale"])
+    cx = float(scene["cx"])
+    cy = float(scene["cy"])
+    points = []
+    for (x, y), radial_jitter in zip(base, scene["jitter"]):
+        radius = math.hypot(x, y)
+        if radius > 1e-12:
+            amount = float(radial_jitter)
+            x += amount * x / radius
+            y += amount * y / radius
+        points.append(
+            (
+                cx + scale * (cosine * x - sine * y),
+                cy + scale * (sine * x + cosine * y),
+            )
+        )
+    return points
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced scene; the label is independent of nuisances."""
+
+    label = SHAPES[seed % len(SHAPES)]
+    # One nuisance stream is shared by each small seed block so label identity
+    # is counterbalanced against pose, palette, and distractor placement.
+    rng = random.Random((seed // len(SHAPES) + 104729) * 1009)
+    near_boundary = seed % 5 == 0
+    jitter_limit = 0.040 if near_boundary else rng.choice((0.004, 0.007, 0.010))
+    jitter = [round(rng.uniform(-jitter_limit, jitter_limit), 6) for _ in range(NODE_COUNT)]
+    scene = {
+        "shape_label": label,
+        "cx": round(rng.uniform(86.0, 234.0), 3),
+        "cy": round(rng.uniform(70.0, 170.0), 3),
+        "scale": round(rng.uniform(45.0, 55.0), 3),
+        "rotation": round(rng.uniform(0.0, 2.0 * math.pi), 6),
+        "stroke_width": round(rng.choice((2.4, 2.8, 3.2, 3.6)), 3),
+        "dot_radius": round(rng.choice((3.7, 4.2, 4.7)), 3),
+        "jitter": jitter,
+        "foreground": list(PALETTE[rng.randrange(len(PALETTE))]),
+        "distractors": [],
+        "distractor_radius": round(rng.choice((3.0, 3.5, 4.0)), 3),
+    }
+
+    target = _target_points(scene)
+    count = rng.randint(3, 7)
+    distractors: list[dict[str, float]] = []
+    for _ in range(count):
+        for _attempt in range(120):
+            x = rng.uniform(18.0, CANVAS[0] - 18.0)
+            y = rng.uniform(18.0, CANVAS[1] - 18.0)
+            if min(math.hypot(x - px, y - py) for px, py in target) > 22.0:
+                distractors.append({"x": round(x, 3), "y": round(y, 3)})
+                break
+    scene["distractors"] = distractors
+    return scene
+
+
+def render(scene: dict) -> Image.Image:
+    """Render identical colored nodes and lines for every answer class."""
+
+    if str(scene["shape_label"]) not in SHAPES:
+        raise ValueError(f"unknown shape {scene['shape_label']!r}")
+    image = Image.new(
+        "RGB",
+        (CANVAS[0] * SUPERSAMPLE, CANVAS[1] * SUPERSAMPLE),
+        BACKGROUND,
+    )
+    draw = ImageDraw.Draw(image)
+    color = tuple(int(value) for value in scene["foreground"])
+    target = _target_points(scene)
+    scaled_target = [(round(x * SUPERSAMPLE), round(y * SUPERSAMPLE)) for x, y in target]
+    line_width = max(1, round(float(scene["stroke_width"]) * SUPERSAMPLE))
+    draw.line(
+        scaled_target + [scaled_target[0]],
+        fill=color,
+        width=line_width,
+        joint="curve",
+    )
+    radius = float(scene["dot_radius"]) * SUPERSAMPLE
+    for x, y in target:
+        px = x * SUPERSAMPLE
+        py = y * SUPERSAMPLE
+        draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=color)
+    distractor_radius = float(scene["distractor_radius"]) * SUPERSAMPLE
+    for distractor in scene["distractors"]:
+        px = float(distractor["x"]) * SUPERSAMPLE
+        py = float(distractor["y"]) * SUPERSAMPLE
+        draw.ellipse(
+            (px - distractor_radius, py - distractor_radius, px + distractor_radius, py + distractor_radius),
+            fill=color,
+        )
+    return image.resize(CANVAS, Image.Resampling.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["shape_label"])
+
+
+def margin(scene: dict) -> float:
+    """Return a positive proxy for the top-two contour-signature gap."""
+
+    jitter = max(abs(float(value)) for value in scene["jitter"])
+    stroke_penalty = abs(float(scene["stroke_width"]) - 3.0) * 0.002
+    return round(max(0.001, 0.108 - 0.75 * jitter - stroke_penalty), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 0.09
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    # This world has no latent aliases: all answer and nuisance fields are
+    # visibly rendered, so the v0.4 evaluator records latent symmetry as N/A.
+    return []

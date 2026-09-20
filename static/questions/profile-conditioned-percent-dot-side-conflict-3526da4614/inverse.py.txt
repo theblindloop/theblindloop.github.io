@@ -1,0 +1,127 @@
+"""Independent pixel-only inverse for the dot-to-slash half-plane relation."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_DARK_PALETTE = np.array(((38, 43, 52), (50, 49, 67), (38, 55, 52)), dtype=np.int16)
+_DOT_PALETTE = np.array(((31, 137, 171), (211, 83, 58), (126, 88, 177)), dtype=np.int16)
+_TOLERANCE = 31.0
+
+
+class AmbiguousImage(ValueError):
+    """Raised when the divider or the two circular evidence marks are unclear."""
+
+
+def _palette_mask(rgb: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    pixels = rgb.astype(np.int16)
+    delta = pixels[:, :, None, :] - palette[None, None, :, :]
+    distances = np.sqrt(np.sum(delta.astype(np.float32) ** 2, axis=3))
+    return np.min(distances, axis=2) <= _TOLERANCE
+
+
+def _components(mask: np.ndarray, minimum_area: int) -> list[dict]:
+    work = mask.copy()
+    height, width = work.shape
+    found: list[dict] = []
+    while bool(work.any()):
+        y0, x0 = np.argwhere(work)[0]
+        queue = deque([(int(y0), int(x0))])
+        work[y0, x0] = False
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            xs.append(x)
+            ys.append(y)
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and work[yy, xx]:
+                    work[yy, xx] = False
+                    queue.append((yy, xx))
+        if len(xs) >= minimum_area:
+            found.append(
+                {
+                    "left": min(xs),
+                    "right": max(xs),
+                    "top": min(ys),
+                    "bottom": max(ys),
+                    "width": max(xs) - min(xs) + 1,
+                    "height": max(ys) - min(ys) + 1,
+                    "area": len(xs),
+                    "cx": float(sum(xs)) / len(xs),
+                    "cy": float(sum(ys)) / len(ys),
+                }
+            )
+    return sorted(found, key=lambda item: (item["cy"], item["cx"]))
+
+
+def measure_image(image: Image.Image) -> dict:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[0] < 300 or rgb.shape[1] < 360:
+        raise AmbiguousImage("image is too small")
+
+    dots = _components(_palette_mask(rgb, _DOT_PALETTE), 900)
+    if len(dots) != 2:
+        raise AmbiguousImage("exactly two large colored dots were not recovered")
+    for dot in dots:
+        if not (50 <= dot["width"] <= 74 and 50 <= dot["height"] <= 74):
+            raise AmbiguousImage("a colored component is not a plausible dot")
+        aspect = float(dot["width"]) / float(dot["height"])
+        radius = (float(dot["width"]) + float(dot["height"])) / 4.0
+        fill_ratio = float(dot["area"]) / (np.pi * radius * radius)
+        if not 0.90 <= aspect <= 1.11 or not 0.82 <= fill_ratio <= 1.12:
+            raise AmbiguousImage("a colored component is not sufficiently circular")
+
+    slash_mask = _palette_mask(rgb, _DARK_PALETTE)
+    ys, xs = np.nonzero(slash_mask)
+    if len(xs) < 2_500:
+        raise AmbiguousImage("the dark diagonal slash is absent or incomplete")
+    points = np.column_stack((xs.astype(np.float64), ys.astype(np.float64)))
+    center = points.mean(axis=0)
+    covariance = np.cov(points - center, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    direction = eigenvectors[:, int(np.argmax(eigenvalues))]
+    normal = np.array((-direction[1], direction[0]), dtype=np.float64)
+    along_projection = (points - center) @ direction
+    cross_projection = (points - center) @ normal
+    visible_length = float(np.ptp(along_projection))
+    visible_width = float(np.ptp(cross_projection))
+    if visible_length < 225.0 or not 12.0 <= visible_width <= 25.0:
+        raise AmbiguousImage("the dark component is not a long, narrow divider")
+
+    signed_distances: list[float] = []
+    radii: list[float] = []
+    clearances: list[float] = []
+    for dot in dots:
+        dot_center = np.array((dot["cx"], dot["cy"]), dtype=np.float64)
+        signed = float((dot_center - center) @ normal)
+        radius = (float(dot["width"]) + float(dot["height"])) / 4.0
+        clearance = abs(signed) - radius - visible_width / 2.0
+        if clearance < 20.0:
+            raise AmbiguousImage("a dot center is too close to the visible divider boundary")
+        signed_distances.append(signed)
+        radii.append(radius)
+        clearances.append(clearance)
+
+    decision = "yes" if signed_distances[0] * signed_distances[1] < 0.0 else "no"
+    return {
+        "decision": decision,
+        "margin": min(clearances),
+        "signed_distances": signed_distances,
+        "dot_boxes": dots,
+        "slash_center": center.tolist(),
+        "slash_direction": direction.tolist(),
+        "slash_length": visible_length,
+        "slash_width": visible_width,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    try:
+        return str(measure_image(image)["decision"])
+    except (AmbiguousImage, ValueError, IndexError, TypeError, np.linalg.LinAlgError):
+        return "abstain"

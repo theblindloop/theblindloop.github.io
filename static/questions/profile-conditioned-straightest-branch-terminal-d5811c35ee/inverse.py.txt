@@ -1,0 +1,178 @@
+"""Independent pixel-only inverse for straightest-branch routing."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+INK = np.array((34, 37, 42), dtype=np.int16)
+MARKERS = {
+    "start": (35, 171, 96),
+    "junction": (137, 86, 205),
+    "red": (220, 65, 75),
+    "blue": (50, 105, 220),
+    "orange": (238, 145, 35),
+    "cyan": (25, 170, 190),
+}
+TERMINAL_COLORS = ("red", "blue", "orange", "cyan")
+COLOR_TOLERANCE = 48.0
+INK_TOLERANCE = 62.0
+MIN_COMPONENT_PIXELS = 90
+NODE_CLEARANCE = 23.0
+INTERMEDIATE_CLEARANCE = 24.0
+MIN_EDGE_INK_FRACTION = 0.90
+MIN_ORACLE_GAP_DEGREES = 8.0
+
+
+def _components(mask: np.ndarray) -> list[tuple[float, float, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    results: list[tuple[float, float, int]] = []
+    seeds_y, seeds_x = np.nonzero(mask)
+    for sy, sx in zip(seeds_y.tolist(), seeds_x.tolist()):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        count = 0
+        sum_x = 0.0
+        sum_y = 0.0
+        while queue:
+            y, x = queue.popleft()
+            count += 1
+            sum_x += x
+            sum_y += y
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if count >= MIN_COMPONENT_PIXELS:
+            results.append((sum_x / count, sum_y / count, count))
+    return results
+
+
+def _marker_centers(arr: np.ndarray) -> dict[str, tuple[float, float]]:
+    centers: dict[str, tuple[float, float]] = {}
+    for label, rgb in MARKERS.items():
+        delta = arr.astype(np.int32) - np.array(rgb, dtype=np.int32)
+        mask = np.sqrt(np.sum(delta * delta, axis=2)) < COLOR_TOLERANCE
+        components = _components(mask)
+        expected = 3 if label == "junction" else 1
+        if len(components) != expected:
+            raise ValueError(f"expected {expected} {label} marker(s), found {len(components)}")
+        if label == "junction":
+            for index, (x, y, _) in enumerate(sorted(components)):
+                centers[f"junction_{index}"] = (x, y)
+        else:
+            x, y, _ = components[0]
+            centers[label] = (x, y)
+    return centers
+
+
+def _point_segment_distance(
+    point: tuple[float, float], left: tuple[float, float], right: tuple[float, float]
+) -> tuple[float, float]:
+    vx, vy = right[0] - left[0], right[1] - left[1]
+    wx, wy = point[0] - left[0], point[1] - left[1]
+    denom = vx * vx + vy * vy
+    t = (wx * vx + wy * vy) / denom
+    px, py = left[0] + t * vx, left[1] + t * vy
+    return math.hypot(point[0] - px, point[1] - py), t
+
+
+def _has_edge(
+    left_name: str,
+    right_name: str,
+    centers: dict[str, tuple[float, float]],
+    black: np.ndarray,
+) -> bool:
+    left, right = centers[left_name], centers[right_name]
+    length = math.dist(left, right)
+    if length < 2 * NODE_CLEARANCE + 5:
+        return False
+    for name, point in centers.items():
+        if name in {left_name, right_name}:
+            continue
+        distance, t = _point_segment_distance(point, left, right)
+        if 0.07 < t < 0.93 and distance < INTERMEDIATE_CLEARANCE:
+            return False
+
+    count = max(30, int(length * 1.2))
+    lo = NODE_CLEARANCE / length
+    ts = np.linspace(lo, 1.0 - lo, count)
+    xs = np.rint(left[0] + ts * (right[0] - left[0])).astype(int)
+    ys = np.rint(left[1] + ts * (right[1] - left[1])).astype(int)
+    xs = np.clip(xs, 0, black.shape[1] - 1)
+    ys = np.clip(ys, 0, black.shape[0] - 1)
+    return float(black[ys, xs].mean()) >= MIN_EDGE_INK_FRACTION
+
+
+def _graph(
+    centers: dict[str, tuple[float, float]], arr: np.ndarray
+) -> dict[str, list[str]]:
+    delta = arr.astype(np.int32) - INK.astype(np.int32)
+    black = np.sqrt(np.sum(delta * delta, axis=2)) < INK_TOLERANCE
+    names = list(centers)
+    adjacency = {name: [] for name in names}
+    for index, left in enumerate(names):
+        for right in names[index + 1 :]:
+            if _has_edge(left, right, centers, black):
+                adjacency[left].append(right)
+                adjacency[right].append(left)
+    if len(adjacency["start"]) != 1:
+        raise ValueError(f"START degree is {len(adjacency['start'])}, expected 1")
+    for color in TERMINAL_COLORS:
+        if len(adjacency[color]) != 1:
+            raise ValueError(f"{color} terminal degree is {len(adjacency[color])}, expected 1")
+    junctions = [name for name in names if name.startswith("junction_")]
+    if any(len(adjacency[name]) != 3 for name in junctions):
+        raise ValueError("every purple junction must have degree 3")
+    return adjacency
+
+
+def _deviation(incoming: tuple[float, float], outgoing: tuple[float, float]) -> float:
+    a = math.hypot(*incoming)
+    b = math.hypot(*outgoing)
+    cosine = max(-1.0, min(1.0, (incoming[0] * outgoing[0] + incoming[1] * outgoing[1]) / (a * b)))
+    return math.degrees(math.acos(cosine))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the reached terminal color using only RGB pixels."""
+
+    arr = np.asarray(image.convert("RGB"))
+    centers = _marker_centers(arr)
+    adjacency = _graph(centers, arr)
+    previous: str | None = None
+    current = "start"
+    terminal_set = set(TERMINAL_COLORS)
+    for _ in range(len(centers) + 2):
+        if current in terminal_set:
+            return current
+        options = [name for name in adjacency[current] if name != previous]
+        if previous is None:
+            following = options[0]
+        else:
+            if len(options) != 2:
+                raise ValueError(f"visited junction has {len(options)} forward choices")
+            incoming = (
+                centers[current][0] - centers[previous][0],
+                centers[current][1] - centers[previous][1],
+            )
+            scored = []
+            for name in options:
+                outgoing = (
+                    centers[name][0] - centers[current][0],
+                    centers[name][1] - centers[current][1],
+                )
+                scored.append((_deviation(incoming, outgoing), name))
+            scored.sort()
+            if scored[1][0] - scored[0][0] < MIN_ORACLE_GAP_DEGREES:
+                raise ValueError("pixel angular choice is ambiguous")
+            following = scored[0][1]
+        previous, current = current, following
+    raise ValueError("pixel routing did not reach a terminal")

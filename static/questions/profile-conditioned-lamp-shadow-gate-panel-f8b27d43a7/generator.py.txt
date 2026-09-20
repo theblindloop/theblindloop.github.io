@@ -1,0 +1,310 @@
+"""Deterministic sampler and raster renderer for the lamp-shadow gate world.
+
+Every scene is a row of five framed panels.  Each panel draws one point lamp, one
+opaque tilted bar hanging between the lamp and the panel floor, a grey floor rail
+and one coloured gateway segment lying on that rail.  The shadow the lamp casts of
+the bar onto the floor is never drawn: it has to be constructed by projecting the
+bar through the lamp.  In exactly one panel that projected shadow falls entirely
+inside the gateway; in every other panel it spills past a gateway edge.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 976
+HEIGHT = 300
+N_PANELS = 5
+PANEL_W = 180
+PANEL_H = 260
+MARGIN_X = 14
+MARGIN_Y = 20
+PANEL_GAP = 12
+FRAME_PX = 2
+
+LAMP_R = 6
+BAR_HALF_W = 2.5
+FLOOR_HALF_W = 1.0
+DOOR_HALF_W = 3.0
+
+WIN_SLACK_MIN = 11.0
+LOSS_SLACK_MAX = -12.0
+SLACK_TOL = 5.0
+QUARANTINE_MARGIN = 10.0
+
+BACKGROUND = (255, 255, 255)
+FRAME_COLOR = (62, 62, 62)
+FLOOR_COLOR = (168, 168, 168)
+# (lamp, bar, gateway): red-dominant, blue-dominant, green-dominant triples.
+PALETTES = (
+    ((235, 150, 20), (30, 70, 190), (20, 140, 70)),
+    ((214, 110, 30), (60, 60, 200), (30, 150, 90)),
+    ((240, 170, 40), (20, 90, 170), (15, 130, 60)),
+    ((225, 130, 25), (45, 80, 210), (25, 145, 80)),
+)
+
+
+def _panel_box(index: int) -> tuple:
+    x0 = MARGIN_X + index * (PANEL_W + PANEL_GAP)
+    return (x0, MARGIN_Y, x0 + PANEL_W, MARGIN_Y + PANEL_H)
+
+
+def _norm_angle(angle_deg: float) -> float:
+    return round(((float(angle_deg) % 360.0) + 360.0) % 360.0, 6)
+
+
+def bar_corners(cx: float, cy: float, angle_deg: float, half_len: float) -> list:
+    """The four corners of the drawn bar rectangle, in drawing order."""
+    angle = math.radians(_norm_angle(angle_deg))
+    ux, uy = math.cos(angle), math.sin(angle)
+    nx, ny = -uy, ux
+    cx, cy = float(cx), float(cy)
+    half_len = float(half_len)
+    return [
+        (cx + half_len * ux + BAR_HALF_W * nx, cy + half_len * uy + BAR_HALF_W * ny),
+        (cx + half_len * ux - BAR_HALF_W * nx, cy + half_len * uy - BAR_HALF_W * ny),
+        (cx - half_len * ux - BAR_HALF_W * nx, cy - half_len * uy - BAR_HALF_W * ny),
+        (cx - half_len * ux + BAR_HALF_W * nx, cy - half_len * uy + BAR_HALF_W * ny),
+    ]
+
+
+def shadow_span(lamp: list, corners: list, floor_y: float) -> tuple:
+    """Horizontal span the lamp's straight-line shadow of the bar covers on the floor."""
+    lamp_x, lamp_y = float(lamp[0]), float(lamp[1])
+    floor_y = float(floor_y)
+    xs = []
+    for px, py in corners:
+        depth = py - lamp_y
+        if depth <= 1.0:
+            return None
+        xs.append(lamp_x + (px - lamp_x) * (floor_y - lamp_y) / depth)
+    return (min(xs), max(xs))
+
+
+def panel_slack(lamp: list, corners: list, floor_y: float, door: list) -> float:
+    """Smallest clearance in pixels between the shadow span and the gateway edges.
+
+    Positive exactly when the whole shadow lies inside the gateway segment.
+    """
+    span = shadow_span(lamp, corners, floor_y)
+    if span is None:
+        return -1.0e6
+    ends = sorted(float(v) for v in door)
+    return min(span[0] - ends[0], ends[1] - span[1])
+
+
+def bar_span(corners: list) -> tuple:
+    xs = [p[0] for p in corners]
+    return (min(xs), max(xs))
+
+
+def panel_corners(panel: dict) -> list:
+    """Convenience accessor used by the sampler and by tests, not by the gold path."""
+    bar = panel["bar"]
+    return bar_corners(bar["cx"], bar["cy"], bar["angle_deg"], bar["half_len"])
+
+
+def panel_shadow_span(panel: dict) -> tuple:
+    return shadow_span(panel["lamp"], panel_corners(panel), panel["floor_y"])
+
+
+def panel_clearance(panel: dict) -> float:
+    return panel_slack(panel["lamp"], panel_corners(panel), panel["floor_y"], panel["door"])
+
+
+def _sample_panel(rng: random.Random, box: tuple, role: str) -> dict:
+    x0, y0, x1, y1 = box
+    lo_x, hi_x = x0 + FRAME_PX + 5, x1 - FRAME_PX - 5
+    for _ in range(4000):
+        floor_y = round(y1 - rng.uniform(28.0, 42.0), 4)
+        lamp = (
+            round(rng.uniform(x0 + 26.0, x1 - 26.0), 4),
+            round(y0 + rng.uniform(16.0, 34.0), 4),
+        )
+        bar = {
+            "cx": round(rng.uniform(x0 + 32.0, x1 - 32.0), 4),
+            "cy": round(rng.uniform(lamp[1] + 95.0, floor_y - 58.0), 4),
+            "angle_deg": _norm_angle(rng.uniform(-38.0, 38.0)),
+            "half_len": round(rng.uniform(20.0, 38.0), 4),
+        }
+        panel = {"lamp": [lamp[0], lamp[1]], "bar": bar, "floor_y": floor_y, "door": [0.0, 0.0]}
+        if (floor_y - lamp[1]) / (bar["cy"] - lamp[1]) > 2.25:
+            continue
+        span = panel_shadow_span(panel)
+        if span is None:
+            continue
+        shadow_w = span[1] - span[0]
+        if not 24.0 <= shadow_w <= 92.0:
+            continue
+        if not (lo_x + 2.0 <= span[0] and span[1] <= hi_x - 2.0):
+            continue
+        bar_lo, bar_hi = bar_span(panel_corners(panel))
+        width = shadow_w + rng.uniform(26.0, 60.0)
+        door = None
+        if role == "winner":
+            head_room = width - shadow_w - WIN_SLACK_MIN
+            if head_room <= WIN_SLACK_MIN:
+                continue
+            left = span[0] - rng.uniform(WIN_SLACK_MIN, head_room)
+            door = (left, left + width)
+            # The bar's own horizontal extent must not sit inside the gateway, so
+            # the naive non-projective reading never points at the winner.
+            if door[0] < bar_lo and bar_hi < door[1]:
+                continue
+        elif role == "lure":
+            # Gateway swallows the bar itself, but not the bar's shadow.
+            slot = width - (bar_hi - bar_lo)
+            if slot < 20.0:
+                continue
+            left = bar_lo - rng.uniform(9.0, slot - 9.0)
+            door = (left, left + width)
+        elif role == "shift":
+            offset = rng.uniform(13.0, 34.0)
+            left = span[0] + offset if rng.random() < 0.5 else span[1] - width - offset
+            door = (left, left + width)
+        else:  # "clear": gateway sits wholly to one side of the shadow
+            gap = rng.uniform(10.0, 26.0)
+            options = [(span[1] + gap, span[1] + gap + width), (span[0] - gap - width, span[0] - gap)]
+            if rng.random() < 0.5:
+                options.reverse()
+            door = None
+            for option in options:
+                room = min(hi_x, option[1]) - max(lo_x, option[0])
+                if option[0] >= lo_x and option[1] <= hi_x:
+                    door = option
+                    break
+                if room >= 30.0:
+                    door = (max(lo_x, option[0]), min(hi_x, option[1]))
+                    break
+            if door is None:
+                continue
+        if door[0] < lo_x or door[1] > hi_x or (door[1] - door[0]) < 28.0:
+            continue
+        panel["door"] = [round(door[0], 4), round(door[1], 4)]
+        slack = panel_clearance(panel)
+        if role == "winner":
+            if slack < WIN_SLACK_MIN:
+                continue
+        elif slack > LOSS_SLACK_MAX:
+            continue
+        return panel
+    raise RuntimeError(f"panel sampling failed to converge for role {role!r}")
+
+
+def sample_scene(seed: int) -> dict:
+    digest = hashlib.sha256(f"lamp_shadow_gate_panel|{int(seed)}".encode("utf-8")).hexdigest()
+    rng = random.Random(digest)
+    answer = rng.randrange(N_PANELS)
+    roles = ["lure", "lure", "shift", "clear"]
+    rng.shuffle(roles)
+    roles.insert(answer, "winner")
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "palette": rng.randrange(len(PALETTES)),
+        "panels": [
+            _sample_panel(rng, _panel_box(index), roles[index]) for index in range(N_PANELS)
+        ],
+    }
+    if is_quarantined(scene):  # pragma: no cover - the sampler enforces the bands
+        raise RuntimeError("sampler produced a quarantined scene")
+    return scene
+
+
+def _draw_panel(panel: dict, draw: ImageDraw.ImageDraw, box: tuple, colours: tuple) -> None:
+    x0, y0, x1, y1 = box
+    lamp_colour, bar_colour, door_colour = colours
+    draw.rectangle([x0, y0, x1, y1], outline=FRAME_COLOR, width=FRAME_PX)
+    floor_y = float(panel["floor_y"])
+    draw.rectangle(
+        [x0 + FRAME_PX + 3, floor_y - FLOOR_HALF_W, x1 - FRAME_PX - 3, floor_y + FLOOR_HALF_W],
+        fill=FLOOR_COLOR,
+    )
+    door = sorted(float(v) for v in panel["door"])
+    draw.rectangle(
+        [door[0], floor_y - DOOR_HALF_W, door[1], floor_y + DOOR_HALF_W], fill=door_colour
+    )
+    bar = panel["bar"]
+    draw.polygon(
+        bar_corners(bar["cx"], bar["cy"], bar["angle_deg"], bar["half_len"]), fill=bar_colour
+    )
+    lamp_x, lamp_y = float(panel["lamp"][0]), float(panel["lamp"][1])
+    draw.ellipse(
+        [lamp_x - LAMP_R, lamp_y - LAMP_R, lamp_x + LAMP_R, lamp_y + LAMP_R], fill=lamp_colour
+    )
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    colours = PALETTES[int(scene["palette"]) % len(PALETTES)]
+    for index, panel in enumerate(scene["panels"]):
+        _draw_panel(panel, draw, _panel_box(index), colours)
+    return image
+
+
+def _slacks(scene: dict) -> list:
+    values = []
+    for panel in scene["panels"]:
+        bar = panel["bar"]
+        corners = bar_corners(bar["cx"], bar["cy"], bar["angle_deg"], bar["half_len"])
+        values.append(panel_slack(panel["lamp"], corners, panel["floor_y"], panel["door"]))
+    return values
+
+
+def margin(scene: dict) -> float:
+    ordered = sorted(_slacks(scene), reverse=True)
+    return float(ordered[0] - ordered[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    ordered = sorted(_slacks(scene), reverse=True)
+    return bool(ordered[0] < SLACK_TOL or (ordered[0] - ordered[1]) < QUARANTINE_MARGIN)
+
+
+def analytic_gold(scene: dict) -> str:
+    if is_quarantined(scene):
+        return "ambiguous"
+    slacks = _slacks(scene)
+    return f"panel-{max(range(len(slacks)), key=lambda i: slacks[i]) + 1}"
+
+
+def _copy(scene: dict) -> dict:
+    return {
+        "width": scene["width"],
+        "height": scene["height"],
+        "palette": scene["palette"],
+        "panels": [
+            {
+                "lamp": list(p["lamp"]),
+                "bar": dict(p["bar"]),
+                "floor_y": p["floor_y"],
+                "door": list(p["door"]),
+            }
+            for p in scene["panels"]
+        ],
+    }
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Declared latent aliases: pixel-identical rewrites of the same scene."""
+    transforms = []
+
+    shifted = _copy(scene)
+    shifted["palette"] = int(scene["palette"]) + len(PALETTES)
+    transforms.append(("palette_period", shifted))
+
+    swapped = _copy(scene)
+    for panel in swapped["panels"]:
+        panel["door"] = [panel["door"][1], panel["door"][0]]
+    transforms.append(("door_endpoint_swap", swapped))
+
+    turned = _copy(scene)
+    for panel in turned["panels"]:
+        panel["bar"]["angle_deg"] = _norm_angle(float(panel["bar"]["angle_deg"]) + 180.0)
+    transforms.append(("bar_half_turn", turned))
+    return transforms

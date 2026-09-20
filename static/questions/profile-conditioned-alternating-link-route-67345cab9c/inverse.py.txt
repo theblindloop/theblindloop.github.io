@@ -1,0 +1,168 @@
+"""Independent pixel-only inverse arm for alternating_link_route.
+
+The arm segments circular junction rings and blue/orange link strokes, binds each
+stroke to two recovered junction centers, and performs constrained graph search.
+It imports no candidate module and receives no latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(int(y), int(x))])
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if (
+                    0 <= ny < height
+                    and 0 <= nx < width
+                    and mask[ny, nx]
+                    and not seen[ny, nx]
+                ):
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _center(component: np.ndarray) -> np.ndarray:
+    return np.asarray([component[:, 1].mean(), component[:, 0].mean()])
+
+
+def _bind_link(points: np.ndarray, centers: np.ndarray) -> tuple[int, int]:
+    xy = points[:, ::-1]
+    distances = [float(np.min(np.sum((xy - center) ** 2, axis=1))) for center in centers]
+    order = np.argsort(distances)
+    if len(order) < 2 or distances[int(order[1])] > 24.0**2:
+        raise ValueError("link endpoints are not recoverable")
+    first, second = int(order[0]), int(order[1])
+    if first == second:
+        raise ValueError("link endpoints collapse")
+    return (first, second) if first < second else (second, first)
+
+
+def _bind_terminal(component: np.ndarray, centers: np.ndarray) -> int:
+    point = _center(component)
+    distances = np.sum((centers - point) ** 2, axis=1)
+    index = int(np.argmin(distances))
+    if float(distances[index]) > 3.0**2:
+        raise ValueError("terminal marker does not bind to a junction")
+    return index
+
+
+def _alternating_exists(
+    edges: list[tuple[int, int, str]], start: int, target: int
+) -> bool:
+    adjacency: dict[int, list[tuple[int, str]]] = {index: [] for index in range(12)}
+    for first, second, color in edges:
+        adjacency[first].append((second, color))
+        adjacency[second].append((first, color))
+
+    def visit(vertex: int, last_color: str | None, seen: frozenset[int]) -> bool:
+        if vertex == target:
+            return True
+        for neighbor, color in adjacency[vertex]:
+            if neighbor in seen or color == last_color:
+                continue
+            if visit(neighbor, color, seen | {neighbor}):
+                return True
+        return False
+
+    return visit(start, None, frozenset({start}))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red, green, blue = array[..., 0], array[..., 1], array[..., 2]
+
+    orange = (
+        (red > 175)
+        & (red > green + 60)
+        & (green > 62)
+        & (green < 185)
+        & (blue < 120)
+    )
+    green_terminal = (
+        (red < 118)
+        & (green > 120)
+        & (green > red + 45)
+        & (green > blue + 25)
+        & ~orange
+    )
+    purple_terminal = (
+        (red > 103)
+        & (red < 195)
+        & (blue > 132)
+        & (blue > green + 40)
+        & ~orange
+    )
+    neutral_node = (
+        (red > 45)
+        & (red < 145)
+        & (green > 50)
+        & (green < 145)
+        & (blue > 60)
+        & (blue < 160)
+        & (blue - red < 55)
+        & ~green_terminal
+        & ~purple_terminal
+        & ~orange
+    )
+    blue_link = (
+        (red < 105)
+        & (green > 70)
+        & (green < 145)
+        & (blue > 145)
+        & (blue > red + 65)
+        & (blue > green + 28)
+        & ~purple_terminal
+    )
+    node_mask = neutral_node | green_terminal | purple_terminal
+
+    node_parts = _components(node_mask, 250)
+    green_parts = _components(green_terminal, 220)
+    purple_parts = _components(purple_terminal, 220)
+    blue_parts = _components(blue_link, 180)
+    orange_parts = _components(orange, 180)
+    if len(node_parts) != 12:
+        raise ValueError(f"expected 12 visible junctions, found {len(node_parts)}")
+    if len(green_parts) != 1 or len(purple_parts) != 1:
+        raise ValueError("green and purple terminal junctions must be unique")
+    if len(blue_parts) != 8 or len(orange_parts) != 9:
+        raise ValueError(
+            f"expected 8 blue and 9 orange links, found {len(blue_parts)} and {len(orange_parts)}"
+        )
+
+    centers = np.asarray([_center(component) for component in node_parts])
+    green_index = _bind_terminal(green_parts[0], centers)
+    purple_index = _bind_terminal(purple_parts[0], centers)
+    if green_index == purple_index:
+        raise ValueError("terminal colors collapse onto one junction")
+
+    edges = [(*_bind_link(component, centers), "blue") for component in blue_parts]
+    edges.extend((*_bind_link(component, centers), "orange") for component in orange_parts)
+    keys = [(first, second) for first, second, _ in edges]
+    if len(set(keys)) != 17:
+        raise ValueError("visible graph has duplicate or ambiguous links")
+    degrees = [0] * 12
+    for first, second in keys:
+        degrees[first] += 1
+        degrees[second] += 1
+    if sorted(degrees) != [2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4]:
+        raise ValueError("recovered junction lattice has an invalid degree sequence")
+    return "yes" if _alternating_exists(edges, green_index, purple_index) else "no"

@@ -1,0 +1,193 @@
+"""Independent pixel-only inverse arm for the woven-cord strand world.
+
+Receives one RGB image and nothing else. It segments ink and beads, recovers the
+straight cord bars from run lengths, joins bars only where they physically meet
+(an elbow), and therefore reconstructs the weave: a cord that is interrupted by a
+white break at a crossing yields two bars that are NOT joined by ink adjacency,
+so the strand is rebuilt by continuing each stub straight across the break.
+
+It imports no renderer, prompt, generator, verifier, or analytic-gold code and
+never sees the latent scene.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "weave_strand_pair-oracle-0.1.0"
+
+DARK_MAX = 110
+MIN_BAR_RUN = 28          # a straight cord bar is much longer than it is wide
+BEAD_ORDER = ("red", "green", "blue")
+MAX_BRIDGE = 64           # widest break a stub may be continued across
+BRIDGE_ALIGN = 7          # centreline tolerance when continuing a stub
+
+
+def _masks(image: Image.Image):
+    rgb = np.asarray(image.convert("RGB")).astype(np.int16)
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    dark = (red < DARK_MAX) & (green < DARK_MAX) & (blue < DARK_MAX)
+    beads = {
+        "red": (red > 150) & (green < 110) & (blue < 110),
+        "green": (green > 110) & (red < 130) & (blue < 130),
+        "blue": (blue > 150) & (red < 130) & (green < 130),
+    }
+    return dark, beads
+
+
+def _long_runs(mask: np.ndarray, minimum: int) -> np.ndarray:
+    """Keep pixels that lie in a horizontal run of at least `minimum` pixels."""
+    keep = np.zeros_like(mask)
+    padded = np.zeros((mask.shape[0], mask.shape[1] + 2), dtype=np.int8)
+    padded[:, 1:-1] = mask.astype(np.int8)
+    change = np.diff(padded, axis=1)
+    for y in range(mask.shape[0]):
+        starts = np.flatnonzero(change[y] == 1)
+        ends = np.flatnonzero(change[y] == -1)
+        for x0, x1 in zip(starts, ends):
+            if x1 - x0 >= minimum:
+                keep[y, x0:x1] = True
+    return keep
+
+
+class _Union:
+    def __init__(self) -> None:
+        self.parent: dict = {}
+
+    def find(self, item):
+        self.parent.setdefault(item, item)
+        while self.parent[item] != item:
+            self.parent[item] = self.parent[self.parent[item]]
+            item = self.parent[item]
+        return item
+
+    def union(self, left, right) -> None:
+        a, b = self.find(left), self.find(right)
+        if a != b:
+            self.parent[a] = b
+
+
+def _label_bars(mask: np.ndarray):
+    """Label 4-connected components of a run mask; returns (labels, bar table)."""
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    padded = np.zeros((mask.shape[0], mask.shape[1] + 2), dtype=np.int8)
+    padded[:, 1:-1] = mask.astype(np.int8)
+    change = np.diff(padded, axis=1)
+    union = _Union()
+    runs: list = []
+    previous: list = []
+    for y in range(mask.shape[0]):
+        starts = np.flatnonzero(change[y] == 1)
+        ends = np.flatnonzero(change[y] == -1)
+        current = []
+        for x0, x1 in zip(starts, ends):
+            index = len(runs)
+            runs.append((y, int(x0), int(x1)))
+            union.find(index)
+            for other, ox0, ox1 in previous:
+                if int(x0) < ox1 and ox0 < int(x1):
+                    union.union(index, other)
+            current.append((index, int(x0), int(x1)))
+        previous = current
+    bars: dict = {}
+    for index, (y, x0, x1) in enumerate(runs):
+        root = union.find(index) + 1
+        labels[y, x0:x1] = root
+        entry = bars.setdefault(root, [y, y, x0, x1])
+        entry[0] = min(entry[0], y)
+        entry[1] = max(entry[1], y)
+        entry[2] = min(entry[2], x0)
+        entry[3] = max(entry[3], x1)
+    return labels, bars
+
+
+def _bar_axis(box, horizontal: bool):
+    """Return (centre, low, high) of a bar along its own direction."""
+    y0, y1, x0, x1 = box
+    if horizontal:
+        return (y0 + y1) / 2.0, float(x0), float(x1 - 1)
+    return (x0 + x1 - 1) / 2.0, float(y0), float(y1)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Name the bead pair that lies on one and the same woven cord."""
+    dark, beads = _masks(image)
+    ink = dark.copy()
+    for mask in beads.values():
+        ink |= mask
+
+    horizontal_mask = _long_runs(ink, MIN_BAR_RUN)
+    vertical_mask = _long_runs(ink.T, MIN_BAR_RUN).T
+    h_labels, h_bars = _label_bars(horizontal_mask)
+    v_labels, v_bars = _label_bars(vertical_mask.T)
+    v_labels = v_labels.T
+    v_bars = {key: [box[2], box[3] - 1, box[0], box[1] + 1] for key, box in v_bars.items()}
+
+    union = _Union()
+    for key in h_bars:
+        union.find(("h", key))
+    for key in v_bars:
+        union.find(("v", key))
+
+    # elbows: a horizontal and a vertical bar that share ink are one corner.
+    overlap = np.flatnonzero((h_labels > 0).ravel() & (v_labels > 0).ravel())
+    flat_h = h_labels.ravel()
+    flat_v = v_labels.ravel()
+    for index in overlap:
+        union.union(("h", int(flat_h[index])), ("v", int(flat_v[index])))
+
+    # weave: continue every stub straight across a white break.
+    for kind, table in (("h", h_bars), ("v", v_bars)):
+        items = [(key, _bar_axis(box, kind == "h")) for key, box in table.items()]
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                (key_a, (centre_a, low_a, high_a)) = items[i]
+                (key_b, (centre_b, low_b, high_b)) = items[j]
+                if abs(centre_a - centre_b) > BRIDGE_ALIGN:
+                    continue
+                gap = max(low_b - high_a, low_a - high_b)
+                if 0 < gap <= MAX_BRIDGE:
+                    union.union((kind, key_a), (kind, key_b))
+
+    roots = {}
+    for name in BEAD_ORDER:
+        mask = beads[name]
+        count = int(mask.sum())
+        if count < 60:
+            raise ValueError(f"bead {name} is missing or too small")
+        ys, xs = np.nonzero(mask)
+        cy, cx = int(round(ys.mean())), int(round(xs.mean()))
+        label = None
+        for radius in range(0, 12):
+            found = set()
+            y0, y1 = max(0, cy - radius), min(dark.shape[0], cy + radius + 1)
+            x0, x1 = max(0, cx - radius), min(dark.shape[1], cx + radius + 1)
+            window_h = h_labels[y0:y1, x0:x1]
+            window_v = v_labels[y0:y1, x0:x1]
+            for value in np.unique(window_h):
+                if value:
+                    found.add(("h", int(value)))
+            for value in np.unique(window_v):
+                if value:
+                    found.add(("v", int(value)))
+            if found:
+                label = sorted({union.find(item) for item in found}, key=str)
+                if len(label) != 1:
+                    raise ValueError(f"bead {name} sits on more than one cord")
+                label = label[0]
+                break
+        if label is None:
+            raise ValueError(f"bead {name} does not sit on a cord")
+        roots[name] = label
+
+    same = [
+        (a, b)
+        for i, a in enumerate(BEAD_ORDER)
+        for b in BEAD_ORDER[i + 1 :]
+        if roots[a] == roots[b]
+    ]
+    if len(same) != 1:
+        raise ValueError("the image does not show exactly one shared-cord bead pair")
+    first, second = same[0]
+    return f"{first}_{second}"

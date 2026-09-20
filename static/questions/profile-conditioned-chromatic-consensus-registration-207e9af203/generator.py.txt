@@ -1,0 +1,225 @@
+"""Deterministic scene sampler and raster renderer.
+
+The latent layer masks are defined in aligned 9-by-9 coordinates. Rendering
+translates each complete color layer (including its diamond fiducial) by a
+visible integer-cell offset into a larger 13-by-13 work grid. A 2-of-3 vote in
+aligned coordinates is exactly one of four equal-ink arrow templates.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+STEP = 24
+OUTER_N = 13
+INNER_N = 9
+PAD_CELLS = 2
+
+BG = (250, 251, 253)
+PANEL = (255, 255, 255)
+GRID = (210, 216, 224)
+CYAN = (18, 166, 184)
+GOLD = (236, 169, 28)
+INK = (24, 34, 48)
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (218, 52, 64),
+    "green": (28, 151, 91),
+    "blue": (52, 97, 211),
+}
+COLOR_SUBPOSITIONS: dict[str, tuple[int, int]] = {
+    "red": (-5, -4),
+    "green": (5, -4),
+    "blue": (0, 5),
+}
+LABELS = ("up", "right", "down", "left")
+
+_UP = np.array(
+    [
+        [0, 0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 1, 1, 1, 0, 0, 0],
+        [0, 0, 1, 1, 1, 1, 1, 0, 0],
+        [0, 1, 1, 1, 1, 1, 1, 1, 0],
+        [0, 0, 0, 1, 1, 1, 0, 0, 0],
+        [0, 0, 0, 1, 1, 1, 0, 0, 0],
+        [0, 0, 0, 1, 1, 1, 0, 0, 0],
+        [0, 0, 0, 1, 1, 1, 0, 0, 0],
+        [0, 0, 0, 1, 1, 1, 0, 0, 0],
+    ],
+    dtype=np.uint8,
+)
+
+
+def template(label: str) -> np.ndarray:
+    """Return a fresh 9-by-9 binary template in image row/column order."""
+    turns = {"up": 0, "left": 1, "down": 2, "right": 3}
+    if label not in turns:
+        raise KeyError(label)
+    return np.rot90(_UP, turns[label]).copy()
+
+
+def _rotate_offset(offset: tuple[int, int], turns: int) -> tuple[int, int]:
+    dx, dy = offset
+    for _ in range(turns % 4):
+        dx, dy = dy, -dx
+    return dx, dy
+
+
+def _balanced_assignments(
+    target: np.ndarray, rng: random.Random
+) -> list[list[list[int]]]:
+    """Encode 0 cells with one channel and 1 cells with two channels.
+
+    Singleton and missing-channel identities are separately shuffled and cycled,
+    keeping per-channel totals almost equal while avoiding an answer-shaped mask
+    in any one layer.
+    """
+    layers = np.zeros((3, INNER_N, INNER_N), dtype=np.uint8)
+    zeros = [(r, c) for r in range(INNER_N) for c in range(INNER_N) if not target[r, c]]
+    ones = [(r, c) for r in range(INNER_N) for c in range(INNER_N) if target[r, c]]
+    rng.shuffle(zeros)
+    rng.shuffle(ones)
+    zero_cycle = [0, 1, 2]
+    one_cycle = [0, 1, 2]
+    rng.shuffle(zero_cycle)
+    rng.shuffle(one_cycle)
+    for index, (r, c) in enumerate(zeros):
+        layers[zero_cycle[index % 3], r, c] = 1
+    for index, (r, c) in enumerate(ones):
+        missing = one_cycle[index % 3]
+        layers[:, r, c] = 1
+        layers[missing, r, c] = 0
+    return layers.tolist()
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    label = LABELS[int(seed) % len(LABELS)]
+    layers = _balanced_assignments(template(label), rng)
+
+    turns = rng.randrange(4)
+    offsets = [_rotate_offset(item, turns) for item in ((-2, -1), (2, -1), (0, 2))]
+    rng.shuffle(offsets)
+    colors = list(PALETTE)
+    rng.shuffle(colors)
+
+    frame_x = 100 + rng.randint(-5, 5)
+    frame_y = 184 + rng.randint(-3, 3)
+    target_x = 256 + rng.randint(-7, 7)
+    target_y = 91 + rng.randint(-4, 4)
+    return {
+        "layers": layers,
+        "offsets": [list(item) for item in offsets],
+        "channel_colors": colors,
+        "frame_x": frame_x,
+        "frame_y": frame_y,
+        "target_x": target_x,
+        "target_y": target_y,
+    }
+
+
+def _vote(layers: Iterable[Iterable[Iterable[int]]]) -> np.ndarray:
+    arr = np.asarray(layers, dtype=np.uint8)
+    if arr.shape != (3, INNER_N, INNER_N) or np.any((arr != 0) & (arr != 1)):
+        raise ValueError("layers must be a binary 3-by-9-by-9 array")
+    return (arr.sum(axis=0) >= 2).astype(np.uint8)
+
+
+def _classify(vote: np.ndarray) -> tuple[str, float]:
+    distances = sorted(
+        (int(np.count_nonzero(vote != template(label))), label) for label in LABELS
+    )
+    best_distance, best_label = distances[0]
+    runner_distance = distances[1][0]
+    return best_label, float(runner_distance - best_distance)
+
+
+def analytic_gold(scene: dict) -> str:
+    layers = scene["layers"]
+    return _classify(_vote(layers))[0]
+
+
+def margin(scene: dict) -> float:
+    return _classify(_vote(scene["layers"]))[1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 8.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []
+
+
+def _diamond(draw: ImageDraw.ImageDraw, cx: int, cy: int, radius: int, fill: tuple[int, int, int]) -> None:
+    draw.polygon([(cx, cy - radius), (cx + radius, cy), (cx, cy + radius), (cx - radius, cy)], fill=fill)
+
+
+def render(scene: dict) -> Image.Image:
+    layers = scene["layers"]
+    offsets = scene["offsets"]
+    channel_colors = scene["channel_colors"]
+    frame_x = int(scene["frame_x"])
+    frame_y = int(scene["frame_y"])
+    target_x = int(scene["target_x"])
+    target_y = int(scene["target_y"])
+
+    layer_arr = np.asarray(layers, dtype=np.uint8)
+    if layer_arr.shape != (3, INNER_N, INNER_N):
+        raise ValueError("invalid layer dimensions")
+    if sorted(channel_colors) != sorted(PALETTE):
+        raise ValueError("channel_colors must be a palette permutation")
+    if len(offsets) != 3:
+        raise ValueError("three offsets are required")
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(image)
+    outer_right = frame_x + OUTER_N * STEP
+    outer_bottom = frame_y + OUTER_N * STEP
+    draw.rounded_rectangle(
+        (frame_x - 7, frame_y - 7, outer_right + 7, outer_bottom + 7),
+        radius=9,
+        fill=PANEL,
+        outline=(180, 189, 201),
+        width=2,
+    )
+    for k in range(OUTER_N + 1):
+        x = frame_x + k * STEP
+        y = frame_y + k * STEP
+        draw.line((x, frame_y, x, outer_bottom), fill=GRID, width=1)
+        draw.line((frame_x, y, outer_right, y), fill=GRID, width=1)
+
+    inner_left = frame_x + PAD_CELLS * STEP
+    inner_top = frame_y + PAD_CELLS * STEP
+    inner_right = inner_left + INNER_N * STEP
+    inner_bottom = inner_top + INNER_N * STEP
+    draw.rectangle((inner_left, inner_top, inner_right, inner_bottom), outline=CYAN, width=4)
+
+    # Gold target is the visible destination for all three layer fiducials.
+    draw.ellipse((target_x - 15, target_y - 15, target_x + 15, target_y + 15), outline=GOLD, width=4)
+    draw.line((target_x - 20, target_y, target_x + 20, target_y), fill=GOLD, width=2)
+    draw.line((target_x, target_y - 20, target_x, target_y + 20), fill=GOLD, width=2)
+
+    for layer_index, color_name in enumerate(channel_colors):
+        color = PALETTE[color_name]
+        dx_cells, dy_cells = (int(value) for value in offsets[layer_index])
+        pin_x = target_x + dx_cells * STEP
+        pin_y = target_y + dy_cells * STEP
+        _diamond(draw, pin_x, pin_y, 8, color)
+        sub_x, sub_y = COLOR_SUBPOSITIONS[color_name]
+        for row in range(INNER_N):
+            for col in range(INNER_N):
+                if not layer_arr[layer_index, row, col]:
+                    continue
+                outer_col = PAD_CELLS + col + dx_cells
+                outer_row = PAD_CELLS + row + dy_cells
+                cx = frame_x + outer_col * STEP + STEP // 2 + sub_x
+                cy = frame_y + outer_row * STEP + STEP // 2 + sub_y
+                draw.rounded_rectangle((cx - 4, cy - 4, cx + 4, cy + 4), radius=2, fill=color)
+
+    return image

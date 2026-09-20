@@ -1,0 +1,161 @@
+"""Deterministic renderer and analytic arm for paired constellation chirality."""
+
+from __future__ import annotations
+
+import itertools
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 360
+DOT_RADIUS = 6
+N_POINTS = 7
+QUARANTINE_MARGIN = 8.0
+_PERMUTATIONS = np.asarray(list(itertools.permutations(range(N_POINTS))), dtype=np.int16)
+
+
+def _rotation(theta: float) -> np.ndarray:
+    return np.asarray(
+        [[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]],
+        dtype=np.float64,
+    )
+
+
+def _assignment(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Match unlabeled points using their complete normalized distance signatures."""
+    def signatures(points: np.ndarray) -> np.ndarray:
+        distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+        nonzero = distances[np.triu_indices(len(points), 1)]
+        scale = float(np.median(nonzero))
+        return np.sort(distances, axis=1)[:, 1:] / scale
+
+    a = signatures(left)
+    b = signatures(right)
+    cost = ((a[:, None, :] - b[None, :, :]) ** 2).sum(axis=2)
+    scores = cost[np.arange(N_POINTS)[None, :], _PERMUTATIONS].sum(axis=1)
+    return _PERMUTATIONS[int(np.argmin(scores))]
+
+
+def _relation_errors(scene: dict) -> tuple[float, float]:
+    left = np.asarray(scene["left_points"], dtype=np.float64)
+    right = np.asarray(scene["right_points"], dtype=np.float64)
+    permutation = _assignment(left, right)
+    right = right[permutation]
+
+    left = left - left.mean(axis=0)
+    right = right - right.mean(axis=0)
+    left /= math.sqrt(float((left * left).sum() / len(left)))
+    right /= math.sqrt(float((right * right).sum() / len(right)))
+
+    u, _, vt = np.linalg.svd(left.T @ right)
+    base_det = 1.0 if np.linalg.det(u @ vt) >= 0 else -1.0
+    errors = []
+    for desired_det in (1.0, -1.0):
+        correction = np.eye(2)
+        correction[-1, -1] = desired_det * base_det
+        transform = u @ correction @ vt
+        residual = left @ transform - right
+        errors.append(math.sqrt(float((residual * residual).sum() / len(left))))
+    return errors[0], errors[1]
+
+
+def analytic_gold(scene: dict) -> str:
+    rotation_error, mirror_error = _relation_errors(scene)
+    return "rotated" if rotation_error < mirror_error else "mirrored"
+
+
+def margin(scene: dict) -> float:
+    rotation_error, mirror_error = _relation_errors(scene)
+    return abs(rotation_error - mirror_error) * 100.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def _well_spaced(points: np.ndarray, minimum: float = 22.0) -> bool:
+    distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+    distances += np.eye(len(points)) * 1e6
+    return float(distances.min()) >= minimum
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    intended = "rotated" if int(seed) % 2 == 0 else "mirrored"
+    for _ in range(500):
+        base: list[tuple[float, float]] = []
+        for _point in range(N_POINTS):
+            for _try in range(1000):
+                candidate = (rng.uniform(-1.0, 1.0), rng.uniform(-0.9, 0.9))
+                if all(math.dist(candidate, prior) >= 0.42 for prior in base):
+                    base.append(candidate)
+                    break
+            else:
+                break
+        if len(base) != N_POINTS:
+            continue
+        motif = np.asarray(base, dtype=np.float64)
+        motif -= motif.mean(axis=0)
+        if np.linalg.matrix_rank(motif) < 2:
+            continue
+
+        left_angle = rng.uniform(0.0, 2.0 * math.pi)
+        right_angle = rng.uniform(0.0, 2.0 * math.pi)
+        left_scale = rng.uniform(68.0, 82.0)
+        right_scale = rng.uniform(62.0, 80.0)
+        left_center = np.asarray([rng.uniform(126.0, 142.0), rng.uniform(170.0, 190.0)])
+        right_center = np.asarray([rng.uniform(370.0, 386.0), rng.uniform(170.0, 190.0)])
+
+        left = motif @ _rotation(left_angle).T * left_scale + left_center
+        parity = np.eye(2)
+        if intended == "mirrored":
+            parity[0, 0] = -1.0
+        right = motif @ parity @ _rotation(right_angle).T * right_scale + right_center
+        left = np.rint(left).astype(int)
+        right = np.rint(right).astype(int)
+
+        if not (_well_spaced(left) and _well_spaced(right)):
+            continue
+        if left[:, 0].min() < 14 or left[:, 0].max() > 238:
+            continue
+        if right[:, 0].min() < 274 or right[:, 0].max() > 498:
+            continue
+        if min(left[:, 1].min(), right[:, 1].min()) < 14:
+            continue
+        if max(left[:, 1].max(), right[:, 1].max()) > HEIGHT - 14:
+            continue
+
+        scene = {"left_points": left.tolist(), "right_points": right.tolist()}
+        if analytic_gold(scene) == intended and margin(scene) >= QUARANTINE_MARGIN + 4.0:
+            return scene
+    raise RuntimeError(f"could not sample an unambiguous scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), (250, 249, 246))
+    draw = ImageDraw.Draw(image)
+    draw.line([(WIDTH // 2, 18), (WIDTH // 2, HEIGHT - 18)], fill=(190, 192, 194), width=3)
+    # Keep these scene accesses explicit: the protected rendered-field audit
+    # verifies that every field read by analytic_gold also reaches the pixels.
+    points = list(scene["left_points"]) + list(scene["right_points"])
+    for x, y in points:
+        draw.ellipse(
+            [x - DOT_RADIUS, y - DOT_RADIUS, x + DOT_RADIUS, y + DOT_RADIUS],
+            fill=(24, 27, 31),
+        )
+    return image
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return [
+        (
+            "reverse_point_list_orders",
+            {
+                "left_points": list(reversed(scene["left_points"])),
+                "right_points": list(reversed(scene["right_points"])),
+            },
+        )
+    ]

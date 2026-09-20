@@ -1,0 +1,201 @@
+"""Independent pixel-only inverse for the connected LIFO trace.
+
+This module deliberately knows only the public visual code: fixed raster colors,
+badge silhouettes, and the station rules stated in the question. It never
+imports the renderer or reads scene data.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_PALETTE = np.asarray(
+    [
+        (249, 251, 253),  # background
+        (37, 57, 76),  # route and stack ring
+        (214, 92, 58),  # operation markers
+        (37, 145, 94),  # start
+        (127, 84, 159),  # finish
+        (163, 171, 181),  # remote distractors
+        (218, 74, 86),  # token color 1
+        (47, 125, 183),  # token color 2
+        (232, 166, 56),  # token color 3
+    ],
+    dtype=np.float32,
+)
+_TOKEN_LABELS = {6: 0, 7: 1, 8: 2}
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    distances = ((array[:, :, None, :] - _PALETTE[None, None, :, :]) ** 2).sum(axis=3)
+    return distances.argmin(axis=2)
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= minimum:
+            components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    y, x = component.mean(axis=0)
+    return float(y), float(x)
+
+
+def _shape_stats(component: np.ndarray) -> tuple[float, int, int, int, int]:
+    ys, xs = component[:, 0], component[:, 1]
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    height, width = y1 - y0 + 1, x1 - x0 + 1
+    fill = len(component) / float(height * width)
+    return fill, width, height, x0, y0
+
+
+def _near_corner_count(component: np.ndarray, width: int, height: int, x0: int, y0: int) -> int:
+    points = component
+    corners = ((x0, y0), (x0 + width - 1, y0), (x0, y0 + height - 1), (x0 + width - 1, y0 + height - 1))
+    return sum(
+        int(np.any((np.abs(points[:, 1] - x) <= 4) & (np.abs(points[:, 0] - y) <= 4)))
+        for x, y in corners
+    )
+
+
+def _station_kind(component: np.ndarray) -> str:
+    fill, width, height, x0, y0 = _shape_stats(component)
+    if not (22 <= width <= 31 and 22 <= height <= 31):
+        raise ValueError("station silhouette has an invalid size")
+    if fill > 0.60:
+        return "push"
+    if _near_corner_count(component, width, height, x0, y0) >= 3:
+        return "pop"
+    return "swap"
+
+
+def _token_kind(component: np.ndarray) -> int:
+    fill, width, height, _, _ = _shape_stats(component)
+    if not (14 <= width <= 19 and 14 <= height <= 19):
+        raise ValueError("badge silhouette has an invalid size")
+    if fill > 0.86:
+        return 1  # square = B
+    if fill > 0.59:
+        return 0  # circle = A
+    if fill > 0.30:
+        return 2  # triangle = C
+    raise ValueError("badge silhouette is ambiguous")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the complete stack program from pixels and return its top label."""
+
+    labels = _labels(image)
+    route = labels == 1
+    operations_mask = labels == 2
+    start = labels == 3
+    finish = labels == 4
+    tokens_mask = labels >= 6
+
+    start_parts = _components(start, minimum=180)
+    finish_parts = _components(finish, minimum=300)
+    stations = _components(operations_mask, minimum=35)
+    token_parts = _components(tokens_mask, minimum=40)
+    if len(start_parts) != 1 or len(finish_parts) != 1:
+        raise ValueError("missing or ambiguous trace endpoints")
+    if len(stations) != 8:
+        raise ValueError("expected eight stack stations")
+    if not (3 <= len(token_parts) <= 13):
+        raise ValueError("badge inventory is incomplete")
+
+    graph = route | operations_mask | start | finish
+    graph_parts = _components(graph, minimum=25)
+    start_seed = tuple(int(round(value)) for value in _centroid(start_parts[0]))
+    finish_seed = tuple(int(round(value)) for value in _centroid(finish_parts[0]))
+
+    def _contains(component: np.ndarray, point: tuple[int, int]) -> bool:
+        return bool(np.any((component[:, 0] == point[0]) & (component[:, 1] == point[1])))
+
+    start_component = next((component for component in graph_parts if _contains(component, start_seed)), None)
+    finish_component = next((component for component in graph_parts if _contains(component, finish_seed)), None)
+    if start_component is None or finish_component is None or start_component is not finish_component:
+        raise ValueError("connected trace is broken")
+
+    station_rows = sorted(
+        [(_centroid(component)[1], _centroid(component)[0], component) for component in stations],
+        key=lambda item: item[0],
+    )
+    if any(station_rows[index + 1][0] - station_rows[index][0] < 28.0 for index in range(7)):
+        raise ValueError("station order is unresolved")
+
+    token_rows = [(_centroid(component)[1], _centroid(component)[0], component) for component in token_parts]
+    leftmost = min(row[0] for row in token_rows)
+    initial_rows = [row for row in token_rows if row[0] <= leftmost + 16.0]
+    initial_components = {id(row[2]) for row in initial_rows}
+    payload_rows = [row for row in token_rows if id(row[2]) not in initial_components]
+    if not (3 <= len(initial_rows) <= 5):
+        raise ValueError("initial stack is incomplete")
+    initial_rows.sort(key=lambda row: row[1], reverse=True)  # bottom to top in image coordinates
+    stack = [_token_kind(row[2]) for row in initial_rows]
+    used_payloads: set[int] = set()
+
+    for _, station_y, component in station_rows:
+        station_x = _centroid(component)[1]
+        kind = _station_kind(component)
+        if kind == "push":
+            candidates = []
+            for index, row in enumerate(payload_rows):
+                if index in used_payloads:
+                    continue
+                distance = math.dist((station_x, station_y), (row[0], row[1]))
+                if distance < 42.0:
+                    candidates.append((distance, index, row))
+            if len(candidates) != 1:
+                raise ValueError("push payload is missing or ambiguous")
+            _, payload_index, payload = candidates[0]
+            used_payloads.add(payload_index)
+            stack.append(_token_kind(payload[2]))
+        elif kind == "pop":
+            if len(stack) < 2:
+                raise ValueError("pop would underflow the visible stack")
+            stack.pop()
+        else:
+            if len(stack) < 2:
+                raise ValueError("swap would underflow the visible stack")
+            stack[-1], stack[-2] = stack[-2], stack[-1]
+
+    push_count = sum(_station_kind(component) == "push" for _, _, component in station_rows)
+    if len(used_payloads) != push_count or len(payload_rows) != push_count:
+        raise ValueError("unexpected push payload count")
+    if not stack:
+        raise ValueError("stack is empty at finish")
+    return ("A", "B", "C")[stack[-1]]

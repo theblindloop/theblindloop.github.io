@@ -1,0 +1,185 @@
+"""Independent final-PNG inverse arm for oriented-part correspondence.
+
+The code has no renderer palette, latent state, or card coordinates.  It finds
+the sixteen chromatic triangle components, clusters their four repeated colors,
+groups the upper reference and three lower plates by relative layout, recovers
+each triangle's socket and pointing direction, and exhaustively tests the four
+common quarter-turns.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+@dataclass(frozen=True)
+class _Component:
+    cx: float
+    cy: float
+    xmin: int
+    xmax: int
+    ymin: int
+    ymax: int
+    area: int
+    rgb: tuple[int, int, int]
+
+
+def _components(arr: np.ndarray) -> list[_Component]:
+    high = arr.max(axis=2).astype(np.int16)
+    low = arr.min(axis=2).astype(np.int16)
+    mask = (high - low >= 50) & (high >= 105) & (low <= 210)
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[_Component] = []
+    for start_y, start_x in zip(*np.nonzero(mask), strict=True):
+        y, x = int(start_y), int(start_x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            py, px = queue.popleft()
+            points.append((py, px))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = py + dy, px + dx
+                    if (
+                        0 <= ny < height and 0 <= nx < width
+                        and mask[ny, nx] and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) < 180:
+            continue
+        ys = np.fromiter((point[0] for point in points), dtype=np.int32)
+        xs = np.fromiter((point[1] for point in points), dtype=np.int32)
+        pixels = arr[ys, xs]
+        median = np.median(pixels, axis=0)
+        result.append(
+            _Component(
+                float(xs.mean()), float(ys.mean()), int(xs.min()), int(xs.max()),
+                int(ys.min()), int(ys.max()), len(points),
+                tuple(int(round(value)) for value in median),
+            )
+        )
+    return result
+
+
+def _color_classes(components: list[_Component]) -> list[list[_Component]]:
+    classes: list[list[_Component]] = []
+    centers: list[np.ndarray] = []
+    for component in sorted(components, key=lambda item: item.rgb):
+        rgb = np.array(component.rgb, dtype=np.float64)
+        distances = [float(np.linalg.norm(rgb - center)) for center in centers]
+        if distances and min(distances) < 42.0:
+            index = distances.index(min(distances))
+            classes[index].append(component)
+            centers[index] = np.mean(
+                np.array([item.rgb for item in classes[index]], dtype=np.float64), axis=0
+            )
+        else:
+            classes.append([component])
+            centers.append(rgb)
+    sizes = sorted(len(group) for group in classes)
+    if len(classes) != 4 or sizes != [4, 4, 4, 4]:
+        raise ValueError(f"expected four repeated part colors, found class sizes {sizes}")
+    return classes
+
+
+def _direction(component: _Component) -> int:
+    box_cx = (component.xmin + component.xmax) / 2.0
+    box_cy = (component.ymin + component.ymax) / 2.0
+    shift_x = component.cx - box_cx
+    shift_y = component.cy - box_cy
+    if max(abs(shift_x), abs(shift_y)) < 2.0:
+        raise ValueError("triangle direction is not visually recoverable")
+    # A triangle's centroid lies toward its broad base, opposite its tip.
+    if abs(shift_x) > abs(shift_y):
+        return 3 if shift_x > 0 else 1
+    return 0 if shift_y > 0 else 2
+
+
+def _mapping(
+    group: list[_Component], color_lookup: dict[int, int]
+) -> dict[int, tuple[int, int]]:
+    center_x = sum(item.cx for item in group) / 4.0
+    center_y = sum(item.cy for item in group) / 4.0
+    result: dict[int, tuple[int, int]] = {}
+    slots: set[int] = set()
+    for item in group:
+        dx, dy = item.cx - center_x, item.cy - center_y
+        if max(abs(dx), abs(dy)) < 25.0:
+            raise ValueError("part is too close to plate center")
+        if abs(dx) > abs(dy):
+            slot = 1 if dx > 0 else 3
+        else:
+            slot = 2 if dy > 0 else 0
+        color = color_lookup[id(item)]
+        if color in result or slot in slots:
+            raise ValueError("plate repeats a color or socket")
+        result[color] = (slot, _direction(item))
+        slots.add(slot)
+    if set(result) != {0, 1, 2, 3} or slots != {0, 1, 2, 3}:
+        raise ValueError("plate does not contain one part in each socket")
+    return result
+
+
+def _score(reference: dict[int, tuple[int, int]], test: dict[int, tuple[int, int]]) -> int:
+    scores = []
+    for turns in range(4):
+        mismatch = 0
+        for color in range(4):
+            ref_slot, ref_direction = reference[color]
+            test_slot, test_direction = test[color]
+            mismatch += test_slot != (ref_slot + turns) % 4
+            mismatch += test_direction != (ref_direction + turns) % 4
+        scores.append(mismatch)
+    return min(scores)
+
+
+def _analyse(image: Image.Image) -> tuple[str, float, list[int]]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    components = _components(arr)
+    if len(components) != 16:
+        raise ValueError(f"expected sixteen visible colored parts, found {len(components)}")
+    classes = _color_classes(components)
+    lookup = {
+        id(component): identity
+        for identity, group in enumerate(classes)
+        for component in group
+    }
+    by_y = sorted(components, key=lambda item: item.cy)
+    reference_group = by_y[:4]
+    lower = by_y[4:]
+    if max(item.cy for item in reference_group) >= min(item.cy for item in lower):
+        raise ValueError("reference and test parts are not visibly separated")
+    lower_by_x = sorted(lower, key=lambda item: item.cx)
+    test_groups = [lower_by_x[index:index + 4] for index in range(0, 12, 4)]
+    if len(test_groups) != 3:
+        raise ValueError("could not recover three test plates")
+    if not (
+        max(item.cx for item in test_groups[0]) < min(item.cx for item in test_groups[1])
+        and max(item.cx for item in test_groups[1]) < min(item.cx for item in test_groups[2])
+    ):
+        raise ValueError("test plate groups overlap")
+    reference = _mapping(reference_group, lookup)
+    tests = [_mapping(group, lookup) for group in test_groups]
+    scores = [_score(reference, test) for test in tests]
+    order = sorted(range(3), key=scores.__getitem__)
+    gap = scores[order[1]] - scores[order[0]]
+    if scores[order[0]] != 0:
+        raise ValueError(f"no exact common-rotation match; best mismatch {scores[order[0]]}")
+    if gap < 1:
+        raise ValueError("ambiguous common-rotation match")
+    return ("A", "B", "C")[order[0]], float(gap), scores
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _analyse(image)[0]

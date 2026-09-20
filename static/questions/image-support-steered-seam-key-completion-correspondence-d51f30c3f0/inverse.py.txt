@@ -1,0 +1,209 @@
+"""Independent pixel-only inverse for the connected seam-key workbench.
+
+The inverse locates the visible navy workbench, checks each light card, samples
+the centers of the public 9x9 patch cells, recovers the four attached key
+lengths, applies the declared rotation, and only then reads the winning marker.
+It receives no latent scene or renderer state.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_FRAME = np.asarray((26, 74, 98), dtype=np.float32)
+_CARD = np.asarray((239, 236, 223), dtype=np.float32)
+_PATCH = np.asarray((213, 91, 76), dtype=np.float32)
+_NEUTRAL = np.asarray((111, 163, 150), dtype=np.float32)
+_AMBER = np.asarray((229, 164, 52), dtype=np.float32)
+_VIOLET = np.asarray((177, 92, 189), dtype=np.float32)
+
+_FRAME_MIN_W = 225
+_FRAME_MAX_W = 280
+_FRAME_MIN_H = 205
+_FRAME_MAX_H = 250
+_PANEL_RELS = {"R": (8, 9), "A": (88, 9), "B": (168, 9)}
+_PANEL_W = 74
+_PANEL_H = 212
+_PATCH_X = 10
+_PATCH_Y = 52
+_GRID = 9
+_CELL = 6
+_CORE_START = 3
+_CORE_END = 5
+_TOL = 82.0
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float = _TOL) -> np.ndarray:
+    return np.linalg.norm(array - color, axis=2) < tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            component = np.zeros_like(mask, dtype=bool)
+            ys, xs = zip(*points, strict=True)
+            component[np.asarray(ys), np.asarray(xs)] = True
+            found.append(component)
+    return found
+
+
+def _bbox(component: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(component)
+    if not len(ys):
+        raise ValueError("empty workbench component")
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _workbench_bbox(array: np.ndarray) -> tuple[int, int, int, int]:
+    candidates = []
+    for component in _components(_mask(array, _FRAME, 70.0), 5000):
+        x0, y0, x1, y1 = _bbox(component)
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        if _FRAME_MIN_W <= width <= _FRAME_MAX_W and _FRAME_MIN_H <= height <= _FRAME_MAX_H:
+            candidates.append((component.sum(), (x0, y0, x1, y1)))
+    if len(candidates) != 1:
+        raise ValueError("expected one connected translated workbench")
+    return candidates[0][1]
+
+
+def _nearest_name(pixel: np.ndarray, palette: tuple[tuple[str, np.ndarray], ...]) -> str:
+    distances = [(name, float(np.linalg.norm(pixel - color))) for name, color in palette]
+    name, distance = min(distances, key=lambda item: item[1])
+    if distance >= 105.0:
+        raise ValueError("marker color is unreadable")
+    return name
+
+
+def _read_grid(array: np.ndarray, x: int, y: int) -> list[list[int]]:
+    grid: list[list[int]] = []
+    for row in range(_GRID):
+        values: list[int] = []
+        for col in range(_GRID):
+            px = int(round(x + _PATCH_X + col * _CELL + _CELL / 2.0))
+            py = int(round(y + _PATCH_Y + row * _CELL + _CELL / 2.0))
+            pixel = array[py, px]
+            patch_distance = float(np.linalg.norm(pixel - _PATCH))
+            card_distance = float(np.linalg.norm(pixel - _CARD))
+            if min(patch_distance, card_distance) >= 92.0:
+                raise ValueError("patch cell is unreadable")
+            values.append(int(patch_distance < card_distance))
+        grid.append(values)
+    return grid
+
+
+def _signature(grid: list[list[int]]) -> tuple[int, int, int, int]:
+    for row in range(_CORE_START, _CORE_END + 1):
+        if not all(grid[row][col] for col in range(_CORE_START, _CORE_END + 1)):
+            raise ValueError("patch core is incomplete")
+    center = 4
+    lengths = []
+    for positions in (
+        [(CORE, center) for CORE in range(_CORE_START - 1, -1, -1)],
+        [(center, CORE) for CORE in range(_CORE_END + 1, _GRID)],
+        [(CORE, center) for CORE in range(_CORE_END + 1, _GRID)],
+        [(center, CORE) for CORE in range(_CORE_START - 1, -1, -1)],
+    ):
+        count = 0
+        for row, col in positions:
+            if not grid[row][col]:
+                break
+            count += 1
+        if count < 1 or count > 3:
+            raise ValueError("patch key length is outside the public range")
+        if any(grid[row][col] for row, col in positions[count:]):
+            raise ValueError("patch key has a gap")
+        lengths.append(count)
+    expected = [[0 for _ in range(_GRID)] for _ in range(_GRID)]
+    for row in range(_CORE_START, _CORE_END + 1):
+        for col in range(_CORE_START, _CORE_END + 1):
+            expected[row][col] = 1
+    for distance in range(1, lengths[0] + 1):
+        expected[_CORE_START - distance][center] = 1
+    for distance in range(1, lengths[1] + 1):
+        expected[center][_CORE_END + distance] = 1
+    for distance in range(1, lengths[2] + 1):
+        expected[_CORE_END + distance][center] = 1
+    for distance in range(1, lengths[3] + 1):
+        expected[center][_CORE_START - distance] = 1
+    if grid != expected:
+        raise ValueError("patch has an unexpected colored part")
+    return tuple(lengths)  # type: ignore[return-value]
+
+
+def _read_panel(
+    array: np.ndarray, x: int, y: int, *, candidate: bool
+) -> tuple[tuple[int, int, int, int], str]:
+    # The geometric center contains the connected patch; sample the clear card
+    # surface below it so card presence is checked independently.
+    body = array[y + 195, x + _PANEL_W // 2]
+    if float(np.linalg.norm(body - _CARD)) >= 110.0:
+        raise ValueError("panel card is missing")
+    signature = _signature(_read_grid(array, x, y))
+    marker_pixel = array[y + 19, x + 61]
+    if candidate:
+        marker = _nearest_name(marker_pixel, (("amber", _AMBER), ("violet", _VIOLET)))
+    else:
+        _nearest_name(marker_pixel, (("neutral", _NEUTRAL),))
+        marker = "neutral"
+    return signature, marker
+
+
+def _rotate_cw(signature: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    return (signature[3], signature[0], signature[1], signature[2])
+
+
+def _error(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+    return sum(abs(a - b) for a, b in zip(left, right, strict=True))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the marker on the uniquely matching transformed patch."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    x0, y0, _, _ = _workbench_bbox(array)
+    reference, _ = _read_panel(
+        array,
+        x0 + _PANEL_RELS["R"][0],
+        y0 + _PANEL_RELS["R"][1],
+        candidate=False,
+    )
+    panels = {
+        slot: _read_panel(
+            array,
+            x0 + _PANEL_RELS[slot][0],
+            y0 + _PANEL_RELS[slot][1],
+            candidate=True,
+        )
+        for slot in ("A", "B")
+    }
+    totals = {sum(reference), *(sum(value[0]) for value in panels.values())}
+    if len(totals) != 1:
+        raise ValueError("visible patches do not have equal total ink")
+    errors = {
+        slot: _error(reference, _rotate_cw(panels[slot][0])) for slot in ("A", "B")
+    }
+    if errors["A"] == errors["B"]:
+        raise ValueError("transformed key errors are tied")
+    best = "A" if errors["A"] < errors["B"] else "B"
+    return panels[best][1]

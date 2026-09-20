@@ -1,0 +1,244 @@
+"""Independent pixel-only inverse for the alternating-route search.
+
+The inverse uses only the RGB raster and the public four-sector question. It
+segments saturated route ink, thins each connected route, traces its longest
+endpoint-to-endpoint skeleton path, simplifies that path to six vertices, and
+tests the ordered signs of its four turns. It never imports or reads renderer
+state.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+_QUADRANTS = ("NW", "NE", "SW", "SE")
+_MIN_COMPONENT_AREA = 700
+_MIN_TURN_SINE = 0.16
+_RDP_EPSILONS = (8.0, 5.0, 3.0, 1.5)
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    spread = array.max(axis=2) - array.min(axis=2)
+    # Saturated route colors are separated from the off-white canvas and gray guides.
+    return (spread > 30.0) & (array.min(axis=2) < 235.0)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) > len(best):
+            best = points
+    if len(best) < _MIN_COMPONENT_AREA:
+        raise ValueError("sector route component is missing")
+    output = np.zeros_like(mask, dtype=bool)
+    yy, xx = np.asarray(best).T
+    output[yy, xx] = True
+    return output
+
+
+def _neighbors(mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    return np.stack(
+        (
+            padded[:-2, 1:-1],
+            padded[:-2, 2:],
+            padded[1:-1, 2:],
+            padded[2:, 2:],
+            padded[2:, 1:-1],
+            padded[2:, :-2],
+            padded[1:-1, :-2],
+            padded[:-2, :-2],
+        ),
+        axis=0,
+    )
+
+
+def _thin(mask: np.ndarray) -> np.ndarray:
+    """Zhang-Suen thinning, implemented independently over the binary route mask."""
+
+    image = mask.copy()
+    for _ in range(80):
+        changed = False
+        for phase in (0, 1):
+            values = _neighbors(image)
+            count = values.sum(axis=0)
+            transitions = sum(
+                np.logical_and(values[index] == 0, values[(index + 1) % 8] == 1)
+                for index in range(8)
+            )
+            p2, p3, p4, p5, p6, p7, p8, p9 = values
+            common = image & (count >= 2) & (count <= 6) & (transitions == 1)
+            if phase == 0:
+                removable = common & (~(p2 & p4 & p6)) & (~(p4 & p6 & p8))
+            else:
+                removable = common & (~(p2 & p4 & p8)) & (~(p2 & p6 & p8))
+            if np.any(removable):
+                image[removable] = False
+                changed = True
+        if not changed:
+            break
+    return image
+
+
+def _trace_longest_path(skeleton: np.ndarray) -> np.ndarray:
+    points = [tuple(int(value) for value in item) for item in np.argwhere(skeleton)]
+    if len(points) < 20:
+        raise ValueError("route skeleton is too short")
+    point_set = set(points)
+    adjacency: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for point in points:
+        y, x = point
+        adjacency[point] = [
+            (y + dy, x + dx)
+            for dy in (-1, 0, 1)
+            for dx in (-1, 0, 1)
+            if (dy or dx) and (y + dy, x + dx) in point_set
+        ]
+    endpoints = [point for point in points if len(adjacency[point]) <= 1]
+    if len(endpoints) < 2:
+        raise ValueError("route has no two traceable endpoints")
+
+    best_distance = -1
+    best_pair: tuple[tuple[int, int], tuple[int, int]] | None = None
+    best_previous: dict[tuple[int, int], tuple[int, int] | None] = {}
+    endpoint_set = set(endpoints)
+    for start in endpoints:
+        queue: deque[tuple[int, int]] = deque([start])
+        distances = {start: 0}
+        previous: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        while queue:
+            current = queue.popleft()
+            for neighbor in adjacency[current]:
+                if neighbor not in distances:
+                    distances[neighbor] = distances[current] + 1
+                    previous[neighbor] = current
+                    queue.append(neighbor)
+        for finish in endpoint_set.intersection(distances):
+            if distances[finish] > best_distance:
+                best_distance = distances[finish]
+                best_pair = (start, finish)
+                best_previous = previous
+    if best_pair is None:
+        raise ValueError("route endpoint path could not be reconstructed")
+
+    path: list[tuple[int, int]] = []
+    cursor: tuple[int, int] | None = best_pair[1]
+    while cursor is not None:
+        path.append(cursor)
+        cursor = best_previous[cursor]
+    path.reverse()
+    return np.asarray([(float(x), float(y)) for y, x in path], dtype=np.float64)
+
+
+def _point_line_distance(point: np.ndarray, first: np.ndarray, last: np.ndarray) -> float:
+    direction = last - first
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-9:
+        return float(np.linalg.norm(point - first))
+    offset = point - first
+    cross = float(direction[0] * offset[1] - direction[1] * offset[0])
+    return abs(cross) / norm
+
+
+def _rdp(points: np.ndarray, epsilon: float) -> np.ndarray:
+    if len(points) < 3:
+        return points
+    distances = np.asarray(
+        [_point_line_distance(point, points[0], points[-1]) for point in points[1:-1]],
+        dtype=np.float64,
+    )
+    if not len(distances):
+        return points[[0, -1]]
+    index = int(np.argmax(distances)) + 1
+    if float(distances[index - 1]) <= epsilon:
+        return points[[0, -1]]
+    left = _rdp(points[: index + 1], epsilon)
+    right = _rdp(points[index:], epsilon)
+    return np.vstack((left[:-1], right))
+
+
+def _fit_six_vertices(path: np.ndarray) -> np.ndarray:
+    for epsilon in _RDP_EPSILONS:
+        simplified = _rdp(path, epsilon)
+        if len(simplified) == 6:
+            return simplified
+    # A rounded raster join can leave a harmless extra vertex. Keep the most
+    # separated six RDP vertices, preserving the endpoint order.
+    simplified = _rdp(path, 1.0)
+    if len(simplified) < 6:
+        raise ValueError(f"route simplified to only {len(simplified)} vertices")
+    if len(simplified) > 6:
+        indices = np.linspace(0, len(simplified) - 1, 6).round().astype(int)
+        return simplified[indices]
+    return simplified
+
+
+def _route_measure(crop: np.ndarray) -> tuple[int, float]:
+    component = _largest_component(crop)
+    skeleton = _thin(component)
+    path = _trace_longest_path(skeleton)
+    vertices = _fit_six_vertices(path)
+    vectors = np.diff(vertices, axis=0)
+    lengths = np.linalg.norm(vectors, axis=1)
+    if np.any(lengths < 22.0):
+        raise ValueError("route segment fit is too short")
+    cross_values = np.asarray(
+        [
+            float(vectors[index, 0] * vectors[index + 1, 1] - vectors[index, 1] * vectors[index + 1, 0])
+            for index in range(4)
+        ],
+        dtype=np.float64,
+    )
+    normalized = cross_values / (lengths[:-1] * lengths[1:])
+    if np.any(np.abs(normalized) < _MIN_TURN_SINE):
+        raise ValueError("route bend is too close to straight")
+    signs = np.where(cross_values > 0.0, 1, -1)
+    alternations = int(np.sum(signs[:-1] != signs[1:]))
+    return alternations, float(np.min(np.abs(normalized)))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the unique alternating-route sector, or abstain on incomplete pixels."""
+
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    mask = _ink_mask(rgb)
+    measurements: dict[str, tuple[int, float]] = {}
+    for row, vertical in (("N", 0), ("S", 1)):
+        for column, horizontal in (("W", 0), ("E", 1)):
+            quadrant = row + column
+            y0, y1 = vertical * (height // 2), (vertical + 1) * (height // 2)
+            x0, x1 = horizontal * (width // 2), (horizontal + 1) * (width // 2)
+            try:
+                measurements[quadrant] = _route_measure(mask[y0:y1, x0:x1])
+            except ValueError:
+                continue
+
+    winners = [quadrant for quadrant, (count, _) in measurements.items() if count == 3]
+    if len(winners) != 1:
+        raise ValueError(f"pixel evidence has {len(winners)} alternating-route winners")
+    return winners[0]

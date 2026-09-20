@@ -1,0 +1,122 @@
+"""Independent image-only inverse for the compact closed-loop world."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+BACKGROUND = np.asarray((255, 255, 255), dtype=np.float32)
+ROUTE = np.asarray((239, 229, 187), dtype=np.float32)
+AMBER = np.asarray((242, 157, 40), dtype=np.float32)
+VIOLET = np.asarray((176, 73, 183), dtype=np.float32)
+GREEN = np.asarray((39, 174, 106), dtype=np.float32)
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    return np.linalg.norm(array.astype(np.float32) - color, axis=2) <= tolerance
+
+
+def _largest_component(mask: np.ndarray, minimum: int) -> np.ndarray:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: list[tuple[int, int]] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            component.append((cy, cx))
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    if len(best) < minimum:
+        raise ValueError("required colored component is absent")
+    return np.asarray(best, dtype=np.float64)
+
+
+def _centroid(mask: np.ndarray, minimum: int = 40) -> tuple[float, float]:
+    points = _largest_component(mask, minimum)
+    return float(points[:, 1].mean()), float(points[:, 0].mean())
+
+
+def _require_intact_local_tile(array: np.ndarray) -> None:
+    """Require the compact area-like support, abstaining after local erasure."""
+
+    foreground = np.linalg.norm(array.astype(np.float32) - BACKGROUND, axis=2) > 24.0
+    body = _largest_component(foreground, 5000)
+    min_y, min_x = np.floor(body.min(axis=0)).astype(int)
+    max_y, max_x = np.ceil(body.max(axis=0)).astype(int)
+    width = max_x - min_x + 1
+    height = max_y - min_y + 1
+    if not (90 <= width <= 180 and 90 <= height <= 180):
+        raise ValueError("compact local tile is missing or damaged")
+    occupancy = float(np.mean(foreground[min_y : max_y + 1, min_x : max_x + 1]))
+    if occupancy < 0.79:
+        raise ValueError("filled local tile is incomplete")
+    # The compact tile is the only large component and is not allowed to be a
+    # thin remnant after a grid ablation or a destructive raster corruption.
+    if len(body) < 10500:
+        raise ValueError("area-like route support is incomplete")
+
+
+def _fit_loop_center(route_points: np.ndarray) -> tuple[float, float, float]:
+    if len(route_points) < 180:
+        raise ValueError("closed route has too little visible support")
+    x = route_points[:, 1]
+    y = route_points[:, 0]
+    matrix = np.column_stack((2.0 * x, 2.0 * y, np.ones_like(x)))
+    target = x * x + y * y
+    try:
+        center_x, center_y, constant = np.linalg.lstsq(matrix, target, rcond=None)[0]
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("loop circle fit failed") from exc
+    radius_sq = float(constant + center_x * center_x + center_y * center_y)
+    if radius_sq <= 0.0:
+        raise ValueError("loop radius fit failed")
+    radius = math.sqrt(radius_sq)
+    residual = np.abs(np.hypot(x - center_x, y - center_y) - radius)
+    if not (28.0 <= radius <= 75.0) or float(np.median(residual)) > 4.5:
+        raise ValueError("loop centerline is unstable")
+    angles = np.mod(np.arctan2(y - center_y, x - center_x), 2.0 * math.pi)
+    histogram, _ = np.histogram(angles, bins=36, range=(0.0, 2.0 * math.pi))
+    if int(np.count_nonzero(histogram)) < 30:
+        raise ValueError("closed route has a broken centerline")
+    return float(center_x), float(center_y), float(radius)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    _require_intact_local_tile(array)
+    route_points = np.argwhere(_mask(array, ROUTE, 48.0)).astype(np.float64)
+    if len(route_points) < 180:
+        raise ValueError("closed route has too little visible support")
+    center_x, center_y, _ = _fit_loop_center(route_points)
+    green = _centroid(_mask(array, GREEN, 58.0))
+    amber = _centroid(_mask(array, AMBER, 58.0))
+    violet = _centroid(_mask(array, VIOLET, 58.0))
+
+    def clockwise_offset(point: tuple[float, float]) -> float:
+        angle = math.atan2(point[1] - center_y, point[0] - center_x)
+        start_angle = math.atan2(green[1] - center_y, green[0] - center_x)
+        return float((angle - start_angle) % (2.0 * math.pi))
+
+    amber_offset = clockwise_offset(amber)
+    violet_offset = clockwise_offset(violet)
+    gap = abs(amber_offset - violet_offset) * 40.0
+    if gap < 7.0:
+        raise ValueError("cyclic port order is too close to resolve")
+    return "amber" if amber_offset < violet_offset else "violet"

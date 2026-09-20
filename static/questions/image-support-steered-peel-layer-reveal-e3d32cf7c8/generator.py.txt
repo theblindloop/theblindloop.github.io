@@ -1,0 +1,356 @@
+"""Layer-peel reveal: one thick blob whose symbol exists only after one peel.
+
+A symbol is a thin figure of ten cells on an eleven-by-eleven lattice. The
+renderer never draws that figure. It draws the figure grown by one ring - every
+cell within one step of a figure cell, diagonal steps included - and then packs
+further dark cells onto the rim of the resulting slab until every scene shows
+exactly the same amount of ink inside exactly the same bounding rectangle. The
+result is one thick, solid, area-like blob whose outline is randomised and whose
+interior alone carries the answer.
+
+The declared operation is a single peel: delete every dark cell that touches a
+pale cell or the outside of the lattice, at an edge or at a corner. The rim
+cells - the grown ring and every packed rim cell alike - all touch pale, so the
+peel removes them and leaves exactly the ten cells of the figure. The blob is
+drawn inside one bordered panel that spans about half of the canvas side, so
+every part of one medium-sized connected region is decisive and nothing outside
+it is.
+"""
+
+from __future__ import annotations
+
+import itertools
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "peel_layer_reveal-renderer-0.1.0"
+
+CANVAS = 560
+CELLS = 11
+FRAME_PX = 5
+CELL_CHOICES = (22, 24, 26)
+EDGE_MARGIN = 20
+
+# The figure lives inside rows and columns 2..8, so growing it by one ring stays
+# inside rows and columns 1..9 and the outermost ring of lattice cells is always
+# pale. The blob therefore never touches the panel border.
+INNER_LO = 1
+INNER_HI = CELLS - 2
+TOTAL_INK_CELLS = 50
+
+PAPER = (250, 250, 250)
+BACKGROUND = (235, 236, 238)
+TINTS = ((0, 0, 0), (0, 6, 12), (12, 6, 0), (5, 12, 0))
+
+MIN_CONTRAST = 62.0
+MAX_CONTRAST = 152.0
+QUARANTINE_CLEARANCE = 34.0
+
+CHAFF_CLEARANCE = 24
+CHAFF_MIN_PX = 7
+CHAFF_MAX_PX = 14
+CHAFF_GAP = 14
+
+GLYPHS = ("bars", "corner", "pipes", "tee")
+PARALLEL_STROKE_GLYPHS = frozenset({"bars", "pipes"})
+
+
+def _row(row: int, col0: int, col1: int) -> set[tuple[int, int]]:
+    return {(row, col) for col in range(col0, col1 + 1)}
+
+
+def _col(col: int, row0: int, row1: int) -> set[tuple[int, int]]:
+    return {(row, col) for row in range(row0, row1 + 1)}
+
+
+def _template(cells: set[tuple[int, int]]) -> np.ndarray:
+    grid = np.zeros((CELLS, CELLS), dtype=np.uint8)
+    for row, col in cells:
+        grid[row, col] = 1
+    return grid
+
+
+# Four figures, each exactly ten cells, each built from two straight strokes of
+# five cells. Parallel strokes are kept three cells apart and stroke junctions
+# are square corners, which is what makes the peel recover them exactly.
+TEMPLATES: dict[str, np.ndarray] = {
+    "bars": _template(_row(2, 2, 6) | _row(6, 4, 8)),
+    "corner": _template(_col(3, 4, 8) | _row(4, 4, 8)),
+    "pipes": _template(_col(3, 2, 6) | _col(7, 4, 8)),
+    "tee": _template(_row(3, 3, 7) | _col(5, 4, 8)),
+}
+
+
+def grow(grid: np.ndarray) -> np.ndarray:
+    """Every cell within one step of a dark cell, diagonal steps included."""
+
+    out = np.zeros_like(grid)
+    for drow, dcol in itertools.product((-1, 0, 1), repeat=2):
+        out |= np.roll(np.roll(grid, drow, axis=0), dcol, axis=1)
+    return out
+
+
+def peel(grid: np.ndarray) -> np.ndarray:
+    """The declared operation: drop every dark cell that touches pale.
+
+    A cell survives only when all eight of its neighbours are dark. Cells beyond
+    the lattice edge count as pale, so an edge cell can never survive.
+    """
+
+    padded = np.zeros((CELLS + 2, CELLS + 2), dtype=np.uint8)
+    padded[1:-1, 1:-1] = grid
+    survives = np.ones((CELLS, CELLS), dtype=np.uint8)
+    for drow, dcol in itertools.product((-1, 0, 1), repeat=2):
+        survives &= padded[1 + drow:CELLS + 1 + drow, 1 + dcol:CELLS + 1 + dcol]
+    return (survives & grid).astype(np.uint8)
+
+
+# Design invariants asserted at import time. Every figure is recovered exactly by
+# one peel of its grown slab, no figure is larger than the constant ink budget,
+# and every pair of figures differs in at least twelve of the 121 lattice cells.
+for _name, _grid in TEMPLATES.items():
+    assert int(_grid.sum()) == 10, _name
+    _grown = grow(_grid)
+    assert (peel(_grown) == _grid).all(), _name
+    assert int(_grown.sum()) <= TOTAL_INK_CELLS - 6, _name
+    assert _grown[0, :].sum() == 0 and _grown[-1, :].sum() == 0, _name
+    assert _grown[:, 0].sum() == 0 and _grown[:, -1].sum() == 0, _name
+
+MIN_GLYPH_SEPARATION = min(
+    int(np.abs(TEMPLATES[a].astype(int) - TEMPLATES[b].astype(int)).sum())
+    for a, b in itertools.combinations(GLYPHS, 2)
+)
+assert MIN_GLYPH_SEPARATION >= 12
+
+
+def _neighbours(row: int, col: int) -> list[tuple[int, int]]:
+    return [
+        (row + drow, col + dcol)
+        for drow, dcol in itertools.product((-1, 0, 1), repeat=2)
+        if (drow, dcol) != (0, 0)
+    ]
+
+
+def _touches(blob: np.ndarray, row: int, col: int) -> bool:
+    """Is this cell eight-connected to the blob, keeping it one component?"""
+
+    return any(
+        0 <= nrow < CELLS and 0 <= ncol < CELLS and blob[nrow, ncol]
+        for nrow, ncol in _neighbours(row, col)
+    )
+
+
+def _bbox_deficit(blob: np.ndarray) -> tuple[int, int, int, int]:
+    """How far the blob's bounding box falls short of the full inner window."""
+
+    filled = np.argwhere(blob)
+    return (
+        int(filled[:, 0].min()) - INNER_LO,
+        INNER_HI - int(filled[:, 0].max()),
+        int(filled[:, 1].min()) - INNER_LO,
+        INNER_HI - int(filled[:, 1].max()),
+    )
+
+
+def _rim_candidates(blob: np.ndarray, figure: np.ndarray) -> list[tuple[int, int]]:
+    """Pale inner cells that may be inked without disturbing the peel."""
+
+    out = []
+    for row in range(INNER_LO, INNER_HI + 1):
+        for col in range(INNER_LO, INNER_HI + 1):
+            if blob[row, col] or not _touches(blob, row, col):
+                continue
+            trial = blob.copy()
+            trial[row, col] = 1
+            if (peel(trial) == figure).all():
+                out.append((row, col))
+    return out
+
+
+def _pack_rim(figure: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Ink rim cells until the blob has the fixed ink budget and bounding box.
+
+    Rim cells are proposed from a symbol-independent pool - every pale inner cell
+    touching the blob - and are accepted only when the peel of the enlarged blob
+    is still exactly the figure. Cells that extend the blob toward a side of the
+    inner window it has not reached yet are taken first, so every finished blob
+    fills the same nine-by-nine bounding box whichever figure it hides.
+    """
+
+    blob = grow(figure).copy()
+    while int(blob.sum()) < TOTAL_INK_CELLS:
+        candidates = _rim_candidates(blob, figure)
+        if not candidates:
+            raise RuntimeError("no admissible rim cell remains")
+        top, bottom, left, right = _bbox_deficit(blob)
+        if top > 0:
+            wanted = [cell for cell in candidates if cell[0] < INNER_LO + top]
+        elif bottom > 0:
+            wanted = [cell for cell in candidates if cell[0] > INNER_HI - bottom]
+        elif left > 0:
+            wanted = [cell for cell in candidates if cell[1] < INNER_LO + left]
+        elif right > 0:
+            wanted = [cell for cell in candidates if cell[1] > INNER_HI - right]
+        else:
+            wanted = candidates
+        pool = wanted or candidates
+        row, col = pool[int(rng.integers(len(pool)))]
+        blob[row, col] = 1
+    if _bbox_deficit(blob) != (0, 0, 0, 0):
+        raise RuntimeError("blob did not fill the inner bounding box")
+    return blob
+
+
+def _luma(color: tuple[int, int, int]) -> float:
+    return 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample the figure, the packed blob, the panel geometry, tones and chaff."""
+
+    # Two-word seeding decorrelates the first draws of consecutive scene seeds,
+    # which keeps the figure classes balanced across a contiguous dataset.
+    rng = np.random.default_rng([int(seed), 0x9E3D])
+    glyph = GLYPHS[int(rng.integers(len(GLYPHS)))]
+    blob = _pack_rim(TEMPLATES[glyph], rng)
+    cell_px = int(CELL_CHOICES[int(rng.integers(len(CELL_CHOICES)))])
+    panel_px = CELLS * cell_px + 2 * FRAME_PX
+    span = CANVAS - panel_px - 2 * EDGE_MARGIN
+    top = int(EDGE_MARGIN + rng.integers(span + 1))
+    left = int(EDGE_MARGIN + rng.integers(span + 1))
+    # One scene in five is drawn from the band straddling the quarantine
+    # clearance so that near-boundary and quarantined cases are always covered.
+    if rng.random() < 0.2:
+        contrast = float(np.round(rng.uniform(MIN_CONTRAST, MIN_CONTRAST + 14.0), 3))
+    else:
+        contrast = float(np.round(rng.uniform(MIN_CONTRAST, MAX_CONTRAST), 3))
+    tint = TINTS[int(rng.integers(len(TINTS)))]
+
+    chaff: list[list[int]] = []
+    wanted = 4 + int(rng.integers(6))
+    for _ in range(400):
+        if len(chaff) >= wanted:
+            break
+        size = int(CHAFF_MIN_PX + rng.integers(CHAFF_MAX_PX - CHAFF_MIN_PX + 1))
+        cy = int(rng.integers(6, CANVAS - size - 6))
+        cx = int(rng.integers(6, CANVAS - size - 6))
+        if (
+            cy + size + CHAFF_CLEARANCE > top
+            and cy < top + panel_px + CHAFF_CLEARANCE
+            and cx + size + CHAFF_CLEARANCE > left
+            and cx < left + panel_px + CHAFF_CLEARANCE
+        ):
+            continue
+        clash = False
+        for oy, ox, osize in chaff:
+            if (
+                cy + size + CHAFF_GAP > oy
+                and cy < oy + osize + CHAFF_GAP
+                and cx + size + CHAFF_GAP > ox
+                and cx < ox + osize + CHAFF_GAP
+            ):
+                clash = True
+                break
+        if clash:
+            continue
+        chaff.append([cy, cx, size])
+    return {
+        "canvas": CANVAS,
+        "cells": CELLS,
+        "cell_px": cell_px,
+        "frame_px": FRAME_PX,
+        "glyph": glyph,
+        "blob": [[int(value) for value in row] for row in blob],
+        "top": top,
+        "left": left,
+        "contrast": contrast,
+        "tint": list(tint),
+        "chaff": chaff,
+    }
+
+
+def _ink_color(scene: dict) -> tuple[int, int, int]:
+    base = int(round(_luma(PAPER) - float(scene["contrast"])))
+    tint = tuple(int(value) for value in scene["tint"])
+    return (
+        max(0, min(255, base + tint[0])),
+        max(0, min(255, base + tint[1])),
+        max(0, min(255, base + tint[2])),
+    )
+
+
+def _clearance(scene: dict) -> float:
+    """Half the rendered paper-to-ink luma gap: the per-cell decision clearance."""
+
+    return 0.5 * (_luma(PAPER) - _luma(_ink_color(scene)))
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterise the scene with flat, hard-edged blocks and no antialiasing."""
+
+    canvas = int(scene["canvas"])
+    cell = int(scene["cell_px"])
+    frame = int(scene["frame_px"])
+    top = int(scene["top"])
+    left = int(scene["left"])
+    ink = np.array(_ink_color(scene), dtype=np.uint8)
+    paper = np.array(PAPER, dtype=np.uint8)
+    array = np.zeros((canvas, canvas, 3), dtype=np.uint8)
+    array[:, :] = np.array(BACKGROUND, dtype=np.uint8)
+
+    for cy, cx, size in scene["chaff"]:
+        array[cy:cy + size, cx:cx + size] = ink
+
+    panel_px = CELLS * cell + 2 * frame
+    array[top:top + panel_px, left:left + panel_px] = ink
+    array[top + frame:top + panel_px - frame, left + frame:left + panel_px - frame] = paper
+    blob = np.asarray(scene["blob"], dtype=np.uint8)
+    for row in range(CELLS):
+        for col in range(CELLS):
+            if not blob[row, col]:
+                continue
+            y0 = top + frame + row * cell
+            x0 = left + frame + col * cell
+            array[y0:y0 + cell, x0:x0 + cell] = ink
+    return Image.fromarray(array, mode="RGB")
+
+
+def analytic_gold(scene: dict) -> str:
+    """The figure the blob leaves behind after one peel."""
+
+    blob = np.asarray(scene["blob"], dtype=np.uint8)
+    survivors = peel(blob)
+    matches = [name for name, grid in TEMPLATES.items() if (survivors == grid).all()]
+    if len(matches) != 1:
+        raise ValueError("peeled blob does not match exactly one declared figure")
+    return matches[0]
+
+
+def margin(scene: dict) -> float:
+    """Per-cell luma clearance, the binding decision margin of the world."""
+
+    return float(round(_clearance(scene), 6))
+
+
+def symbol_gap(scene: dict) -> int:
+    """Runner-up gap: cells by which the peeled figure beats the next figure."""
+
+    survivors = peel(np.asarray(scene["blob"], dtype=np.uint8))
+    scores = sorted(
+        int(np.abs(survivors.astype(int) - grid.astype(int)).sum())
+        for grid in TEMPLATES.values()
+    )
+    return int(scores[1] - scores[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Flag scenes whose per-cell tone clearance is too small to read by eye."""
+
+    return bool(_clearance(scene) < QUARANTINE_CLEARANCE)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases exist: every sampled field is rendered injectively."""
+
+    return []

@@ -1,0 +1,343 @@
+"""Renderer for the column-stack-depth world.
+
+A pale instrument sheet carries exactly six pure-black horizontal bars, drawn as
+two disjoint bars on each of three well-separated levels.  Rows never touch, and
+the two bars of one level are always separated by white paper, so all six bars
+are disconnected marks.  Only the horizontal extent (the column range) of each
+bar matters: the decision is the largest number of black bars that a single
+vertical line can cross at once, i.e. the maximum stacking depth of the six
+column intervals.
+
+Coloured bars and grey specks elsewhere on the sheet are decoration; they never
+enter the analytic gold and the pixel arm ignores them by colour.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "column_stack_depth-renderer-0.1.0"
+
+WIDTH = 900
+HEIGHT = 560
+BAND_X0 = 270  # 0.30 * WIDTH
+BAND_X1 = 630  # 0.70 * WIDTH
+LEVEL_Y = (105, 245, 385)  # 0.1875, 0.4375, 0.6875 of HEIGHT
+BAR_HALF_H = 4  # bars are nine pixels thick
+N_LEVELS = 3
+N_BARS = 6  # exactly two bars per level, declared by the public question
+
+MIN_BAR_LEN = 58
+MAX_BAR_LEN = 100
+MIN_SAME_LEVEL_GAP = 16
+INK_WINDOW = (430, 500)  # total black-bar length, identical for every class
+LONGEST_BAR_FLOOR = 90  # every scene shows at least one near-maximal bar
+QUARANTINE_MARGIN_PX = 8.0
+SAMPLING_FLOOR_PX = 6.0
+
+PAPER = (250, 249, 245)
+INK = (0, 0, 0)
+DECOR_COLORS = (
+    (52, 96, 205),
+    (32, 138, 92),
+    (214, 128, 34),
+    (150, 150, 150),
+    (168, 96, 190),
+)
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _level_bars(
+    rng: random.Random, lo: int = BAND_X0, hi: int = BAND_X1
+) -> list[tuple[int, int]]:
+    """Two disjoint column intervals inside [lo, hi], left to right."""
+    span = hi - lo
+    limit = min(MAX_BAR_LEN, span - MIN_BAR_LEN - MIN_SAME_LEVEL_GAP)
+    while True:
+        left_len = rng.randint(MIN_BAR_LEN, limit)
+        right_len = rng.randint(MIN_BAR_LEN, limit)
+        gap = rng.randint(MIN_SAME_LEVEL_GAP, 70)
+        used = left_len + right_len + gap
+        if used <= span:
+            pad = rng.randint(0, span - used)
+            x0 = lo + pad
+            x1 = x0 + left_len
+            x2 = x1 + gap
+            x3 = x2 + right_len
+            return [(x0, x1), (x2, x3)]
+
+
+def _shallow_levels(rng: random.Random) -> list[list[tuple[int, int]]]:
+    """Three levels whose bars leave no column covered three times.
+
+    One level straddles a wide central gap, a second level lives entirely to the
+    right of that gap's left edge and a third entirely to its left edge's mirror,
+    so every column of the band is missed by at least one level.
+    """
+    room = MAX_BAR_LEN + MIN_BAR_LEN + MIN_SAME_LEVEL_GAP
+    cut_low = rng.randint(BAND_X0 + MAX_BAR_LEN, BAND_X1 - room)
+    cut_high = rng.randint(max(cut_low + 24, BAND_X0 + room), BAND_X1 - MAX_BAR_LEN)
+    left_len = rng.randint(MIN_BAR_LEN, min(MAX_BAR_LEN, cut_low - BAND_X0))
+    left_x0 = rng.randint(BAND_X0, cut_low - left_len)
+    right_len = rng.randint(MIN_BAR_LEN, min(MAX_BAR_LEN, BAND_X1 - cut_high))
+    right_x0 = rng.randint(cut_high, BAND_X1 - right_len)
+    straddling = [(left_x0, left_x0 + left_len), (right_x0, right_x0 + right_len)]
+    return [
+        straddling,
+        _level_bars(rng, cut_low, BAND_X1),
+        _level_bars(rng, BAND_X0, cut_high),
+    ]
+
+
+def _pair_clearance(a: tuple[int, int], b: tuple[int, int]) -> float:
+    """Signed horizontal overlap of two column intervals.
+
+    Positive when they share columns, negative when white paper separates them;
+    zero is exactly the visible boundary event where two bar ends line up.
+    """
+    return float(min(a[1], b[1]) - max(a[0], b[0]))
+
+
+def _all_bars(scene: dict) -> list[tuple[int, int]]:
+    return [tuple(interval) for level in scene["levels"] for interval in level]
+
+
+def _margin_of(bars: list[tuple[int, int]]) -> float:
+    worst = None
+    for i in range(len(bars)):
+        for j in range(i + 1, len(bars)):
+            clearance = abs(_pair_clearance(bars[i], bars[j]))
+            worst = clearance if worst is None else min(worst, clearance)
+    return float(worst)
+
+
+def _depth_of(bars: list[tuple[int, int]]) -> int:
+    """Largest number of intervals covering one common column."""
+    best = 0
+    for left, _ in bars:
+        for column in (left, left + 1):
+            count = sum(1 for x0, x1 in bars if x0 <= column <= x1)
+            best = max(best, count)
+    return best
+
+
+def _tighten(levels: list[list[tuple[int, int]]], rng: random.Random) -> None:
+    """Optionally slide one bar to sit a few pixels from a boundary event."""
+    target = rng.uniform(SAMPLING_FLOOR_PX + 0.4, QUARANTINE_MARGIN_PX - 0.4)
+    anchor_level, moving_level = rng.sample(range(N_LEVELS), 2)
+    anchor = levels[anchor_level][rng.randrange(2)]
+    index = rng.randrange(2)
+    moving = levels[moving_level][index]
+    sign = 1 if rng.random() < 0.5 else -1
+    # place the moving bar's left end just inside or just outside the anchor end
+    new_x0 = int(round(anchor[1] - sign * target))
+    shift = new_x0 - moving[0]
+    shifted = (moving[0] + shift, moving[1] + shift)
+    other = levels[moving_level][1 - index]
+    if shifted[0] < BAND_X0 or shifted[1] > BAND_X1:
+        return
+    if index == 0 and shifted[1] + MIN_SAME_LEVEL_GAP > other[0]:
+        return
+    if index == 1 and shifted[0] - MIN_SAME_LEVEL_GAP < other[1]:
+        return
+    levels[moving_level][index] = shifted
+
+
+def _decoration(rng: random.Random) -> list[list[int]]:
+    """Non-decisive coloured marks; never pure black, never inside a bar."""
+    marks: list[list[int]] = []
+    for _ in range(rng.randint(4, 7)):
+        color = rng.randrange(len(DECOR_COLORS))
+        kind = rng.randrange(2)
+        if kind == 0:  # coloured bar, a distractor for the stacking question
+            x0 = rng.randint(24, WIDTH - 140)
+            length = rng.randint(50, 120)
+            y = rng.randint(28, HEIGHT - 28)
+            marks.append([0, x0, y, length, 7, color])
+        else:  # small speck
+            x0 = rng.randint(20, WIDTH - 24)
+            y = rng.randint(20, HEIGHT - 24)
+            size = rng.randint(6, 12)
+            marks.append([1, x0, y, size, size, color])
+    return marks
+
+
+def _clear_of_bars(mark: list[int], bars: list[tuple[int, int]]) -> bool:
+    _, x0, y, w, h, _ = mark
+    box = (x0, y, x0 + w, y + h)
+    for level_y in LEVEL_Y:
+        top = level_y - BAR_HALF_H - 7
+        bottom = level_y + BAR_HALF_H + 7
+        if box[3] >= top and box[1] <= bottom:
+            for bar in bars:
+                if box[2] >= bar[0] - 7 and box[0] <= bar[1] + 7:
+                    return False
+    return True
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one answerable scene."""
+    rng = random.Random(seed)
+    target = 3 if rng.random() < 0.5 else 2
+    for _ in range(4000):
+        if target == 3:
+            levels = [_level_bars(rng) for _ in range(N_LEVELS)]
+        else:
+            levels = _shallow_levels(rng)
+        if rng.random() < 0.22:
+            _tighten(levels, rng)
+        bars = [interval for level in levels for interval in level]
+        if _margin_of(bars) < SAMPLING_FLOOR_PX:
+            continue
+        if _depth_of(bars) != target:
+            continue
+        lengths = [x1 - x0 for x0, x1 in bars]
+        # Total decisive ink and the longest single bar are held inside one
+        # narrow window for every answer class, so neither cue predicts the
+        # stacking depth.
+        if not INK_WINDOW[0] <= sum(lengths) <= INK_WINDOW[1]:
+            continue
+        if max(lengths) < LONGEST_BAR_FLOOR:
+            continue
+        # The six bars always fill the same band footprint, so neither the
+        # leftmost start nor the rightmost end carries information either.
+        if min(x0 for x0, _ in bars) > BAND_X0 + 14:
+            continue
+        if max(x1 for _, x1 in bars) < BAND_X1 - 14:
+            continue
+        order = list(range(N_LEVELS))
+        rng.shuffle(order)
+        levels = [levels[index] for index in order]
+        bars = [interval for level in levels for interval in level]
+        decoration = [
+            mark for mark in _decoration(rng) if _clear_of_bars(mark, bars)
+        ]
+        return {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "levels": [[list(interval) for interval in level] for level in levels],
+            "level_y": list(LEVEL_Y),
+            "bar_half_h": BAR_HALF_H,
+            "decoration": decoration,
+        }
+    raise RuntimeError(f"no answerable scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    """Maximum number of black bars crossed by one vertical line."""
+    return str(_depth_of(_all_bars(scene)))
+
+
+def margin(scene: dict) -> float:
+    """Pixels of the weakest bar-end clearance between two black bars."""
+    return _margin_of(_all_bars(scene))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN_PX
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: every sampled field draws ink."""
+    return []
+
+
+# --------------------------------------------------------------------------
+# support geometry (diagnostics for the tests and the gallery)
+# --------------------------------------------------------------------------
+def decisive_boxes(scene: dict) -> list[list[int]]:
+    boxes = []
+    for level_y, level in zip(scene["level_y"], scene["levels"]):
+        for x0, x1 in level:
+            boxes.append(
+                [x0, level_y - scene["bar_half_h"], x1, level_y + scene["bar_half_h"]]
+            )
+    return boxes
+
+
+def support_box(scene: dict) -> list[int]:
+    boxes = decisive_boxes(scene)
+    return [
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    ]
+
+
+# --------------------------------------------------------------------------
+# label-preserving variants (exercised by the tests, not declared aliases)
+# --------------------------------------------------------------------------
+def translated(scene: dict, dx: int, dy: int) -> dict:
+    out = json_copy(scene)
+    out["levels"] = [[[x0 + dx, x1 + dx] for x0, x1 in level] for level in scene["levels"]]
+    out["level_y"] = [y + dy for y in scene["level_y"]]
+    out["decoration"] = [
+        [kind, x + dx, y + dy, w, h, c] for kind, x, y, w, h, c in scene["decoration"]
+    ]
+    return out
+
+
+def permuted_levels(scene: dict) -> dict:
+    """Rotate which level carries which pair of bars."""
+    out = json_copy(scene)
+    out["levels"] = [scene["levels"][2], scene["levels"][0], scene["levels"][1]]
+    return out
+
+
+def permuted_decoration(scene: dict) -> dict:
+    out = json_copy(scene)
+    out["decoration"] = list(reversed(scene["decoration"]))
+    return out
+
+
+def without_decoration(scene: dict) -> dict:
+    out = json_copy(scene)
+    out["decoration"] = []
+    return out
+
+
+def recolored_decoration(scene: dict) -> dict:
+    out = json_copy(scene)
+    out["decoration"] = [
+        [kind, x, y, w, h, (c + 2) % len(DECOR_COLORS)]
+        for kind, x, y, w, h, c in scene["decoration"]
+    ]
+    return out
+
+
+def json_copy(scene: dict) -> dict:
+    return {
+        "width": scene["width"],
+        "height": scene["height"],
+        "levels": [[list(interval) for interval in level] for level in scene["levels"]],
+        "level_y": list(scene["level_y"]),
+        "bar_half_h": scene["bar_half_h"],
+        "decoration": [list(mark) for mark in scene["decoration"]],
+    }
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (scene["width"], scene["height"]), PAPER)
+    draw = ImageDraw.Draw(image)
+    for kind, x, y, w, h, color in scene["decoration"]:
+        rgb = DECOR_COLORS[color]
+        if kind == 0:
+            draw.rectangle([x, y, x + w, y + h], fill=rgb)
+        else:
+            draw.ellipse([x, y, x + w, y + h], fill=rgb)
+    half = scene["bar_half_h"]
+    for level_y, level in zip(scene["level_y"], scene["levels"]):
+        for x0, x1 in level:
+            draw.rectangle([x0, level_y - half, x1, level_y + half], fill=INK)
+    return image

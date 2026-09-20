@@ -1,0 +1,189 @@
+"""Independent PNG-only inverse arm for visible-key checkpoint chains.
+
+The oracle separately segments the cyan key and purple route markers, classifies
+their silhouettes by fill ratio, reconstructs black links as graph edges, and
+traverses every chain from its green endpoint. It then compares each recovered
+route order with the left-to-right key order. It receives no latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_SWATCHES = {
+    "black": ((35, 39, 47), (27, 33, 41)),
+    "green": ((39, 166, 92), (31, 145, 88)),
+    "purple": ((132, 86, 204), (151, 76, 187)),
+    "cyan": ((27, 164, 181), (18, 148, 169)),
+    "red": ((222, 68, 75), (195, 51, 68)),
+    "blue": ((52, 111, 216), (43, 127, 195)),
+    "orange": ((235, 140, 38), (218, 119, 35)),
+}
+
+
+def _near_any(arr: np.ndarray, swatches, tolerance: float) -> np.ndarray:
+    rgb = arr.astype(np.float32)
+    distances = [np.sum((rgb - np.asarray(color, dtype=np.float32)) ** 2, axis=2) for color in swatches]
+    return np.minimum.reduce(distances) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, min_area: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if visited[y, x]:
+            continue
+        visited[y, x] = True
+        queue = deque([(x, y)])
+        points = []
+        while queue:
+            px, py = queue.popleft()
+            points.append((px, py))
+            for dy in (-1, 0, 1):
+                ny = py + dy
+                if ny < 0 or ny >= height:
+                    continue
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx = px + dx
+                    if 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        queue.append((nx, ny))
+        if len(points) >= min_area:
+            components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _component_center(points: np.ndarray) -> tuple[float, float]:
+    return (
+        float(points[:, 0].min() + points[:, 0].max()) / 2.0,
+        float(points[:, 1].min() + points[:, 1].max()) / 2.0,
+    )
+
+
+def _checkpoint_shape(points: np.ndarray) -> str:
+    width = float(points[:, 0].max() - points[:, 0].min() + 1.0)
+    height = float(points[:, 1].max() - points[:, 1].min() + 1.0)
+    fill_ratio = float(len(points)) / (width * height)
+    if fill_ratio < 0.64:
+        return "triangle"
+    if fill_ratio < 0.90:
+        return "circle"
+    return "square"
+
+
+def _extract_nodes(arr: np.ndarray) -> list[dict]:
+    nodes: list[dict] = []
+    green_components = _components(_near_any(arr, _SWATCHES["green"], 54.0), 120)
+    if len(green_components) != 3:
+        raise ValueError(f"expected three green starts, found {len(green_components)}")
+    for points in green_components:
+        nodes.append({"kind": "start", "center": _component_center(points)})
+
+    purple_components = _components(_near_any(arr, _SWATCHES["purple"], 54.0), 120)
+    if len(purple_components) != 15:
+        raise ValueError(f"expected fifteen checkpoints, found {len(purple_components)}")
+    for points in purple_components:
+        nodes.append(
+            {
+                "kind": "checkpoint",
+                "center": _component_center(points),
+                "shape": _checkpoint_shape(points),
+            }
+        )
+
+    for color in ("red", "blue", "orange"):
+        tolerance = 30.0 if color == "blue" else 54.0
+        components = _components(_near_any(arr, _SWATCHES[color], tolerance), 120)
+        if len(components) != 1:
+            raise ValueError(f"expected one {color} terminal, found {len(components)}")
+        nodes.append({"kind": "terminal", "center": _component_center(components[0]), "color": color})
+    return nodes
+
+
+def _extract_key(arr: np.ndarray) -> list[str]:
+    components = _components(_near_any(arr, _SWATCHES["cyan"], 30.0), 120)
+    if len(components) != 5:
+        raise ValueError(f"expected five cyan key shapes, found {len(components)}")
+    ordered = sorted(components, key=lambda points: _component_center(points)[0])
+    centers = [_component_center(points) for points in ordered]
+    if any(center[1] >= 105.0 for center in centers):
+        raise ValueError("a cyan key shape is outside the visible key band")
+    if any(centers[index + 1][0] - centers[index][0] < 45.0 for index in range(4)):
+        raise ValueError("cyan key order is not visually separated")
+    return [_checkpoint_shape(points) for points in ordered]
+
+
+def _recover_edges(arr: np.ndarray, nodes: list[dict]) -> set[tuple[int, int]]:
+    link_mask = _near_any(arr, _SWATCHES["black"], 50.0)
+    strokes = _components(link_mask, 80)
+    centers = np.asarray([node["center"] for node in nodes], dtype=np.float64)
+    edges: set[tuple[int, int]] = set()
+    for stroke in strokes:
+        delta = stroke[:, None, :] - centers[None, :, :]
+        minimum_distance_sq = np.sum(delta * delta, axis=2).min(axis=0)
+        nearest = np.argsort(minimum_distance_sq)
+        close = [int(index) for index in nearest if minimum_distance_sq[index] <= 28.0**2]
+        if len(close) != 2:
+            raise ValueError(f"a visible link has {len(close)} marker endpoints")
+        edge = tuple(sorted(close))
+        if edge in edges:
+            raise ValueError("duplicate link recovered from raster")
+        edges.add(edge)
+    if len(edges) != 18:
+        raise ValueError(f"expected eighteen links, recovered {len(edges)}")
+    return edges
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    key_sequence = _extract_key(arr)
+    nodes = _extract_nodes(arr)
+    edges = _recover_edges(arr, nodes)
+    adjacency = {index: set() for index in range(len(nodes))}
+    for left, right in edges:
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+
+    sequences: list[tuple[str, list[str]]] = []
+    starts = [index for index, node in enumerate(nodes) if node["kind"] == "start"]
+    for start in starts:
+        if len(adjacency[start]) != 1:
+            raise ValueError("a green start is not a chain endpoint")
+        previous = None
+        current = start
+        shapes: list[str] = []
+        seen = set()
+        for _ in range(8):
+            if current in seen:
+                raise ValueError("cycle found in an advertised chain")
+            seen.add(current)
+            node = nodes[current]
+            if node["kind"] == "checkpoint":
+                shapes.append(node["shape"])
+            if node["kind"] == "terminal":
+                if len(shapes) != 5:
+                    raise ValueError("terminal reached with wrong checkpoint count")
+                sequences.append((node["color"], shapes))
+                break
+            forward = adjacency[current] - ({previous} if previous is not None else set())
+            if len(forward) != 1:
+                raise ValueError("raster graph is branched or broken")
+            next_node = next(iter(forward))
+            previous, current = current, next_node
+        else:
+            raise ValueError("chain traversal did not reach a terminal")
+
+    if len(sequences) != 3 or len({color for color, _ in sequences}) != 3:
+        raise ValueError("did not recover three distinct terminal chains")
+    winners = [color for color, sequence in sequences if sequence == key_sequence]
+    if len(winners) != 1:
+        raise ValueError(f"raster has {len(winners)} routes matching the key")
+    return winners[0]

@@ -1,0 +1,245 @@
+"""Independent image-only inverse for the ribbon-route world.
+
+This module intentionally duplicates the public reference-pattern definitions.  It
+does not import or inspect latent sampling, rendering, prompts, generation, or gold.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+GRID_SIDE = 5
+PANEL_COUNT = 25
+
+_REFERENCE_PATTERNS = {
+    "corner": np.asarray(
+        [
+            [1, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1],
+        ],
+        dtype=np.uint8,
+    ),
+    "tee": np.asarray(
+        [
+            [1, 1, 1, 1, 1],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    ),
+    "chevron": np.asarray(
+        [
+            [1, 0, 0, 0, 1],
+            [1, 0, 0, 0, 1],
+            [0, 1, 0, 1, 0],
+            [0, 1, 0, 1, 0],
+            [0, 0, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    ),
+}
+
+
+class OracleError(ValueError):
+    """The raster lacks a complete, unambiguous declared transform."""
+
+
+@dataclass(frozen=True)
+class Measurement:
+    bits: tuple[int, ...]
+    panel_centers: tuple[tuple[float, float], ...]
+    start_center: tuple[float, float]
+    end_center: tuple[float, float]
+    scores: dict[str, int]
+    decision: str
+    margin: float
+
+
+def _variants(array: np.ndarray) -> tuple[np.ndarray, ...]:
+    output: list[np.ndarray] = []
+    seen: set[bytes] = set()
+    for reflected in (array, np.fliplr(array)):
+        for turns in range(4):
+            item = np.rot90(reflected, turns).copy()
+            key = item.tobytes()
+            if key not in seen:
+                seen.add(key)
+                output.append(item)
+    return tuple(output)
+
+
+_REFERENCE_ORBITS = {
+    name: _variants(pattern) for name, pattern in _REFERENCE_PATTERNS.items()
+}
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    output: list[np.ndarray] = []
+    for raw_y, raw_x in np.argwhere(mask):
+        y, x = int(raw_y), int(raw_x)
+        if visited[y, x]:
+            continue
+        visited[y, x] = True
+        stack = [(y, x)]
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if (
+                    0 <= ny < height
+                    and 0 <= nx < width
+                    and mask[ny, nx]
+                    and not visited[ny, nx]
+                ):
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _centroid(points: np.ndarray) -> tuple[float, float]:
+    return float(points[:, 1].mean()), float(points[:, 0].mean())
+
+
+def _mask_centroid(mask: np.ndarray, label: str) -> tuple[float, float]:
+    points = np.argwhere(mask)
+    if len(points) < 28:
+        raise OracleError(f"missing or damaged {label} fiducial")
+    return _centroid(points)
+
+
+def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _ordered_indices(
+    centers: list[tuple[float, float]],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> list[int]:
+    first = min(range(len(centers)), key=lambda index: _distance(centers[index], start))
+    if _distance(centers[first], start) > 8.0:
+        raise OracleError("red ring does not identify a panel endpoint")
+    ordered = [first]
+    remaining = set(range(len(centers))) - {first}
+    while remaining:
+        current = centers[ordered[-1]]
+        following = min(remaining, key=lambda index: (_distance(current, centers[index]), index))
+        ordered.append(following)
+        remaining.remove(following)
+
+    edges = [
+        _distance(centers[left], centers[right])
+        for left, right in zip(ordered, ordered[1:])
+    ]
+    median_edge = float(np.median(np.asarray(edges, dtype=np.float64)))
+    if not 16.0 <= median_edge <= 24.0:
+        raise OracleError("panel chain spacing is outside the public construction")
+    if min(edges) < 0.72 * median_edge or max(edges) > 1.30 * median_edge:
+        raise OracleError("panels do not form one unbranched, evenly spaced chain")
+    if _distance(centers[ordered[-1]], end) > 10.0:
+        raise OracleError("gold triangle does not identify the opposite endpoint")
+    return ordered
+
+
+def _classify(bits: tuple[int, ...]) -> tuple[str, float, dict[str, int]]:
+    grid = np.asarray(bits, dtype=np.uint8).reshape(GRID_SIDE, GRID_SIDE)
+    scores = {
+        name: min(int(np.count_nonzero(grid != variant)) for variant in variants)
+        for name, variants in _REFERENCE_ORBITS.items()
+    }
+    ordered = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    if ordered[0][1] == ordered[1][1]:
+        return "ambiguous", 0.0, scores
+    return ordered[0][0], float(ordered[1][1] - ordered[0][1]), scores
+
+
+def measure_from_image(image: Image.Image) -> Measurement:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise OracleError("expected an RGB raster")
+    height, width = array.shape[:2]
+    if height < 64 or width < 64:
+        raise OracleError("raster is too small")
+
+    border = np.concatenate(
+        (
+            array[:3].reshape(-1, 3),
+            array[-3:].reshape(-1, 3),
+            array[:, :3].reshape(-1, 3),
+            array[:, -3:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    background = np.median(border, axis=0)
+    channel_spread = array.max(axis=2) - array.min(axis=2)
+    brightness = array.mean(axis=2)
+    background_delta = np.linalg.norm(array.astype(np.float64) - background, axis=2)
+
+    neutral = channel_spread <= 24
+    panel_mask = neutral & (
+        (brightness < 105.0)
+        | ((brightness >= 165.0) & (brightness <= 232.0) & (background_delta > 24.0))
+    )
+    candidates = []
+    for points in _components(panel_mask):
+        if not 110 <= len(points) <= 190:
+            continue
+        y0, x0 = points.min(axis=0)
+        y1, x1 = points.max(axis=0)
+        box_height, box_width = int(y1 - y0 + 1), int(x1 - x0 + 1)
+        if 10 <= box_height <= 15 and 10 <= box_width <= 15:
+            candidates.append(points)
+    if len(candidates) != PANEL_COUNT:
+        raise OracleError(f"expected 25 intact panels, recovered {len(candidates)}")
+
+    red = (
+        (array[:, :, 0] >= 180)
+        & (array[:, :, 1] <= 105)
+        & (array[:, :, 2] <= 120)
+        & ((array[:, :, 0] - array[:, :, 1]) >= 90)
+    )
+    gold = (
+        (array[:, :, 0] >= 215)
+        & (array[:, :, 1] >= 125)
+        & (array[:, :, 1] <= 205)
+        & (array[:, :, 2] <= 80)
+        & ((array[:, :, 0] - array[:, :, 1]) >= 35)
+    )
+    start = _mask_centroid(red, "red-ring")
+    end = _mask_centroid(gold, "gold-triangle")
+
+    centers = [_centroid(points) for points in candidates]
+    order = _ordered_indices(centers, start, end)
+    bits = tuple(
+        int(float(brightness[candidates[index][:, 0], candidates[index][:, 1]].mean()) < 130.0)
+        for index in order
+    )
+    if sum(bits) != 9:
+        raise OracleError("the declared equal-ink construction has been corrupted")
+    decision, gap, scores = _classify(bits)
+    return Measurement(
+        bits=bits,
+        panel_centers=tuple(centers[index] for index in order),
+        start_center=start,
+        end_center=end,
+        scores=scores,
+        decision=decision,
+        margin=gap,
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure_from_image(image).decision

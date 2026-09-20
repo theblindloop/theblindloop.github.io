@@ -1,0 +1,134 @@
+"""Independent image-only inverse for the declared medial-depth ridge transform."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+N = 13
+TOTAL_INK = 84
+
+_TEMPLATE_ROWS = {
+    "fork": (
+        "0000000000000", "0000000000000", "0001000001000", "0000100010000",
+        "0000010100000", "0000001000000", "0000001000000", "0000001000000",
+        "0000001000000", "0000001000000", "0000001000000", "0000000000000",
+        "0000000000000",
+    ),
+    "arch": (
+        "0000000000000", "0000000000000", "0000000000000", "0000000000000",
+        "0000001000000", "0000010100000", "0000100010000", "0001000001000",
+        "0001000001000", "0001000001000", "0000000000000", "0000000000000",
+        "0000000000000",
+    ),
+    "bolt": (
+        "0000000000000", "0000000000000", "0000100000000", "0000100000000",
+        "0000010000000", "0000001000000", "0000000100000", "0000000010000",
+        "0000000010000", "0000000100000", "0000000100000", "0000000000000",
+        "0000000000000",
+    ),
+}
+_TEMPLATES = {
+    name: np.asarray([[char == "1" for char in row] for row in rows], dtype=bool)
+    for name, rows in _TEMPLATE_ROWS.items()
+}
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _component_count(mask: np.ndarray) -> int:
+    remaining = {tuple(map(int, point)) for point in np.argwhere(mask)}
+    count = 0
+    while remaining:
+        count += 1
+        stack = [remaining.pop()]
+        while stack:
+            y, x = stack.pop()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+    return count
+
+
+def _parse_cells(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape != (512, 512, 3):
+        raise OracleAbstention("expected a 512 by 512 RGB raster")
+    red, green, blue = (array[:, :, index].astype(np.int16) for index in range(3))
+    cyan = (red < 80) & (green > 120) & (blue > 130) & (green - red > 55) & (blue - red > 65)
+    points = np.argwhere(cyan)
+    if not len(points):
+        raise OracleAbstention("cyan frame is missing")
+    min_y, min_x = points.min(axis=0)
+    max_y, max_x = points.max(axis=0)
+    width, height = int(max_x - min_x + 1), int(max_y - min_y + 1)
+    if width != height or (width - 6) % N or (width - 6) // N not in (5, 6):
+        raise OracleAbstention("cyan frame has an invalid extent")
+    size = (width - 6) // N
+    border = np.zeros(cyan.shape, dtype=bool)
+    border[min_y:min_y + 3, min_x:max_x + 1] = True
+    border[max_y - 2:max_y + 1, min_x:max_x + 1] = True
+    border[min_y:max_y + 1, min_x:min_x + 3] = True
+    border[min_y:max_y + 1, max_x - 2:max_x + 1] = True
+    if not bool(np.all(cyan[border])):
+        raise OracleAbstention("cyan frame is incomplete")
+    origin_x, origin_y = int(min_x + 3), int(min_y + 3)
+    cells = np.zeros((N, N), dtype=bool)
+    luminance = array.astype(np.float32).mean(axis=2)
+    for y in range(N):
+        for x in range(N):
+            x0, y0 = origin_x + x * size, origin_y + y * size
+            inset = 1 if size >= 5 else 0
+            patch = luminance[y0 + inset:y0 + size - inset, x0 + inset:x0 + size - inset]
+            cells[y, x] = float(np.median(patch)) < 135.0
+    if int(cells.sum()) != TOTAL_INK:
+        raise OracleAbstention("the connected island does not have the declared equal ink count")
+    if _component_count(cells) != 1:
+        raise OracleAbstention("dark cells do not form one edge-connected island")
+    return cells
+
+
+def _depth_by_relaxation(cells: np.ndarray) -> np.ndarray:
+    distance = np.where(cells, N * N, 0).astype(np.int16)
+    for _ in range(N * 2):
+        previous = distance.copy()
+        for y, x in np.argwhere(cells):
+            neighbors = [
+                distance[y - 1, x] if y else 0,
+                distance[y + 1, x] if y + 1 < N else 0,
+                distance[y, x - 1] if x else 0,
+                distance[y, x + 1] if x + 1 < N else 0,
+            ]
+            distance[y, x] = min(int(distance[y, x]), 1 + min(map(int, neighbors)))
+        if np.array_equal(previous, distance):
+            break
+    return distance
+
+
+def analyze_image(image: Image.Image) -> dict:
+    cells = _parse_cells(image)
+    depth = _depth_by_relaxation(cells)
+    ridge = np.zeros((N, N), dtype=bool)
+    for y, x in np.argwhere(cells):
+        neighborhood = depth[max(0, y - 1):min(N, y + 2), max(0, x - 1):min(N, x + 2)]
+        ridge[y, x] = int(depth[y, x]) >= int(neighborhood.max())
+    distances = {name: int(np.count_nonzero(ridge != target)) for name, target in _TEMPLATES.items()}
+    ordered = sorted(distances, key=lambda name: (distances[name], name))
+    margin = distances[ordered[1]] - distances[ordered[0]]
+    if margin < 2:
+        raise OracleAbstention("top two ridge templates are ambiguous")
+    return {
+        "decision": ordered[0],
+        "margin": float(margin),
+        "distances": distances,
+        "dark_cell_count": int(cells.sum()),
+        "ridge_cell_count": int(ridge.sum()),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

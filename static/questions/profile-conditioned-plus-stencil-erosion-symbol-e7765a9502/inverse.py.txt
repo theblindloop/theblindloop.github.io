@@ -1,0 +1,153 @@
+"""Independent PNG-only inverse for the visible plus-stencil operation."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+FRAME_RGB = np.array((25, 157, 179), dtype=np.int16)
+RESULT_N = 11
+GRID_N = 13
+KERNEL = ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))
+ORIENTATIONS = ("up", "right", "down", "left")
+
+# Public 11x11 template written independently from renderer construction code.
+_OPEN_UP = (
+    "...........",
+    "...........",
+    "...........",
+    "..#.....#..",
+    "..#.....#..",
+    "..#.....#..",
+    "..#.....#..",
+    "..##...##..",
+    "..#######..",
+    "...........",
+    "...........",
+)
+
+
+def _bits(rows: tuple[str, ...]) -> np.ndarray:
+    return np.array([[ch == "#" for ch in row] for row in rows], dtype=bool)
+
+
+def _validate_gold_key(arr: np.ndarray) -> None:
+    red, green, blue = arr[..., 0], arr[..., 1], arr[..., 2]
+    gold = (red > 205) & (green > 135) & (green < 205) & (blue < 90)
+    ys, xs = np.nonzero(gold)
+    if len(xs) < 900:
+        raise ValueError("abstain: visible gold stencil key is missing")
+    xmin, xmax = int(xs.min()), int(xs.max())
+    ymin, ymax = int(ys.min()), int(ys.max())
+    width, height = xmax - xmin + 1, ymax - ymin + 1
+    if not (48 <= width <= 78 and 48 <= height <= 78):
+        raise ValueError("abstain: gold key has invalid extent")
+    observed = np.zeros((3, 3), dtype=bool)
+    for row in range(3):
+        for col in range(3):
+            x = round(xmin + (col + 0.5) * width / 3)
+            y = round(ymin + (row + 0.5) * height / 3)
+            patch = gold[max(0, y - 3): y + 4, max(0, x - 3): x + 4]
+            observed[row, col] = bool(patch.mean() > 0.6)
+    expected = np.array(
+        [[False, True, False], [True, True, True], [False, True, False]], dtype=bool
+    )
+    if not np.array_equal(observed, expected):
+        raise ValueError("abstain: gold key is not the declared five-cell plus")
+
+
+def _frame_interior(arr: np.ndarray) -> tuple[float, float, float, float]:
+    distance = np.abs(arr.astype(np.int16) - FRAME_RGB).max(axis=2)
+    cyan = distance <= 2
+    ys, xs = np.nonzero(cyan)
+    if len(xs) < 1000:
+        raise ValueError("abstain: cyan mosaic frame is missing")
+    xmin, xmax = int(xs.min()), int(xs.max())
+    ymin, ymax = int(ys.min()), int(ys.max())
+    midx, midy = (xmin + xmax) // 2, (ymin + ymax) // 2
+    row_xs = np.flatnonzero(cyan[midy])
+    col_ys = np.flatnonzero(cyan[:, midx])
+    left = row_xs[row_xs < midx]
+    right = row_xs[row_xs > midx]
+    top = col_ys[col_ys < midy]
+    bottom = col_ys[col_ys > midy]
+    if not all(len(values) for values in (left, right, top, bottom)):
+        raise ValueError("abstain: cyan frame is not closed")
+    x0, x1 = int(left.max() + 1), int(right.min())
+    y0, y1 = int(top.max() + 1), int(bottom.min())
+    if abs((x1 - x0) - (y1 - y0)) > 2 or not 300 <= x1 - x0 <= 450:
+        raise ValueError("abstain: mosaic frame geometry is invalid")
+    return float(x0), float(y0), float(x1), float(y1)
+
+
+def _read_source(arr: np.ndarray) -> np.ndarray:
+    x0, y0, x1, y1 = _frame_interior(arr)
+    cell_x, cell_y = (x1 - x0) / GRID_N, (y1 - y0) / GRID_N
+    if abs(cell_x - cell_y) > 0.2:
+        raise ValueError("abstain: cells are not square")
+    source = np.zeros((GRID_N, GRID_N), dtype=bool)
+    for row in range(GRID_N):
+        for col in range(GRID_N):
+            cx = x0 + (col + 0.5) * cell_x
+            cy = y0 + (row + 0.5) * cell_y
+            radius = max(3, int(cell_x * 0.16))
+            patch = arr[
+                int(round(cy)) - radius: int(round(cy)) + radius + 1,
+                int(round(cx)) - radius: int(round(cx)) + radius + 1,
+            ]
+            luminance = (
+                0.2126 * patch[..., 0] + 0.7152 * patch[..., 1] + 0.0722 * patch[..., 2]
+            ).mean()
+            source[row, col] = bool(luminance < 145.0)
+    count = int(source.sum())
+    if not 45 <= count <= 135:
+        raise ValueError("abstain: mosaic dark-tile count is implausible")
+    return source
+
+
+def _erode(source: np.ndarray) -> np.ndarray:
+    result = np.zeros((RESULT_N, RESULT_N), dtype=bool)
+    for row in range(RESULT_N):
+        for col in range(RESULT_N):
+            values = []
+            for dr, dc in KERNEL:
+                values.append(bool(source[row + 1 + dr, col + 1 + dc]))
+            result[row, col] = all(values)
+    return result
+
+
+def _templates() -> dict[str, np.ndarray]:
+    up = _bits(_OPEN_UP)
+    return {
+        "up": up,
+        "left": np.rot90(up, 1).copy(),
+        "down": np.rot90(up, 2).copy(),
+        "right": np.rot90(up, 3).copy(),
+    }
+
+
+def measure_from_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.shape[1] < 500 or arr.shape[0] < 500:
+        raise ValueError("abstain: raster is too small")
+    _validate_gold_key(arr)
+    result = _erode(_read_source(arr))
+    scores = {
+        direction: int((result == template).sum())
+        for direction, template in _templates().items()
+    }
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    decision = ranked[0][0]
+    margin = float(ranked[0][1] - ranked[1][1])
+    if margin < 4.0:
+        raise ValueError(f"abstain: eroded template margin {margin:.1f} is ambiguous")
+    return {
+        "decision": decision,
+        "margin": margin,
+        "scores": scores,
+        "result_ink": int(result.sum()),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure_from_image(image)["decision"])

@@ -1,0 +1,161 @@
+"""Independent PNG-only inverse arm for route_midpoint_marker.
+
+The oracle segments the five colored rings, isolates the black component joining
+the green and purple endpoints, and measures weighted shortest-path distance on
+that raster component. It receives no latent scene or renderer state.
+"""
+
+from __future__ import annotations
+
+import heapq
+import math
+
+import numpy as np
+from PIL import Image
+
+REFERENCES = {
+    "background": [(250, 249, 245), (247, 250, 252), (255, 250, 242)],
+    "ink": [(38, 50, 56), (48, 52, 59), (32, 42, 53)],
+    "corridor": [(207, 213, 216), (202, 216, 209), (217, 210, 197)],
+    "green": [(40, 163, 92), (33, 140, 87), (54, 166, 106)],
+    "purple": [(137, 80, 181), (123, 76, 165), (146, 86, 180)],
+    "red": [(223, 70, 80), (201, 75, 85), (226, 85, 94)],
+    "blue": [(52, 127, 213), (53, 110, 183), (67, 127, 208)],
+    "orange": [(238, 139, 44), (215, 122, 37), (237, 150, 60)],
+}
+MARKERS = ("green", "purple", "red", "blue", "orange")
+
+
+class PixelRouteError(ValueError):
+    """The raster does not contain one safely measurable endpoint-to-endpoint route."""
+
+
+def _labels(image: Image.Image) -> tuple[np.ndarray, list[str]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    names = list(REFERENCES)
+    scores = []
+    for name in names:
+        refs = np.asarray(REFERENCES[name], dtype=np.int32)
+        delta = array[:, :, None, :] - refs[None, None, :, :]
+        scores.append(np.min(np.sum(delta * delta, axis=3), axis=2))
+    return np.argmin(np.stack(scores, axis=2), axis=2), names
+
+
+def _reference_mask(array: np.ndarray, name: str) -> np.ndarray:
+    """Select exact opaque palette pixels, excluding antialiased text fringes."""
+    refs = np.asarray(REFERENCES[name], dtype=np.int32)
+    return np.any(np.all(array[:, :, None, :] == refs[None, None, :, :], axis=3), axis=2)
+
+
+def _marker_centers(array: np.ndarray) -> dict[str, tuple[float, float]]:
+    centers = {}
+    for name in MARKERS:
+        pixels = np.argwhere(_reference_mask(array, name))
+        if not 250 <= len(pixels) <= 700:
+            raise PixelRouteError(f"expected one compact {name} ring, found {len(pixels)} pixels")
+        y0, x0 = pixels.min(axis=0)
+        y1, x1 = pixels.max(axis=0)
+        if not (23 <= x1 - x0 + 1 <= 31 and 23 <= y1 - y0 + 1 <= 31):
+            raise PixelRouteError(f"{name} evidence is not a compact ring")
+        centers[name] = ((float(x0) + float(x1)) / 2.0, (float(y0) + float(y1)) / 2.0)
+    return centers
+
+
+def _components(mask: np.ndarray, minimum: int = 20) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        pixels = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            output.append(np.asarray(pixels, dtype=np.int32))
+    return output
+
+
+def _nearest(component: np.ndarray, center: tuple[float, float]) -> tuple[float, tuple[int, int]]:
+    delta_x = component[:, 1] - center[0]
+    delta_y = component[:, 0] - center[1]
+    squared = delta_x * delta_x + delta_y * delta_y
+    index = int(np.argmin(squared))
+    return float(squared[index]), (int(component[index, 0]), int(component[index, 1]))
+
+
+def _route_component(
+    ink: np.ndarray, centers: dict[str, tuple[float, float]]
+) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+    matches = []
+    for component in _components(ink):
+        green_distance, green_pixel = _nearest(component, centers["green"])
+        purple_distance, purple_pixel = _nearest(component, centers["purple"])
+        if green_distance <= 4.0 and purple_distance <= 4.0:
+            matches.append((component, green_pixel, purple_pixel))
+    if len(matches) != 1:
+        raise PixelRouteError(f"expected one black component joining endpoints, found {len(matches)}")
+    component, start, finish = matches[0]
+    if len(component) < 1800:
+        raise PixelRouteError("endpoint route is implausibly short")
+    return component, start, finish
+
+
+def _distances(
+    shape: tuple[int, int], component: np.ndarray, start: tuple[int, int]
+) -> np.ndarray:
+    allowed = np.zeros(shape, dtype=bool)
+    allowed[component[:, 0], component[:, 1]] = True
+    values = np.full(shape, np.inf, dtype=np.float64)
+    values[start] = 0.0
+    queue = [(0.0, start[0], start[1])]
+    neighbors = (
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
+    )
+    height, width = shape
+    while queue:
+        distance, y, x = heapq.heappop(queue)
+        if distance != values[y, x]:
+            continue
+        for dy, dx, cost in neighbors:
+            ny, nx = y + dy, x + dx
+            candidate = distance + cost
+            if 0 <= ny < height and 0 <= nx < width and allowed[ny, nx] and candidate < values[ny, nx]:
+                values[ny, nx] = candidate
+                heapq.heappush(queue, (candidate, ny, nx))
+    return values
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the checkpoint nearest half the visible route's pixel geodesic."""
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    centers = _marker_centers(array)
+    ink = _reference_mask(array, "ink")
+    component, start, finish = _route_component(ink, centers)
+    distances = _distances(ink.shape, component, start)
+    total = float(distances[finish])
+    if not math.isfinite(total) or total < 700.0:
+        raise PixelRouteError("finish is not safely reachable along a substantial route")
+    scores = []
+    for color in ("red", "blue", "orange"):
+        squared, pixel = _nearest(component, centers[color])
+        if squared > 4.0 or not math.isfinite(float(distances[pixel])):
+            raise PixelRouteError(f"{color} ring is not centered on the route")
+        scores.append((abs(float(distances[pixel]) - total / 2.0), color))
+    scores.sort()
+    if scores[1][0] - scores[0][0] < 24.0:
+        raise PixelRouteError("pixel midpoint decision has insufficient runner-up margin")
+    return scores[0][1]

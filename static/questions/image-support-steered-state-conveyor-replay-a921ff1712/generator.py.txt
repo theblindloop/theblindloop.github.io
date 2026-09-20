@@ -1,0 +1,224 @@
+"""Deterministic renderer and analytic arm for a connected state conveyor."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "state-conveyor-replay-0.1.0"
+CANVAS = (512, 512)
+STATE_LABELS = ("W", "X", "Y", "Z")
+OP_NAMES = ("inc", "dec", "fork", "reset")
+
+# All colors are deliberately fixed and separated.  The image-only arm has
+# this public visual contract duplicated independently in oracle.py.
+PALETTE = {
+    "background": (250, 248, 243),
+    "route": (38, 55, 70),
+    "finish": (211, 65, 62),
+    "distractor": (154, 163, 170),
+    "state_w": (51, 102, 204),
+    "state_x": (226, 168, 32),
+    "state_y": (44, 160, 105),
+    "state_z": (190, 75, 145),
+    "op_inc": (236, 125, 42),
+    "op_dec": (30, 161, 177),
+    "op_fork": (116, 85, 175),
+    "op_reset": (105, 105, 105),
+}
+
+_ROUTE_TEMPLATES = (
+    ((48, 105), (96, 155), (145, 225), (195, 330), (245, 410), (295, 355), (345, 255), (395, 150), (445, 95), (476, 180)),
+    ((48, 405), (96, 355), (145, 255), (195, 150), (245, 95), (295, 150), (345, 255), (395, 355), (445, 410), (476, 335)),
+    ((48, 190), (96, 95), (145, 145), (195, 250), (245, 360), (295, 420), (345, 340), (395, 230), (445, 110), (476, 180)),
+    ((48, 320), (96, 415), (145, 350), (195, 245), (245, 130), (295, 95), (345, 175), (395, 295), (445, 400), (476, 330)),
+)
+
+
+def _colors(scene: dict[str, Any]) -> dict[str, tuple[int, int, int]]:
+    return {name: tuple(int(channel) for channel in value) for name, value in scene["palette"].items()}
+
+
+def _route_for(rng: random.Random) -> list[list[int]]:
+    template = _ROUTE_TEMPLATES[rng.randrange(len(_ROUTE_TEMPLATES))]
+    points: list[list[int]] = []
+    for index, (x, y) in enumerate(template):
+        jitter = 0 if index in (0, len(template) - 1) else 3
+        points.append([int(x + rng.randint(-jitter, jitter)), int(y + rng.randint(-jitter, jitter))])
+    return points
+
+
+def _distractors(rng: random.Random) -> list[dict[str, int]]:
+    anchors = [(23, 72), (488, 72), (24, 468), (488, 468), (27, 258), (485, 258)]
+    rng.shuffle(anchors)
+    result: list[dict[str, int]] = []
+    for index, (x, y) in enumerate(anchors[:4]):
+        result.append(
+            {
+                "kind": index % 2,
+                "x": x + rng.randint(-4, 4),
+                "y": y + rng.randint(-4, 4),
+                "size": rng.randint(6, 9),
+            }
+        )
+    return result
+
+
+def _transition(state: int, op: int) -> int:
+    if op == 0:  # clockwise arrow
+        return (state + 1) % 4
+    if op == 1:  # counterclockwise arrow
+        return (state - 1) % 4
+    if op == 2:  # fork: W/Y hold, X/Z advance
+        return state if state in (0, 2) else (state + 1) % 4
+    if op == 3:  # bar reset
+        return 1
+    raise ValueError(f"unknown operation {op}")
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Sample a balanced, well-separated path and eight visible stations."""
+    rng = random.Random(int(seed))
+
+    # The first six stations always expose all four rule types.  The final two
+    # are selected after the prefix so each seed can be assigned a balanced
+    # terminal class without removing resets or conditional stations.
+    prefix = [0, 1, 2, 3, rng.randrange(4), rng.randrange(4)]
+    rng.shuffle(prefix)
+    prefix_state_by_initial = []
+    for initial in range(4):
+        value = initial
+        for operation in prefix:
+            value = _transition(value, operation)
+        prefix_state_by_initial.append(value)
+
+    target = int(seed) % 4
+    suffix_options = [(left, right) for left in range(4) for right in range(4)]
+    rng.shuffle(suffix_options)
+    selected: tuple[int, int, int] | None = None
+    for left, right in suffix_options:
+        for initial in rng.sample(range(4), 4):
+            value = _transition(_transition(prefix_state_by_initial[initial], left), right)
+            if value == target:
+                selected = (initial, left, right)
+                break
+        if selected is not None:
+            break
+    if selected is None:  # Defensive exhaustive fallback; the table is reachable.
+        raise RuntimeError("could not balance terminal state")
+    initial_state, left, right = selected
+
+    return {
+        "initial_state": initial_state,
+        "station_ops": prefix + [left, right],
+        "route_points": _route_for(rng),
+        "distractors": _distractors(rng),
+        "palette": {name: list(value) for name, value in PALETTE.items()},
+        "canvas": list(CANVAS),
+        "route_width": rng.choice([7, 8]),
+        "marker_radius": 16,
+    }
+
+
+def _draw_station(draw: ImageDraw.ImageDraw, x: int, y: int, operation: int, colors: dict[str, tuple[int, int, int]], radius: int) -> None:
+    fill = colors[f"op_{OP_NAMES[operation]}"]
+    outline = colors["route"]
+    if operation in (0, 1):
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill, outline=outline, width=3)
+        if operation == 0:
+            draw.polygon([(x + 7, y), (x - 3, y - 6), (x - 3, y + 6)], fill=(255, 255, 255))
+        else:
+            draw.polygon([(x - 7, y), (x + 3, y - 6), (x + 3, y + 6)], fill=(255, 255, 255))
+    elif operation == 2:
+        draw.polygon([(x, y - radius), (x + radius, y), (x, y + radius), (x - radius, y)], fill=fill, outline=outline)
+        draw.line([(x - 6, y + 5), (x, y - 4), (x + 6, y + 5)], fill=(255, 255, 255), width=3)
+    elif operation == 3:
+        draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=fill, outline=outline, width=3)
+        draw.rectangle((x - 4, y - 4, x + 4, y + 4), fill=(255, 255, 255))
+    else:
+        raise ValueError(operation)
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    width, height = (int(value) for value in scene["canvas"])
+    colors = _colors(scene)
+    image = Image.new("RGB", (width, height), colors["background"])
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+
+    # A compact public legend makes the symbol semantics visible without
+    # encoding the answer at the finish.
+    draw.text((16, 8), "STATES", fill=colors["route"], font=font)
+    for index, label in enumerate(STATE_LABELS):
+        x = 70 + index * 28
+        draw.ellipse((x - 7, 22 - 7, x + 7, 22 + 7), fill=colors[f"state_{label.lower()}"], outline=colors["route"], width=1)
+        draw.text((x - 3, 32), label, fill=colors["route"], font=font)
+    draw.text((188, 8), "STATION RULES", fill=colors["route"], font=font)
+    legend_x = (282, 334, 386, 438)
+    legend_labels = ("+1", "-1", "F", "X")
+    for x, operation, label in zip(legend_x, range(4), legend_labels, strict=True):
+        _draw_station(draw, x, 22, operation, colors, 8)
+        draw.text((x - 4, 32), label, fill=colors["route"], font=font)
+
+    points = [(int(point[0]), int(point[1])) for point in scene["route_points"]]
+    draw.line(points, fill=colors["route"], width=int(scene["route_width"]), joint="curve")
+    radius = int(scene["marker_radius"])
+    for point, operation in zip(points[1:-1], scene["station_ops"], strict=True):
+        _draw_station(draw, point[0], point[1], int(operation), colors, radius)
+
+    start_x, start_y = points[0]
+    draw.ellipse(
+        (start_x - radius, start_y - radius, start_x + radius, start_y + radius),
+        fill=colors[f"state_{STATE_LABELS[int(scene['initial_state'])].lower()}"],
+        outline=colors["route"],
+        width=4,
+    )
+    finish_x, finish_y = points[-1]
+    draw.ellipse(
+        (finish_x - radius, finish_y - radius, finish_x + radius, finish_y + radius),
+        fill=colors["finish"],
+        outline=colors["route"],
+        width=4,
+    )
+
+    for distractor in scene["distractors"]:
+        x, y, size = (int(distractor[key]) for key in ("x", "y", "size"))
+        if int(distractor["kind"]) == 0:
+            draw.ellipse((x - size, y - size, x + size, y + size), outline=colors["distractor"], width=3)
+        else:
+            draw.rectangle((x - size, y - size, x + size, y + size), outline=colors["distractor"], width=3)
+    return image
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    state = int(scene["initial_state"])
+    for operation in scene["station_ops"]:
+        state = _transition(state, int(operation))
+    return STATE_LABELS[state]
+
+
+def margin(scene: dict[str, Any]) -> float:
+    points = [tuple(float(value) for value in point) for point in scene["route_points"]]
+    radius = float(scene["marker_radius"])
+    route_width = float(scene["route_width"])
+    adjacent = [math.dist(left, right) - (2.0 * radius + route_width) for left, right in zip(points, points[1:])]
+    nonadjacent = [
+        math.dist(points[left], points[right]) - 2.0 * radius
+        for left in range(len(points))
+        for right in range(left + 2, len(points))
+    ]
+    return round(min(adjacent + nonadjacent), 6)
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    return margin(scene) < 12.0
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["distractors"] = list(reversed(twin["distractors"]))
+    return [("distractor_order", twin)]

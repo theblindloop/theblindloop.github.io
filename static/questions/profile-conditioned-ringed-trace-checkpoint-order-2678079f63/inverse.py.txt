@@ -1,0 +1,197 @@
+"""Independent image-only inverse for the ringed trace checkpoint world.
+
+This module deliberately duplicates the small amount of colour knowledge needed
+to read the public raster, but it does not import or inspect renderer state.
+It finds the two chromatic marker rings and their gold bitmap labels, then uses
+a dilated navy ink mask and a flood fill from the green port to compare the
+along-route distances to A and B.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+ROUTE = np.array((39, 54, 73), dtype=np.float32)
+PORT = np.array((44, 137, 91), dtype=np.float32)
+GOLD = np.array((236, 171, 45), dtype=np.float32)
+MARKER_PALETTE = np.asarray(
+    ((218, 75, 83), (36, 150, 163), (126, 89, 181), (224, 143, 45)),
+    dtype=np.float32,
+)
+ROUTE_TOL = 88.0
+CHROMA_TOL = 52.0
+GOLD_TOL = 105.0
+GLYPHS = {
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+}
+
+
+class OracleFitError(ValueError):
+    pass
+
+
+def _color_mask(arr: np.ndarray, color: np.ndarray, tol: float) -> np.ndarray:
+    return np.linalg.norm(arr - color, axis=2) <= tol
+
+
+def _gold_mask(arr: np.ndarray) -> np.ndarray:
+    gold_distance = np.linalg.norm(arr - GOLD, axis=2)
+    marker_distance = np.min(
+        np.stack([np.linalg.norm(arr - color, axis=2) for color in MARKER_PALETTE], axis=2),
+        axis=2,
+    )
+    return (gold_distance <= GOLD_TOL) & (gold_distance + 5.0 < marker_distance)
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue = [(int(y), int(x))]
+        seen[y, x] = True
+        found: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.pop()
+            found.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(found) >= minimum:
+            components.append(np.asarray(found, dtype=np.int32))
+    return components
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    result = mask.copy()
+    for shift in range(1, radius + 1):
+        result[:-shift, :] |= mask[shift:, :]
+        result[shift:, :] |= mask[:-shift, :]
+        result[:, :-shift] |= mask[:, shift:]
+        result[:, shift:] |= mask[:, :-shift]
+    return result
+
+
+def _nearest_point(points: np.ndarray, target: tuple[float, float]) -> tuple[int, int]:
+    dx = points[:, 1].astype(np.float64) - target[0]
+    dy = points[:, 0].astype(np.float64) - target[1]
+    index = int(np.argmin(dx * dx + dy * dy))
+    return int(points[index, 0]), int(points[index, 1])
+
+
+def _glyph_score(gold: np.ndarray, center_x: float, center_y: float, label: str) -> float:
+    """Template score; the small center search absorbs antialias/mean bias."""
+    pattern = GLYPHS[label]
+    best = -1e9
+    for ox in np.arange(-2.0, 2.01, 1.0):
+        for oy in np.arange(-2.0, 2.01, 1.0):
+            score = 0.0
+            x0 = center_x + ox - 7.5
+            y0 = center_y + oy - 10.5
+            for row, line in enumerate(pattern):
+                for col, bit in enumerate(line):
+                    cx = int(round(x0 + col * 3.0 + 1.0))
+                    cy = int(round(y0 + row * 3.0 + 1.0))
+                    xlo, xhi = max(0, cx - 1), min(gold.shape[1], cx + 2)
+                    ylo, yhi = max(0, cy - 1), min(gold.shape[0], cy + 2)
+                    occupied = float(gold[ylo:yhi, xlo:xhi].mean()) if xhi > xlo and yhi > ylo else 0.0
+                    score += occupied if bit == "1" else -0.55 * occupied
+            best = max(best, score)
+    return best
+
+
+def _marker_centers(arr: np.ndarray) -> list[tuple[float, float]]:
+    saturation = arr.max(axis=2).astype(np.int16) - arr.min(axis=2).astype(np.int16)
+    chromatic = saturation >= CHROMA_TOL
+    chromatic &= ~_color_mask(arr, PORT, 60.0)
+    # Keep the gold glyph in this broad mask; its individual cells are much
+    # smaller than a marker ring and are filtered by the component threshold.
+    components = _components(chromatic, minimum=45)
+    centers: list[tuple[float, float]] = []
+    for component in components:
+        # Gold/port removal leaves each marker ring as a large component.
+        cy = float(component[:, 0].mean())
+        cx = float(component[:, 1].mean())
+        if 20.0 < cx < arr.shape[1] - 20.0 and 20.0 < cy < arr.shape[0] - 20.0:
+            centers.append((cx, cy))
+    if len(centers) != 2:
+        raise OracleFitError(f"expected two checkpoint rings, found {len(centers)}")
+    return centers
+
+
+def _route_distances(arr: np.ndarray, centers: list[tuple[float, float]]) -> tuple[float, float]:
+    route = _color_mask(arr, ROUTE, ROUTE_TOL)
+    if int(route.sum()) < 300:
+        raise OracleFitError("navy route mask is too small")
+    port = _color_mask(arr, PORT, 60.0)
+    port_components = _components(port, minimum=20)
+    if not port_components:
+        raise OracleFitError("ringed port is missing")
+    port_component = max(port_components, key=len)
+    port_y = float(port_component[:, 0].mean())
+    port_x = float(port_component[:, 1].mean())
+
+    # Marker glyphs can make small holes in the bridge; a 4-pixel closure is
+    # below the route-to-route clearance guaranteed by the sampler.
+    walkable = _dilate(route, 4)
+    route_points = np.argwhere(walkable)
+    start = _nearest_point(route_points, (port_x, port_y))
+    height, width = walkable.shape
+    distances = np.full((height, width), -1, dtype=np.int32)
+    distances[start] = 0
+    queue: deque[tuple[int, int]] = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distances[y, x]) + 1
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dx or dy):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and walkable[ny, nx] and distances[ny, nx] < 0:
+                    distances[ny, nx] = next_distance
+                    queue.append((ny, nx))
+
+    values = []
+    for center in centers:
+        cy, cx = _nearest_point(route_points, center)
+        y0, y1 = max(0, cy - 8), min(height, cy + 9)
+        x0, x1 = max(0, cx - 8), min(width, cx + 9)
+        local = distances[y0:y1, x0:x1]
+        valid = local[local >= 0]
+        if len(valid) == 0:
+            raise OracleFitError("checkpoint is disconnected from the port")
+        values.append(float(valid.min()))
+    return values[0], values[1]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return A or B using only the final raster."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    centers = _marker_centers(arr)
+    gold = _gold_mask(arr)
+    labels = []
+    for cx, cy in centers:
+        scores = {label: _glyph_score(gold, cx, cy, label) for label in GLYPHS}
+        label = max(scores, key=scores.get)
+        if scores[label] < 2.0:
+            raise OracleFitError("checkpoint label glyph is not legible")
+        labels.append(label)
+    if len(set(labels)) != 2:
+        raise OracleFitError(f"checkpoint labels are not A/B: {labels}")
+    d0, d1 = _route_distances(arr, centers)
+    first = labels[0] if d0 < d1 else labels[1]
+    return first

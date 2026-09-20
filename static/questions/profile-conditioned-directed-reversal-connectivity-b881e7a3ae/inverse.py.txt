@@ -1,0 +1,148 @@
+"""Independent image-only inverse for the directed-network question."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = deque([(int(y), int(x))])
+        points = []
+        while queue:
+            yy, xx = queue.popleft()
+            points.append((yy, xx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = yy + dy, xx + dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) > 180:
+            output.append(points)
+    return output
+
+
+def _ink_at(arr: np.ndarray, x: float, y: float) -> bool:
+    h, w, _ = arr.shape
+    ix, iy = int(round(x)), int(round(y))
+    if ix < 0 or iy < 0 or ix >= w or iy >= h:
+        return False
+    r, g, b = (int(v) for v in arr[iy, ix])
+    is_station = r < 105 and g > 120 and b > 120
+    far_from_background = abs(r - 250) + abs(g - 249) + abs(b - 245) > 105
+    return far_from_background and not is_station
+
+
+def _strip_occupancy(arr: np.ndarray, a, b) -> float:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    dist = math.hypot(dx, dy)
+    ux, uy = dx / dist, dy / dist
+    px, py = -uy, ux
+    supported = total = 0
+    for t in np.linspace(0.18, 0.82, 48):
+        x, y = a[0] + dx * t, a[1] + dy * t
+        hits = sum(_ink_at(arr, x + px * off, y + py * off) for off in (-2, 0, 2))
+        supported += hits >= 2
+        total += 1
+    # A direct link has uninterrupted shaft support. Two collinear links with a
+    # station between them must not be fused into a shortcut edge.
+    return supported / total
+
+
+def _direction_width(arr: np.ndarray, endpoint, other) -> int:
+    dx, dy = other[0] - endpoint[0], other[1] - endpoint[1]
+    dist = math.hypot(dx, dy)
+    ux, uy = dx / dist, dy / dist
+    px, py = -uy, ux
+    x, y = endpoint[0] + dx * 0.59, endpoint[1] + dy * 0.59
+    return sum(_ink_at(arr, x + px * off, y + py * off) for off in range(-16, 17))
+
+
+def _edge_label(arr: np.ndarray, a, b) -> str | None:
+    x, y = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+    r, g, blue = (int(v) for v in arr[int(round(y)), int(round(x))])
+    if r > 145 and r > g * 1.45 and r > blue * 1.35:
+        return "red"
+    if g > 105 and g > r * 1.45 and g > blue * 1.05:
+        return "green"
+    if blue > 140 and blue > r * 1.45 and blue > g * 1.12:
+        return "blue"
+    return None
+
+
+def _reachable_count(n: int, edges: list[tuple[int, int]]) -> int:
+    adjacency = [[] for _ in range(n)]
+    for u, v in edges:
+        adjacency[u].append(v)
+    total = 0
+    for start in range(n):
+        seen = {start}
+        stack = [start]
+        while stack:
+            here = stack.pop()
+            for nxt in adjacency[here]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        total += len(seen) - 1
+    return total
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    station_mask = (r < 110) & (g > 125) & (b > 125) & (np.abs(g.astype(int) - b.astype(int)) < 95)
+    comps = _components(station_mask)
+    if len(comps) != 7:
+        raise ValueError(f"expected seven visible stations, recovered {len(comps)}")
+    nodes = []
+    for points in comps:
+        ys = np.array([p[0] for p in points], dtype=float)
+        xs = np.array([p[1] for p in points], dtype=float)
+        nodes.append((float(xs.mean()), float(ys.mean())))
+    nodes.sort(key=lambda p: (p[1], p[0]))
+
+    directed = []
+    labels: dict[str, int] = {}
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if _strip_occupancy(arr, nodes[i], nodes[j]) < 0.98:
+                continue
+            wi = _direction_width(arr, nodes[i], nodes[j])
+            wj = _direction_width(arr, nodes[j], nodes[i])
+            if abs(wi - wj) < 4:
+                raise ValueError(f"ambiguous arrow direction between stations {i} and {j}")
+            edge = (i, j) if wj > wi else (j, i)
+            edge_index = len(directed)
+            directed.append(edge)
+            label = _edge_label(arr, nodes[i], nodes[j])
+            if label is not None:
+                if label in labels:
+                    raise ValueError(f"duplicate {label} candidate arrow")
+                labels[label] = edge_index
+    if len(directed) != 12:
+        raise ValueError(f"expected twelve directed links, recovered {len(directed)}")
+    if set(labels) != {"red", "green", "blue"}:
+        raise ValueError(f"candidate colors incomplete: {sorted(labels)}")
+
+    full = len(nodes) * (len(nodes) - 1)
+    winners = []
+    for label, index in labels.items():
+        trial = list(directed)
+        u, v = trial[index]
+        trial[index] = (v, u)
+        if _reachable_count(len(nodes), trial) == full:
+            winners.append(label)
+    if len(winners) != 1:
+        raise ValueError(f"image does not yield one successful reversal: {winners}")
+    return winners[0]

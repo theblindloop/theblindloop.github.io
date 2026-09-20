@@ -1,0 +1,323 @@
+"""Bead-trail net-turning world.
+
+One thin connected chain of small beads meanders inside a medium-sized patch of
+the page.  A filled square marks the end where the walk starts, a filled round
+blob marks the end where it stops.  The decision is the SIGN of the total signed
+turning accumulated while walking the chain bead by bead: counter-clockwise
+turns (as seen on the page) count positive, clockwise turns negative.
+
+The quantity is a sum over the whole interior of the trail, so no local crop can
+answer it: the trail is deliberately built from alternating-sign turning chunks
+whose individual magnitudes exceed the net total.  Removing any interior stretch
+of the chain both deletes part of the sum and breaks the chain the inverse arm
+has to follow.
+
+Analytic gold reads exactly one rendered field (``beads``); everything else in
+the latent scene is construction bookkeeping or clutter.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "bead_trail_net_turn-renderer-0.1.0"
+
+CANVAS = 640
+SUPERSAMPLE = 2
+PAGE = (255, 255, 255)
+# Every clutter mark uses one shared pale grey, so the union of clutter is
+# independent of draw order (that is what makes the clutter-order latent alias
+# pixel-identical rather than approximately identical).
+CLUTTER_GREY = (216, 216, 216)
+# Trail inks are all far darker than the clutter grey; the inverse arm keys on
+# darkness only, never on hue, so recolouring is label-preserving.
+INKS = (
+    (26, 28, 34),
+    (30, 26, 58),
+    (56, 22, 28),
+    (18, 48, 42),
+    (48, 40, 16),
+    (40, 24, 52),
+)
+
+QUARANTINE_DEG = 20.0
+MIN_SPACING = 18.0
+MAX_SPACING = 30.0
+# Non-adjacent beads must stay this many spacings apart, so nearest-neighbour
+# chaining of the trail is unambiguous at pixel resolution.
+MIN_SEPARATION_RATIO = 1.5
+CHAIN_GUARD_RATIO = 1.35
+MAX_STEP_TURN = 34.0
+N_CHUNKS = 4
+
+
+# --------------------------------------------------------------------------
+# decision quantity
+# --------------------------------------------------------------------------
+def _net_turning(beads: list) -> float:
+    """Total signed turning in degrees along the ordered bead chain.
+
+    Positive is counter-clockwise as the page is viewed (screen axes: x right,
+    y down).  Reading the chain from the other end negates the sum, which is
+    why the two end markers are part of the question contract.
+    """
+    total = 0.0
+    for index in range(1, len(beads) - 1):
+        ax, ay = beads[index - 1][0], beads[index - 1][1]
+        bx, by = beads[index][0], beads[index][1]
+        cx, cy = beads[index + 1][0], beads[index + 1][1]
+        ux, uy = bx - ax, by - ay
+        vx, vy = cx - bx, cy - by
+        cross = ux * vy - uy * vx
+        dot = ux * vx + uy * vy
+        total += math.degrees(math.atan2(-cross, dot))
+    return total
+
+
+def _turn_label(net: float) -> str:
+    return "counterclockwise" if net > 0.0 else "clockwise"
+
+
+def analytic_gold(scene: dict) -> str:
+    """Gold decision; reads only the rendered bead chain."""
+    return _turn_label(_net_turning(scene["beads"]))
+
+
+def margin(scene: dict) -> float:
+    """Distance to the turning-sign boundary, in degrees."""
+    return abs(_net_turning(scene["beads"]))
+
+
+def _min_separation_ratio(beads: list, spacing: float) -> float:
+    worst = float("inf")
+    for i in range(len(beads)):
+        for j in range(i + 2, len(beads)):
+            gap = math.dist(beads[i], beads[j])
+            worst = min(worst, gap / spacing)
+    return worst
+
+
+def is_quarantined(scene: dict) -> bool:
+    """True for finite-resolution boundary cases and unfollowable chains."""
+    if margin(scene) < QUARANTINE_DEG:
+        return True
+    spacing = float(scene["spacing"])
+    if not MIN_SPACING <= spacing <= MAX_SPACING:
+        return True
+    return _min_separation_ratio(scene["beads"], spacing) < CHAIN_GUARD_RATIO
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _turn_profile(rng: random.Random, n_steps: int, net_target: float) -> list | None:
+    """Per-step turning whose chunk sums alternate in sign and total net_target."""
+    bounds = [round(n_steps * k / N_CHUNKS) for k in range(N_CHUNKS + 1)]
+    lengths = [bounds[k + 1] - bounds[k] for k in range(N_CHUNKS)]
+    if min(lengths) < 4:
+        return None
+    sign = rng.choice((1.0, -1.0))
+    chunks = []
+    for k in range(N_CHUNKS):
+        chunks.append(sign * ((-1.0) ** k) * rng.uniform(70.0, 155.0))
+    chunks[-1] += net_target - sum(chunks)
+    if abs(chunks[-1]) > 210.0 or abs(chunks[-1]) < 45.0:
+        return None
+    profile = []
+    for k in range(N_CHUNKS):
+        length = lengths[k]
+        base = chunks[k] / length
+        jitter = [rng.uniform(-4.0, 4.0) for _ in range(length)]
+        mean = sum(jitter) / length
+        for value in jitter:
+            turn = base + value - mean
+            if abs(turn) > MAX_STEP_TURN:
+                return None
+            profile.append(turn)
+    return profile
+
+
+def _integrate(profile: list, start_heading: float) -> list:
+    """Unit-step polyline in screen orientation (positive turn = viewer CCW).
+
+    ``profile`` holds one turn per interior vertex, so the realised vertex
+    turning of the returned polyline is exactly ``profile`` and its total is
+    exactly the sampled target -- nothing is silently dropped at either end.
+    """
+    heading = start_heading
+    x, y = 0.0, 0.0
+    points = [(x, y)]
+    radians = math.radians(heading)
+    x += math.cos(radians)
+    y -= math.sin(radians)
+    points.append((x, y))
+    for turn in profile:
+        heading += turn
+        radians = math.radians(heading)
+        x += math.cos(radians)
+        y -= math.sin(radians)
+        points.append((x, y))
+    return points
+
+
+def _clutter(rng: random.Random, beads: list) -> tuple[list, list]:
+    """Pale distractor marks: blobs plus decoy bead chains of the same shape."""
+    blobs = []
+    for _ in range(rng.randint(7, 15)):
+        for _attempt in range(40):
+            rx = rng.uniform(9.0, 34.0)
+            ry = rng.uniform(9.0, 34.0)
+            cx = rng.uniform(rx + 4.0, CANVAS - rx - 4.0)
+            cy = rng.uniform(ry + 4.0, CANVAS - ry - 4.0)
+            clear = max(rx, ry) + 17.0
+            if all(math.dist((cx, cy), bead) > clear for bead in beads):
+                blobs.append([round(cx, 3), round(cy, 3), round(rx, 3), round(ry, 3)])
+                break
+    decoys = []
+    for _ in range(rng.randint(2, 4)):
+        for _attempt in range(40):
+            length = rng.randint(4, 9)
+            step = rng.uniform(19.0, 27.0)
+            heading = rng.uniform(0.0, 360.0)
+            x = rng.uniform(60.0, CANVAS - 60.0)
+            y = rng.uniform(60.0, CANVAS - 60.0)
+            chain = [(x, y)]
+            for _ in range(length):
+                heading += rng.uniform(-26.0, 26.0)
+                radians = math.radians(heading)
+                x += step * math.cos(radians)
+                y -= step * math.sin(radians)
+                chain.append((x, y))
+            inside = all(24.0 < px < CANVAS - 24.0 and 24.0 < py < CANVAS - 24.0 for px, py in chain)
+            far = all(math.dist(point, bead) > 26.0 for point in chain for bead in beads)
+            if inside and far:
+                decoys.append([[round(px, 3), round(py, 3)] for px, py in chain])
+                break
+    return blobs, decoys
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic balanced scene sample."""
+    for attempt in range(4000):
+        rng = random.Random((int(seed) * 1000003 + attempt * 7919) & 0x7FFFFFFF)
+        n_beads = rng.choice((25, 27, 29))
+        sign = 1.0 if rng.random() < 0.5 else -1.0
+        if rng.random() < 0.18:
+            magnitude = rng.uniform(12.5, 19.0)
+        else:
+            magnitude = rng.uniform(24.0, 150.0)
+        profile = _turn_profile(rng, n_beads - 2, sign * magnitude)
+        if profile is None:
+            continue
+        start_heading = rng.uniform(0.0, 360.0)
+        unit = _integrate(profile, start_heading)
+        xs = [point[0] for point in unit]
+        ys = [point[1] for point in unit]
+        width = max(xs) - min(xs)
+        height = max(ys) - min(ys)
+        if width < 1e-6 or height < 1e-6:
+            continue
+        # The trail must live inside one medium patch of the page, never
+        # spanning it: the patch side stays well under half the canvas.
+        patch = rng.uniform(280.0, 372.0)
+        spacing = 0.985 * min(patch / width, patch / height)
+        if not MIN_SPACING <= spacing <= MAX_SPACING:
+            continue
+        span_x, span_y = width * spacing, height * spacing
+        pad = 46.0
+        if span_x > CANVAS - 2 * pad or span_y > CANVAS - 2 * pad:
+            continue
+        offset_x = rng.uniform(pad, CANVAS - pad - span_x) - min(xs) * spacing
+        offset_y = rng.uniform(pad, CANVAS - pad - span_y) - min(ys) * spacing
+        beads = [
+            [round(point[0] * spacing + offset_x, 3), round(point[1] * spacing + offset_y, 3)]
+            for point in unit
+        ]
+        if _min_separation_ratio(beads, spacing) < MIN_SEPARATION_RATIO:
+            continue
+        blobs, decoys = _clutter(rng, beads)
+        return {
+            "size": CANVAS,
+            "beads": beads,
+            "bead_radius": 5.0,
+            "spacing": round(spacing, 4),
+            "ink": list(INKS[rng.randrange(len(INKS))]),
+            "clutter": blobs,
+            "decoys": decoys,
+            "turn_profile": [round(turn, 5) for turn in profile],
+            "start_heading": round(start_heading, 5),
+        }
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _blob(draw: ImageDraw.ImageDraw, cx: float, cy: float, rx: float, ry: float, color) -> None:
+    draw.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=color)
+
+
+def render(scene: dict) -> Image.Image:
+    size = int(scene["size"])
+    scale = SUPERSAMPLE
+    image = Image.new("RGB", (size * scale, size * scale), PAGE)
+    draw = ImageDraw.Draw(image)
+    for blob in scene["clutter"]:
+        _blob(draw, blob[0] * scale, blob[1] * scale, blob[2] * scale, blob[3] * scale, CLUTTER_GREY)
+    radius = float(scene["bead_radius"])
+    for chain in scene["decoys"]:
+        for point in chain:
+            _blob(draw, point[0] * scale, point[1] * scale, radius * scale, radius * scale, CLUTTER_GREY)
+    ink = tuple(int(channel) for channel in scene["ink"])
+    beads = scene["beads"]
+    for point in beads[1:-1]:
+        _blob(draw, point[0] * scale, point[1] * scale, radius * scale, radius * scale, ink)
+    half = 8.0 * scale
+    start = beads[0]
+    draw.rectangle(
+        (start[0] * scale - half, start[1] * scale - half, start[0] * scale + half, start[1] * scale + half),
+        fill=ink,
+    )
+    stop = beads[-1]
+    _blob(draw, stop[0] * scale, stop[1] * scale, 9.5 * scale, 9.5 * scale, ink)
+    return image.resize((size, size), Image.LANCZOS)
+
+
+# --------------------------------------------------------------------------
+# declared symmetries
+# --------------------------------------------------------------------------
+def latent_symmetries(scene: dict) -> list:
+    """Pixel-identical latent aliases; gold must be invariant across them."""
+    clutter_alias = dict(scene)
+    clutter_alias["clutter"] = list(reversed(scene["clutter"]))
+    clutter_alias["decoys"] = list(reversed(scene["decoys"]))
+    construction_alias = dict(scene)
+    construction_alias["turn_profile"] = [0.0 for _ in scene["turn_profile"]]
+    construction_alias["start_heading"] = 0.0
+    construction_alias["spacing"] = round(float(scene["spacing"]) + 0.0007, 4)
+    return [
+        ("clutter_order_reversed", clutter_alias),
+        ("construction_bookkeeping_erased", construction_alias),
+    ]
+
+
+def mirrored_scene(scene: dict) -> dict:
+    """Declared label-TRANSFORMING symmetry: mirroring negates the turning sum."""
+    size = float(scene["size"])
+    twin = dict(scene)
+    twin["beads"] = [[round(size - point[0], 3), point[1]] for point in scene["beads"]]
+    twin["clutter"] = [[round(size - blob[0], 3), blob[1], blob[2], blob[3]] for blob in scene["clutter"]]
+    twin["decoys"] = [
+        [[round(size - point[0], 3), point[1]] for point in chain] for chain in scene["decoys"]
+    ]
+    return twin
+
+
+def reversed_walk_scene(scene: dict) -> dict:
+    """Declared label-TRANSFORMING symmetry: swapping the end markers flips gold."""
+    twin = dict(scene)
+    twin["beads"] = list(reversed(scene["beads"]))
+    return twin

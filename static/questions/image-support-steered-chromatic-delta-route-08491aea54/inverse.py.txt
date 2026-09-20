@@ -1,0 +1,130 @@
+"""Independent image-only inverse for the chromatic-delta route."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+N_SECTIONS = 33
+N_TRANSITIONS = 32
+LOOM = tuple(int(bit) for bit in "10011001011001100110011010011001")
+KNOT = tuple(int(bit) for bit in "00011100000110001111101100111100")
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            result.append(np.asarray(pixels, dtype=np.float64))
+    return result
+
+
+def _centers(mask: np.ndarray, minimum: int) -> list[tuple[float, float]]:
+    centers = []
+    for component in _components(mask, minimum):
+        center = component.mean(axis=0)
+        centers.append((float(center[1]), float(center[0])))
+    return centers
+
+
+def _masks(array: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    route0 = (blue - red > 34) & (blue - green > 23) & (red < 135) & (green < 175)
+    route1 = (red - green > 25) & (green - blue > 25) & (green > 84) & (blue < 120)
+    red_cap = (red > 150) & (red - green > 84) & (red - blue > 70) & (green < 112)
+    green_cap = (green > 104) & (green - red > 28) & (green - blue > 13) & (red < 130)
+    return route0, route1, red_cap, green_cap
+
+
+def _route_center(route: np.ndarray, x: float, radius: int = 2) -> float:
+    column = int(round(float(x)))
+    x0 = max(0, column - radius)
+    x1 = min(route.shape[1], column + radius + 1)
+    ys = np.argwhere(route[:, x0:x1])[:, 0] if route[:, x0:x1].any() else np.asarray([])
+    if len(ys) < 5:
+        raise ValueError("route section is missing from the raster")
+    return float(np.median(ys))
+
+
+def _section_color(route0: np.ndarray, route1: np.ndarray, route: np.ndarray, x: float, y: float) -> int:
+    cx = int(round(float(x)))
+    cy = int(round(float(y)))
+    # The route's rounded joins occupy most of a short section pitch.  A
+    # narrow midpoint window avoids borrowing too much of the neighboring
+    # section while retaining a solid multi-pixel color sample.
+    x0 = max(0, cx - 1)
+    x1 = min(route.shape[1], cx + 2)
+    y0 = max(0, cy - 4)
+    y1 = min(route.shape[0], cy + 5)
+    local_route = route[y0:y1, x0:x1]
+    count0 = int(np.count_nonzero(route0[y0:y1, x0:x1] & local_route))
+    count1 = int(np.count_nonzero(route1[y0:y1, x0:x1] & local_route))
+    if max(count0, count1) < 8 or min(count0, count1) > 0.78 * max(count0, count1):
+        raise ValueError("route section color is ambiguous")
+    return 0 if count0 > count1 else 1
+
+
+def _hamming(code: tuple[int, ...], template: tuple[int, ...]) -> int:
+    return sum(left != right for left, right in zip(code, template))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Locate the route, recover section colors, and apply the declared difference."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    route0, route1, red_mask, green_mask = _masks(array)
+    red = _centers(red_mask, 18)
+    green = _centers(green_mask, 18)
+    if len(red) != 1 or len(green) != 1:
+        raise ValueError(f"expected one red start and one green end, got {len(red)} and {len(green)}")
+
+    route = route0 | route1
+    route_components = _components(route, 250)
+    if len(route_components) != 1:
+        raise ValueError("the bicolor route is absent or not one connected component")
+    component = route_components[0]
+    if len(component) < 900:
+        raise ValueError("route evidence is incomplete")
+    route_only = np.zeros_like(route, dtype=bool)
+    route_only[component[:, 0].astype(int), component[:, 1].astype(int)] = True
+    route0 &= route_only
+    route1 &= route_only
+
+    red_x, _ = red[0]
+    green_x, _ = green[0]
+    left, right = min(red_x, green_x), max(red_x, green_x)
+    if right - left < 300.0:
+        raise ValueError("endpoint span is too short for the declared route")
+    pitch = (right - left) / float(N_SECTIONS)
+    sections: list[int] = []
+    for index in range(N_SECTIONS):
+        x = left + (index + 0.5) * pitch
+        y = _route_center(route_only, x)
+        sections.append(_section_color(route0, route1, route_only, x, y))
+    if red_x > green_x:
+        sections.reverse()
+    transitions = tuple(int(sections[index] != sections[index + 1]) for index in range(N_TRANSITIONS))
+    distance_a = _hamming(transitions, LOOM)
+    distance_b = _hamming(transitions, KNOT)
+    return "A" if distance_a <= distance_b else "B"

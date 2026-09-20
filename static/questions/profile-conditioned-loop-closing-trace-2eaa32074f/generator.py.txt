@@ -1,0 +1,188 @@
+"""Deterministic latent sampler and rasterizer for loop-closing contour traces."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw
+
+COLOR_NAMES = ("red", "blue", "green", "orange")
+DEFAULT_PALETTE = {
+    "red": [220, 54, 68],
+    "blue": [43, 105, 205],
+    "green": [31, 151, 91],
+    "orange": [234, 126, 29],
+}
+DEFAULT_BACKGROUND = [249, 248, 244]
+DEFAULT_INK = [36, 38, 43]
+QUARANTINE_MARGIN = 10.0
+
+
+def _polar_contour(
+    cx: float,
+    cy: float,
+    radius: float,
+    gap_angle: float,
+    gap_chord: float,
+    amp1: float,
+    amp2: float,
+    phase1: float,
+    phase2: float,
+    harmonic1: int,
+    harmonic2: int,
+) -> list[list[float]]:
+    """Return a nearly complete irregular polar curve with one visible gap."""
+    half_gap = math.asin(min(0.92, gap_chord / (2.0 * radius)))
+    start = gap_angle + half_gap
+    stop = gap_angle + 2.0 * math.pi - half_gap
+    points: list[list[float]] = []
+    for index in range(181):
+        theta = start + (stop - start) * index / 180.0
+        radial = (
+            radius
+            + amp1 * math.sin(harmonic1 * theta + phase1)
+            + amp2 * math.sin(harmonic2 * theta + phase2)
+        )
+        points.append(
+            [
+                round(cx + radial * math.cos(theta), 4),
+                round(cy + radial * math.sin(theta), 4),
+            ]
+        )
+    return points
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Sample one balanced scene. Consecutive seeds cycle answer color exactly."""
+    rng = random.Random(int(seed))
+    width = height = 640
+    cx = 320.0 + rng.uniform(-14.0, 14.0)
+    cy = 320.0 + rng.uniform(-14.0, 14.0)
+    base_radius = rng.uniform(66.0, 76.0)
+    spacing = rng.uniform(40.0, 47.0)
+    contours: list[list[list[float]]] = []
+    for contour_index in range(4):
+        radius = base_radius + contour_index * spacing + rng.uniform(-1.8, 1.8)
+        contours.append(
+            _polar_contour(
+                cx,
+                cy,
+                radius,
+                rng.uniform(0.0, 2.0 * math.pi),
+                radius * rng.uniform(0.72, 1.55),
+                rng.uniform(1.3, 3.0),
+                rng.uniform(0.7, 1.8),
+                rng.uniform(0.0, 2.0 * math.pi),
+                rng.uniform(0.0, 2.0 * math.pi),
+                rng.choice((2, 3, 4)),
+                rng.choice((5, 6, 7)),
+            )
+        )
+
+    answer_color = COLOR_NAMES[int(seed) % len(COLOR_NAMES)]
+    answer_contour = (int(seed) // len(COLOR_NAMES)) % len(contours)
+    endpoint_colors: list[list[str | None]] = [[None, None] for _ in contours]
+    endpoint_colors[answer_contour][0] = answer_color
+    endpoint_colors[answer_contour][1] = answer_color
+
+    remaining_colors = [color for color in COLOR_NAMES if color != answer_color]
+    remaining_contours = [index for index in range(4) if index != answer_contour]
+    rng.shuffle(remaining_colors)
+    rng.shuffle(remaining_contours)
+    for contour_index, color in zip(remaining_contours, remaining_colors, strict=True):
+        endpoint_colors[contour_index][0] = color
+    # A three-cycle gives every non-answer color two dots on different contours.
+    for index, contour_index in enumerate(remaining_contours):
+        source_contour = remaining_contours[(index + 1) % len(remaining_contours)]
+        endpoint_colors[contour_index][1] = endpoint_colors[source_contour][0]
+
+    return {
+        "width": width,
+        "height": height,
+        "background": list(DEFAULT_BACKGROUND),
+        "ink": list(DEFAULT_INK),
+        "ink_width": 7,
+        "marker_radius": 9,
+        "palette": copy.deepcopy(DEFAULT_PALETTE),
+        "contours": contours,
+        "endpoint_colors": endpoint_colors,
+    }
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    """Select the unique color repeated on both endpoints of one contour."""
+    rows = scene["endpoint_colors"]
+    winners = [str(pair[0]) for pair in rows if len(pair) == 2 and pair[0] == pair[1]]
+    if len(winners) != 1 or winners[0] not in COLOR_NAMES:
+        raise ValueError(f"expected one loop-closing color, found {winners!r}")
+    return winners[0]
+
+
+def _distance(point: list[float], other: list[float]) -> float:
+    return math.hypot(point[0] - other[0], point[1] - other[1])
+
+
+def margin(scene: dict[str, Any]) -> float:
+    """Endpoint-to-runner-up contour association headroom in raster pixels."""
+    contours = scene["contours"]
+    marker_diameter = 2.0 * float(scene["marker_radius"])
+    advantages: list[float] = []
+    for contour_index, contour in enumerate(contours):
+        for endpoint in (contour[0], contour[-1]):
+            runner_up = min(
+                _distance(endpoint, point)
+                for other_index, other in enumerate(contours)
+                if other_index != contour_index
+                for point in other
+            )
+            advantages.append(runner_up - marker_diameter)
+    return round(min(advantages), 6)
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    """Render only declared scene fields; all semantic evidence is visible."""
+    supersample = 3
+    width = int(scene["width"])
+    height = int(scene["height"])
+    background = tuple(int(value) for value in scene["background"])
+    ink = tuple(int(value) for value in scene["ink"])
+    ink_width = int(scene["ink_width"])
+    marker_radius = int(scene["marker_radius"])
+    palette = scene["palette"]
+    contours = scene["contours"]
+    endpoint_colors = scene["endpoint_colors"]
+
+    image = Image.new("RGB", (width * supersample, height * supersample), background)
+    draw = ImageDraw.Draw(image)
+    for contour in contours:
+        points = [(round(p[0] * supersample), round(p[1] * supersample)) for p in contour]
+        draw.line(points, fill=ink, width=ink_width * supersample, joint="curve")
+
+    # A narrow background halo makes each endpoint assignment visibly discrete.
+    halo_radius = marker_radius + 2
+    for contour, color_pair in zip(contours, endpoint_colors, strict=True):
+        for point, color_name in zip((contour[0], contour[-1]), color_pair, strict=True):
+            x = round(point[0] * supersample)
+            y = round(point[1] * supersample)
+            halo = halo_radius * supersample
+            radius = marker_radius * supersample
+            draw.ellipse([x - halo, y - halo, x + halo, y + halo], fill=background)
+            color = tuple(int(value) for value in palette[str(color_name)])
+            draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=color)
+
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Storage order of disjoint contours is a true pixel-identical alias."""
+    twin = copy.deepcopy(scene)
+    twin["contours"] = list(reversed(twin["contours"]))
+    twin["endpoint_colors"] = list(reversed(twin["endpoint_colors"]))
+    return [("reverse_contour_storage_order", twin)]

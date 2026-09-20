@@ -1,0 +1,161 @@
+"""Independent pixel-only inverse for the blocked-junction question."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "blocked_junction_terminal-oracle-0.1.0"
+INK = np.array((30, 44, 67), dtype=np.float32)
+GREEN = np.array((38, 160, 91), dtype=np.float32)
+RED = np.array((211, 66, 61), dtype=np.float32)
+BLUE = np.array((62, 112, 202), dtype=np.float32)
+MARKER = np.array((151, 70, 169), dtype=np.float32)
+
+
+def _color_center(array: np.ndarray, target: np.ndarray) -> tuple[float, float] | None:
+    distance = np.sqrt(((array.astype(np.float32) - target) ** 2).sum(axis=2))
+    mask = distance < 78.0
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 80:
+        return None
+    return float(xs.mean()), float(ys.mean())
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = [(y, x)]
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= 35:
+            result.append(np.asarray(points, dtype=np.float64))
+    return result
+
+
+def _marker_shape(component: np.ndarray) -> tuple[str, tuple[float, float]]:
+    y0, x0 = component.min(axis=0)
+    y1, x1 = component.max(axis=0)
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    width = max(1.0, (x1 - x0) / 2.0)
+    height = max(1.0, (y1 - y0) / 2.0)
+    dx = np.abs(component[:, 1] - cx) / width
+    dy = np.abs(component[:, 0] - cy) / height
+    corner_fraction = float(np.mean((dx > 0.76) & (dy > 0.76)))
+    # A square outline visibly occupies all four corners; a circle does not.
+    shape = "square" if corner_fraction > 0.035 else "circle"
+    return shape, (cx, cy)
+
+
+def _nearest(mask: np.ndarray, center: tuple[float, float], limit: float = 55.0) -> tuple[int, int] | None:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    cx, cy = center
+    distances = (xs.astype(np.float64) - cx) ** 2 + (ys.astype(np.float64) - cy) ** 2
+    index = int(np.argmin(distances))
+    if float(distances[index]) > limit * limit:
+        return None
+    return int(ys[index]), int(xs[index])
+
+
+def _flood(mask: np.ndarray, starts: list[tuple[int, int]]) -> np.ndarray:
+    reachable = np.zeros_like(mask, dtype=bool)
+    height, width = mask.shape
+    if not starts:
+        return reachable
+    queue: deque[tuple[int, int]] = deque()
+    for sy, sx in starts:
+        if 0 <= sy < height and 0 <= sx < width and mask[sy, sx] and not reachable[sy, sx]:
+            reachable[sy, sx] = True
+            queue.append((sy, sx))
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dx or dy):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not reachable[ny, nx]:
+                    reachable[ny, nx] = True
+                    queue.append((ny, nx))
+    return reachable
+
+
+def _nearby_pixels(mask: np.ndarray, center: tuple[float, float], limit: float = 52.0) -> list[tuple[int, int]]:
+    """Collect a small endpoint neighborhood, avoiding a brittle single seed."""
+
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return []
+    cx, cy = center
+    keep = (xs.astype(np.float64) - cx) ** 2 + (ys.astype(np.float64) - cy) ** 2 <= limit * limit
+    return [(int(y), int(x)) for y, x in zip(ys[keep], xs[keep])]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the terminal still connected after erasing the square gate."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    green_center = _color_center(array, GREEN)
+    red_center = _color_center(array, RED)
+    blue_center = _color_center(array, BLUE)
+    if green_center is None or red_center is None or blue_center is None:
+        return "unknown"
+
+    red_channel, green_channel, blue_channel = array[:, :, 0], array[:, :, 1], array[:, :, 2]
+    marker_mask = (red_channel > 90.0) & (blue_channel > 110.0) & (blue_channel > red_channel + 14.0) & (red_channel > green_channel + 28.0)
+    marker_components = _components(marker_mask)
+    if len(marker_components) != 2:
+        return "unknown"
+    marker_info = [_marker_shape(component) for component in marker_components]
+    squares = [center for shape, center in marker_info if shape == "square"]
+    if len(squares) != 1:
+        return "unknown"
+    square_center = squares[0]
+
+    distance_to_ink = np.sqrt(((array - INK) ** 2).sum(axis=2))
+    dark = (distance_to_ink < 112.0) & (~marker_mask)
+    # Erase the visible square junction and all three incident arms in the
+    # counterfactual image. The generated marker radius is 21--25 px while the
+    # line width is 8--11 px, so this disk creates a stable graph cut.
+    yy, xx = np.indices(dark.shape)
+    # The opaque colored marker outline can overwrite the dark stroke at a
+    # junction. Reconnect each visible marker's local arms through its center
+    # before applying the requested square-node removal.
+    for _, center in marker_info:
+        bridge = ((xx - center[0]) ** 2 + (yy - center[1]) ** 2) <= 32.0 ** 2
+        dark[bridge] = True
+    blocked = ((xx - square_center[0]) ** 2 + (yy - square_center[1]) ** 2) <= 36.0 ** 2
+    dark[blocked] = False
+
+    source_pixels = _nearby_pixels(dark, green_center)
+    red_pixels = _nearby_pixels(dark, red_center)
+    blue_pixels = _nearby_pixels(dark, blue_center)
+    if not source_pixels or not red_pixels or not blue_pixels:
+        return "unknown"
+    reachable = _flood(dark, source_pixels)
+    red_reachable = any(reachable[y, x] for y, x in red_pixels)
+    blue_reachable = any(reachable[y, x] for y, x in blue_pixels)
+    if red_reachable ^ blue_reachable:
+        return "red" if red_reachable else "blue"
+    return "unknown"

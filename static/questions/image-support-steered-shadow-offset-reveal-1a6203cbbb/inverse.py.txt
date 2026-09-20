@@ -1,0 +1,266 @@
+"""Independent pixel-only arm for the shadow-offset self-overlay reveal world.
+
+It receives one RGB raster and nothing else.  It locates the visible black
+fiducials, sorts them into the bordered plate and the two gauge pips, rectifies
+the plate's 11x11 cell lattice from its border box and measured border
+thickness, reads each cell against the two tone clusters the plate itself
+exposes, measures the gauge displacement in units of that plate's own cell
+width, executes the declared self-superposition at that slide, and classifies
+the resulting mark pattern against the declared symbol alphabet with a runner-up
+Hamming margin.  Anything ambiguous returns the abstention token.
+
+This module imports no renderer, prompt, generator, verifier or gold code and
+accepts no latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "shadow_offset_reveal-oracle-0.1.0"
+ABSTAIN = "undetermined"
+
+_MARK_DARK = np.asarray((18.0, 18.0, 22.0))
+_MARK_TOLERANCE = 60.0
+
+_CELLS = 11
+_SYMBOL_SIDE = 5
+_SYMBOL_OFFSET = (_CELLS - _SYMBOL_SIDE) // 2
+
+_MIN_PLATE_SIDE = 45
+_MAX_PLATE_SIDE = 75
+_MAX_PIP_SIDE = 12
+_MIN_PIP_SIDE = 3
+
+_MIN_TONE_SEPARATION = 14.0
+_MAX_CLUSTER_SPREAD = 6.0
+_MIN_SYMBOL_MARGIN = 4
+_MAX_SYMBOL_DISTANCE = 2
+_VECTOR_TOLERANCE = 0.22
+_ALLOWED_STEPS = (2, 3)
+
+_SYMBOL_ART = {
+    "plus": ("..#..", "..#..", "#####", "..#..", "..#.."),
+    "ex": ("#...#", ".#.#.", "..#..", ".#.#.", "#...#"),
+    "tee": ("#####", "..#..", "..#..", "..#..", "..#.."),
+    "ell": ("#....", "#....", "#....", "#....", "#####"),
+}
+
+
+def _templates() -> dict[str, tuple[int, ...]]:
+    built: dict[str, tuple[int, ...]] = {}
+    for name, art in _SYMBOL_ART.items():
+        if len(art) != _SYMBOL_SIDE or any(len(row) != _SYMBOL_SIDE for row in art):
+            raise ValueError("symbol art is not a 5 by 5 block")
+        cells = {
+            (_SYMBOL_OFFSET + r, _SYMBOL_OFFSET + c)
+            for r, row in enumerate(art)
+            for c, char in enumerate(row)
+            if char == "#"
+        }
+        built[name] = tuple(
+            1 if (r, c) in cells else 0 for r in range(_CELLS) for c in range(_CELLS)
+        )
+    return built
+
+
+TEMPLATES = _templates()
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[list[tuple[int, int]]] = []
+    for start in np.argwhere(mask):
+        origin = (int(start[0]), int(start[1]))
+        if seen[origin]:
+            continue
+        seen[origin] = True
+        stack = [origin]
+        group: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            group.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width:
+                    if mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        groups.append(group)
+        if len(groups) > 32:
+            break
+    return groups
+
+
+def _boxes(mask: np.ndarray):
+    found = []
+    for group in _components(mask):
+        ys = [point[0] for point in group]
+        xs = [point[1] for point in group]
+        y0, y1 = min(ys), max(ys)
+        x0, x1 = min(xs), max(xs)
+        side = y1 - y0 + 1
+        if side != x1 - x0 + 1:
+            return None
+        found.append((y0, x0, side, len(group)))
+    return found
+
+
+def _plate_thickness(mask: np.ndarray, box) -> int | None:
+    y0, x0, side, _area = box
+    column = x0 + side // 2
+    thickness = 0
+    while thickness < side and mask[y0 + thickness, column]:
+        thickness += 1
+    if not 1 <= thickness <= 5:
+        return None
+    interior = side - 2 * thickness
+    if interior <= 0 or interior % _CELLS:
+        return None
+    return thickness
+
+
+def _luma(colour) -> float:
+    return float(0.299 * colour[0] + 0.587 * colour[1] + 0.114 * colour[2])
+
+
+def _cell_colours(array: np.ndarray, box, thickness: int):
+    y0, x0, side, _area = box
+    interior = side - 2 * thickness
+    cell = interior // _CELLS
+    if cell < 3:
+        return None
+    inset = max(1, cell // 4)
+    colours = []
+    for row in range(_CELLS):
+        for col in range(_CELLS):
+            cy = y0 + thickness + row * cell
+            cx = x0 + thickness + col * cell
+            patch = array[cy + inset : cy + cell - inset, cx + inset : cx + cell - inset]
+            if patch.size == 0:
+                return None
+            values = patch.reshape(-1, 3).astype(np.float32)
+            spread = float((values.max(axis=0) - values.min(axis=0)).max())
+            if spread > 2.0:
+                return None  # every cell must be one flat rendered tone
+            colours.append(values.mean(axis=0))
+    return colours, cell
+
+
+def _split_tones(colours):
+    lumas = sorted(_luma(colour) for colour in colours)
+    gaps = [(lumas[i + 1] - lumas[i], i) for i in range(len(lumas) - 1)]
+    best_gap, split = max(gaps)
+    if best_gap < _MIN_TONE_SEPARATION:
+        return None
+    low = lumas[: split + 1]
+    high = lumas[split + 1 :]
+    if not low or not high:
+        return None
+    if (low[-1] - low[0]) > _MAX_CLUSTER_SPREAD:
+        return None
+    if (high[-1] - high[0]) > _MAX_CLUSTER_SPREAD:
+        return None
+    return (low[-1] + high[0]) / 2.0
+
+
+def _gauge_vector(pips, cell_px: int):
+    """Slide vector in cells, from the hollow ring pip to the solid pip."""
+    rings = [pip for pip in pips if pip[0] == "ring"]
+    solids = [pip for pip in pips if pip[0] == "solid"]
+    if len(rings) != 1 or len(solids) != 1:
+        return None
+    _kind, ry, rx = rings[0]
+    _kind, sy, sx = solids[0]
+    steps = []
+    for delta in (sy - ry, sx - rx):
+        raw = delta / float(cell_px)
+        step = int(round(raw))
+        if abs(raw - step) > _VECTOR_TOLERANCE:
+            return None
+        steps.append(step)
+    dy, dx = steps
+    magnitudes = sorted((abs(dy), abs(dx)))
+    if magnitudes[1] not in _ALLOWED_STEPS:
+        return None
+    if magnitudes[0] not in (0, magnitudes[1]):
+        return None
+    if magnitudes[1] == 0:
+        return None
+    return dy, dx
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        return ABSTAIN
+    delta = np.linalg.norm(array.astype(np.float32) - _MARK_DARK.astype(np.float32), axis=2)
+    mask = delta <= _MARK_TOLERANCE
+    boxes = _boxes(mask)
+    if boxes is None or len(boxes) != 3:
+        return ABSTAIN
+
+    plates = [box for box in boxes if _MIN_PLATE_SIDE <= box[2] <= _MAX_PLATE_SIDE]
+    pip_boxes = [box for box in boxes if _MIN_PIP_SIDE <= box[2] <= _MAX_PIP_SIDE]
+    if len(plates) != 1 or len(pip_boxes) != 2:
+        return ABSTAIN
+
+    plate = plates[0]
+    y0, x0, side, area = plate
+    if not 0.05 <= area / float(side * side) <= 0.45:
+        return ABSTAIN
+    if mask[y0 + side // 2, x0 + side // 2]:
+        return ABSTAIN
+    thickness = _plate_thickness(mask, plate)
+    if thickness is None:
+        return ABSTAIN
+    read = _cell_colours(array, plate, thickness)
+    if read is None:
+        return ABSTAIN
+    colours, cell_px = read
+    threshold = _split_tones(colours)
+    if threshold is None:
+        return ABSTAIN
+    dark = [_luma(colour) < threshold for colour in colours]
+
+    pips = []
+    for box in pip_boxes:
+        py, px, pside, parea = box
+        cy = py + pside // 2
+        cx = px + pside // 2
+        filled = parea / float(pside * pside)
+        if mask[cy, cx] and filled > 0.95:
+            pips.append(("solid", cy, cx))
+        elif not mask[cy, cx] and 0.5 <= filled <= 0.95:
+            pips.append(("ring", cy, cx))
+        else:
+            return ABSTAIN
+    vector = _gauge_vector(pips, cell_px)
+    if vector is None:
+        return ABSTAIN
+    dy, dx = vector
+
+    marks = []
+    for row in range(_CELLS):
+        for col in range(_CELLS):
+            source_row = row - dy
+            source_col = col - dx
+            here = dark[row * _CELLS + col]
+            if not (0 <= source_row < _CELLS and 0 <= source_col < _CELLS):
+                marks.append(0)
+                continue
+            there = dark[source_row * _CELLS + source_col]
+            marks.append(1 if (here and there) else 0)
+
+    ranked = sorted(
+        (sum(1 for a, b in zip(marks, template) if a != b), name)
+        for name, template in TEMPLATES.items()
+    )
+    best_distance, best_name = ranked[0]
+    runner_up = ranked[1][0]
+    if best_distance > _MAX_SYMBOL_DISTANCE:
+        return ABSTAIN
+    if runner_up - best_distance < _MIN_SYMBOL_MARGIN:
+        return ABSTAIN
+    return best_name

@@ -1,0 +1,146 @@
+"""Pixel-only oracle for the summed-reach ruler search world.
+
+The module receives one RGB image and the public question contract. It never
+imports the renderer, prompts, generator or verifier and never receives latent
+scene data.
+
+Route: the modal colour is the background. Of the two remaining colours the more
+frequent one is the candidate ink and the other is the reference ink, because the
+four candidate bars always carry strictly more area than the two reference bars.
+Connected components above a speck-sized floor are taken separately in each
+colour. The two reference components must be found in opposite far corners of the
+page, and their bounding-box widths are added to give the combined reference
+reach. The four candidate components are ordered top to bottom by centroid, each
+bounding-box width is compared against that combined reach, and the component
+with the smallest absolute error wins provided the error is negligible and the
+runner-up error is clearly larger. Anything else abstains.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "sum_reach_ruler_search-oracle-0.1.0"
+
+WORDS = ("first", "second", "third", "fourth")
+ABSTAIN = "abstain"
+
+MIN_COMPONENT = 200      # a bar covers at least 40 x 12 pixels; a speck covers 9
+MATCH_TOLERANCE = 4      # an exact summed-reach match lands on zero error
+MIN_PIXEL_MARGIN = 6     # the runner-up error must be clearly larger
+CORNER_SPAN = 0.42       # references must sit in opposite far corners
+
+
+def _colour_layers(image: Image.Image):
+    arr = np.asarray(image.convert("RGB")).astype(np.int32)
+    keys = (arr[:, :, 0] << 16) + (arr[:, :, 1] << 8) + arr[:, :, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    if len(values) < 3:
+        return None
+    order = np.argsort(-counts)
+    ink = values[order[1]]
+    reference = values[order[2]]
+    return keys, ink, reference
+
+
+def _components(mask: np.ndarray) -> list:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    blobs = []
+    for start in zip(*np.nonzero(mask)):
+        if seen[start]:
+            continue
+        stack = [start]
+        seen[start] = True
+        cells = []
+        while stack:
+            y, x = stack.pop()
+            cells.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        blobs.append(cells)
+    return blobs
+
+
+def _bars(mask: np.ndarray) -> list:
+    out = []
+    for cells in _components(mask):
+        if len(cells) < MIN_COMPONENT:
+            continue
+        ys = np.array([y for y, _ in cells])
+        xs = np.array([x for _, x in cells])
+        out.append(
+            {
+                "width": int(xs.max() - xs.min()) + 1,
+                "height": int(ys.max() - ys.min()) + 1,
+                "centre_x": float(xs.mean()),
+                "centre_y": float(ys.mean()),
+                "area": len(cells),
+            }
+        )
+    return out
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Combined reference reach, per-candidate error and the runner-up margin."""
+
+    layers = _colour_layers(image)
+    if layers is None:
+        return None
+    keys, ink_key, reference_key = layers
+    height, width = keys.shape
+
+    references = _bars(keys == reference_key)
+    if len(references) != 2:
+        return None
+    first, second = sorted(references, key=lambda r: r["centre_x"])
+    # The two references must genuinely sit in widely separated opposite corners.
+    if first["centre_x"] > CORNER_SPAN * width or second["centre_x"] < (1 - CORNER_SPAN) * width:
+        return None
+    if abs(first["centre_y"] - second["centre_y"]) < CORNER_SPAN * height:
+        return None
+    for record in references:
+        if record["height"] >= record["width"]:
+            return None
+    combined = float(first["width"] + second["width"])
+
+    candidates = _bars(keys == ink_key)
+    if len(candidates) != 4:
+        return None
+    candidates.sort(key=lambda r: r["centre_y"])
+    for record in candidates:
+        if record["height"] >= record["width"]:
+            return None
+    spread_x = max(r["centre_x"] for r in candidates) - min(r["centre_x"] for r in candidates)
+    if spread_x > 0.5 * width:
+        return None
+
+    errors = [abs(record["width"] - combined) for record in candidates]
+    ranked = sorted(range(4), key=lambda i: errors[i])
+    best, second_best = ranked[0], ranked[1]
+    pixel_margin = float(errors[second_best] - errors[best])
+    return {
+        "combined_reference": combined,
+        "widths": [record["width"] for record in candidates],
+        "errors": errors,
+        "winner": best,
+        "pixel_margin": pixel_margin,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Which stacked candidate bar matches the two references added together."""
+
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    if report["errors"][report["winner"]] > MATCH_TOLERANCE:
+        return ABSTAIN
+    if report["pixel_margin"] < MIN_PIXEL_MARGIN:
+        return ABSTAIN
+    return WORDS[report["winner"]]

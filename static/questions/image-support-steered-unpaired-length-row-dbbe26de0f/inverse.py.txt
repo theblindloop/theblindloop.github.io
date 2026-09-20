@@ -1,0 +1,144 @@
+"""Pixel-only inverse arm for the unpaired-length-row world.
+
+Input: the final PNG only. No scene, no renderer, no gold, no metadata.
+
+Pass structure:
+  1. dark-ink mask by luminance;
+  2. connected components (4-neighbour flood on run-length rows);
+  3. keep axis-aligned solid horizontal bars;
+  4. split the bars into two panels by the widest horizontal gap between
+     component left edges;
+  5. require four bars on the left and three on the right;
+  6. read every bar's own drawn length as its bounding-box width;
+  7. for each left bar take the distance to the closest right length; the
+     unpaired row is the one whose distance is large while every other left
+     distance is zero. Otherwise abstain.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+DARK_MAX_LUMA = 110       # bars are dark ink; decoration and guides are pale
+MIN_BAR_LEN = 18
+BAR_THICK_RANGE = (5, 14)
+FILL_MIN = 0.90           # solid rectangle
+PAIR_TOL = 2              # px slack allowed for a "same length" pair
+ODD_MIN = 6               # px the unpaired bar must clear
+ABSTAIN = "abstain"
+
+
+def _mask(image: Image.Image):
+    arr = np.asarray(image.convert("RGB"), dtype=np.int32)
+    luma = (299 * arr[:, :, 0] + 587 * arr[:, :, 1] + 114 * arr[:, :, 2]) // 1000
+    return luma <= DARK_MAX_LUMA
+
+
+def _runs(mask):
+    """Horizontal runs of dark pixels, one list per row."""
+    h, w = mask.shape
+    out = []
+    padded = np.zeros((h, w + 2), dtype=bool)
+    padded[:, 1:-1] = mask
+    diff = np.diff(padded.astype(np.int8), axis=1)
+    for y in range(h):
+        starts = np.flatnonzero(diff[y] == 1)
+        ends = np.flatnonzero(diff[y] == -1) - 1
+        out.append(list(zip(starts.tolist(), ends.tolist())))
+    return out
+
+
+def _components(mask):
+    """4-connected components via run-length union-find."""
+    rows = _runs(mask)
+    parent = []
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    labels = []          # per row: list of run ids
+    boxes = []           # id -> [x0, x1, y0, y1, area]
+    prev_runs, prev_ids = [], []
+    for y, runs in enumerate(rows):
+        ids = []
+        for x0, x1 in runs:
+            rid = len(parent)
+            parent.append(rid)
+            boxes.append([x0, x1, y, y, x1 - x0 + 1])
+            ids.append(rid)
+            for (px0, px1), pid in zip(prev_runs, prev_ids):
+                if px0 <= x1 and x0 <= px1:
+                    union(rid, pid)
+        labels.append(ids)
+        prev_runs, prev_ids = runs, ids
+
+    merged = {}
+    for rid in range(len(parent)):
+        root = find(rid)
+        bx = boxes[rid]
+        m = merged.get(root)
+        if m is None:
+            merged[root] = list(bx)
+        else:
+            m[0] = min(m[0], bx[0])
+            m[1] = max(m[1], bx[1])
+            m[2] = min(m[2], bx[2])
+            m[3] = max(m[3], bx[3])
+            m[4] += bx[4]
+    return [{"x0": v[0], "x1": v[1], "y0": v[2], "y1": v[3], "area": v[4]}
+            for v in merged.values()]
+
+
+def _bars(comps):
+    out = []
+    for c in comps:
+        bw = c["x1"] - c["x0"] + 1
+        bh = c["y1"] - c["y0"] + 1
+        if bw < MIN_BAR_LEN or not (BAR_THICK_RANGE[0] <= bh <= BAR_THICK_RANGE[1]):
+            continue
+        if bw <= bh:
+            continue
+        if c["area"] < FILL_MIN * bw * bh:
+            continue
+        out.append({"len": bw, "cx": (c["x0"] + c["x1"]) / 2.0,
+                    "cy": (c["y0"] + c["y1"]) / 2.0, "x0": c["x0"]})
+    return out
+
+
+def _split_columns(bars):
+    """Split by the widest gap between sorted left edges."""
+    ordered = sorted(bars, key=lambda b: b["x0"])
+    best, cut = -1.0, None
+    for i in range(1, len(ordered)):
+        gap = ordered[i]["x0"] - ordered[i - 1]["x0"]
+        if gap > best:
+            best, cut = gap, i
+    if cut is None or best < 150:
+        return None, None
+    return ordered[:cut], ordered[cut:]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    bars = _bars(_components(_mask(image)))
+    if len(bars) != 7:
+        return ABSTAIN
+    left, right = _split_columns(bars)
+    if left is None or len(left) != 4 or len(right) != 3:
+        return ABSTAIN
+    left = sorted(left, key=lambda b: b["cy"])
+    rlens = [b["len"] for b in right]
+    dists = [min(abs(b["len"] - r) for r in rlens) for b in left]
+    order = sorted(range(len(left)), key=lambda i: -dists[i])
+    odd, runner = order[0], order[1]
+    if dists[odd] < ODD_MIN or dists[runner] > PAIR_TOL:
+        return ABSTAIN
+    return str(odd + 1)

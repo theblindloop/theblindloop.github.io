@@ -1,0 +1,265 @@
+"""Independent PNG-only inverse arm for nested carrier exchange replay."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_PALETTE_GROUPS = (
+    ((52, 126, 192), (38, 108, 174)),
+    ((48, 154, 104), (31, 137, 88)),
+    ((203, 83, 145), (180, 69, 130)),
+)
+_ORANGE = np.array((248, 221, 183), dtype=np.int16)
+_PURPLE = np.array((225, 211, 243), dtype=np.int16)
+_PARCEL = np.array((250, 246, 220), dtype=np.int16)
+_RED = np.array((211, 55, 62), dtype=np.int16)
+_ANSWERS = ("LEFT", "MIDDLE", "RIGHT")
+
+
+class PixelParseError(ValueError):
+    pass
+
+
+def _near(arr: np.ndarray, color: np.ndarray | tuple[int, int, int], tolerance: float = 14.0) -> np.ndarray:
+    target = np.asarray(color, dtype=np.int16)
+    return np.linalg.norm(arr.astype(np.int16) - target, axis=2) <= tolerance
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(values)
+    if not len(indices):
+        return []
+    breaks = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.r_[indices[0], indices[breaks + 1]]
+    ends = np.r_[indices[breaks], indices[-1]]
+    return [(int(a), int(b)) for a, b in zip(starts, ends, strict=True)]
+
+
+def _rect_components(
+    mask: np.ndarray, minimum_area: int
+) -> list[tuple[tuple[int, int, int, int], int]]:
+    """Recover separated fill islands from projection runs, without layout constants."""
+    found: list[tuple[tuple[int, int, int, int], int]] = []
+    for y0, y1 in _runs(mask.any(axis=1)):
+        strip = mask[y0 : y1 + 1]
+        for x0, x1 in _runs(strip.any(axis=0)):
+            area = int(strip[:, x0 : x1 + 1].sum())
+            if area >= minimum_area:
+                found.append(((x0, y0, x1, y1), area))
+    return found
+
+
+def _blob_areas(mask: np.ndarray, minimum_area: int) -> list[int]:
+    """Eight-connected component areas in a small operand crop."""
+    remaining = mask.copy()
+    height, width = remaining.shape
+    areas: list[int] = []
+    for start_y, start_x in zip(*np.nonzero(remaining), strict=True):
+        if not remaining[start_y, start_x]:
+            continue
+        remaining[start_y, start_x] = False
+        queue = deque([(int(start_y), int(start_x))])
+        area = 0
+        while queue:
+            y, x = queue.popleft()
+            area += 1
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if remaining[ny, nx]:
+                        remaining[ny, nx] = False
+                        queue.append((ny, nx))
+        if area >= minimum_area:
+            areas.append(area)
+    return areas
+
+
+def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
+def _crop(mask: np.ndarray, box: tuple[int, int, int, int], pad: int = 0) -> np.ndarray:
+    x0, y0, x1, y1 = box
+    return mask[max(0, y0 - pad) : min(mask.shape[0], y1 + pad + 1),
+                max(0, x0 - pad) : min(mask.shape[1], x1 + pad + 1)]
+
+
+def _count_pips(
+    dark: np.ndarray, box: tuple[int, int, int, int], *, minimum_area: int
+) -> tuple[int, float]:
+    x0, y0, x1, y1 = box
+    inset = max(7, round(min(x1 - x0 + 1, y1 - y0 + 1) * 0.15))
+    interior = dark[y0 + inset : y1 - inset + 1, x0 + inset : x1 - inset + 1]
+    areas = _blob_areas(interior, minimum_area=minimum_area)
+    if not 1 <= len(areas) <= 3 or any(area > 210 for area in areas):
+        raise PixelParseError(f"invalid separated pip evidence {sorted(areas)}")
+    return len(areas), float(min(area - minimum_area for area in areas) / 8.0)
+
+
+def _identity_masks(arr: np.ndarray) -> list[np.ndarray]:
+    masks = []
+    for shades in _PALETTE_GROUPS:
+        masks.append(_near(arr, shades[0]) | _near(arr, shades[1]))
+    return masks
+
+
+def _initial_bindings(
+    arr: np.ndarray, identity_masks: list[np.ndarray]
+) -> tuple[list[int], list[int], int, list[float]]:
+    carts: list[tuple[float, int, int]] = []
+    confidence: list[float] = []
+    for identity, mask in enumerate(identity_masks):
+        large = [
+            (box, area)
+            for box, area in _rect_components(mask, minimum_area=900)
+            if area >= 7000 and _center(box)[1] < arr.shape[0] * 0.55
+        ]
+        if len(large) != 1:
+            raise PixelParseError(f"cart identity {identity} has {len(large)} initial bodies")
+        box, area = large[0]
+        carts.append((_center(box)[0], identity, area))
+        confidence.append((area - 7000) / 500.0)
+    carts.sort()
+    cart_order = [identity for _, identity, _ in carts]
+    cart_xs = [x for x, _, _ in carts]
+    if len(set(cart_order)) != 3 or min(np.diff(cart_xs)) < 220:
+        raise PixelParseError("initial cart docks are merged or unresolved")
+
+    parcel_mask = _near(arr, _PARCEL)
+    parcels = [
+        (box, area)
+        for box, area in _rect_components(parcel_mask, minimum_area=1500)
+        if area >= 3500 and _center(box)[1] < arr.shape[0] * 0.45
+    ]
+    if len(parcels) != 3:
+        raise PixelParseError(f"expected three initial parcels, found {len(parcels)}")
+    parcels.sort(key=lambda item: _center(item[0])[0])
+
+    dark = np.all(arr < 92, axis=2)
+    red = _near(arr, _RED, tolerance=18.0)
+    parcel_by_cart = [0, 0, 0]
+    target_values: list[int] = []
+    for dock_index, (box, area) in enumerate(parcels):
+        px = _center(box)[0]
+        if abs(px - cart_xs[dock_index]) > 35:
+            raise PixelParseError("parcel is not centered over its cart")
+        value, pip_gap = _count_pips(dark, box, minimum_area=42)
+        cart_id = cart_order[dock_index]
+        parcel_by_cart[cart_id] = value
+        confidence.extend(((area - 3500) / 300.0, pip_gap))
+        red_count = int(_crop(red, box, pad=13).sum())
+        if red_count >= 300:
+            target_values.append(value)
+            confidence.append((red_count - 300) / 60.0)
+        elif red_count > 35:
+            raise PixelParseError("target outline evidence is partial")
+    if sorted(parcel_by_cart) != [1, 2, 3]:
+        raise PixelParseError(f"parcel identities are not a complete 1..3 set: {parcel_by_cart}")
+    if len(target_values) != 1:
+        raise PixelParseError(f"expected one red-ringed parcel, found {len(target_values)}")
+    return cart_order, parcel_by_cart, target_values[0], confidence
+
+
+def _card_boxes(arr: np.ndarray) -> list[tuple[tuple[int, int, int, int], str, int]]:
+    cards: list[tuple[tuple[int, int, int, int], str, int]] = []
+    for kind, color in (("cart", _ORANGE), ("parcel", _PURPLE)):
+        for box, area in _rect_components(_near(arr, color), minimum_area=12000):
+            if _center(box)[1] > arr.shape[0] * 0.45:
+                cards.append((box, kind, area))
+    cards.sort(key=lambda item: _center(item[0])[0])
+    if len(cards) != 7:
+        raise PixelParseError(f"expected seven operation cards, found {len(cards)}")
+    widths = [box[2] - box[0] + 1 for box, _, _ in cards]
+    centers = [_center(box) for box, _, _ in cards]
+    median_width = float(np.median(widths))
+    if max(widths) - min(widths) > 0.12 * median_width:
+        raise PixelParseError("operation card widths are inconsistent")
+    if max(y for _, y in centers) - min(y for _, y in centers) > 0.2 * median_width:
+        raise PixelParseError("operation cards do not form one ordered row")
+    x_gaps = np.diff([x for x, _ in centers])
+    if len(x_gaps) and float(min(x_gaps)) < median_width + 8:
+        raise PixelParseError("operation card order is unresolved")
+    return cards
+
+
+def _purple_operands(
+    arr: np.ndarray,
+    dark: np.ndarray,
+    box: tuple[int, int, int, int],
+) -> tuple[int, int, list[float]]:
+    x0, y0, x1, y1 = box
+    local = arr[y0 : y1 + 1, x0 : x1 + 1]
+    local_parcel = _near(local, _PARCEL)
+    tokens = _rect_components(local_parcel, minimum_area=1200)
+    if len(tokens) != 2:
+        raise PixelParseError(f"purple card has {len(tokens)} dock operands")
+    absolute = [
+        ((token[0] + x0, token[1] + y0, token[2] + x0, token[3] + y0), area)
+        for token, area in tokens
+    ]
+    absolute.sort(key=lambda item: _center(item[0])[0])
+    values = []
+    confidence = []
+    for token, area in absolute:
+        value, gap = _count_pips(dark, token, minimum_area=24)
+        values.append(value - 1)
+        confidence.extend(((area - 1200) / 180.0, gap))
+    if values[0] == values[1] or any(value not in (0, 1, 2) for value in values):
+        raise PixelParseError(f"purple dock operands are invalid: {values}")
+    return values[0], values[1], confidence
+
+
+def _orange_operands(
+    identity_masks: list[np.ndarray], box: tuple[int, int, int, int]
+) -> tuple[int, int, list[float]]:
+    counts = [int(_crop(mask, box).sum()) for mask in identity_masks]
+    present = [identity for identity, count in enumerate(counts) if count >= 650]
+    if len(present) != 2:
+        raise PixelParseError(f"orange cart operands are unresolved: {counts}")
+    absent = next(count for identity, count in enumerate(counts) if identity not in present)
+    if absent > 80:
+        raise PixelParseError("orange card contains stray third-cart evidence")
+    confidence = [(counts[identity] - 650) / 100.0 for identity in present]
+    confidence.append((80 - absent) / 10.0)
+    return present[0], present[1], confidence
+
+
+def _decode(image: Image.Image) -> tuple[str, float]:
+    arr = np.asarray(image.convert("RGB"))
+    if arr.ndim != 3 or min(arr.shape[:2]) < 200:
+        raise PixelParseError("raster is too small")
+    identity_masks = _identity_masks(arr)
+    cart_order, parcel_by_cart, target, confidence = _initial_bindings(arr, identity_masks)
+    dark = np.all(arr < 92, axis=2)
+    cards = _card_boxes(arr)
+
+    order = list(cart_order)
+    contents = list(parcel_by_cart)
+    for box, kind, area in cards:
+        confidence.append((area - 12000) / 1000.0)
+        if kind == "cart":
+            a, b, gaps = _orange_operands(identity_masks, box)
+            dock_a, dock_b = order.index(a), order.index(b)
+            order[dock_a], order[dock_b] = order[dock_b], order[dock_a]
+        else:
+            a, b, gaps = _purple_operands(arr, dark, box)
+            cart_a, cart_b = order[a], order[b]
+            contents[cart_a], contents[cart_b] = contents[cart_b], contents[cart_a]
+        confidence.extend(gaps)
+
+    target_cart = contents.index(target)
+    decision = _ANSWERS[order.index(target_cart)]
+    if not confidence or min(confidence) <= 0:
+        raise PixelParseError("retained evidence has no positive runner-up separation")
+    return decision, float(min(confidence))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return _decode(image)[0]
+
+
+def decision_margin_from_image(image: Image.Image) -> float:
+    """Pixel-only distance of the weakest retained component from rejection."""
+    return _decode(image)[1]

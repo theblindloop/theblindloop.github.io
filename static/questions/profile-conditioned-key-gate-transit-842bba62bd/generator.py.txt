@@ -1,0 +1,263 @@
+"""Renderer and analytic gold for key_gate_transit.
+
+A courier walks a corridor from left to right past an ordered row of stations.
+A station is either a *pickup* (a coloured disc drawn above the corridor) which
+adds one key of its colour to the courier's bag, or a *gate* (a coloured post
+drawn across the corridor) which spends one key of its own colour to let the
+courier through.  If the bag holds no key of a gate's colour the courier stops
+at that gate and nothing further along the corridor happens.
+
+The tracked state is therefore a *multiset of held keys*, not a position and not
+a single carried value: a key picked up early can be spent by an early gate and
+be unavailable to a later gate of the same colour, so the answer is not a
+function of how many pickups and gates of each colour the picture contains.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import Counter
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "key_gate_transit-renderer-0.1.0"
+
+CANVAS = (1000, 420)
+BG = (255, 255, 255)
+
+COLOURS: dict[str, tuple[int, int, int]] = {
+    "blue": (40, 80, 200),
+    "green": (30, 150, 60),
+    "orange": (235, 130, 20),
+    "purple": (140, 50, 175),
+    "yellow": (240, 205, 30),
+}
+COLOUR_NAMES = tuple(sorted(COLOURS))
+
+N_STATIONS = 13
+X0 = 95.0
+PITCH = 66.0
+JITTER = 6.0
+
+CORRIDOR_TOP = 250
+CORRIDOR_BOT = 330
+PICKUP_CY = 170
+PICKUP_R = 17
+GATE_TOP = 236
+GATE_BOT = 344
+GATE_HALF_W = 6
+
+MIN_SEP = 36.0            # centre separation two stations need to read apart
+QUARANTINE_MARGIN = 6.0
+
+INK = (25, 25, 25)
+GREY_BAND = (232, 232, 232)
+GREY_EDGE = (120, 120, 120)
+GREY_ARROW = (150, 150, 150)
+
+
+# --------------------------------------------------------------------------
+# replay
+# --------------------------------------------------------------------------
+def _ordered(scene: dict) -> list[dict]:
+    """Stations in drawn left-to-right order, recovered from drawn abscissa."""
+    return sorted(scene["stations"], key=lambda s: (s["x"], s["slot"]))
+
+
+def _replay(stations: list[dict]) -> tuple[str, int, int] | None:
+    """Return (blocking colour, gates opened, blocking index) or None."""
+    bag: Counter[str] = Counter()
+    opened = 0
+    for i, st in enumerate(stations):
+        if st["kind"] == "pickup":
+            bag[st["colour"]] += 1
+        else:
+            if bag[st["colour"]] > 0:
+                bag[st["colour"]] -= 1
+                opened += 1
+            else:
+                return st["colour"], opened, i
+    return None
+
+
+def analytic_gold(scene: dict) -> str:
+    out = _replay(_ordered(scene))
+    if out is None:
+        raise ValueError("scene has no blocking gate; sampler must guarantee one")
+    colour, opened, _ = out
+    return f"{colour}|{opened}"
+
+
+def margin(scene: dict) -> float:
+    """Smallest drawn clearance any reading of the image depends on."""
+    xs = [s["x"] for s in _ordered(scene)]
+    gap = min(b - a for a, b in zip(xs, xs[1:])) - MIN_SEP
+    row = float(GATE_TOP - (PICKUP_CY + PICKUP_R))
+    return round(min(gap, row), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _global_counts(stations: list[dict]) -> tuple[Counter, Counter]:
+    picks: Counter[str] = Counter()
+    gates: Counter[str] = Counter()
+    for st in stations:
+        (picks if st["kind"] == "pickup" else gates)[st["colour"]] += 1
+    return picks, gates
+
+
+def _order_critical(stations: list[dict], i: int) -> bool:
+    """Does swapping drawn neighbours i and i+1 change the answer?"""
+    swapped = list(stations)
+    swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
+    a, b = _replay(stations), _replay(swapped)
+    if a is None or b is None:
+        return True
+    return a[:2] != b[:2]
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(0xC0FFEE ^ (seed * 2_654_435_761 & 0xFFFFFFFF))
+
+    target_colour = COLOUR_NAMES[seed % len(COLOUR_NAMES)]
+    target_opened = 1 + (seed // len(COLOUR_NAMES)) % 4
+    hide_global = rng.random() < 0.65
+    require_spent = rng.random() < 0.55
+    not_first_gate = rng.random() < 0.75
+    want_tight = rng.random() < 0.14
+
+    # Constraint ladder: the strictest counterbalancing set is tried first and
+    # relaxed one clause at a time, so sampling always terminates with a legal
+    # scene while nearly every seed lands on the fully counterbalanced set.
+    ladder = (
+        {"opened", "all_colours", "global", "spent", "first_gate"},
+        {"opened", "all_colours", "global"},
+        {"opened", "all_colours"},
+        {"all_colours"},
+        set(),
+    )
+
+    kinds_colours = None
+    for active in ladder:
+        for _ in range(20_000):
+            seq = []
+            for _ in range(N_STATIONS):
+                kind = "pickup" if rng.random() < 0.5 else "gate"
+                seq.append({"kind": kind, "colour": rng.choice(COLOUR_NAMES)})
+            stations = [dict(s, slot=i, x=0.0) for i, s in enumerate(seq)]
+            out = _replay(stations)
+            if out is None:
+                continue               # no blocking gate: never a legal scene
+            colour, opened, idx = out
+            if colour != target_colour:
+                continue               # the answer colour is balanced by seed
+            if idx > N_STATIONS - 3:   # the stop is never the last station
+                continue
+            if "opened" in active and opened != target_opened:
+                continue
+            if "all_colours" in active and len({s["colour"] for s in seq}) != len(COLOUR_NAMES):
+                continue               # every colour drawn: ink is balanced
+            picks, gates = _global_counts(stations)
+            if "global" in active and hide_global and picks[colour] < gates[colour]:
+                continue               # global counting must mispredict
+            spent = any(
+                s["kind"] == "pickup" and s["colour"] == colour for s in stations[:idx]
+            )
+            if "spent" in active and require_spent and not spent:
+                continue               # a key of that colour was really used
+            first_gate = next(
+                (s["colour"] for s in stations if s["kind"] == "gate"), None
+            )
+            if "first_gate" in active and not_first_gate and first_gate == colour:
+                continue               # not just "the colour of the first gate"
+            kinds_colours = seq
+            break
+        if kinds_colours is not None:
+            break
+    if kinds_colours is None:              # pragma: no cover - ladder is ample
+        raise RuntimeError(f"sampling failed for seed {seed}")
+
+    xs = [X0 + i * PITCH + rng.uniform(-JITTER, JITTER) for i in range(N_STATIONS)]
+    stations = [
+        {"slot": i, "kind": kinds_colours[i]["kind"], "colour": kinds_colours[i]["colour"],
+         "x": round(xs[i], 3)}
+        for i in range(N_STATIONS)
+    ]
+
+    tight = False
+    if want_tight:
+        critical = [i for i in range(N_STATIONS - 1) if _order_critical(stations, i)]
+        if critical:
+            i = rng.choice(critical)
+            squeeze = MIN_SEP + rng.uniform(0.5, 5.0)
+            shift = (stations[i + 1]["x"] - stations[i]["x"]) - squeeze
+            for j in range(i + 1, N_STATIONS):
+                stations[j]["x"] = round(stations[j]["x"] - shift, 3)
+            tight = True
+
+    order = list(range(N_STATIONS))
+    rng.shuffle(order)                     # list order carries no information
+    return {
+        "canvas": list(CANVAS),
+        "n_stations": N_STATIONS,
+        "tight_pair": tight,
+        "stations": [stations[i] for i in order],
+    }
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Re-orderings of the station bag: pixel-identical and answer-preserving."""
+    st = list(scene["stations"])
+    out: list[tuple[str, dict]] = []
+    for name, perm in (
+        ("bag_reversed", st[::-1]),
+        ("bag_rot1", st[1:] + st[:1]),
+        ("bag_rot3", st[3:] + st[:3]),
+        ("bag_sorted_by_colour", sorted(st, key=lambda s: (s["colour"], s["kind"]))),
+    ):
+        alt = dict(scene)
+        alt["stations"] = [dict(s) for s in perm]
+        out.append((name, alt))
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    w, h = scene["canvas"]
+    img = Image.new("RGB", (w, h), BG)
+    d = ImageDraw.Draw(img)
+
+    # corridor band
+    d.rectangle([60, CORRIDOR_TOP, w - 40, CORRIDOR_BOT], fill=GREY_BAND)
+    d.line([60, CORRIDOR_TOP, w - 40, CORRIDOR_TOP], fill=GREY_EDGE, width=3)
+    d.line([60, CORRIDOR_BOT, w - 40, CORRIDOR_BOT], fill=GREY_EDGE, width=3)
+
+    # walking-direction arrow in the top margin
+    d.line([70, 62, w - 80, 62], fill=GREY_ARROW, width=5)
+    d.polygon([(w - 80, 46), (w - 80, 78), (w - 48, 62)], fill=GREY_ARROW)
+
+    # courier
+    d.polygon([(24, 268), (24, 312), (56, 290)], fill=INK)
+
+    for st in _ordered(scene):
+        x = st["x"]
+        col = COLOURS[st["colour"]]
+        if st["kind"] == "pickup":
+            d.ellipse(
+                [x - PICKUP_R, PICKUP_CY - PICKUP_R, x + PICKUP_R, PICKUP_CY + PICKUP_R],
+                fill=col, outline=INK, width=2,
+            )
+            d.line([x, PICKUP_CY + PICKUP_R, x, CORRIDOR_TOP - 6], fill=GREY_EDGE, width=2)
+        else:
+            d.rectangle(
+                [x - GATE_HALF_W, GATE_TOP, x + GATE_HALF_W, GATE_BOT],
+                fill=col, outline=INK, width=2,
+            )
+    return img

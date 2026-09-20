@@ -1,0 +1,172 @@
+"""Deterministic renderer for the predictive-delta emblem world."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+CANVAS = (520, 420)
+SYMBOLS = ("loop", "spear", "wave", "crown")
+TILE_SIZES = (216, 232, 248)
+PALETTE_BANKS = (
+    (
+        (216, 50, 64),
+        (36, 126, 220),
+        (36, 174, 102),
+        (190, 70, 190),
+    ),
+    (
+        (224, 90, 42),
+        (40, 144, 208),
+        (28, 166, 132),
+        (172, 78, 204),
+    ),
+    (
+        (204, 56, 86),
+        (42, 118, 214),
+        (54, 168, 88),
+        (200, 82, 174),
+    ),
+)
+
+
+def _label_index(seed: int) -> int:
+    """Counterbalance the four labels in every consecutive block of four seeds."""
+    return int(seed) % len(SYMBOLS)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a translated marked raster with nuisance fields independent of label."""
+    seed = int(seed)
+    block_seed = seed - (seed % len(SYMBOLS))
+    rng = np.random.default_rng((block_seed ^ 0xA5B3571D) & ((1 << 63) - 1))
+    tile_size = int(rng.choice(TILE_SIZES))
+    tile_x = int(rng.integers(72, CANVAS[0] - tile_size - 72))
+    tile_y = int(rng.integers(60, CANVAS[1] - tile_size - 58))
+    palette_bank = PALETTE_BANKS[int(rng.integers(0, len(PALETTE_BANKS)))]
+    palette = [[int(channel) for channel in color] for color in palette_bank]
+    order = [int(value) for value in rng.permutation(4)]
+    return {
+        "symbol": SYMBOLS[_label_index(seed)],
+        "tile_x": tile_x,
+        "tile_y": tile_y,
+        "tile_size": tile_size,
+        "palette": palette,
+        "order": order,
+        "marker_size": int(rng.choice((9, 11, 13))),
+        "carrier_phase": int(rng.integers(0, 2)),
+        "carrier_amplitude": int(rng.choice((16, 20, 24))),
+        "signal_strength": int(rng.choice((76, 84, 92))),
+        "base_level": int(rng.choice((148, 156, 164, 172))),
+        "background": int(rng.choice((234, 241, 248))),
+    }
+
+
+def _segment_distance(
+    x: np.ndarray,
+    y: np.ndarray,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> np.ndarray:
+    x0, y0 = start
+    x1, y1 = end
+    vx, vy = x1 - x0, y1 - y0
+    denominator = vx * vx + vy * vy
+    t = ((x - x0) * vx + (y - y0) * vy) / denominator
+    t = np.clip(t, 0.0, 1.0)
+    return np.hypot(x - (x0 + t * vx), y - (y0 + t * vy))
+
+
+def _symbol_mask(symbol: str, size: int) -> np.ndarray:
+    center = (size - 1) / 2.0
+    yy, xx = np.indices((size, size), dtype=np.float32)
+    x = (xx - center) / (size / 2.0)
+    y = (yy - center) / (size / 2.0)
+    if symbol == "loop":
+        radius = np.hypot(x, y)
+        mask = (radius >= 0.32) & (radius <= 0.49)
+    elif symbol == "spear":
+        half_width = np.clip((y + 0.64) * 0.78, 0.0, 0.43)
+        tip = (y >= -0.64) & (y <= -0.08) & (np.abs(x) <= half_width)
+        shaft = (np.abs(x) <= 0.075) & (y >= -0.08) & (y <= 0.58)
+        mask = tip | shaft
+    elif symbol == "wave":
+        curve = 0.24 * np.sin(2.15 * np.pi * x)
+        mask = (np.abs(y - curve) <= 0.075) & (np.abs(x) <= 0.78)
+    elif symbol == "crown":
+        left_outer = _segment_distance(x, y, (-0.62, 0.42), (-0.38, -0.30)) < 0.075
+        left_inner = _segment_distance(x, y, (-0.38, -0.30), (0.0, 0.22)) < 0.075
+        right_inner = _segment_distance(x, y, (0.0, 0.22), (0.38, -0.30)) < 0.075
+        right_outer = _segment_distance(x, y, (0.38, -0.30), (0.62, 0.42)) < 0.075
+        base = _segment_distance(x, y, (-0.62, 0.42), (0.62, 0.42)) < 0.075
+        mask = left_outer | left_inner | right_inner | right_outer | base
+    else:
+        raise ValueError(f"unknown symbol: {symbol}")
+    return mask & (np.abs(x) < 0.86) & (np.abs(y) < 0.86)
+
+
+def _encode_delta(target: np.ndarray, phase: int, amplitude: int) -> np.ndarray:
+    """Store each row as mid-gray predictive residuals plus an alternating carrier."""
+    encoded = np.empty_like(target, dtype=np.uint8)
+    encoded[:, 0] = np.clip(target[:, 0], 0.0, 255.0).astype(np.uint8)
+    if target.shape[1] > 1:
+        columns = np.arange(1, target.shape[1], dtype=np.int32)
+        carrier = np.where(((columns + int(phase)) % 2) == 0, float(amplitude), -float(amplitude))
+        delta = target[:, 1:] - target[:, :-1]
+        encoded[:, 1:] = np.clip(128.0 + delta + carrier[None, :], 0.0, 255.0).astype(np.uint8)
+    return encoded
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one carrier-dominated predictive-residual tile and four fiducials."""
+    width, height = CANVAS
+    image = np.full((height, width, 3), int(scene["background"]), dtype=np.uint8)
+    size = int(scene["tile_size"])
+    mask = _symbol_mask(str(scene["symbol"]), size)
+    target = float(scene["base_level"]) - float(scene["signal_strength"]) * mask.astype(np.float32)
+    tile = _encode_delta(target, int(scene["carrier_phase"]), int(scene["carrier_amplitude"]))
+    rgb_tile = np.repeat(tile[:, :, None], 3, axis=2)
+    tx, ty = int(scene["tile_x"]), int(scene["tile_y"])
+    image[ty : ty + size, tx : tx + size] = rgb_tile
+
+    output = Image.fromarray(image, mode="RGB")
+    draw = ImageDraw.Draw(output)
+    half = int(scene["marker_size"]) // 2
+    marker_centers = (
+        (tx - 10, ty - 10),
+        (tx + size + 9, ty - 10),
+        (tx - 10, ty + size + 9),
+        (tx + size + 9, ty + size + 9),
+    )
+    palette = scene["palette"]
+    order = scene["order"]
+    for corner, (cx, cy) in enumerate(marker_centers):
+        color = tuple(int(channel) for channel in palette[int(order[corner])])
+        draw.rectangle((cx - half, cy - half, cx + half, cy + half), fill=color)
+    return output
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["symbol"])
+
+
+def margin(scene: dict) -> float:
+    """One-sided transform-evidence margin in gray levels."""
+    return float(int(scene["signal_strength"]) - 20)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 0.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Swap two redundant palette coordinates while preserving each rendered corner."""
+    twin = dict(scene)
+    twin["palette"] = [list(color) for color in scene["palette"]]
+    twin["order"] = [int(value) for value in scene["order"]]
+    twin["palette"][0], twin["palette"][1] = twin["palette"][1], twin["palette"][0]
+    twin["order"] = [
+        1 if value == 0 else 0 if value == 1 else value for value in twin["order"]
+    ]
+    return [("palette_order_relabeling", twin)]

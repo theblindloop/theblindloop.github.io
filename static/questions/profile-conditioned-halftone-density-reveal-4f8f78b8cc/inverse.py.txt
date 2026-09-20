@@ -1,0 +1,124 @@
+"""Image-only inverse arm for the halftone-density reveal world.
+
+Receives a PIL image and the public question contract only: it locates the
+blue frame, rebuilds the 5x5 cell grid, executes the declared blur by
+averaging the achromatic speckle inside each cell, ignores the orange
+decoration, and matches the nine darkest cells against the six named
+templates.  It imports no renderer, prompt, generator, verifier or gold code
+and never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "halftone_density_reveal-oracle-0.1.0"
+
+GRID = 5
+ON_CELLS = 9
+ABSTAIN = "ambiguous"
+ABSTAIN_MARGIN = 6.0
+
+# Independently re-typed from the public question contract.
+_ROWS: dict[str, tuple[str, ...]] = {
+    "diamond": ("..X..", ".X.X.", "X.X.X", ".X.X.", "..X.."),
+    "ell": ("X....", "X....", "X....", "X....", "XXXXX"),
+    "ex": ("X...X", ".X.X.", "..X..", ".X.X.", "X...X"),
+    "flag": ("XXX..", "XXX..", "X....", "X....", "X...."),
+    "plus": ("..X..", "..X..", "XXXXX", "..X..", "..X.."),
+    "zee": ("XXXXX", "...X.", "..X..", ".X...", "X...."),
+}
+SYMBOL_NAMES: tuple[str, ...] = tuple(sorted(_ROWS))
+_MASKS: dict[str, np.ndarray] = {
+    name: np.array(
+        [[1.0 if ch == "X" else -1.0 for ch in row] for row in rows],
+        dtype=np.float64,
+    )
+    for name, rows in _ROWS.items()
+}
+
+
+class OracleError(RuntimeError):
+    """Raised when the declared fiducials are not present in the raster."""
+
+
+def _frame_interior(rgb: np.ndarray) -> tuple[int, int, int, int]:
+    r = rgb[:, :, 0].astype(np.int16)
+    g = rgb[:, :, 1].astype(np.int16)
+    b = rgb[:, :, 2].astype(np.int16)
+    blue = (b - np.maximum(r, g)) > 40
+    ys, xs = np.nonzero(blue)
+    if ys.size < 400:
+        raise OracleError("no blue frame fiducial found")
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    mid = (y0 + y1) // 2
+    row = blue[mid, x0 : x1 + 1]
+    thickness = 0
+    while thickness < row.size and row[thickness]:
+        thickness += 1
+    if thickness < 2:
+        raise OracleError("frame thickness not measurable")
+    return (
+        y0 + thickness,
+        x0 + thickness,
+        y1 + 1 - thickness,
+        x1 + 1 - thickness,
+    )
+
+
+def cell_means(image: Image.Image) -> np.ndarray:
+    """Declared transform: blur each cell to one flat grey tone."""
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    top, left, bottom, right = _frame_interior(rgb)
+    if bottom - top < 5 * GRID or right - left < 5 * GRID:
+        raise OracleError("panel interior too small to hold a 5x5 grid")
+    arr = rgb[top:bottom, left:right].astype(np.float64)
+    chroma = arr.max(axis=2) - arr.min(axis=2)
+    achromatic = chroma <= 30.0  # drops the orange decoration
+    grey = arr.mean(axis=2)
+    height, width = grey.shape
+    means = np.zeros((GRID, GRID), dtype=np.float64)
+    for r in range(GRID):
+        for c in range(GRID):
+            y0 = top + int(round(r * height / GRID))
+            y1 = top + int(round((r + 1) * height / GRID))
+            x0 = left + int(round(c * width / GRID))
+            x1 = left + int(round((c + 1) * width / GRID))
+            inset = max(3, min(y1 - y0, x1 - x0) // 12)
+            sub_g = grey[y0 - top + inset : y1 - top - inset,
+                         x0 - left + inset : x1 - left - inset]
+            sub_m = achromatic[y0 - top + inset : y1 - top - inset,
+                               x0 - left + inset : x1 - left - inset]
+            if sub_m.sum() < 25:
+                raise OracleError("cell has no readable speckle")
+            means[r, c] = float(sub_g[sub_m].mean())
+    return means
+
+
+def decision_with_margin(image: Image.Image) -> tuple[str, float]:
+    means = cell_means(image)
+    threshold = 0.5 * (float(means.min()) + float(means.max()))
+    deviation = threshold - means  # positive where the cell is denser/darker
+    scores = [(name, float((_MASKS[name] * deviation).sum())) for name in SYMBOL_NAMES]
+    best_name, best = scores[0]
+    for name, value in scores[1:]:
+        if value > best:
+            best_name, best = name, value
+    runner_up = max(value for name, value in scores if name != best_name)
+    return best_name, float(best - runner_up)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    name, _ = decision_with_margin(image)
+    return name
+
+
+def decision_or_abstain(image: Image.Image) -> str:
+    """Abstaining wrapper used for corruption and erasure probes."""
+    try:
+        name, gap = decision_with_margin(image)
+    except OracleError:
+        return ABSTAIN
+    return name if gap >= ABSTAIN_MARGIN else ABSTAIN

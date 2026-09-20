@@ -1,0 +1,126 @@
+"""Independent image-only inverse for the compass north-alignment question."""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "compass-north-prior-oracle-0.1.0"
+SECTOR_HALF_ANGLE = 16.0
+
+# Public swatches are repeated here so this module has no dependency on the
+# renderer or on latent scene data.
+MARKER_SWATCHES = np.asarray(
+    ((24, 135, 213), (171, 61, 174), (228, 123, 24), (28, 163, 112)),
+    dtype=np.float32,
+)
+NEEDLE_SWATCHES = np.asarray(
+    ((202, 45, 55), (19, 86, 166), (176, 65, 22), (95, 45, 160)),
+    dtype=np.float32,
+)
+DIAL_SWATCHES = np.asarray(
+    ((250, 251, 248), (244, 248, 252), (252, 247, 239)),
+    dtype=np.float32,
+)
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    height, width = mask.shape
+    remaining = mask.copy()
+    found: list[tuple[np.ndarray, np.ndarray]] = []
+    while remaining.any():
+        y0, x0 = np.argwhere(remaining)[0]
+        queue = deque([(int(y0), int(x0))])
+        remaining[y0, x0] = False
+        ys: list[int] = []
+        xs: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            ys.append(y)
+            xs.append(x)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    yy = y + dy
+                    xx = x + dx
+                    if 0 <= yy < height and 0 <= xx < width and remaining[yy, xx]:
+                        remaining[yy, xx] = False
+                        queue.append((yy, xx))
+        if len(ys) >= minimum:
+            found.append((np.asarray(ys, dtype=np.float64), np.asarray(xs, dtype=np.float64)))
+    return found
+
+
+def _palette_mask(arr: np.ndarray, palette: np.ndarray, threshold: float) -> np.ndarray:
+    distances = np.linalg.norm(arr[..., None, :] - palette[None, None, :, :], axis=-1)
+    return distances.min(axis=-1) <= threshold
+
+
+def _largest(components: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
+    if not components:
+        raise ValueError("required colored component was not visible")
+    return max(components, key=lambda item: len(item[0]))
+
+
+def _center_from_dial(arr: np.ndarray) -> tuple[float, float]:
+    # The flat interior swatches are exact after downsampling.  A tight
+    # threshold keeps the near-white background out of the dial component.
+    mask = _palette_mask(arr, DIAL_SWATCHES, 6.0)
+    components = _components(mask, minimum=5000)
+    # One background choice is intentionally close to one dial swatch.  A
+    # full-canvas component is therefore possible; the dial is the compact
+    # large component with a circular-sized bounding box.
+    compact = [
+        item
+        for item in components
+        if (item[1].max() - item[1].min()) < arr.shape[1] * 0.75
+        and (item[0].max() - item[0].min()) < arr.shape[0] * 0.75
+    ]
+    ys, xs = _largest(compact or components)
+    # The outermost flat dial pixels remain present even after all overlays;
+    # their bounding box is a stable raster estimate of the circle center.
+    return (float((xs.min() + xs.max()) * 0.5), float((ys.min() + ys.max()) * 0.5))
+
+
+def _angle_from_vector(dx: float, dy: float) -> float:
+    return math.degrees(math.atan2(dx, -dy)) % 360.0
+
+
+def _angular_distance(first: float, second: float) -> float:
+    delta = (float(first) - float(second) + 180.0) % 360.0 - 180.0
+    return abs(delta)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover yes/no using only RGB pixels and the public visual contract."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    center_x, center_y = _center_from_dial(arr)
+
+    marker_mask = _palette_mask(arr, MARKER_SWATCHES, 38.0)
+    marker_components = _components(marker_mask, minimum=120)
+    marker_y, marker_x = _largest(marker_components)
+    marker_x_mean = float(marker_x.mean())
+    marker_y_mean = float(marker_y.mean())
+    north_angle = _angle_from_vector(marker_x_mean - center_x, marker_y_mean - center_y)
+
+    needle_mask = _palette_mask(arr, NEEDLE_SWATCHES, 38.0)
+    needle_components = _components(needle_mask, minimum=80)
+    if not needle_components:
+        raise ValueError("needle component was not visible")
+    # The needle is the colored component whose centroid is nearest the dial
+    # center.  The farthest tenth of its pixels estimates the pointed tip and
+    # suppresses the broad triangular base.
+    needle_y, needle_x = max(needle_components, key=lambda item: len(item[0]))
+    distances = np.hypot(needle_x - center_x, needle_y - center_y)
+    cutoff = float(np.percentile(distances, 90.0))
+    tip = distances >= cutoff
+    needle_dx = float((needle_x[tip] - center_x).mean())
+    needle_dy = float((needle_y[tip] - center_y).mean())
+    needle_angle = _angle_from_vector(needle_dx, needle_dy)
+
+    return "yes" if _angular_distance(needle_angle, north_angle) <= SECTOR_HALF_ANGLE else "no"

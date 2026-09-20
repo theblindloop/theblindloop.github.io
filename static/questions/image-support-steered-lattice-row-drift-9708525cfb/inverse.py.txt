@@ -1,0 +1,157 @@
+"""Pixel-only inverse arm for the lattice-row-drift world.
+
+Input is the final PNG and nothing else: no latent scene, no renderer import,
+no analytic gold. The arm segments the dark plate by luminance, reconstructs the
+declared global evidence -- the plate's enclosed negative space, i.e. the hole
+lattice -- and applies the declared decision rule to the accumulated sideways
+step of the rows.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "lattice_row_drift-oracle-0.1.0"
+
+DARK_LUMA = 150.0
+DRIFT_T = 4.5
+MARGIN_MIN = 1.5
+MIN_ROWS = 4
+MIN_COLS = 3
+MIN_HOLES = 12
+MAX_HOLES = 64
+MAX_RESIDUAL = 1.0
+UNCLEAR = "unclear"
+
+
+def _plate_support(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    luma = 0.299 * array[:, :, 0] + 0.587 * array[:, :, 1] + 0.114 * array[:, :, 2]
+    return luma < DARK_LUMA
+
+
+def _sealed_negative_space(plate: np.ndarray) -> np.ndarray:
+    """Light pixels that the flood entering from the image border never wets."""
+    light = np.logical_not(plate)
+    wet = np.zeros(light.shape, dtype=bool)
+    wet[0, :] = light[0, :]
+    wet[-1, :] = light[-1, :]
+    wet[:, 0] = light[:, 0]
+    wet[:, -1] = light[:, -1]
+    while True:
+        spread = wet.copy()
+        spread[1:, :] = np.logical_or(spread[1:, :], wet[:-1, :])
+        spread[:-1, :] = np.logical_or(spread[:-1, :], wet[1:, :])
+        spread[:, 1:] = np.logical_or(spread[:, 1:], wet[:, :-1])
+        spread[:, :-1] = np.logical_or(spread[:, :-1], wet[:, 1:])
+        spread = np.logical_and(spread, light)
+        if np.array_equal(spread, wet):
+            return np.logical_and(light, np.logical_not(wet))
+        wet = spread
+
+
+def _rectangular_holes(sealed: np.ndarray):
+    """Each sealed pocket as (left, top, width, height); None if any pocket is
+    not one solid rectangle cleanly separated from every other pocket."""
+    rows_total, cols_total = sealed.shape
+    todo = sealed.copy()
+    found = []
+    while bool(np.any(todo)):
+        if len(found) >= MAX_HOLES:
+            return None
+        position = int(np.argmax(todo))
+        top = position // cols_total
+        left = position - top * cols_total
+        strip = todo[top, left:]
+        breaks = np.nonzero(np.logical_not(strip))[0]
+        wide = int(breaks[0]) if breaks.size else int(strip.size)
+        tall = 1
+        while top + tall < rows_total and bool(np.all(todo[top + tall, left : left + wide])):
+            tall += 1
+        if not bool(np.all(sealed[top : top + tall, left : left + wide])):
+            return None
+        ring_rows = slice(max(top - 1, 0), min(top + tall + 1, rows_total))
+        ring_cols = slice(max(left - 1, 0), min(left + wide + 1, cols_total))
+        if top > 0 and bool(np.any(sealed[top - 1, ring_cols])):
+            return None
+        if top + tall < rows_total and bool(np.any(sealed[top + tall, ring_cols])):
+            return None
+        if left > 0 and bool(np.any(sealed[ring_rows, left - 1])):
+            return None
+        if left + wide < cols_total and bool(np.any(sealed[ring_rows, left + wide])):
+            return None
+        found.append((left, top, wide, tall))
+        todo[top : top + tall, left : left + wide] = False
+    return found
+
+
+def _common_step(sequence):
+    if len(sequence) < 2:
+        return None
+    deltas = [sequence[k + 1] - sequence[k] for k in range(len(sequence) - 1)]
+    if min(deltas) <= 0 or max(deltas) != min(deltas):
+        return None
+    return deltas[0]
+
+
+def _row_step(image: Image.Image):
+    """Sideways step per row of the reconstructed lattice, or None if the
+    lattice is incomplete, irregular, or not fully sealed."""
+    plate = _plate_support(image)
+    if int(np.count_nonzero(plate)) == 0:
+        return None
+    holes = _rectangular_holes(_sealed_negative_space(plate))
+    if holes is None or len(holes) < MIN_HOLES:
+        return None
+    if len({hole[2] for hole in holes}) != 1 or len({hole[3] for hole in holes}) != 1:
+        return None
+    by_row: dict[int, list[int]] = {}
+    for left, top, _, _ in holes:
+        by_row.setdefault(top, []).append(left)
+    row_tops = sorted(by_row)
+    if len(row_tops) < MIN_ROWS or _common_step(row_tops) is None:
+        return None
+    sizes = {len(by_row[top]) for top in row_tops}
+    if len(sizes) != 1 or min(sizes) < MIN_COLS:
+        return None
+    column_pitches = set()
+    centres = []
+    for top in row_tops:
+        lefts = sorted(by_row[top])
+        pitch = _common_step(lefts)
+        if pitch is None:
+            return None
+        column_pitches.add(pitch)
+        centres.append(sum(lefts) / len(lefts))
+    if len(column_pitches) != 1:
+        return None
+    n = len(centres)
+    mid_index = (n - 1) / 2.0
+    mid_value = sum(centres) / n
+    cov = sum((k - mid_index) * (v - mid_value) for k, v in enumerate(centres))
+    var = sum((k - mid_index) ** 2 for k in range(n))
+    step = cov / var
+    base = mid_value - step * mid_index
+    worst = max(abs(v - (base + step * k)) for k, v in enumerate(centres))
+    if worst > MAX_RESIDUAL:
+        return None
+    return step
+
+
+def decision_from_image(image: Image.Image) -> str:
+    step = _row_step(image)
+    if step is None:
+        return UNCLEAR
+    if abs(abs(step) - DRIFT_T) < MARGIN_MIN:
+        return UNCLEAR
+    if step > DRIFT_T:
+        return "steps_right"
+    if step < -DRIFT_T:
+        return "steps_left"
+    return "in_line"
+
+
+def decision_step(image: Image.Image):
+    """Diagnostic helper (not used by the protected probe)."""
+    return _row_step(image)

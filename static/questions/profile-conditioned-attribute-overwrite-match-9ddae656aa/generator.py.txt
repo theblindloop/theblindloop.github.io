@@ -1,0 +1,308 @@
+"""Renderer, analytic gold and margin for attribute_overwrite_match.
+
+A token carries two independent registers, a shape and a colour. The top row of
+the image draws the token's starting state in its leftmost panel, followed by an
+ordered row of machine cards. A card holding a grey shape assigns that shape to
+the token and leaves its colour alone; a card holding a wide colour bar assigns
+that colour and leaves its shape alone. The bottom row draws four candidate
+objects; exactly one of them carries both the shape and the colour the token
+ends up with. The final token itself is never drawn.
+
+The scene is a plain dict of JSON types. Ops and slots are stored as unordered
+bags whose drawn position comes from an explicit field, so re-orderings of the
+bags are pixel-identical and answer-preserving latent symmetries.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "attribute_overwrite_match-renderer-0.1.0"
+
+# ---------------------------------------------------------------- palette
+BG = (222, 226, 234)
+PANEL_BG = (252, 246, 228)
+PANEL_EDGE = (90, 90, 90)
+GLYPH_GREY = (128, 128, 128)
+ARROW = (60, 60, 60)
+
+SHAPES = ("triangle", "circle", "square")
+# bbox coverage of each drawn shape; the pixel arm re-measures exactly this
+SHAPE_RATIO = {"triangle": 0.50, "circle": 0.785, "square": 1.0}
+
+COLOURS = {
+    "red": (214, 38, 38),
+    "blue": (40, 84, 204),
+    "green": (26, 150, 72),
+    "amber": (232, 150, 20),
+}
+COLOUR_NAMES = tuple(COLOURS)
+
+SLOT_WORDS = ("one", "two", "three", "four")
+
+# ---------------------------------------------------------------- geometry
+CANVAS = (1120, 430)
+PANEL = 150
+GLYPH = 90
+BAR_W, BAR_H = 110, 46
+ROW_Y = (34, 236)
+QUARANTINE_THRESHOLD = 6.0
+
+
+def _colour_gap(c1, c2) -> float:
+    return (abs(c1[0] - c2[0]) + abs(c1[1] - c2[1]) + abs(c1[2] - c2[2])) / 8.0
+
+
+def _shape_gap(s1: str, s2: str) -> float:
+    return abs(SHAPE_RATIO[s1] - SHAPE_RATIO[s2]) * 100.0
+
+
+def _pair_score(pair, target_shape, target_rgb) -> float:
+    """How strongly a drawn slot is distinguishable from the token's final state.
+
+    One clearly different attribute is enough to rule a slot out, so the score is
+    the strongest single piece of drawn counter-evidence.
+    """
+    best = 0.0
+    if pair["shape"] != target_shape:
+        best = max(best, _shape_gap(pair["shape"], target_shape))
+    best = max(best, _colour_gap(tuple(pair["rgb"]), target_rgb))
+    return best
+
+
+# ---------------------------------------------------------------- sampling
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+
+    n_ops = rng.choice((3, 3, 4, 4, 5))
+    # counterbalanced answer slot, final shape and final colour
+    answer_slot = seed % 4
+    final_shape = SHAPES[(seed // 4) % 3]
+    final_colour = COLOUR_NAMES[(seed // 12) % 4]
+
+    # op type pattern: sometimes a register is never written, so the drawn
+    # starting state has to be carried through
+    mode = rng.choice(("both", "both", "both", "shape_only", "colour_only"))
+    if mode == "shape_only":
+        n_shape = n_ops
+    elif mode == "colour_only":
+        n_shape = 0
+    else:
+        n_shape = rng.randint(1, n_ops - 1)
+    kinds = ["shape"] * n_shape + ["colour"] * (n_ops - n_shape)
+    rng.shuffle(kinds)
+
+    # start state: carries a register only when that register is never written
+    # a written register never starts at its final value, so dropping the last
+    # card of a kind always moves the replay
+    start_shape = (
+        final_shape if n_shape == 0 else rng.choice([s for s in SHAPES if s != final_shape])
+    )
+    start_colour = (
+        final_colour
+        if n_shape == n_ops
+        else rng.choice([c for c in COLOUR_NAMES if c != final_colour])
+    )
+
+    # build the op values so that the LAST op of each kind produces the final
+    # value and any earlier op of the same kind produces a different, overwritten
+    # value that the distractors will offer
+    ops = []
+    last_shape_i = max((i for i, k in enumerate(kinds) if k == "shape"), default=None)
+    last_colour_i = max((i for i, k in enumerate(kinds) if k == "colour"), default=None)
+    stale_shape = None
+    stale_colour = None
+    for i, kind in enumerate(kinds):
+        if kind == "shape":
+            if i == last_shape_i:
+                value = final_shape
+            else:
+                value = rng.choice([s for s in SHAPES if s != final_shape])
+                stale_shape = value
+        else:
+            if i == last_colour_i:
+                value = final_colour
+            else:
+                value = rng.choice([c for c in COLOUR_NAMES if c != final_colour])
+                stale_colour = value
+        ops.append({"slot": i, "kind": kind, "value": value})
+
+    target_rgb = COLOURS[final_colour]
+
+    # distractors: the overwritten values, the drawn starting state, and fillers
+    wanted = []
+    if stale_shape is not None:
+        wanted.append({"shape": stale_shape, "colour": final_colour})
+    if stale_colour is not None:
+        wanted.append({"shape": final_shape, "colour": stale_colour})
+    wanted.append({"shape": start_shape, "colour": start_colour})
+    rng.shuffle(wanted)
+
+    used = {(final_shape, final_colour)}
+    distractors = []
+    for cand in wanted:
+        key = (cand["shape"], cand["colour"])
+        if key in used or len(distractors) >= 3:
+            continue
+        used.add(key)
+        distractors.append(cand)
+    while len(distractors) < 3:
+        cand = {"shape": rng.choice(SHAPES), "colour": rng.choice(COLOUR_NAMES)}
+        key = (cand["shape"], cand["colour"])
+        if key in used:
+            continue
+        used.add(key)
+        distractors.append(cand)
+    rng.shuffle(distractors)
+
+    slots = [{"index": answer_slot, "shape": final_shape, "rgb": list(target_rgb)}]
+    fill = [i for i in range(4) if i != answer_slot]
+    for idx, cand in zip(fill, distractors):
+        slots.append({"index": idx, "shape": cand["shape"], "rgb": list(COLOURS[cand["colour"]])})
+
+    # explicit tight mode: nudge one distractor's drawn colour towards the
+    # token's final colour until the two are hard to separate at this raster
+    # resolution. Gold stays well defined (the nudged colour is not the palette
+    # colour) but the case is quarantined.
+    if rng.random() < 0.14:
+        victim = next(s for s in slots if s["index"] != answer_slot)
+        victim["shape"] = final_shape
+        victim["rgb"] = [
+            max(0, min(255, target_rgb[c] + rng.choice((-1, 1)) * rng.randint(2, 9)))
+            for c in range(3)
+        ]
+
+    rng.shuffle(slots)
+
+    n_top = 1 + n_ops
+    top_jitter = rng.randint(-14, 14)
+    bottom_jitter = rng.randint(-14, 14)
+
+    return {
+        "seed": seed,
+        "start": {"shape": start_shape, "colour": start_colour},
+        "ops": ops,
+        "slots": slots,
+        "n_top": n_top,
+        "top_jitter": top_jitter,
+        "bottom_jitter": bottom_jitter,
+        "gap": rng.choice((22, 26, 30)),
+    }
+
+
+# ---------------------------------------------------------------- gold
+def _replay(scene: dict) -> tuple[str, str]:
+    shape = scene["start"]["shape"]
+    colour = scene["start"]["colour"]
+    for op in sorted(scene["ops"], key=lambda o: o["slot"]):
+        if op["kind"] == "shape":
+            shape = op["value"]
+        else:
+            colour = op["value"]
+    return shape, colour
+
+
+def analytic_gold(scene: dict) -> str:
+    shape, colour = _replay(scene)
+    rgb = COLOURS[colour]
+    matches = [
+        s["index"]
+        for s in scene["slots"]
+        if s["shape"] == shape and tuple(s["rgb"]) == rgb
+    ]
+    if len(matches) != 1:
+        raise ValueError("scene does not have exactly one matching slot")
+    return f"{SLOT_WORDS[matches[0]]}|{shape}"
+
+
+def margin(scene: dict) -> float:
+    shape, colour = _replay(scene)
+    rgb = COLOURS[colour]
+    scores = [
+        _pair_score(s, shape, rgb)
+        for s in scene["slots"]
+        if not (s["shape"] == shape and tuple(s["rgb"]) == rgb)
+    ]
+    geometric = scene["gap"] / 2.0
+    return round(min(scores + [geometric]), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_THRESHOLD
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    out = []
+    for name, key in (
+        ("ops_bag_reversed", "ops"),
+        ("slots_bag_reversed", "slots"),
+    ):
+        alt = dict(scene)
+        alt[key] = list(reversed(scene[key]))
+        out.append((name, alt))
+    alt = dict(scene)
+    alt["ops"] = scene["ops"][1:] + scene["ops"][:1]
+    alt["slots"] = scene["slots"][2:] + scene["slots"][:2]
+    out.append(("both_bags_rotated", alt))
+    return out
+
+
+# ---------------------------------------------------------------- drawing
+def _row_x(count: int, gap: int, jitter: int) -> list[int]:
+    total = count * PANEL + (count - 1) * gap
+    x0 = (CANVAS[0] - total) // 2 + jitter
+    return [x0 + i * (PANEL + gap) for i in range(count)]
+
+
+def _panel(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
+    draw.rectangle([x, y, x + PANEL, y + PANEL], fill=PANEL_BG, outline=PANEL_EDGE, width=3)
+
+
+def _shape(draw: ImageDraw.ImageDraw, cx: int, cy: int, shape: str, rgb) -> None:
+    h = GLYPH // 2
+    if shape == "circle":
+        draw.ellipse([cx - h, cy - h, cx + h, cy + h], fill=rgb)
+    elif shape == "square":
+        draw.rectangle([cx - h, cy - h, cx + h, cy + h], fill=rgb)
+    else:
+        draw.polygon([(cx, cy - h), (cx - h, cy + h), (cx + h, cy + h)], fill=rgb)
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", CANVAS, BG)
+    d = ImageDraw.Draw(img)
+
+    gap = scene["gap"]
+    top = _row_x(scene["n_top"], gap, scene["top_jitter"])
+    bottom = _row_x(4, gap, scene["bottom_jitter"])
+    ty, by = ROW_Y
+
+    # start panel then the machine cards in drawn slot order
+    _panel(d, top[0], ty)
+    _shape(d, top[0] + PANEL // 2, ty + PANEL // 2, scene["start"]["shape"], COLOURS[scene["start"]["colour"]])
+    for op in sorted(scene["ops"], key=lambda o: o["slot"]):
+        x = top[1 + op["slot"]]
+        _panel(d, x, ty)
+        cx, cy = x + PANEL // 2, ty + PANEL // 2
+        if op["kind"] == "shape":
+            _shape(d, cx, cy, op["value"], GLYPH_GREY)
+        else:
+            d.rectangle(
+                [cx - BAR_W // 2, cy - BAR_H // 2, cx + BAR_W // 2, cy + BAR_H // 2],
+                fill=COLOURS[op["value"]],
+            )
+
+    # left-to-right order arrow under the top row
+    ay = ty + PANEL + 22
+    d.line([top[0] + 10, ay, top[-1] + PANEL - 10, ay], fill=ARROW, width=4)
+    tip = top[-1] + PANEL - 10
+    d.polygon([(tip, ay), (tip - 20, ay - 10), (tip - 20, ay + 10)], fill=ARROW)
+
+    for slot in sorted(scene["slots"], key=lambda s: s["index"]):
+        x = bottom[slot["index"]]
+        _panel(d, x, by)
+        _shape(d, x + PANEL // 2, by + PANEL // 2, slot["shape"], tuple(slot["rgb"]))
+
+    return img

@@ -1,0 +1,162 @@
+"""Independent pixel-only graph reconstruction for Trail Hop Balance."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+_PROTOTYPES = {
+    0: ((248, 247, 243), (246, 249, 247), (250, 246, 244)),
+    1: ((27, 48, 68), (34, 57, 79), (23, 46, 72)),
+    2: ((207, 219, 226), (214, 221, 225), (203, 216, 224)),
+    3: ((37, 151, 91), (27, 143, 89), (51, 139, 82)),
+    4: ((230, 126, 37), (222, 112, 31), (238, 137, 43)),
+    5: ((139, 78, 176), (151, 70, 169), (125, 82, 184)),
+}
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 200:
+        raise OracleAbstention("unsupported raster")
+    distances = []
+    for category in range(6):
+        colors = np.asarray(_PROTOTYPES[category], dtype=np.int32)
+        squared = ((array[:, :, None, :] - colors[None, None, :, :]) ** 2).sum(axis=3)
+        distances.append(squared.min(axis=2))
+    distance = np.stack(distances, axis=2)
+    labels = distance[:, :, :2].argmin(axis=2)
+    for category in range(2, 6):
+        labels[distance[:, :, category] <= 900] = category
+    return labels
+
+
+def _components(mask: np.ndarray, minimum: int = 100) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        queue = deque([(y0, x0)])
+        seen[y0, x0] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _recover_stations(labels: np.ndarray) -> tuple[list[tuple[float, float]], int, int, int]:
+    counts = {2: 5, 3: 1, 4: 1, 5: 1}
+    centers: list[tuple[float, float]] = []
+    marked: dict[int, int] = {}
+    for category in (2, 3, 4, 5):
+        parts = _components(labels == category)
+        if len(parts) != counts[category]:
+            raise OracleAbstention(f"station category {category} count is {len(parts)}, expected {counts[category]}")
+        for part in parts:
+            area = len(part)
+            ys, xs = part[:, 0], part[:, 1]
+            if not 125 <= area <= 520 or np.ptp(xs) < 12 or np.ptp(ys) < 12:
+                raise OracleAbstention("a station interior is clipped, erased, or malformed")
+            index = len(centers)
+            centers.append((float(xs.mean()), float(ys.mean())))
+            if category != 2:
+                marked[category] = index
+    if len(centers) != 8 or set(marked) != {3, 4, 5}:
+        raise OracleAbstention("colored stations are ambiguous")
+    nearest = min(math.dist(centers[i], centers[j]) for i in range(8) for j in range(i + 1, 8))
+    if nearest < 38.0:
+        raise OracleAbstention("station centers are too close")
+    return centers, marked[3], marked[4], marked[5]
+
+
+def _corridor_coverage(navy: np.ndarray, first: tuple[float, float], second: tuple[float, float]) -> float:
+    x1, y1 = first
+    x2, y2 = second
+    length = math.hypot(x2 - x1, y2 - y1)
+    guard = 18.0
+    if length <= 2 * guard + 5:
+        raise OracleAbstention("station clearance is too small")
+    steps = max(8, int(length - 2 * guard) + 1)
+    hits = 0
+    for step in range(steps):
+        along = guard + (length - 2 * guard) * step / max(1, steps - 1)
+        ratio = along / length
+        x = int(round(x1 + ratio * (x2 - x1)))
+        y = int(round(y1 + ratio * (y2 - y1)))
+        patch = navy[max(0, y - 2):y + 3, max(0, x - 2):x + 3]
+        hits += int(patch.size > 0 and float(patch.mean()) >= 0.58)
+    return hits / steps
+
+
+def _graph(centers: list[tuple[float, float]], navy: np.ndarray) -> list[tuple[int, int]]:
+    edges: list[tuple[int, int]] = []
+    for left in range(8):
+        for right in range(left + 1, 8):
+            coverage = _corridor_coverage(navy, centers[left], centers[right])
+            if coverage >= 0.82:
+                edges.append((left, right))
+    if len(edges) != 8:
+        raise OracleAbstention(f"expected eight complete links, found {len(edges)}")
+    adjacency = [[] for _ in range(8)]
+    for left, right in edges:
+        adjacency[left].append(right)
+        adjacency[right].append(left)
+    degrees = sorted(len(items) for items in adjacency)
+    if degrees != [1, 1, 2, 2, 2, 2, 3, 3]:
+        raise OracleAbstention(f"unexpected station degrees: {degrees}")
+    seen = {0}
+    queue = deque([0])
+    while queue:
+        node = queue.popleft()
+        for neighbor in adjacency[node]:
+            if neighbor not in seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+    if len(seen) != 8:
+        raise OracleAbstention("station graph is disconnected")
+    return edges
+
+
+def _distances(edges: list[tuple[int, int]], source: int) -> list[int]:
+    adjacency = [[] for _ in range(8)]
+    for left, right in edges:
+        adjacency[left].append(right)
+        adjacency[right].append(left)
+    distance = [-1] * 8
+    distance[source] = 0
+    queue = deque([source])
+    while queue:
+        node = queue.popleft()
+        for neighbor in adjacency[node]:
+            if distance[neighbor] < 0:
+                distance[neighbor] = distance[node] + 1
+                queue.append(neighbor)
+    return distance
+
+
+def decision_from_image(image: Image.Image) -> str:
+    labels = _labels(image)
+    centers, green, orange, purple = _recover_stations(labels)
+    edges = _graph(centers, labels == 1)
+    distances = _distances(edges, green)
+    if distances[orange] < 0 or distances[purple] < 0:
+        raise OracleAbstention("a query station is unreachable")
+    return "yes" if distances[orange] == distances[purple] else "no"

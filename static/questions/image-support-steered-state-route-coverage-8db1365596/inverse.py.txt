@@ -1,0 +1,138 @@
+"""Independent pixel-only inverse for the connected-route coverage world."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+_COLORS = {
+    "background": (249, 251, 253),
+    "route": (36, 61, 84),
+    "operation": (218, 96, 57),
+    "state_a": (191, 69, 68),
+    "state_b": (41, 149, 94),
+    "state_c": (65, 105, 190),
+    "state_d": (132, 83, 169),
+}
+_LABELS = ("A", "B", "C", "D")
+
+
+def _masks(image: Image.Image) -> dict[str, np.ndarray]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return {
+        name: np.all(array == np.asarray(color, dtype=np.uint8), axis=2)
+        for name, color in _COLORS.items()
+    }
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _centroid(component: np.ndarray) -> tuple[float, float]:
+    y, x = component.mean(axis=0)
+    return float(y), float(x)
+
+
+def _bbox_stats(component: np.ndarray) -> tuple[float, float, float, float]:
+    ys, xs = component[:, 0], component[:, 1]
+    height = float(ys.max() - ys.min() + 1)
+    width = float(xs.max() - xs.min() + 1)
+    fill = len(component) / (width * height)
+    offset = float(xs.mean() - (xs.min() + xs.max()) / 2.0)
+    return fill, width, height, offset
+
+
+def _operation(component: np.ndarray) -> int:
+    """Classify a right triangle, left triangle, or centered hollow square."""
+
+    fill, width, height, offset = _bbox_stats(component)
+    if not (24.0 <= width <= 32.0 and 24.0 <= height <= 32.0):
+        raise ValueError("station glyph has invalid size")
+    if abs(offset) <= 1.8 and 0.28 < fill < 0.65:
+        return 0
+    # The filled triangle's area is heavier toward its flat base: a visible
+    # right-pointing tip therefore has a negative centroid offset, and a
+    # left-pointing tip has a positive offset.
+    if offset < -1.8 and 0.28 < fill < 0.70:
+        return 1
+    if offset > 1.8 and 0.28 < fill < 0.70:
+        return -1
+    raise ValueError("station glyph silhouette is ambiguous")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the start state and all nine ordered updates from pixels."""
+
+    masks = _masks(image)
+    state_components: list[tuple[int, np.ndarray]] = []
+    for state, name in enumerate(("state_a", "state_b", "state_c", "state_d")):
+        components = _components(masks[name], minimum=250)
+        if len(components) > 1:
+            raise ValueError("multiple components use one state color")
+        if components:
+            component = components[0]
+            fill, width, height, _ = _bbox_stats(component)
+            if not (32.0 <= width <= 46.0 and 32.0 <= height <= 46.0 and fill > 0.50):
+                raise ValueError("start badge is ambiguous")
+            state_components.append((state, component))
+    if len(state_components) != 1:
+        raise ValueError("expected exactly one colored start badge")
+    initial_state = state_components[0][0]
+
+    operation_components = _components(masks["operation"], minimum=70)
+    if len(operation_components) != 9:
+        raise ValueError("expected nine visible station glyphs")
+    ordered: list[tuple[float, np.ndarray]] = []
+    for component in operation_components:
+        _, center_x = _centroid(component)
+        ordered.append((center_x, component))
+    ordered.sort(key=lambda item: item[0])
+    # Station centers are spaced by at least 37 pixels; opposing triangle
+    # centroids can shift the measured centers toward one another by roughly
+    # ten pixels, so 20 pixels is a conservative finite-raster cutoff.
+    if any(right[0] - left[0] < 20.0 for left, right in zip(ordered, ordered[1:])):
+        raise ValueError("station order is unresolved")
+    operations = [_operation(component) for _, component in ordered]
+
+    route = masks["route"]
+    traversable = route | masks["operation"] | masks["state_a"] | masks["state_b"] | masks["state_c"] | masks["state_d"]
+    route_components = _components(traversable, minimum=100)
+    if len(route_components) != 1:
+        raise ValueError("route is missing or disconnected")
+
+    state = initial_state
+    trace = [state]
+    for operation in operations:
+        state = (state + operation) % 4
+        trace.append(state)
+    missing = [candidate for candidate in range(4) if candidate not in trace]
+    if len(missing) != 1:
+        raise ValueError("replay has zero or multiple absent states")
+    return _LABELS[missing[0]]

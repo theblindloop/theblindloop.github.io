@@ -1,0 +1,184 @@
+"""Independent pixel-only inverse for the mosaic correspondence question.
+
+This module intentionally repeats the public visual palette and panel framing
+instead of importing renderer state. It recovers tile centroids from exact RGB
+cores, infers the visible lattice step, canonicalizes the color-position
+pattern under quarter-turns, and finally reads the halo on the winning panel.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+PANEL_BOXES = {
+    "reference": (24, 54, 386, 506),
+    "A": (446, 54, 808, 506),
+    "B": (870, 54, 1232, 506),
+}
+TILE_PALETTE = {
+    "red": (220, 50, 47),
+    "blue": (38, 91, 185),
+    "green": (40, 151, 77),
+    "gold": (235, 157, 24),
+    "purple": (135, 70, 170),
+}
+HALO_PALETTE = {
+    "amber": (238, 150, 24),
+    "cyan": (20, 165, 185),
+    "violet": (143, 77, 184),
+}
+EXPECTED_TILES = 5
+MIN_COMPONENT_PIXELS = 120
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    output: list[list[tuple[int, int]]] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist(), strict=True):
+        if visited[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        visited[start_y, start_x] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            component.append((y, x))
+            for next_y, next_x in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if (
+                    0 <= next_y < height
+                    and 0 <= next_x < width
+                    and mask[next_y, next_x]
+                    and not visited[next_y, next_x]
+                ):
+                    visited[next_y, next_x] = True
+                    stack.append((next_y, next_x))
+        output.append(component)
+    return output
+
+
+def _crop(array: np.ndarray, panel: str) -> tuple[np.ndarray, int, int]:
+    left, top, right, bottom = PANEL_BOXES[panel]
+    # Remove the panel title strip and border, while retaining the complete object.
+    x0, y0 = left + 8, top + 28
+    return array[y0 : bottom - 8, x0 : right - 8], x0, y0
+
+
+def _tile_centres(image: Image.Image, panel: str) -> dict[str, tuple[float, float]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    crop, x0, y0 = _crop(array, panel)
+    centres: dict[str, tuple[float, float]] = {}
+    for color, rgb in TILE_PALETTE.items():
+        mask = np.all(crop == np.asarray(rgb, dtype=np.uint8), axis=2)
+        components = [component for component in _components(mask) if len(component) >= MIN_COMPONENT_PIXELS]
+        if len(components) != 1:
+            raise ValueError(f"{panel}: expected one {color} tile component, found {len(components)}")
+        component = components[0]
+        ys = np.asarray([point[0] for point in component], dtype=np.float64)
+        xs = np.asarray([point[1] for point in component], dtype=np.float64)
+        centres[color] = (float(xs.mean() + x0), float(ys.mean() + y0))
+    if len(centres) != EXPECTED_TILES:
+        raise ValueError(f"{panel}: incomplete tile palette")
+    return centres
+
+
+def _lattice_step(centres: dict[str, tuple[float, float]]) -> float:
+    axis_values = [
+        [point[0] for point in centres.values()],
+        [point[1] for point in centres.values()],
+    ]
+    gaps = [
+        abs(left - right)
+        for values in axis_values
+        for index, left in enumerate(values)
+        for right in values[index + 1 :]
+    ]
+    useful = [gap for gap in gaps if gap > 20.0]
+    if not useful:
+        raise ValueError("tile centroids do not expose a lattice spacing")
+    step = min(useful)
+    if not 30.0 <= step <= 70.0:
+        raise ValueError(f"unexpected lattice spacing {step:.2f}")
+    return step
+
+
+def _normalise(cells: list[tuple[int, int, str]]) -> tuple[tuple[int, int, str], ...]:
+    min_x = min(cell[0] for cell in cells)
+    min_y = min(cell[1] for cell in cells)
+    return tuple(sorted((x - min_x, y - min_y, color) for x, y, color in cells))
+
+
+def _turn(point: tuple[int, int], turns: int) -> tuple[int, int]:
+    x, y = point
+    for _ in range(turns % 4):
+        x, y = -y, x
+    return x, y
+
+
+def _pattern(centres: dict[str, tuple[float, float]]) -> list[tuple[int, int, str]]:
+    step = _lattice_step(centres)
+    min_x = min(point[0] for point in centres.values())
+    min_y = min(point[1] for point in centres.values())
+    cells = []
+    for color, (x, y) in centres.items():
+        gx = int(round((x - min_x) / step))
+        gy = int(round((y - min_y) / step))
+        cells.append((gx, gy, color))
+    if len({(x, y) for x, y, _ in cells}) != EXPECTED_TILES:
+        raise ValueError("two tile colors occupy one recovered lattice position")
+    return cells
+
+
+def _rotated_map(cells: list[tuple[int, int, str]], turns: int) -> dict[tuple[int, int], str]:
+    moved = []
+    for x, y, color in cells:
+        tx, ty = _turn((x, y), turns)
+        moved.append((tx, ty, color))
+    normal = _normalise(moved)
+    return {(x, y): color for x, y, color in normal}
+
+
+def _mismatch(reference: list[tuple[int, int, str]], candidate: list[tuple[int, int, str]]) -> int:
+    reference_map = _rotated_map(reference, 0)
+    best = 10**6
+    for turns in range(4):
+        candidate_map = _rotated_map(candidate, turns)
+        positions = set(reference_map) | set(candidate_map)
+        best = min(
+            best,
+            sum(reference_map.get(position) != candidate_map.get(position) for position in positions),
+        )
+    return int(best)
+
+
+def _halo_color(image: Image.Image, panel: str) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    crop, _, _ = _crop(array, panel)
+    counts = {
+        color: int(np.all(crop == np.asarray(rgb, dtype=np.uint8), axis=2).sum())
+        for color, rgb in HALO_PALETTE.items()
+    }
+    color, count = max(counts.items(), key=lambda item: item[1])
+    if count < 180:
+        raise ValueError(f"{panel}: no measurable halo color")
+    ties = [name for name, value in counts.items() if value == count]
+    if len(ties) != 1:
+        raise ValueError(f"{panel}: halo colors are tied")
+    return color
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the winning candidate's halo color from the final PNG alone."""
+
+    reference = _pattern(_tile_centres(image, "reference"))
+    candidate_a = _pattern(_tile_centres(image, "A"))
+    candidate_b = _pattern(_tile_centres(image, "B"))
+    scores = (_mismatch(reference, candidate_a), _mismatch(reference, candidate_b))
+    if scores.count(0) != 1 or scores[0] == scores[1]:
+        raise ValueError(f"ambiguous or incomplete correspondence: scores={scores}")
+    return _halo_color(image, "A" if scores[0] == 0 else "B")

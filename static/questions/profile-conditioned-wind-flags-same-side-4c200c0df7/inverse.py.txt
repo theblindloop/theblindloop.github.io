@@ -1,0 +1,123 @@
+"""Pixel-only inverse arm for `wind_flags_same_side`.
+
+Receives one PNG and nothing else: no latent scene, no renderer, no prompt
+module, no analytic gold.  It segments the page into flat colour classes, takes
+the darkest low-chroma class as the two poles, splits it into two vertical
+bars, takes the two saturated classes as the two flags, attaches each flag to
+its nearer pole, and measures how far each flag's cloth reaches to the left and
+to the right of that pole's centre line.  It reports whether the two flags
+reach out to the same side or to opposite sides, and abstains whenever the
+poles are not two well formed bars, the flags are not two separate saturated
+marks one per pole, or a cloth is too close to symmetric about its pole to pick
+a side.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "wind_flags_same_side-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+
+MIN_CLASS_PX = 90       # smaller flat colour classes are stray ink
+CHROMA_MIN = 60         # saturated cloth versus grey poles, ground and clouds
+POLE_MIN_PX = 700
+POLE_W_LO, POLE_W_HI = 5, 22
+POLE_H_MIN = 80
+FLAG_MIN_PX = 300
+ABSTAIN_BAND = 24.0     # declared: every flag reaches at least 40 px sideways
+
+
+def _classes(arr: np.ndarray) -> list:
+    codes = (
+        arr[:, :, 0].astype(np.int64) * 65536
+        + arr[:, :, 1].astype(np.int64) * 256
+        + arr[:, :, 2].astype(np.int64)
+    )
+    values, counts = np.unique(codes, return_counts=True)
+    out = []
+    for value, count in zip(values.tolist(), counts.tolist()):
+        if count < MIN_CLASS_PX:
+            continue
+        r, g, b = (value >> 16) & 255, (value >> 8) & 255, value & 255
+        if r > 245 and g > 245 and b > 245:
+            continue  # the page itself
+        ys, xs = np.nonzero(codes == value)
+        out.append(
+            {
+                "count": int(count),
+                "chroma": int(max(r, g, b) - min(r, g, b)),
+                "luma": int(r) * 299 + int(g) * 587 + int(b) * 114,
+                "xs": xs,
+                "ys": ys,
+            }
+        )
+    return out
+
+
+def _column_runs(xs: np.ndarray) -> list:
+    """Split a pixel set into groups of contiguous image columns."""
+    cols = np.unique(xs)
+    runs, start, prev = [], int(cols[0]), int(cols[0])
+    for c in cols[1:].tolist():
+        if c - prev > 1:
+            runs.append((start, prev))
+            start = c
+        prev = c
+    runs.append((start, prev))
+    return runs
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    classes = _classes(arr)
+    if len(classes) < 3:
+        return ABSTAIN
+
+    grey = [c for c in classes if c["chroma"] < CHROMA_MIN]
+    flags = [c for c in classes if c["chroma"] >= CHROMA_MIN]
+    if not grey or len(flags) != 2:
+        return ABSTAIN
+
+    poles = min(grey, key=lambda c: c["luma"])
+    if poles["count"] < POLE_MIN_PX:
+        return ABSTAIN
+    runs = _column_runs(poles["xs"])
+    if len(runs) != 2:
+        return ABSTAIN
+
+    centres, spans = [], []
+    for lo, hi in runs:
+        if not (POLE_W_LO <= hi - lo + 1 <= POLE_W_HI):
+            return ABSTAIN
+        sel = (poles["xs"] >= lo) & (poles["xs"] <= hi)
+        ys = poles["ys"][sel]
+        if int(ys.max() - ys.min() + 1) < POLE_H_MIN:
+            return ABSTAIN
+        centres.append((lo + hi) / 2.0)
+        spans.append((int(ys.min()), int(ys.max())))
+
+    assigned, signs = [], []
+    for flag in flags:
+        if flag["count"] < FLAG_MIN_PX:
+            return ABSTAIN
+        fx, fy = flag["xs"], flag["ys"]
+        cx = (float(fx.min()) + float(fx.max())) / 2.0
+        idx = 0 if abs(cx - centres[0]) <= abs(cx - centres[1]) else 1
+        lo_y, hi_y = spans[idx]
+        if not (lo_y <= int(fy.min()) <= hi_y):
+            return ABSTAIN  # cloth is not hanging on that pole
+        pc = centres[idx]
+        reach_right = float(fx.max()) - pc
+        reach_left = pc - float(fx.min())
+        diff = reach_right - reach_left
+        if abs(diff) < ABSTAIN_BAND:
+            return ABSTAIN  # limp cloth: no side is picked
+        assigned.append(idx)
+        signs.append(1 if diff > 0 else -1)
+
+    if len(assigned) != 2 or assigned[0] == assigned[1]:
+        return ABSTAIN
+    return "same" if signs[0] == signs[1] else "opposite"

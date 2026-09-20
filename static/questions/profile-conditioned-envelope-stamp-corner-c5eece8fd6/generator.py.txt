@@ -1,0 +1,252 @@
+"""Renderer for ``envelope_stamp_corner``.
+
+Latent scene z = a rectangular envelope lying on a page at an arbitrary turn
+angle, one triangular flap whose straight base runs along the envelope's own top
+edge, one small square stamp placed at one of the four corners *of the envelope*,
+a few thin address strokes, and fixed page decoration (frame + corner ticks).
+
+The gold answer is the corner of the ENVELOPE that contains the centre of the
+stamp, named in the envelope's own upright frame: the flap's base edge is the
+envelope's top, and left/right are read after turning the envelope upright
+without flipping it over. Because the turn angle is sampled uniformly and
+independently of the answer, the stamp's position in the *page* frame carries no
+information about the gold: the same page-quadrant occurs with all four answers.
+
+The canonical prior under test ("a stamp goes in the top-right corner") is
+recorded for analysis only and is never used as gold.
+
+Margin: m = min(|sx|, |sy|) in canvas pixels, the distance from the stamp centre
+to the nearer of the envelope's two own mid-lines. The mid-lines are the painted
+decision boundary: as the stamp centre crosses one of them the answer flips to
+the neighbouring corner. Scenes with m < 14 px are quarantined.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "envelope_stamp_corner-renderer-0.1.0"
+
+WIDTH = 600
+HEIGHT = 460
+BACKGROUND = (255, 255, 255)
+
+# Role palettes. Roles keep their identity across scenes (the paper stock is the
+# large pale field, the flap is the big triangle on it, the stamp is the small
+# square patch) but the concrete ink of every role is resampled per scene, so no
+# colour predicts the answer. The oracle identifies roles by painted structure
+# -- area rank, bounding-box aspect and fill -- never by a fixed RGB triple.
+BODY_INKS = [
+    (238, 230, 214), (226, 234, 240), (232, 226, 240), (228, 240, 226),
+    (243, 232, 226), (231, 231, 231), (240, 238, 218), (222, 238, 238),
+]
+FLAP_INKS = [
+    (196, 176, 140), (150, 178, 200), (170, 156, 196), (156, 190, 154),
+    (204, 160, 148), (172, 172, 172), (196, 188, 128), (144, 186, 186),
+]
+STAMP_INKS = [
+    (192, 48, 60), (36, 96, 176), (32, 128, 92), (152, 56, 152),
+    (208, 116, 24), (52, 52, 160), (176, 32, 116), (24, 132, 144),
+]
+LINE_INKS = [
+    (92, 92, 92), (70, 78, 96), (96, 82, 70), (78, 92, 78), (86, 76, 96),
+]
+FRAME_INKS = [(198, 198, 198), (206, 202, 194), (194, 200, 206)]
+
+CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
+CANONICAL_PRIOR_ANSWER = "top-right"
+
+FRAME_INSET = 14
+QUARANTINE_PX = 14.0
+MIN_OFFSET_PX = 8.0
+
+
+def _dist(a, b) -> float:
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene. Pure function of ``seed``."""
+    rng = random.Random(seed)
+
+    # Balanced answer: the four corners cycle with the seed, independently of
+    # every nuisance below (angle, palette, size, ink, address strokes).
+    corner = CORNERS[seed % 4]
+    up_sign = 1.0 if corner.startswith("top") else -1.0
+    right_sign = 1.0 if corner.endswith("right") else -1.0
+
+    # The envelope is always clearly oblong (short side at most 0.78 of the long
+    # side) so that its two painted axes are unambiguous in the raster.
+    hw = rng.uniform(95.0, 130.0)
+    hh = hw * rng.uniform(0.50, 0.78)
+    theta_deg = rng.uniform(0.0, 360.0)
+    radius = math.hypot(hw, hh)
+    cx = rng.uniform(FRAME_INSET + 12 + radius, WIDTH - FRAME_INSET - 12 - radius)
+    cy = rng.uniform(FRAME_INSET + 12 + radius, HEIGHT - FRAME_INSET - 12 - radius)
+
+    while True:
+        body = list(rng.choice(BODY_INKS))
+        flap = list(rng.choice(FLAP_INKS))
+        stamp_ink = list(rng.choice(STAMP_INKS))
+        line_ink = list(rng.choice(LINE_INKS))
+        inks = [body, flap, stamp_ink, line_ink]
+        if min(_dist(a, b) for i, a in enumerate(inks) for b in inks[i + 1:]) >= 55.0:
+            break
+
+    stamp_half = rng.uniform(11.0, 16.0)
+    flap_apex_frac = rng.uniform(0.05, 0.25)
+
+    # Offsets of the stamp centre in the envelope's own frame (+x right, +y up).
+    # A near-boundary band is sampled on purpose so the gallery covers scenes
+    # whose stamp straddles a mid-line of the envelope.
+    lo = MIN_OFFSET_PX
+    hi_x = hw - stamp_half - 7.0
+    hi_y = hh - stamp_half - 7.0
+    if rng.random() < 0.25:
+        sx = rng.uniform(lo, min(lo + 14.0, hi_x))
+    else:
+        sx = rng.uniform(min(lo + 10.0, hi_x), hi_x)
+    if rng.random() < 0.25:
+        sy = rng.uniform(lo, min(lo + 14.0, hi_y))
+    else:
+        sy = rng.uniform(min(lo + 10.0, hi_y), hi_y)
+    sx *= right_sign
+    sy *= up_sign
+
+    lines = []
+    for _ in range(rng.randint(2, 4)):
+        length = rng.uniform(42.0, min(96.0, 1.7 * hw))
+        thick = rng.uniform(4.0, 6.0)
+        for _try in range(40):
+            lx = rng.uniform(-(hw - 7.0 - length / 2), hw - 7.0 - length / 2)
+            ly = rng.uniform(-(hh - 7.0 - thick / 2), hh - 7.0 - thick / 2)
+            if (abs(lx - sx) < (length / 2 + stamp_half + 6.0)
+                    and abs(ly - sy) < (thick / 2 + stamp_half + 6.0)):
+                continue
+            if any(abs(ly - o[1]) < (thick / 2 + o[3] / 2 + 6.0)
+                   and abs(lx - o[0]) < (length / 2 + o[2] / 2 + 6.0) for o in lines):
+                continue
+            lines.append([round(lx, 3), round(ly, 3), round(length, 3), round(thick, 3)])
+            break
+
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "cx": round(cx, 3),
+        "cy": round(cy, 3),
+        "hw": round(hw, 3),
+        "hh": round(hh, 3),
+        "theta_deg": round(theta_deg, 3),
+        "body_color": body,
+        "flap_color": flap,
+        "stamp_color": stamp_ink,
+        "line_color": line_ink,
+        "frame_color": list(rng.choice(FRAME_INKS)),
+        "flap_apex_frac": round(flap_apex_frac, 4),
+        "stamp_half": round(stamp_half, 3),
+        "sx": round(sx, 3),
+        "sy": round(sy, 3),
+        "lines": lines,
+        "decor": [rng.randint(9, 17) for _ in range(4)],
+    }
+
+
+def _axes(scene: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    t = math.radians(scene["theta_deg"])
+    up = (math.sin(t), -math.cos(t))
+    right = (-up[1], up[0])
+    return up, right
+
+
+def _to_image(scene: dict, x: float, y: float) -> tuple[float, float]:
+    up, right = _axes(scene)
+    return (scene["cx"] + x * right[0] + y * up[0],
+            scene["cy"] + x * right[1] + y * up[1])
+
+
+def _rect_poly(scene: dict, x0: float, y0: float, x1: float, y1: float) -> list:
+    return [_to_image(scene, x, y) for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+
+
+def flap_polygon(scene: dict) -> list:
+    """Image-space vertices of the flap triangle (exposed for erasure tests)."""
+    hw, hh = scene["hw"], scene["hh"]
+    return [_to_image(scene, -(hw - 3.0), hh - 3.0),
+            _to_image(scene, hw - 3.0, hh - 3.0),
+            _to_image(scene, 0.0, -scene["flap_apex_frac"] * hh)]
+
+
+def stamp_polygon(scene: dict) -> list:
+    """Image-space vertices of the stamp square (exposed for erasure tests)."""
+    s = scene["stamp_half"]
+    return _rect_poly(scene, scene["sx"] - s, scene["sy"] - s,
+                      scene["sx"] + s, scene["sy"] + s)
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterise the scene. Flat polygon fills only: every pixel is an exact
+    palette colour, so the raster is byte-deterministic and antialiasing-free."""
+    img = Image.new("RGB", (scene["width"], scene["height"]), BACKGROUND)
+    draw = ImageDraw.Draw(img)
+
+    frame = tuple(scene["frame_color"])
+    i = FRAME_INSET
+    draw.rectangle([i, i, scene["width"] - 1 - i, scene["height"] - 1 - i], outline=frame, width=2)
+    d = scene["decor"]
+    for k, (px, py) in enumerate(((i + 8, i + 8), (scene["width"] - 9 - i, i + 8),
+                                  (i + 8, scene["height"] - 9 - i),
+                                  (scene["width"] - 9 - i, scene["height"] - 9 - i))):
+        draw.line([px, py, px, py + d[k]], fill=frame, width=2)
+
+    hw, hh = scene["hw"], scene["hh"]
+    draw.polygon(_rect_poly(scene, -hw, -hh, hw, hh), fill=tuple(scene["body_color"]))
+
+    draw.polygon(flap_polygon(scene), fill=tuple(scene["flap_color"]))
+
+    for lx, ly, length, thick in scene["lines"]:
+        draw.polygon(_rect_poly(scene, lx - length / 2, ly - thick / 2,
+                                lx + length / 2, ly + thick / 2),
+                     fill=tuple(scene["line_color"]))
+
+    draw.polygon(stamp_polygon(scene), fill=tuple(scene["stamp_color"]))
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Corner of the envelope containing the stamp centre, in the envelope's own
+    upright frame (flap base = top, no flip)."""
+    vertical = "top" if scene["sy"] > 0 else "bottom"
+    horizontal = "right" if scene["sx"] > 0 else "left"
+    return f"{vertical}-{horizontal}"
+
+
+def margin(scene: dict) -> float:
+    """Distance in canvas pixels from the stamp centre to the nearer mid-line of
+    the envelope: the visible quantity that has to shrink to zero for the corner
+    reading to flip."""
+    return round(min(abs(scene["sx"]), abs(scene["sy"])), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent aliases are declared: every latent field is painted, so no
+    nontrivial transform of the scene leaves the raster identical."""
+    return []
+
+
+def scene_targets(scene: dict) -> dict:
+    return {
+        "corner": analytic_gold(scene),
+        "offset_right_px": scene["sx"],
+        "offset_up_px": scene["sy"],
+        "continuous": margin(scene),
+        "canonical_prior_answer": CANONICAL_PRIOR_ANSWER,
+        "is_canonical": analytic_gold(scene) == CANONICAL_PRIOR_ANSWER,
+        "turn_deg": scene["theta_deg"],
+    }

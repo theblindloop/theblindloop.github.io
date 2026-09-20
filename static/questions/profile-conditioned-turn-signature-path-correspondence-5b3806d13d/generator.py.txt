@@ -1,0 +1,243 @@
+"""Deterministic analytic sampler and Pillow renderer.
+
+The label is an exact equality between discrete, visibly marked turn words.  All
+four paths use five segments with the same multiset of lengths, so total path
+ink, bend count, and endpoint count do not identify the matching card.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 960, 620
+BACKGROUND = (250, 248, 242)
+NAVY = (28, 53, 84)
+BLACK = (20, 23, 28)
+YELLOW = (246, 194, 38)
+CYAN = (31, 184, 202)
+BORDER_RGB = {
+    "gray": (102, 108, 119),
+    "red": (205, 55, 65),
+    "green": (35, 150, 82),
+    "blue": (43, 98, 205),
+}
+
+REFERENCE_BOX = (340, 40, 620, 280)
+CANDIDATE_BOXES = (
+    (20, 350, 300, 590),
+    (340, 350, 620, 590),
+    (660, 350, 940, 590),
+)
+
+_ANSWER_COLORS = ("red", "green", "blue")
+_LENGTHS = [28, 34, 38, 42, 48]  # same total and multiset on every card
+_TURN_WORDS = [
+    [-1, -1, -1, 1],
+    [-1, -1, 1, -1],
+    [-1, -1, 1, 1],
+    [-1, 1, -1, -1],
+    [-1, 1, -1, 1],
+    [-1, 1, 1, -1],
+    [-1, 1, 1, 1],
+    [1, -1, -1, -1],
+    [1, -1, -1, 1],
+    [1, -1, 1, -1],
+    [1, -1, 1, 1],
+    [1, 1, -1, -1],
+    [1, 1, -1, 1],
+    [1, 1, 1, -1],
+]
+_VECTORS = ((1, 0), (0, 1), (-1, 0), (0, -1))
+
+
+def _path_points(turns: Iterable[int], lengths: Iterable[int], rotation: int) -> list[tuple[int, int]]:
+    direction = rotation % 4
+    points = [(0, 0)]
+    turns = list(turns)
+    for index, length in enumerate(lengths):
+        dx, dy = _VECTORS[direction]
+        x, y = points[-1]
+        points.append((x + dx * int(length), y + dy * int(length)))
+        if index < len(turns):
+            direction = (direction + int(turns[index])) % 4
+    return points
+
+
+def _segments_intersect(a, b, c, d) -> bool:
+    """Closed intersection test for axis-aligned segments."""
+    if a[0] == b[0] and c[0] == d[0]:
+        if a[0] != c[0]:
+            return False
+        return max(min(a[1], b[1]), min(c[1], d[1])) <= min(max(a[1], b[1]), max(c[1], d[1]))
+    if a[1] == b[1] and c[1] == d[1]:
+        if a[1] != c[1]:
+            return False
+        return max(min(a[0], b[0]), min(c[0], d[0])) <= min(max(a[0], b[0]), max(c[0], d[0]))
+    if a[0] == b[0]:
+        vertical_a, vertical_b, horiz_a, horiz_b = a, b, c, d
+    else:
+        vertical_a, vertical_b, horiz_a, horiz_b = c, d, a, b
+    return (
+        min(horiz_a[0], horiz_b[0]) <= vertical_a[0] <= max(horiz_a[0], horiz_b[0])
+        and min(vertical_a[1], vertical_b[1]) <= horiz_a[1] <= max(vertical_a[1], vertical_b[1])
+    )
+
+
+def _clear_path(turns: list[int], lengths: list[int], rotation: int) -> bool:
+    points = _path_points(turns, lengths, rotation)
+    # Non-neighbor vertices must not share a row/column; this makes the raster
+    # graph reconstruction unambiguous without any coordinate template.
+    for i, p in enumerate(points):
+        for j, q in enumerate(points):
+            if j <= i + 1:
+                continue
+            if p[0] == q[0] or p[1] == q[1]:
+                return False
+            if abs(p[0] - q[0]) + abs(p[1] - q[1]) < 22:
+                return False
+    segments = list(zip(points, points[1:]))
+    for vertex_index, (x, y) in enumerate(points):
+        for segment_index, (a, b) in enumerate(segments):
+            if segment_index in (vertex_index - 1, vertex_index):
+                continue
+            if a[0] == b[0]:
+                nearest_x = a[0]
+                nearest_y = min(max(y, min(a[1], b[1])), max(a[1], b[1]))
+            else:
+                nearest_x = min(max(x, min(a[0], b[0])), max(a[0], b[0]))
+                nearest_y = a[1]
+            if abs(x - nearest_x) + abs(y - nearest_y) < 22:
+                return False
+    for i, (a, b) in enumerate(segments):
+        for j, (c, d) in enumerate(segments):
+            if j <= i + 1:
+                continue
+            if _segments_intersect(a, b, c, d):
+                return False
+    return True
+
+
+def _sample_lengths(rng: random.Random, turns: list[int], rotation: int) -> list[int]:
+    for _ in range(500):
+        lengths = list(_LENGTHS)
+        rng.shuffle(lengths)
+        if _clear_path(turns, lengths, rotation):
+            return lengths
+    raise RuntimeError("could not construct a clear path")
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    reference = list(_TURN_WORDS[int(seed) % len(_TURN_WORDS)])
+    winner_color = _ANSWER_COLORS[int(seed) % 3]
+    winner_position = (int(seed) // 3) % 3
+
+    other_colors = [color for color in _ANSWER_COLORS if color != winner_color]
+    rng.shuffle(other_colors)
+    candidate_colors = other_colors[:]
+    candidate_colors.insert(winner_position, winner_color)
+
+    # Two nonmatching words with equal cardinality; one is a one-turn near miss.
+    near_choices = [word for word in _TURN_WORDS if sum(a != b for a, b in zip(word, reference)) == 1]
+    near = list(near_choices[(int(seed) // 7) % len(near_choices)])
+    far_choices = [word for word in _TURN_WORDS if sum(a != b for a, b in zip(word, reference)) >= 2]
+    far = list(far_choices[rng.randrange(len(far_choices))])
+    distractors = [near, far]
+    rng.shuffle(distractors)
+    candidate_turns: list[list[int]] = []
+    for position in range(3):
+        candidate_turns.append(list(reference) if position == winner_position else distractors.pop())
+
+    rotations = [rng.randrange(4) for _ in range(4)]
+    segment_lengths = [_sample_lengths(rng, reference, rotations[0])]
+    for turns, rotation in zip(candidate_turns, rotations[1:]):
+        segment_lengths.append(_sample_lengths(rng, turns, rotation))
+
+    return {
+        "reference_turns": reference,
+        "candidate_turns": candidate_turns,
+        "segment_lengths": segment_lengths,
+        "rotations": rotations,
+        "candidate_colors": candidate_colors,
+    }
+
+
+def _centered_points(turns, lengths, rotation, box):
+    points = _path_points(turns, lengths, rotation)
+    min_x = min(p[0] for p in points)
+    max_x = max(p[0] for p in points)
+    min_y = min(p[1] for p in points)
+    max_y = max(p[1] for p in points)
+    cx = (box[0] + box[2]) // 2
+    cy = (box[1] + box[3]) // 2
+    ox = round(cx - (min_x + max_x) / 2)
+    oy = round(cy - (min_y + max_y) / 2)
+    return [(x + ox, y + oy) for x, y in points]
+
+
+def _draw_card(draw: ImageDraw.ImageDraw, box, border_name, turns, lengths, rotation):
+    draw.rounded_rectangle(box, radius=12, fill=(255, 255, 255), outline=BORDER_RGB[border_name], width=6)
+    points = _centered_points(turns, lengths, rotation, box)
+    draw.line(points, fill=NAVY, width=9, joint="curve")
+    for x, y in points[1:-1]:
+        draw.ellipse((x - 8, y - 8, x + 8, y + 8), fill=BLACK)
+    sx, sy = points[0]
+    ex, ey = points[-1]
+    draw.ellipse((sx - 10, sy - 10, sx + 10, sy + 10), fill=YELLOW)
+    draw.ellipse((ex - 10, ey - 10, ex + 10, ey + 10), fill=CYAN)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    _draw_card(
+        draw,
+        REFERENCE_BOX,
+        "gray",
+        scene["reference_turns"],
+        scene["segment_lengths"][0],
+        scene["rotations"][0],
+    )
+    for index, box in enumerate(CANDIDATE_BOXES):
+        _draw_card(
+            draw,
+            box,
+            scene["candidate_colors"][index],
+            scene["candidate_turns"][index],
+            scene["segment_lengths"][index + 1],
+            scene["rotations"][index + 1],
+        )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    reference = tuple(scene["reference_turns"])
+    matches = [
+        index
+        for index, turns in enumerate(scene["candidate_turns"])
+        if tuple(turns) == reference
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one match, found {len(matches)}")
+    return scene["candidate_colors"][matches[0]]
+
+
+def margin(scene: dict) -> float:
+    reference = tuple(scene["reference_turns"])
+    distances = sorted(
+        sum(a != b for a, b in zip(reference, turns))
+        for turns in scene["candidate_turns"]
+    )
+    return float(distances[1] - distances[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    reference = tuple(scene["reference_turns"])
+    return sum(tuple(turns) == reference for turns in scene["candidate_turns"]) != 1
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

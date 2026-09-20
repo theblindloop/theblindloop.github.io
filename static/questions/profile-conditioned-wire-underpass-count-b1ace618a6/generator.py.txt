@@ -1,0 +1,344 @@
+"""wire_underpass_count renderer.
+
+Latent scene z: a ring of ports, a set of straight gray wires drawn as chords of
+that ring, and a per-crossing over/under assignment.  Where two wires cross, the
+wire that passes UNDER is erased for a short stretch on both sides of the wire
+that passes OVER, which is the standard knot/wiring-diagram occlusion cue.
+
+The decision variable is
+
+    under_passes = number of crossings along the wire that starts at the green
+                   port at which that wire is the one drawn underneath
+
+recovered by following one stroke from a marked start and classifying each
+crossing event it meets as over (continuous ink) or under (a break, then the
+crossing wire's ink, then a second break).
+
+Everything the analytic label reads is drawn: wire endpoints, the per-crossing
+over/under assignment, and which port is green.  There is no unrendered latent
+field, hence latent_alias.mode = not_applicable and latent_symmetries() == [].
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "wire_underpass_count-renderer-0.1.0"
+
+# -- canvas / style (all fixed; no answer-specific styling) --------------------
+CANVAS = 560
+CENTER = (280.0, 280.0)
+RING_R = 235.0
+STROKE_W = 5              # wire stroke width, px
+ERASE_HALF = 12.0         # half-length of the break cut into the UNDER wire, px
+ERASE_HALF_W = 4.0        # half-width of that cut (> stroke half-width 2.5), px
+REDRAW_HALF = 16.0        # half-length of the OVER wire redrawn on top, px
+PORT_R = 10               # green start-port disk radius, px
+CAP_R = 6                 # plain port disk radius, px
+BG = (255, 255, 255)
+WIRE = (60, 60, 60)
+GREEN = (0, 150, 70)
+
+# -- sampling constraints -----------------------------------------------------
+MIN_CROSS_ANGLE_DEG = 34.0    # near-parallel crossings are unresolvable
+MIN_PORT_ANGLE_RAD = 0.32     # keeps ports (and their caps) apart on the ring
+MIN_CHORD_LEN = 200.0
+MIN_CROSS_TO_PORT = 40.0      # crossing clear of every port disk
+MIN_CROSS_CLEARANCE = 22.0    # crossing clear of every NON-participating wire
+MIN_PORT_TO_OTHER_WIRE = 34.0 # green port's own wire is the only ink near it
+SEP_NORMAL = 42.0             # min distance between two crossing points
+SEP_TIGHT = 34.0              # near-boundary mode (produces quarantine cases)
+TIGHT_PROB = 0.22
+
+# margin bookkeeping: the redraw+erase footprint around one crossing spans
+# REDRAW_HALF + ERASE_HALF = 28px, so crossing separation only becomes
+# decision-critical as it approaches that footprint.
+FOOTPRINT_PX = REDRAW_HALF + ERASE_HALF
+ANNULUS_CLEARANCE_PX = 26.0   # radius the pixel arm probes around the green port
+QUARANTINE_MARGIN = 6.5
+
+
+# ---------------------------------------------------------------- geometry ---
+def _seg_point_dist(p, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    vx, vy = bx - ax, by - ay
+    L2 = vx * vx + vy * vy
+    t = 0.0 if L2 == 0 else ((px - ax) * vx + (py - ay) * vy) / L2
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _intersect(w1, w2):
+    """Proper interior intersection of two segments, or None."""
+    (x1, y1), (x2, y2) = w1["a"], w1["b"]
+    (x3, y3), (x4, y4) = w2["a"], w2["b"]
+    d1x, d1y = x2 - x1, y2 - y1
+    d3x, d3y = x4 - x3, y4 - y3
+    den = d1x * d3y - d1y * d3x
+    if abs(den) < 1e-9:
+        return None
+    t = ((x3 - x1) * d3y - (y3 - y1) * d3x) / den
+    u = ((x3 - x1) * d1y - (y3 - y1) * d1x) / den
+    if not (0.02 < t < 0.98 and 0.02 < u < 0.98):
+        return None
+    return (x1 + t * d1x, y1 + t * d1y)
+
+
+def _unit(w):
+    (ax, ay), (bx, by) = w["a"], w["b"]
+    L = math.hypot(bx - ax, by - ay)
+    return (bx - ax) / L, (by - ay) / L
+
+
+def _cross_angle_deg(w1, w2) -> float:
+    u1, u2 = _unit(w1), _unit(w2)
+    c = abs(u1[0] * u2[0] + u1[1] * u2[1])
+    return math.degrees(math.acos(min(1.0, c)))
+
+
+# ---------------------------------------------------------------- sampling ---
+def sample_scene(seed: int) -> dict:
+    """Sample one scene.  Balanced by construction: the target answer cycles
+    with the seed while the wire count and the number of crossings ON the green
+    wire are drawn independently, so neither ink, crossing count, nor wire count
+    predicts the answer."""
+    rng = random.Random(seed * 7919 + 13)
+    target = seed % 4
+
+    for _ in range(4000):
+        tight = rng.random() < TIGHT_PROB
+        sep_req = SEP_TIGHT if tight else SEP_NORMAL
+        n = rng.choice([4, 5, 6])
+        hi = min(5, n - 1)
+        lo = max(target, 3)
+        if lo > hi:
+            continue
+        desired = rng.randint(lo, hi)
+
+        angles = []
+        for _try in range(200):
+            if len(angles) == 2 * n:
+                break
+            cand = rng.uniform(0.0, 2 * math.pi)
+            if all(
+                abs((cand - a + math.pi) % (2 * math.pi) - math.pi) >= MIN_PORT_ANGLE_RAD
+                for a in angles
+            ):
+                angles.append(cand)
+        if len(angles) != 2 * n:
+            continue
+        rng.shuffle(angles)
+
+        wires = []
+        ok = True
+        for k in range(n):
+            t1, t2 = angles[2 * k], angles[2 * k + 1]
+            a = (CENTER[0] + RING_R * math.cos(t1), CENTER[1] + RING_R * math.sin(t1))
+            b = (CENTER[0] + RING_R * math.cos(t2), CENTER[1] + RING_R * math.sin(t2))
+            if math.dist(a, b) < MIN_CHORD_LEN:
+                ok = False
+                break
+            wires.append({"a": [round(a[0], 3), round(a[1], 3)],
+                          "b": [round(b[0], 3), round(b[1], 3)]})
+        if not ok:
+            continue
+
+        # all pairwise crossings
+        crossings = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                p = _intersect(wires[i], wires[j])
+                if p is None:
+                    continue
+                ang = _cross_angle_deg(wires[i], wires[j])
+                if ang < MIN_CROSS_ANGLE_DEG:
+                    ok = False
+                    break
+                crossings.append({"i": i, "j": j,
+                                  "p": [round(p[0], 3), round(p[1], 3)],
+                                  "angle_deg": round(ang, 3)})
+            if not ok:
+                break
+        if not ok:
+            continue
+
+        green_cross = [c for c in crossings if 0 in (c["i"], c["j"])]
+        if len(green_cross) != desired:
+            continue
+
+        # geometric separation constraints
+        sep_min = 1e9
+        for x in range(len(crossings)):
+            for y in range(x + 1, len(crossings)):
+                sep_min = min(sep_min, math.dist(crossings[x]["p"], crossings[y]["p"]))
+        if sep_min < sep_req:
+            continue
+
+        ports = [tuple(w["a"]) for w in wires] + [tuple(w["b"]) for w in wires]
+        if any(
+            math.dist(c["p"], q) < MIN_CROSS_TO_PORT for c in crossings for q in ports
+        ):
+            continue
+
+        clear_min = 1e9
+        for c in crossings:
+            for k, w in enumerate(wires):
+                if k in (c["i"], c["j"]):
+                    continue
+                clear_min = min(clear_min, _seg_point_dist(c["p"], w["a"], w["b"]))
+        if clear_min < MIN_CROSS_CLEARANCE:
+            continue
+
+        green_end = rng.choice(["a", "b"])
+        port = tuple(wires[0][green_end])
+        port_clear = min(
+            (_seg_point_dist(port, w["a"], w["b"]) for w in wires[1:]), default=1e9
+        )
+        if port_clear < MIN_PORT_TO_OTHER_WIRE:
+            continue
+
+        # over/under assignment: exactly `target` of the green wire's crossings
+        # put the green wire underneath; every other crossing is independent.
+        idx = list(range(len(green_cross)))
+        rng.shuffle(idx)
+        under_green = set(idx[:target])
+        gset = {id(c) for k, c in enumerate(green_cross) if k in under_green}
+        for c in crossings:
+            if 0 in (c["i"], c["j"]):
+                c["under"] = 0 if id(c) in gset else (c["j"] if c["i"] == 0 else c["i"])
+            else:
+                c["under"] = c["i"] if rng.random() < 0.5 else c["j"]
+            c["over"] = c["j"] if c["under"] == c["i"] else c["i"]
+        crossings.sort(key=lambda c: (c["i"], c["j"]))
+
+        return {
+            "canvas": CANVAS,
+            "ring_center": [CENTER[0], CENTER[1]],
+            "ring_radius": RING_R,
+            "stroke_width": STROKE_W,
+            "wires": wires,
+            "crossings": crossings,
+            "green_wire": 0,
+            "green_end": green_end,
+            "wire_color": list(WIRE),
+            "green_color": list(GREEN),
+            "background": list(BG),
+        }
+    raise RuntimeError(f"could not sample a valid scene for seed {seed}")
+
+
+# --------------------------------------------------------------- rendering ---
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (scene["canvas"], scene["canvas"]), tuple(scene["background"]))
+    d = ImageDraw.Draw(img)
+    wire_c = tuple(scene["wire_color"])
+    bg_c = tuple(scene["background"])
+    w = scene["stroke_width"]
+    wires = scene["wires"]
+
+    for wire in wires:
+        d.line([tuple(wire["a"]), tuple(wire["b"])], fill=wire_c, width=w)
+
+    for c in scene["crossings"]:
+        px, py = c["p"]
+        under, over = wires[c["under"]], wires[c["over"]]
+        ux, uy = _unit(under)
+        nx, ny = -uy, ux
+        corners = [
+            (px + ux * ERASE_HALF + nx * ERASE_HALF_W, py + uy * ERASE_HALF + ny * ERASE_HALF_W),
+            (px + ux * ERASE_HALF - nx * ERASE_HALF_W, py + uy * ERASE_HALF - ny * ERASE_HALF_W),
+            (px - ux * ERASE_HALF - nx * ERASE_HALF_W, py - uy * ERASE_HALF - ny * ERASE_HALF_W),
+            (px - ux * ERASE_HALF + nx * ERASE_HALF_W, py - uy * ERASE_HALF + ny * ERASE_HALF_W),
+        ]
+        d.polygon(corners, fill=bg_c)
+        vx, vy = _unit(over)
+        d.line(
+            [(px - vx * REDRAW_HALF, py - vy * REDRAW_HALF),
+             (px + vx * REDRAW_HALF, py + vy * REDRAW_HALF)],
+            fill=wire_c,
+            width=w,
+        )
+
+    green_end = scene["green_end"]
+    port = tuple(wires[scene["green_wire"]][green_end])
+    for k, wire in enumerate(wires):
+        for key in ("a", "b"):
+            if k == scene["green_wire"] and key == green_end:
+                continue
+            x, y = wire[key]
+            d.ellipse([x - CAP_R, y - CAP_R, x + CAP_R, y + CAP_R], fill=wire_c)
+    d.ellipse(
+        [port[0] - PORT_R, port[1] - PORT_R, port[0] + PORT_R, port[1] + PORT_R],
+        fill=tuple(scene["green_color"]),
+    )
+    return img
+
+
+# ------------------------------------------------------------ analytic gold ---
+def _green_crossings(scene: dict) -> list[dict]:
+    g = scene["green_wire"]
+    return [c for c in scene["crossings"] if g in (c["i"], c["j"])]
+
+
+def analytic_gold(scene: dict) -> str:
+    """Number of crossings where the green-started wire runs underneath."""
+    g = scene["green_wire"]
+    return str(sum(1 for c in _green_crossings(scene) if c["under"] == g))
+
+
+def margin(scene: dict) -> float:
+    """Smallest decision-critical clearance, in pixels.
+
+    Three ways the over/under evidence on the green wire can degrade:
+      * the visible break beside an over-running wire gets short (crossing angle
+        approaches parallel);
+      * two crossings get close enough that one crossing's redraw could reach
+        into the other's break;
+      * a third wire encroaches on a crossing, or on the green port, blurring
+        which stroke the trace is on.
+    """
+    g = scene["green_wire"]
+    wires = scene["wires"]
+    terms = []
+
+    for c in _green_crossings(scene):
+        if c["under"] == g:
+            theta = math.radians(c["angle_deg"])
+            terms.append(ERASE_HALF - (scene["stroke_width"] / 2.0) / math.sin(theta))
+        else:
+            terms.append(9.5)  # continuous ink: capped, never the binding term
+
+    cs = scene["crossings"]
+    for x in range(len(cs)):
+        for y in range(x + 1, len(cs)):
+            terms.append((math.dist(cs[x]["p"], cs[y]["p"]) - FOOTPRINT_PX) / 2.0)
+
+    for c in cs:
+        for k, w in enumerate(wires):
+            if k in (c["i"], c["j"]):
+                continue
+            terms.append(_seg_point_dist(c["p"], w["a"], w["b"]) - 16.0)
+
+    port = tuple(wires[g][scene["green_end"]])
+    for k, w in enumerate(wires):
+        if k == g:
+            continue
+        terms.append(_seg_point_dist(port, w["a"], w["b"]) - ANNULUS_CLEARANCE_PX)
+
+    return round(float(min(terms)), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases: every scene field (port positions, per-crossing
+    over/under assignment, which port is green) is drawn, and the label reads
+    only drawn fields.  Declared empty; latent_alias.mode = not_applicable."""
+    return []

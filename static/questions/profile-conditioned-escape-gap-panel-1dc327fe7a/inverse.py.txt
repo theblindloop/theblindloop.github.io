@@ -1,0 +1,148 @@
+"""Pixel-only decision arm for the escape-gap panel world.
+
+Receives a rendered RGB image and nothing else. It thresholds dark ink, labels
+connected components, groups them into panel lanes, classifies each lane into a
+large broken ring and a small dot by component extent, fits the ring centre with
+an algebraic circle fit, recovers the ring opening from the empty angular sector
+of the ring's own pixels, and returns the lane whose dot bearing falls inside its
+opening.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+DARK_LUMINANCE = 110.0
+MIN_COMPONENT_AREA = 60
+PANEL_COUNT = 4
+ANGLE_BINS = 180
+RING_MIN_EXTENT = 60
+DOT_MAX_EXTENT = 26
+DECISION_TOLERANCE = 4.0
+AMBIGUOUS = "ambiguous"
+PANELS = ("panel_1", "panel_2", "panel_3", "panel_4")
+
+
+def _dark_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float64)
+    luminance = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    return luminance < DARK_LUMINANCE
+
+
+def _components(mask: np.ndarray) -> list:
+    height, width = mask.shape
+    seen = np.zeros((height, width), dtype=bool)
+    found = []
+    for start_y in range(height):
+        for start_x in range(width):
+            if not mask[start_y, start_x] or seen[start_y, start_x]:
+                continue
+            stack = [(start_y, start_x)]
+            seen[start_y, start_x] = True
+            pixels = []
+            while stack:
+                y, x = stack.pop()
+                pixels.append((y, x))
+                for ny in (y - 1, y, y + 1):
+                    if ny < 0 or ny >= height:
+                        continue
+                    for nx in (x - 1, x, x + 1):
+                        if nx < 0 or nx >= width:
+                            continue
+                        if mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+            if len(pixels) >= MIN_COMPONENT_AREA:
+                found.append(np.array(pixels, dtype=np.float64))
+    return found
+
+
+def _extent(pixels: np.ndarray) -> float:
+    span_y = pixels[:, 0].max() - pixels[:, 0].min() + 1
+    span_x = pixels[:, 1].max() - pixels[:, 1].min() + 1
+    return float(max(span_y, span_x))
+
+
+def _circle_center(pixels: np.ndarray):
+    """Algebraic (Kasa) circle fit: unbiased by the missing arc sector."""
+    ys = pixels[:, 0]
+    xs = pixels[:, 1]
+    design = np.stack([2.0 * xs, 2.0 * ys, np.ones_like(xs)], axis=1)
+    target = xs * xs + ys * ys
+    solution, *_ = np.linalg.lstsq(design, target, rcond=None)
+    return float(solution[1]), float(solution[0])
+
+
+def _opening(pixels: np.ndarray, center_y: float, center_x: float):
+    """Centre and width, in degrees, of the widest empty angular sector."""
+    angles = np.degrees(np.arctan2(pixels[:, 0] - center_y, pixels[:, 1] - center_x)) % 360.0
+    bins = np.zeros(ANGLE_BINS, dtype=bool)
+    bins[(angles / (360.0 / ANGLE_BINS)).astype(int) % ANGLE_BINS] = True
+    if bins.all() or not bins.any():
+        return None
+    empty = [index for index in range(ANGLE_BINS) if not bins[index]]
+    runs = []
+    start = empty[0]
+    previous = empty[0]
+    for index in empty[1:]:
+        if index != previous + 1:
+            runs.append((start, previous))
+            start = index
+        previous = index
+    runs.append((start, previous))
+    if len(runs) > 1 and runs[0][0] == 0 and runs[-1][1] == ANGLE_BINS - 1:
+        merged = (runs[-1][0] - ANGLE_BINS, runs[0][1])
+        runs = runs[1:-1] + [merged]
+    best = max(runs, key=lambda run: run[1] - run[0])
+    if len(runs) > 1:
+        rest = max(run[1] - run[0] for run in runs if run is not best)
+        if rest >= best[1] - best[0]:
+            return None
+    step = 360.0 / ANGLE_BINS
+    width = (best[1] - best[0] + 1) * step
+    center = ((best[0] + best[1] + 1) / 2.0) * step % 360.0
+    return center, width
+
+
+def _angular_distance(first: float, second: float) -> float:
+    delta = (first - second) % 360.0
+    if delta > 180.0:
+        delta = 360.0 - delta
+    return delta
+
+
+def decision_from_image(image: Image.Image) -> str:
+    mask = _dark_mask(image)
+    _height, width = mask.shape
+    lane = width / PANEL_COUNT
+    lanes: dict = {index: [] for index in range(PANEL_COUNT)}
+    for pixels in _components(mask):
+        center_x = float(pixels[:, 1].mean())
+        index = min(PANEL_COUNT - 1, max(0, int(center_x // lane)))
+        lanes[index].append(pixels)
+    clearances = []
+    for index in range(PANEL_COUNT):
+        parts = lanes[index]
+        if len(parts) != 2:
+            return AMBIGUOUS
+        parts.sort(key=_extent)
+        dot, ring = parts
+        if _extent(dot) > DOT_MAX_EXTENT or _extent(ring) < RING_MIN_EXTENT:
+            return AMBIGUOUS
+        center_y, center_x = _circle_center(ring)
+        opening = _opening(ring, center_y, center_x)
+        if opening is None:
+            return AMBIGUOUS
+        gap_center, gap_width = opening
+        bearing = math.degrees(
+            math.atan2(float(dot[:, 0].mean()) - center_y, float(dot[:, 1].mean()) - center_x)
+        )
+        clearances.append(_angular_distance(bearing, gap_center) - gap_width / 2.0)
+    inside = [index for index, value in enumerate(clearances) if value < -DECISION_TOLERANCE]
+    outside = [value for index, value in enumerate(clearances) if index not in inside]
+    if len(inside) != 1 or any(value < DECISION_TOLERANCE for value in outside):
+        return AMBIGUOUS
+    return PANELS[inside[0]]

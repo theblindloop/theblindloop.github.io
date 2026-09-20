@@ -1,0 +1,285 @@
+"""Rail-hop reveal world.
+
+One thin wire snakes back and forth across a small bank of rails. At every
+wire/rail crossing the wire either arches over the rail (a visible hop) or cuts
+straight across it. Walking the wire from its beaded end and writing one grid
+row per pass, in the direction of travel, turns the hops into a 5x5 pattern that
+spells one abstract glyph.
+
+Only the wire carries the decision. The rails, the bead-free end, the frame-free
+background and every scattered distractor mark are decoration: the pixel oracle
+reads the wire's own connected stroke and nothing else.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "rail_hop_reveal-renderer-0.1.0"
+
+CANVAS = 640
+PASSES = 5
+CROSSINGS = 5
+
+# Wire-frame geometry, in pixels. These are rendering constants, not thresholds.
+SPAN_W = 176          # x0 -> x1 length of every horizontal pass
+ROW_GAP = 32          # vertical distance between consecutive passes
+COL_MARGIN = 28       # first crossing offset from x0
+COL_STEP = 30         # spacing between crossing centres
+STROKE = 3            # wire and rail stroke width
+HOP_HALF = 7          # half width of a hop arch
+GAP_HALF = 6          # half width of the straight-line break under an arch
+BEAD_R = 6            # radius of the start bead
+BEAD_INSET = 10       # bead centre offset inward from the wire's free end
+
+QUARANTINE_CLEARANCE = 10.0   # minimum arch height, in pixels, for a clean read
+
+GLYPHS: dict[str, tuple[str, ...]] = {
+    "ell": ("#....", "#....", "#....", "#....", "#####"),
+    "zed": ("###..", "...#.", "..#..", ".#...", "..###"),
+    "eff": ("####.", "#....", "###..", "#....", "....."),
+    "tee": ("#####", "..#..", "..#..", "..#..", "..#.."),
+}
+GLYPH_NAMES = tuple(sorted(GLYPHS))
+
+WIRE_COLORS = (
+    (24, 62, 138),
+    (139, 32, 38),
+    (28, 96, 74),
+    (86, 40, 122),
+    (20, 20, 24),
+)
+RAIL_COLORS = (
+    (140, 146, 156),
+    (168, 138, 96),
+    (120, 158, 150),
+    (152, 128, 170),
+)
+DISTRACTOR_COLORS = (
+    (196, 122, 60),
+    (110, 168, 96),
+    (176, 96, 148),
+    (96, 150, 190),
+    (150, 150, 96),
+    (128, 108, 176),
+)
+BACKGROUNDS = ((250, 249, 246), (247, 250, 251), (251, 248, 250), (248, 248, 245))
+
+
+def glyph_cells(name: str) -> tuple[tuple[int, ...], ...]:
+    """The 5x5 zero/one mask of one declared glyph, in reading order."""
+    return tuple(
+        tuple(1 if ch == "#" else 0 for ch in row) for row in GLYPHS[name]
+    )
+
+
+def hamming(a: str, b: str) -> int:
+    """Cell disagreement count between two declared glyphs."""
+    ga, gb = glyph_cells(a), glyph_cells(b)
+    return sum(ga[r][c] != gb[r][c] for r in range(PASSES) for c in range(CROSSINGS))
+
+
+def _opposite(side: str) -> str:
+    return "right" if side == "left" else "left"
+
+
+def pass_rows(start_row: str) -> tuple[int, ...]:
+    """Physical row index (0 = topmost) visited by each travel pass."""
+    return tuple(range(PASSES)) if start_row == "top" else tuple(range(PASSES - 1, -1, -1))
+
+
+def pass_sides(start_side: str) -> tuple[str, ...]:
+    """Side each travel pass starts from; passes alternate direction."""
+    return tuple(start_side if k % 2 == 0 else _opposite(start_side) for k in range(PASSES))
+
+
+def physical_hops(scene: dict) -> tuple[tuple[int, ...], ...]:
+    """Hop mask laid out in image order (row 0 topmost, column 0 leftmost)."""
+    cells = glyph_cells(scene["glyph"])
+    rows = pass_rows(scene["start_row"])
+    sides = pass_sides(scene["start_side"])
+    grid = [[0] * CROSSINGS for _ in range(PASSES)]
+    for travel_row, (phys_row, side) in enumerate(zip(rows, sides)):
+        for column in range(CROSSINGS):
+            travel_col = column if side == "left" else CROSSINGS - 1 - column
+            grid[phys_row][column] = cells[travel_row][travel_col]
+    return tuple(tuple(row) for row in grid)
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one fully rendered latent scene."""
+    rng = random.Random(seed * 7919 + 17)
+    glyph = rng.choice(GLYPH_NAMES)
+    start_row = rng.choice(("top", "bottom"))
+    start_side = rng.choice(("left", "right"))
+    hop_h = rng.choice((10, 11, 12, 13))
+    background = rng.choice(BACKGROUNDS)
+    wire_color = rng.choice(WIRE_COLORS)
+    rail_color = rng.choice([c for c in RAIL_COLORS if c != wire_color])
+
+    frame_h = (PASSES - 1) * ROW_GAP
+    x0 = rng.randint(70, CANVAS - SPAN_W - 70)
+    y0 = rng.randint(70 + hop_h, CANVAS - frame_h - 70)
+
+    rail_over = rng.randint(10, 18)
+    distractors = _sample_distractors(rng, x0, y0, frame_h)
+    return {
+        "canvas": CANVAS,
+        "glyph": glyph,
+        "start_row": start_row,
+        "start_side": start_side,
+        "origin": [x0, y0],
+        "span_w": SPAN_W,
+        "row_gap": ROW_GAP,
+        "col_margin": COL_MARGIN,
+        "col_step": COL_STEP,
+        "stroke": STROKE,
+        "hop_h": hop_h,
+        "bead_r": BEAD_R,
+        "rail_over": rail_over,
+        "background": list(background),
+        "wire_color": list(wire_color),
+        "rail_color": list(rail_color),
+        "distractors": distractors,
+    }
+
+
+def _sample_distractors(rng: random.Random, x0: int, y0: int, frame_h: int) -> list[dict]:
+    """Scattered nondiagnostic marks placed clear of the wire frame."""
+    keep_out = (x0 - 34, y0 - 34, x0 + SPAN_W + 34, y0 + frame_h + 34)
+    marks: list[dict] = []
+    attempts = 0
+    wanted = rng.randint(6, 11)
+    while len(marks) < wanted and attempts < 400:
+        attempts += 1
+        kind = rng.choice(("dot", "tick", "chip", "kink"))
+        w = rng.randint(10, 30)
+        h = rng.randint(10, 30)
+        px = rng.randint(24, CANVAS - 24 - w)
+        py = rng.randint(24, CANVAS - 24 - h)
+        if px + w >= keep_out[0] and px <= keep_out[2] and py + h >= keep_out[1] and py <= keep_out[3]:
+            continue
+        marks.append(
+            {
+                "kind": kind,
+                "box": [px, py, px + w, py + h],
+                "color": list(rng.choice(DISTRACTOR_COLORS)),
+                "flip": rng.choice((0, 1)),
+            }
+        )
+    return marks
+
+
+def crossing_x(scene: dict, column: int) -> int:
+    """Image x of one crossing centre."""
+    return scene["origin"][0] + scene["col_margin"] + column * scene["col_step"]
+
+
+def row_y(scene: dict, row: int) -> int:
+    """Image y of one horizontal pass."""
+    return scene["origin"][1] + row * scene["row_gap"]
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterise one scene with flat fills and no antialiasing."""
+    img = Image.new("RGB", (scene["canvas"], scene["canvas"]), tuple(scene["background"]))
+    draw = ImageDraw.Draw(img)
+    _draw_distractors(draw, scene)
+    _draw_rails(draw, scene)
+    _draw_wire(draw, scene)
+    return img
+
+
+def _bar(draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, y1: int, color) -> None:
+    if x1 < x0 or y1 < y0:
+        return
+    draw.rectangle([x0, y0, x1, y1], fill=tuple(color))
+
+
+def _draw_distractors(draw: ImageDraw.ImageDraw, scene: dict) -> None:
+    for mark in scene["distractors"]:
+        x0, y0, x1, y1 = mark["box"]
+        color = tuple(mark["color"])
+        if mark["kind"] == "dot":
+            draw.ellipse([x0, y0, x0 + 9, y0 + 9], fill=color)
+        elif mark["kind"] == "tick":
+            _bar(draw, x0, y0, x1, y0 + 2, color)
+        elif mark["kind"] == "chip":
+            draw.rectangle([x0, y0, x0 + 11, y1], outline=color, width=2)
+        else:
+            mid = (x0 + x1) // 2
+            _bar(draw, x0, y0, mid, y0 + 2, color)
+            if mark["flip"]:
+                _bar(draw, mid, y0, mid + 2, y1, color)
+            else:
+                _bar(draw, mid, y0 - min(y0, 8), mid + 2, y0 + 2, color)
+
+
+def _draw_rails(draw: ImageDraw.ImageDraw, scene: dict) -> None:
+    top = row_y(scene, 0) - scene["rail_over"]
+    bottom = row_y(scene, PASSES - 1) + scene["rail_over"]
+    for column in range(CROSSINGS):
+        cx = crossing_x(scene, column)
+        _bar(draw, cx - 1, top, cx + 1, bottom, scene["rail_color"])
+
+
+def _draw_wire(draw: ImageDraw.ImageDraw, scene: dict) -> None:
+    color = scene["wire_color"]
+    hops = physical_hops(scene)
+    x0 = scene["origin"][0]
+    x1 = x0 + scene["span_w"]
+    hop_h = scene["hop_h"]
+
+    for row in range(PASSES):
+        y = row_y(scene, row)
+        breaks = [crossing_x(scene, c) for c in range(CROSSINGS) if hops[row][c]]
+        cursor = x0
+        for bx in breaks:
+            _bar(draw, cursor, y - 1, bx - GAP_HALF - 1, y + 1, color)
+            cursor = bx + GAP_HALF + 1
+        _bar(draw, cursor, y - 1, x1, y + 1, color)
+        for bx in breaks:
+            _bar(draw, bx - HOP_HALF, y - hop_h - 1, bx + HOP_HALF, y - hop_h + 1, color)
+            _bar(draw, bx - HOP_HALF, y - hop_h, bx - HOP_HALF + 2, y + 1, color)
+            _bar(draw, bx + HOP_HALF - 2, y - hop_h, bx + HOP_HALF, y + 1, color)
+
+    rows = pass_rows(scene["start_row"])
+    sides = pass_sides(scene["start_side"])
+    for k in range(PASSES - 1):
+        end_side = _opposite(sides[k])
+        tx = x0 if end_side == "left" else x1
+        ya, yb = row_y(scene, rows[k]), row_y(scene, rows[k + 1])
+        _bar(draw, tx - 1, min(ya, yb) - 1, tx + 1, max(ya, yb) + 1, color)
+
+    bead_x = x0 + BEAD_INSET if sides[0] == "left" else x1 - BEAD_INSET
+    bead_y = row_y(scene, rows[0])
+    r = scene["bead_r"]
+    draw.ellipse([bead_x - r, bead_y - r, bead_x + r, bead_y + r], fill=tuple(color))
+
+
+def analytic_gold(scene: dict) -> str:
+    """The declared glyph spelled by the hops in travel order."""
+    return scene["glyph"]
+
+
+def hamming_margin(scene: dict) -> int:
+    """Cells separating the true glyph from its nearest declared rival."""
+    target = scene["glyph"]
+    return min(hamming(target, other) for other in GLYPH_NAMES if other != target)
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin: glyph separation capped by arch clearance."""
+    return float(min(hamming_margin(scene), scene["hop_h"] - 4))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Flag scenes whose arches are too shallow to read reliably."""
+    return bool(scene["hop_h"] < QUARANTINE_CLEARANCE)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No unrendered latent freedom exists, so this gate is not applicable."""
+    return []

@@ -1,0 +1,211 @@
+"""Independent inverse arm for the patterned-plug cable world.
+
+Only the final RGB raster is accepted.  The implementation locates the visible
+plug bodies by their fill, samples each 3x3 face, finds the unique Hamming match,
+discovers the five alternating background bands, classifies each adjacent-lane
+module as vertical or crossed from cable pixels, composes those visible swaps,
+and finally classifies the reached socket by hue.  No latent values or rendering
+module are imported.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_PLUG = np.array((205, 217, 226), dtype=np.int16)
+_MAGENTA = np.array((207, 43, 139), dtype=np.int16)
+_INK = np.array((38, 43, 49), dtype=np.int16)
+_CABLE = np.array((65, 73, 82), dtype=np.int16)
+_STAGES = (np.array((232, 240, 247), dtype=np.int16), np.array((243, 234, 219), dtype=np.int16))
+_COLOR_VARIANTS = {
+    "red": ((210, 55, 65), (195, 65, 79), (225, 70, 50)),
+    "green": ((38, 157, 91), (31, 145, 104), (54, 159, 77)),
+    "blue": ((44, 106, 211), (57, 112, 195), (47, 119, 219)),
+    "orange": ((234, 139, 30), (220, 128, 43), (236, 151, 45)),
+}
+
+
+def _near(arr: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    delta = arr.astype(np.int32) - color.astype(np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int32) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[tuple[int, int, int, int, int, float, float]]:
+    height, width = mask.shape
+    remaining = set((ys * width + xs).tolist() for ys, xs in zip(*np.nonzero(mask), strict=True))
+    result = []
+    while remaining:
+        root = remaining.pop()
+        queue = deque([root])
+        points = [root]
+        while queue:
+            value = queue.popleft()
+            y, x = divmod(value, width)
+            for neighbour in (value - 1, value + 1, value - width, value + width):
+                if neighbour not in remaining:
+                    continue
+                ny, nx = divmod(neighbour, width)
+                if abs(nx - x) + abs(ny - y) != 1:
+                    continue
+                remaining.remove(neighbour)
+                queue.append(neighbour)
+                points.append(neighbour)
+        if len(points) < minimum:
+            continue
+        values = np.asarray(points, dtype=np.int64)
+        ys = values // width
+        xs = values % width
+        result.append((int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()), len(points), float(xs.mean()), float(ys.mean())))
+    return result
+
+
+def _plug_faces(arr: np.ndarray) -> list[tuple[int, int, int, int, float, float]]:
+    parts = _components(_near(arr, _PLUG, 12.0), minimum=1200)
+    faces = []
+    for x0, y0, x1, y1, area, cx, cy in parts:
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if 68 <= width <= 92 and 68 <= height <= 92 and area >= 2200:
+            faces.append((x0, y0, x1, y1, (x0 + x1) / 2.0, (y0 + y1) / 2.0))
+    if len(faces) != 5:
+        raise ValueError(f"expected five visible plug bodies, found {len(faces)}")
+    return faces
+
+
+def _read_pattern(arr: np.ndarray, face: tuple[int, int, int, int, float, float]) -> frozenset[tuple[int, int]]:
+    x0, y0, x1, y1, cx, cy = face
+    pitch_x = (x1 - x0 + 1) * (18.0 / 84.0)
+    pitch_y = (y1 - y0 + 1) * (18.0 / 84.0)
+    dark = _near(arr, _INK, 38.0)
+    cells = set()
+    for row in range(3):
+        for column in range(3):
+            x = int(round(cx + (column - 1) * pitch_x))
+            y = int(round(cy + (row - 1) * pitch_y))
+            patch = dark[max(0, y - 4):y + 5, max(0, x - 4):x + 5]
+            fraction = float(patch.mean()) if patch.size else 0.0
+            if fraction > 0.55:
+                cells.add((row, column))
+            elif fraction > 0.12:
+                raise ValueError("a plug cell is visually ambiguous")
+    if len(cells) != 4:
+        raise ValueError(f"plug face has {len(cells)} black cells instead of four")
+    return frozenset(cells)
+
+
+def _stage_bands(arr: np.ndarray) -> list[tuple[int, int]]:
+    masks = [_near(arr, color, 7.0) for color in _STAGES]
+    labels: list[int] = []
+    for y in range(arr.shape[0]):
+        counts = [int(mask[y].sum()) for mask in masks]
+        labels.append(int(np.argmax(counts)) if max(counts) >= 250 else -1)
+    runs: list[tuple[int, int, int]] = []
+    start = 0
+    current = labels[0]
+    for y in range(1, len(labels) + 1):
+        value = labels[y] if y < len(labels) else None
+        if value == current:
+            continue
+        if current in (0, 1) and y - start >= 35:
+            runs.append((start, y - 1, current))
+        start, current = y, value
+    if len(runs) != 5 or [label for _, _, label in runs] != [0, 1, 0, 1, 0]:
+        raise ValueError(f"could not recover five alternating cable bands: {runs}")
+    return [(y0, y1) for y0, y1, _ in runs]
+
+
+def _visible_swaps(arr: np.ndarray, lane_x: list[float], bands: list[tuple[int, int]]) -> list[list[int]]:
+    dark = _near(arr, _CABLE, 45.0)
+    routes: list[list[int]] = []
+    for y0, y1 in bands:
+        height = y1 - y0 + 1
+        layer: list[int] = []
+        evidence: dict[int, int] = {}
+        for left in range(3):
+            xa, xb = lane_x[left], lane_x[left + 1]
+            lo = int(round(xa + 0.22 * (xb - xa)))
+            hi = int(round(xb - 0.22 * (xb - xa)))
+            top = int(round(y0 + 0.12 * height))
+            bottom = int(round(y1 - 0.12 * height))
+            count = int(dark[top:bottom + 1, lo:hi + 1].sum())
+            evidence[left] = count
+            if count >= 240:
+                layer.append(left)
+            elif count > 45:
+                raise ValueError(f"ambiguous crossover ink in band {y0}-{y1}, pair {left}: {count}")
+        if any(layer[index + 1] == layer[index] + 1 for index in range(len(layer) - 1)):
+            raise ValueError("overlapping adjacent crossovers are not a valid cable band")
+
+        destinations = list(range(4))
+        for left in layer:
+            destinations[left], destinations[left + 1] = destinations[left + 1], destinations[left]
+        for start, destination in enumerate(destinations):
+            for fraction in (0.24, 0.76):
+                x = int(round(lane_x[start] + fraction * (lane_x[destination] - lane_x[start])))
+                y = int(round(y0 + fraction * (y1 - y0)))
+                patch = dark[max(0, y - 6):y + 7, max(0, x - 6):x + 7]
+                if patch.size == 0 or int(patch.sum()) < 14:
+                    raise ValueError("a cable segment is missing or broken away from its crossing")
+        routes.append(layer)
+    if sum(len(layer) for layer in routes) != 4:
+        raise ValueError("the visible braid must contain exactly four crossovers")
+    return routes
+
+
+def _socket_order(arr: np.ndarray) -> list[str]:
+    sockets: list[tuple[float, str]] = []
+    for name, variants in _COLOR_VARIANTS.items():
+        mask = np.zeros(arr.shape[:2], dtype=bool)
+        for variant in variants:
+            mask |= _near(arr, np.array(variant, dtype=np.int16), 20.0)
+        ys, xs = np.nonzero(mask)
+        if len(xs) < 700:
+            raise ValueError(f"missing or damaged {name} socket")
+        sockets.append((float(np.median(xs)), name))
+    sockets.sort()
+    gaps = [sockets[index + 1][0] - sockets[index][0] for index in range(3)]
+    if min(gaps) < 70:
+        raise ValueError("colored sockets are not four separated endpoints")
+    return [name for _, name in sockets]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 500 or arr.shape[1] < 650:
+        raise ValueError("image is too small for this question world")
+    faces = _plug_faces(arr)
+    marker = _near(arr, _MAGENTA, 25.0)
+    ys, xs = np.nonzero(marker)
+    if len(xs) < 150:
+        raise ValueError("reference magenta marker is absent")
+    mx, my = float(xs.mean()), float(ys.mean())
+    reference_face = min(faces, key=lambda face: (face[4] - mx) ** 2 + (face[5] - my) ** 2)
+    if (reference_face[4] - mx) ** 2 + (reference_face[5] - my) ** 2 > 70.0 ** 2:
+        raise ValueError("magenta marker does not identify a plug")
+    bank_faces = sorted((face for face in faces if face is not reference_face), key=lambda face: face[4])
+    if len(bank_faces) != 4:
+        raise ValueError("could not separate reference from four cable-bank plugs")
+
+    reference = _read_pattern(arr, reference_face)
+    patterns = [_read_pattern(arr, face) for face in bank_faces]
+    distances = [len(reference ^ pattern) for pattern in patterns]
+    best = min(distances)
+    winners = [index for index, value in enumerate(distances) if value == best]
+    runner_up = sorted(distances)[1]
+    if best != 0 or len(winners) != 1 or runner_up < 2:
+        raise ValueError(f"plug correspondence is not unique with margin: {distances}")
+
+    bands = _stage_bands(arr)
+    lane_x = [face[4] for face in bank_faces]
+    routes = _visible_swaps(arr, lane_x, bands)
+    position = winners[0]
+    for layer in routes:
+        for left in layer:
+            if position == left:
+                position = left + 1
+            elif position == left + 1:
+                position = left
+    sockets = _socket_order(arr)
+    return sockets[position]

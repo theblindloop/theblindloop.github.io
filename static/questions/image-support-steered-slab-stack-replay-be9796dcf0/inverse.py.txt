@@ -1,0 +1,140 @@
+"""Independent pixel-only inverse arm for the slab-stack world.
+
+It receives one RGB image and the public question contract only: the slab is a
+four-by-four block of abutting square tiles, the top-left tile is filled edge to
+edge with the starting chip colour, and each remaining tile is a coloured push
+disk or a dark pop cross read row by row. Nothing here imports the renderer,
+the prompts, the generator, the verifier or any analytic gold, and no latent
+scene data is accepted.
+
+Pipeline: segment the tile-paper colour, take its bounding box as the tile
+block, refuse blocks that are not a clean square of paper (this is how damaged
+or partly erased slabs abstain instead of inventing an answer), split the block
+into a four-by-four lattice, classify each cell from colour statistics in its
+central window, then replay the recovered instruction word on a stack.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "slab_stack_replay-oracle-0.1.0"
+
+ROWS = 4
+COLS = 4
+
+_PAPER = (226, 214, 184)
+_DARK = (40, 44, 52)
+_BLANK = (255, 255, 255)
+_CHIPS = {
+    "red": (206, 58, 52),
+    "green": (54, 148, 84),
+    "blue": (52, 96, 196),
+    "purple": (140, 74, 176),
+}
+
+_PAPER_TOL = 30.0
+_CLASS_TOL = 60.0
+_INSET = 0.20
+_MIN_BLOCK_PX = 96
+_MAX_BLOCK_PX = 320
+_MAX_ASPECT_SKEW = 0.12
+_MIN_PAPER_FRACTION = 0.40
+_MAX_BLANK_FRACTION = 0.02
+_MIN_CELL_PAPER = 0.05
+_MIN_CHIP_FRACTION = 0.12
+_MIN_CROSS_FRACTION = 0.05
+_MIN_FILL_FRACTION = 0.90
+
+
+class SlabReadError(ValueError):
+    """The image does not expose one readable slab (abstention)."""
+
+
+def _distance(array: np.ndarray, colour) -> np.ndarray:
+    reference = np.asarray(colour, dtype=np.float32)
+    return np.sqrt(((array - reference) ** 2).sum(axis=-1))
+
+
+def _block_bounds(array: np.ndarray) -> tuple[int, int, int, int]:
+    paper = _distance(array, _PAPER) <= _PAPER_TOL
+    if paper.sum() < 256:
+        raise SlabReadError("no tile paper found")
+    rows = np.flatnonzero(paper.any(axis=1))
+    cols = np.flatnonzero(paper.any(axis=0))
+    y0, y1 = int(rows[0]), int(rows[-1]) + 1
+    x0, x1 = int(cols[0]), int(cols[-1]) + 1
+    height, width = y1 - y0, x1 - x0
+    if not (_MIN_BLOCK_PX <= height <= _MAX_BLOCK_PX and _MIN_BLOCK_PX <= width <= _MAX_BLOCK_PX):
+        raise SlabReadError(f"tile block {width}x{height} is not a plausible slab")
+    if abs(width - height) > _MAX_ASPECT_SKEW * max(width, height):
+        raise SlabReadError(f"tile block {width}x{height} is not square")
+    window = array[y0:y1, x0:x1]
+    if float(paper[y0:y1, x0:x1].mean()) < _MIN_PAPER_FRACTION:
+        raise SlabReadError("tile block holds too little paper")
+    if float((_distance(window, _BLANK) <= _PAPER_TOL).mean()) > _MAX_BLANK_FRACTION:
+        raise SlabReadError("tile block is punctured by blank pixels")
+    return x0, y0, x1, y1
+
+
+def _classify(window: np.ndarray) -> str:
+    total = float(window.shape[0] * window.shape[1])
+    if total < 36.0:
+        raise SlabReadError("cell window too small to classify")
+    blank = float((_distance(window, _BLANK) <= _PAPER_TOL).sum()) / total
+    if blank > _MAX_BLANK_FRACTION:
+        raise SlabReadError("cell is partly erased")
+    names = ["paper", "cross", *sorted(_CHIPS)]
+    palette = [_PAPER, _DARK, *(_CHIPS[name] for name in sorted(_CHIPS))]
+    stack = np.stack([_distance(window, colour) for colour in palette], axis=-1)
+    best = stack.argmin(axis=-1)
+    near = stack.min(axis=-1) <= _CLASS_TOL
+    fractions = {
+        name: float(((best == index) & near).sum()) / total for index, name in enumerate(names)
+    }
+    chips = sorted(_CHIPS)
+    leader = max(chips, key=lambda name: fractions[name])
+    if fractions["paper"] < _MIN_CELL_PAPER:
+        if fractions[leader] < _MIN_FILL_FRACTION:
+            raise SlabReadError("cell shows neither paper nor a full colour fill")
+        return "fill:" + leader
+    if fractions[leader] >= _MIN_CHIP_FRACTION:
+        return "push:" + leader
+    if fractions["cross"] >= _MIN_CROSS_FRACTION:
+        return "pop"
+    raise SlabReadError("cell glyph is unreadable")
+
+
+def read_slab(image: Image.Image) -> list[str]:
+    """Recover the sixteen tile glyphs in reading order from pixels alone."""
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    x0, y0, x1, y1 = _block_bounds(array)
+    glyphs = []
+    for row in range(ROWS):
+        top = y0 + (y1 - y0) * row // ROWS
+        bottom = y0 + (y1 - y0) * (row + 1) // ROWS
+        for col in range(COLS):
+            left = x0 + (x1 - x0) * col // COLS
+            right = x0 + (x1 - x0) * (col + 1) // COLS
+            iy = int(round((bottom - top) * _INSET))
+            ix = int(round((right - left) * _INSET))
+            glyphs.append(_classify(array[top + iy : bottom - iy, left + ix : right - ix]))
+    fills = [index for index, glyph in enumerate(glyphs) if glyph.startswith("fill:")]
+    if fills != [0]:
+        raise SlabReadError(f"expected exactly one edge-to-edge start tile at the top left: {fills}")
+    return glyphs
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Colour name of the chip left on top after replaying the whole slab."""
+    glyphs = read_slab(image)
+    stack = [glyphs[0].split(":", 1)[1]]
+    for glyph in glyphs[1:]:
+        if glyph == "pop":
+            if len(stack) < 2:
+                raise SlabReadError("recovered word pops the stack empty")
+            stack.pop()
+        else:
+            stack.append(glyph.split(":", 1)[1])
+    return stack[-1]

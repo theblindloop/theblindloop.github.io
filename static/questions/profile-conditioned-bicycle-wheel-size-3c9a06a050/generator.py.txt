@@ -1,0 +1,332 @@
+"""Forward arm for `bicycle_wheel_size`.
+
+Latent scene z: a white page carrying one side-view two-wheeled machine. The two
+wheels are black rings standing on a drawn ground line; the coloured frame,
+saddle and handlebar, the loose coloured spots and the grey page decoration are
+nuisance ink.  Gold is a comparison of the two drawn wheel diameters under a
+rule that is declared in the question itself:
+
+    d_left = 2 * left_r, d_right = 2 * right_r, d_max = max(d_left, d_right)
+    same  if |d_left - d_right| <  0.10 * d_max
+    left  if  d_left - d_right >= 0.10 * d_max
+    right if  d_right - d_left >= 0.10 * d_max
+
+The margin is the visible distance to that boundary in canvas pixels,
+
+    m = | |d_left - d_right| - 0.10 * d_max |,
+
+i.e. how many pixels of diameter the smaller wheel would have to gain or lose
+before the reported answer changes.  The runner-up answer is `same` for a
+`left`/`right` scene and the nearer side for a `same` scene.
+
+The familiar prior -- a bicycle has two equal wheels -- is the canonical variant
+and is recorded for analysis only; it is never used as gold.  Wheel scale, page
+positions, frame colour, spoke count, spot count and which way the machine faces
+are sampled independently of the answer.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "bicycle_wheel_size-renderer-0.1.0"
+
+WIDTH, HEIGHT = 640, 420
+GROUND_Y = 356
+SUPERSAMPLE = 3
+
+RATIO_THRESHOLD = 0.10  # declared in the question: a tenth of the larger diameter
+QUARANTINE_PX = 5.0  # margin below this is a finite-resolution boundary case
+
+DECISIONS = ("left", "right", "same")
+CANONICAL_DECISION = "same"  # the two-equal-wheels prior
+
+WHEEL_INK = (20, 20, 20)
+PAGE_INK = (150, 150, 150)
+GROUND_INK = (150, 120, 40)
+FRAME_PALETTE = (
+    (200, 45, 60),
+    (40, 95, 205),
+    (25, 150, 135),
+    (215, 140, 25),
+    (140, 60, 190),
+)
+SPOT_PALETTE = ((225, 95, 40), (60, 165, 70), (70, 120, 215), (190, 70, 165))
+
+R_MAX_RANGE = (62.0, 100.0)  # radius of the larger wheel
+SAME_RATIO_RANGE = (0.0, 0.055)  # |dd| / d_max for the equal-wheel class
+DIFF_RATIO_RANGE = (0.15, 0.45)  # |dd| / d_max for the unequal class
+X_LEFT_RANGE = (112.0, 158.0)
+X_RIGHT_RANGE = (482.0, 528.0)
+RING_W_RANGE = (7, 10)
+SPOKE_CHOICES = (6, 8, 10)
+N_SPOTS_RANGE = (1, 4)
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene.  Every field below is painted into the raster."""
+    rng = random.Random(seed)
+
+    target = rng.choice(DECISIONS)
+    r_max = rng.uniform(*R_MAX_RANGE)
+    if target == "same":
+        # Half of the equal-wheel scenes are exactly equal (the literal prior);
+        # the rest sit inside the declared tolerance but are not identical, so
+        # "same" cannot be read off from a pixel-perfect coincidence.
+        ratio = 0.0 if rng.random() < 0.5 else rng.uniform(0.02, SAME_RATIO_RANGE[1])
+    else:
+        ratio = rng.uniform(*DIFF_RATIO_RANGE)
+    r_min = r_max * (1.0 - ratio)
+
+    if target == "left":
+        left_r, right_r = r_max, r_min
+    elif target == "right":
+        left_r, right_r = r_min, r_max
+    else:
+        left_r, right_r = (r_max, r_min) if rng.random() < 0.5 else (r_min, r_max)
+
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "ground_y": GROUND_Y,
+        "x_left": round(rng.uniform(*X_LEFT_RANGE), 3),
+        "x_right": round(rng.uniform(*X_RIGHT_RANGE), 3),
+        "left_r": round(left_r, 3),
+        "right_r": round(right_r, 3),
+        "ring_w": rng.randint(*RING_W_RANGE),
+        "hub_r": rng.randint(8, 11),
+        "spoke_count": rng.choice(SPOKE_CHOICES),
+        "spoke_phase": round(rng.uniform(0.0, math.pi), 4),
+        # `facing` decides which hub carries the handlebar: it is sampled
+        # independently of the answer, so "the front wheel" is not a cue.
+        "facing": rng.choice(("left", "right")),
+        "frame_color": list(rng.choice(FRAME_PALETTE)),
+        "spot_color": list(rng.choice(SPOT_PALETTE)),
+        "spots": _sample_spots(rng),
+    }
+    return scene
+
+
+def _sample_spots(rng: random.Random) -> list:
+    """Loose coloured spots high on the page, clear of both wheels."""
+    spots = []
+    for _ in range(rng.randint(*N_SPOTS_RANGE)):
+        spots.append(
+            [
+                round(rng.uniform(70.0, WIDTH - 70.0), 2),
+                round(rng.uniform(46.0, 96.0), 2),
+                round(rng.uniform(7.0, 13.0), 2),
+            ]
+        )
+    return spots
+
+
+# --------------------------------------------------------------------------- #
+# gold, margin, quarantine
+# --------------------------------------------------------------------------- #
+def _diameters(scene: dict) -> tuple[float, float]:
+    return 2.0 * float(scene["left_r"]), 2.0 * float(scene["right_r"])
+
+
+def analytic_gold(scene: dict) -> str:
+    d_l, d_r = _diameters(scene)
+    thresh = RATIO_THRESHOLD * max(d_l, d_r)
+    if abs(d_l - d_r) < thresh:
+        return "same"
+    return "left" if d_l > d_r else "right"
+
+
+def margin(scene: dict) -> float:
+    """Pixels of diameter between this scene and the declared decision boundary."""
+    d_l, d_r = _diameters(scene)
+    thresh = RATIO_THRESHOLD * max(d_l, d_r)
+    return round(abs(abs(d_l - d_r) - thresh), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def runner_up(scene: dict) -> str:
+    """The answer this scene would take if its margin closed."""
+    d_l, d_r = _diameters(scene)
+    if analytic_gold(scene) == "same":
+        return "left" if d_l > d_r else "right"
+    return "same"
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent aliases are declared: see candidate.json (`not_applicable`)."""
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def render(scene: dict) -> Image.Image:
+    ss = SUPERSAMPLE
+    w, h = int(scene["width"]), int(scene["height"])
+    img = Image.new("RGB", (w * ss, h * ss), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    def line(p, q, color, width):
+        draw.line([p[0] * ss, p[1] * ss, q[0] * ss, q[1] * ss], fill=tuple(color),
+                  width=max(1, int(round(width * ss))))
+
+    def disc(cx, cy, r, color):
+        draw.ellipse([(cx - r) * ss, (cy - r) * ss, (cx + r) * ss, (cy + r) * ss],
+                     fill=tuple(color))
+
+    def ring(cx, cy, r, width, color):
+        draw.ellipse([(cx - r) * ss, (cy - r) * ss, (cx + r) * ss, (cy + r) * ss],
+                     outline=tuple(color), width=max(1, int(round(width * ss))))
+
+    # Fixed page decoration: identical in every image of the set.
+    draw.rectangle([10 * ss, 10 * ss, (w - 10) * ss, (h - 10) * ss],
+                   outline=PAGE_INK, width=2 * ss)
+    for tx, ty in ((26, 26), (w - 26, 26), (26, h - 26), (w - 26, h - 26)):
+        line((tx - 8, ty), (tx + 8, ty), PAGE_INK, 2)
+
+    gy = float(scene["ground_y"])
+    line((24, gy), (w - 24, gy), GROUND_INK, 3)
+
+    xl, xr = float(scene["x_left"]), float(scene["x_right"])
+    rl, rr = float(scene["left_r"]), float(scene["right_r"])
+    yl, yr = gy - rl, gy - rr  # both wheels stand on the ground line
+    frame = scene["frame_color"]
+
+    # Frame first, wheels on top: no frame ink ever occludes a rim.
+    mid = ((xl + xr) / 2.0, gy - 52.0)
+    seat_sign = -1.0 if scene["facing"] == "right" else 1.0
+    seat = (mid[0] + seat_sign * 46.0, gy - 196.0)
+    front = (xr, yr) if scene["facing"] == "right" else (xl, yl)
+    bar_top = (front[0] - seat_sign * 16.0, gy - 208.0)
+
+    line((xl, yl), mid, frame, 7)
+    line((xr, yr), mid, frame, 7)
+    line(mid, seat, frame, 7)
+    line((seat[0] - 22, seat[1]), (seat[0] + 22, seat[1]), frame, 8)
+    line(seat, bar_top, frame, 6)
+    line(front, bar_top, frame, 7)
+    line((bar_top[0] - 24, bar_top[1]), (bar_top[0] + 24, bar_top[1]), frame, 8)
+
+    for cx, cy, r in scene["spots"]:
+        disc(float(cx), float(cy), float(r), scene["spot_color"])
+
+    ring_w = int(scene["ring_w"])
+    hub_r = int(scene["hub_r"])
+    phase = float(scene["spoke_phase"])
+    for cx, cy, r in ((xl, yl, rl), (xr, yr, rr)):
+        for k in range(int(scene["spoke_count"])):
+            a = phase + 2.0 * math.pi * k / int(scene["spoke_count"])
+            inner = r - ring_w * 0.4  # spokes bite into the rim: one ink body
+            line((cx, cy), (cx + inner * math.cos(a), cy + inner * math.sin(a)),
+                 WHEEL_INK, 3)
+        ring(cx, cy, r - ring_w / 2.0, ring_w, WHEEL_INK)
+        disc(cx, cy, hub_r, WHEEL_INK)
+
+    return img.resize((w, h), Image.LANCZOS)
+
+
+def ink_pixels(image: Image.Image) -> int:
+    """Diagnostic only: how much non-white ink the page carries."""
+    import numpy as np
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    return int((arr.min(axis=-1) < 220).sum())
+
+
+# --------------------------------------------------------------------------- #
+# gold-preserving nuisance edits and declared label-transforming edits
+# --------------------------------------------------------------------------- #
+def translate(scene: dict, dx: float, dy: float) -> dict:
+    alt = dict(scene)
+    alt["x_left"] = float(scene["x_left"]) + dx
+    alt["x_right"] = float(scene["x_right"]) + dx
+    alt["ground_y"] = float(scene["ground_y"]) + dy
+    alt["spots"] = [[float(x) + dx, float(y) + dy, float(r)] for x, y, r in scene["spots"]]
+    return alt
+
+
+def recolor(scene: dict) -> dict:
+    alt = dict(scene)
+    fi = FRAME_PALETTE.index(tuple(scene["frame_color"]))
+    si = SPOT_PALETTE.index(tuple(scene["spot_color"]))
+    alt["frame_color"] = list(FRAME_PALETTE[(fi + 1) % len(FRAME_PALETTE)])
+    alt["spot_color"] = list(SPOT_PALETTE[(si + 1) % len(SPOT_PALETTE)])
+    return alt
+
+
+def restyle(scene: dict, seed: int) -> dict:
+    """Permute nuisance decoration: spokes, spot layout, and which way it faces."""
+    rng = random.Random(seed ^ 0x5EED)
+    alt = dict(scene)
+    alt["spoke_count"] = rng.choice(SPOKE_CHOICES)
+    alt["spoke_phase"] = round(rng.uniform(0.0, math.pi), 4)
+    alt["facing"] = "left" if scene["facing"] == "right" else "right"
+    alt["spots"] = _sample_spots(rng)
+    return alt
+
+
+def rescale(scene: dict, factor: float = 0.88) -> dict:
+    """Scale both wheels by one factor: the ratio rule is scale invariant."""
+    alt = dict(scene)
+    alt["left_r"] = float(scene["left_r"]) * factor
+    alt["right_r"] = float(scene["right_r"]) * factor
+    return alt
+
+
+def mirror(scene: dict) -> dict:
+    """Declared label-transforming edit: the page is flipped left-right, so the
+    answer `left` becomes `right`, `right` becomes `left`, and `same` is fixed."""
+    w = float(scene["width"])
+    alt = dict(scene)
+    alt["x_left"] = w - float(scene["x_right"])
+    alt["x_right"] = w - float(scene["x_left"])
+    alt["left_r"] = float(scene["right_r"])
+    alt["right_r"] = float(scene["left_r"])
+    alt["facing"] = "left" if scene["facing"] == "right" else "right"
+    alt["spots"] = [[w - float(x), float(y), float(r)] for x, y, r in scene["spots"]]
+    return alt
+
+
+def mirrored_decision(decision: str) -> str:
+    return {"left": "right", "right": "left", "same": "same"}[decision]
+
+
+def set_class(scene: dict, decision: str) -> dict:
+    """Repaint the same page so that gold is exactly `decision`, keeping every
+    nuisance field (positions, colours, spokes, spots, facing) untouched."""
+    if decision not in DECISIONS:
+        raise ValueError(f"unknown decision: {decision}")
+    r_max = max(float(scene["left_r"]), float(scene["right_r"]))
+    if decision == "same":
+        left_r = right_r = r_max
+    else:
+        r_min = r_max * (1.0 - 0.30)
+        left_r, right_r = (r_max, r_min) if decision == "left" else (r_min, r_max)
+    alt = dict(scene)
+    alt["left_r"] = round(left_r, 3)
+    alt["right_r"] = round(right_r, 3)
+    return alt
+
+
+def collapse_margin(scene: dict) -> dict:
+    """Move the scene exactly onto the declared boundary: the margin is zero and
+    the answer is no longer certifiable."""
+    r_max = max(float(scene["left_r"]), float(scene["right_r"]))
+    r_min = r_max * (1.0 - RATIO_THRESHOLD)
+    alt = dict(scene)
+    if analytic_gold(scene) == "right" or (
+        analytic_gold(scene) == "same" and float(scene["right_r"]) > float(scene["left_r"])
+    ):
+        alt["left_r"], alt["right_r"] = r_min, r_max
+    else:
+        alt["left_r"], alt["right_r"] = r_max, r_min
+    return alt

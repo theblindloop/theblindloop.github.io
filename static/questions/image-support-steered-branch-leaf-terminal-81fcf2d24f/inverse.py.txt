@@ -1,0 +1,168 @@
+"""Independent RGB-only endpoint-count oracle for the side-tip graph world."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ROUTE_RGB = np.array((38, 54, 71), dtype=np.float32)
+MARKER_RGB = {
+    "green": np.array((38, 170, 104), dtype=np.float32),
+    "amber": np.array((226, 151, 34), dtype=np.float32),
+    "violet": np.array((132, 86, 190), dtype=np.float32),
+}
+
+
+class OracleFitError(ValueError):
+    """The final raster does not expose two unambiguous tree endpoint counts."""
+
+
+def _components(mask: np.ndarray, min_area: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        queue: deque[tuple[int, int]] = deque([(y0, x0)])
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= min_area:
+            found.append(np.asarray(pixels, dtype=np.int32))
+    return found
+
+
+def _marker_centers(array: np.ndarray, name: str, expected: int) -> list[np.ndarray]:
+    distance = np.linalg.norm(array - MARKER_RGB[name][None, None, :], axis=2)
+    # The violet hue is close to a gray Lanczos fringe around dark strokes;
+    # this tighter interior threshold excludes that nuisance without losing a
+    # large connected marker core.
+    parts = _components(distance < 55.0, min_area=80)
+    if len(parts) != expected:
+        raise OracleFitError(f"expected {expected} {name} markers, found {len(parts)}")
+    return [part.astype(np.float64).mean(axis=0) for part in parts]
+
+
+def _route_components(array: np.ndarray) -> list[np.ndarray]:
+    distance = np.linalg.norm(array - ROUTE_RGB[None, None, :], axis=2)
+    parts = _components(distance < 78.0, min_area=180)
+    if len(parts) != 2:
+        raise OracleFitError(f"expected two disconnected route networks, found {len(parts)}")
+    return parts
+
+
+def _nearest_component(center: np.ndarray, parts: list[np.ndarray]) -> tuple[int, float]:
+    distances = [float(np.linalg.norm(part.astype(np.float64) - center[None, :], axis=1).min()) for part in parts]
+    index = int(np.argmin(distances))
+    return index, distances[index]
+
+
+def _thin(mask: np.ndarray) -> np.ndarray:
+    """Zhang-Suen thinning, implemented here independently of the renderer."""
+
+    image = mask.copy()
+    while True:
+        changed = False
+        for phase in (0, 1):
+            p2 = image[:-2, 1:-1]
+            p3 = image[:-2, 2:]
+            p4 = image[1:-1, 2:]
+            p5 = image[2:, 2:]
+            p6 = image[2:, 1:-1]
+            p7 = image[2:, :-2]
+            p8 = image[1:-1, :-2]
+            p9 = image[:-2, :-2]
+            neighbors = (p2, p3, p4, p5, p6, p7, p8, p9)
+            count = sum(item.astype(np.uint8) for item in neighbors)
+            transitions = (
+                ((~p2) & p3).astype(np.uint8)
+                + ((~p3) & p4).astype(np.uint8)
+                + ((~p4) & p5).astype(np.uint8)
+                + ((~p5) & p6).astype(np.uint8)
+                + ((~p6) & p7).astype(np.uint8)
+                + ((~p7) & p8).astype(np.uint8)
+                + ((~p8) & p9).astype(np.uint8)
+                + ((~p9) & p2).astype(np.uint8)
+            )
+            if phase == 0:
+                condition = p2 & p4 & p6
+                condition2 = p4 & p6 & p8
+            else:
+                condition = p2 & p4 & p8
+                condition2 = p2 & p6 & p8
+            remove = image[1:-1, 1:-1] & (count >= 2) & (count <= 6)
+            remove &= transitions == 1
+            remove &= ~condition
+            remove &= ~condition2
+            if np.any(remove):
+                image[1:-1, 1:-1][remove] = False
+                changed = True
+        if not changed:
+            return image
+
+
+def _endpoint_centers(component: np.ndarray, route_mask: np.ndarray) -> list[np.ndarray]:
+    component_mask = np.zeros_like(route_mask, dtype=bool)
+    component_mask[component[:, 0], component[:, 1]] = True
+    skeleton = _thin(component_mask)
+    padded = np.pad(skeleton, 1, mode="constant", constant_values=False)
+    height, width = skeleton.shape
+    degree = sum(
+        padded[1 + dy : 1 + dy + height, 1 + dx : 1 + dx + width].astype(np.uint8)
+        for dy, dx in ((-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1))
+    )
+    endpoints = skeleton & (degree == 1)
+    clusters = _components(endpoints, min_area=1)
+    return [part.astype(np.float64).mean(axis=0) for part in clusters]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Count unmarked leaves in each dark component using only the final PNG."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    greens = _marker_centers(array, "green", 2)
+    ambers = _marker_centers(array, "amber", 1)
+    violets = _marker_centers(array, "violet", 1)
+    components = _route_components(array)
+    terminals = [("amber", ambers[0]), ("violet", violets[0])]
+    green_links = [_nearest_component(center, components) for center in greens]
+    terminal_links = [(name, *_nearest_component(center, components)) for name, center in terminals]
+    if any(distance > 36.0 for _, distance in green_links + [(name, distance) for name, _, distance in terminal_links]):
+        raise OracleFitError("colored endpoint is not bound to a route")
+    if len({index for index, _ in green_links}) != 2:
+        raise OracleFitError("green starts do not bind two distinct components")
+    terminal_by_component = {index: name for name, index, _ in terminal_links}
+    if len(terminal_by_component) != 2:
+        raise OracleFitError("terminals do not bind two distinct components")
+    green_by_component = {index: center for center, (index, _) in zip(greens, green_links, strict=True)}
+    counts: dict[int, int] = {}
+    for index, component in enumerate(components):
+        if index not in green_by_component or index not in terminal_by_component:
+            raise OracleFitError("each component needs one green start and one terminal")
+        endpoints = _endpoint_centers(component, np.zeros_like(array[:, :, 0], dtype=bool))
+        marker_centers = [green_by_component[index], next(center for name, center in terminals if terminal_by_component[index] == name)]
+        side_tips = [
+            point for point in endpoints
+            if min(float(np.linalg.norm(point - marker)) for marker in marker_centers) > 42.0
+        ]
+        if not 1 <= len(side_tips) <= 3:
+            raise OracleFitError(f"component {index} has ambiguous side-tip count {len(side_tips)}")
+        counts[index] = len(side_tips)
+    if len(set(counts.values())) != 2:
+        raise OracleFitError("equal side-tip counts are quarantined")
+    winner_component = max(sorted(counts), key=lambda key: (counts[key], key))
+    return terminal_by_component[winner_component]

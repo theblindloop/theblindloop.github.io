@@ -1,0 +1,144 @@
+"""Independent pixel-only inverse arm for the door-merge world.
+
+Receives the final PNG and nothing else: no latent scene, no renderer, no
+analytic gold.  It classifies pixels against the published palette, floods the
+white paper into rooms separated by ink, works out which two rooms each shut
+coloured door has on its two sides, and names the door whose two sides are the
+green dot's room and the red dot's room.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_ABSTAIN = "abstain"
+
+_REFS = {
+    "paper": (255, 255, 255),
+    "wall": (20, 20, 20),
+    "orange": (245, 150, 10),
+    "purple": (150, 55, 200),
+    "teal": (0, 160, 175),
+    "green": (25, 130, 45),
+    "red": (205, 30, 35),
+}
+_TOL = 46.0
+_DILATE = 12
+_MIN_DOOR_PX = 120
+_MIN_SIDE_PX = 40
+_SIDE_FRACTION = 0.15
+_DOORS = ("orange", "purple", "teal")
+
+
+def _classify(image: Image.Image):
+    a = np.asarray(image.convert("RGB")).astype(np.float32)
+    names = list(_REFS)
+    dists = np.stack(
+        [np.linalg.norm(a - np.array(_REFS[n], dtype=np.float32), axis=2) for n in names], axis=0
+    )
+    best = dists.argmin(axis=0)
+    close = dists.min(axis=0) <= _TOL
+    masks = {n: (best == k) & close for k, n in enumerate(names)}
+    masks["_mixed"] = ~close
+    return masks
+
+
+def _label(free):
+    h, w = free.shape
+    lab = np.zeros((h, w), dtype=np.int32)
+    cur = 0
+    free_l = free.tolist()
+    lab_l = [[0] * w for _ in range(h)]
+    for sy in range(h):
+        row = free_l[sy]
+        for sx in range(w):
+            if not row[sx] or lab_l[sy][sx]:
+                continue
+            cur += 1
+            q = deque([(sy, sx)])
+            lab_l[sy][sx] = cur
+            while q:
+                y, x = q.popleft()
+                if y > 0 and free_l[y - 1][x] and not lab_l[y - 1][x]:
+                    lab_l[y - 1][x] = cur
+                    q.append((y - 1, x))
+                if y + 1 < h and free_l[y + 1][x] and not lab_l[y + 1][x]:
+                    lab_l[y + 1][x] = cur
+                    q.append((y + 1, x))
+                if x > 0 and free_l[y][x - 1] and not lab_l[y][x - 1]:
+                    lab_l[y][x - 1] = cur
+                    q.append((y, x - 1))
+                if x + 1 < w and free_l[y][x + 1] and not lab_l[y][x + 1]:
+                    lab_l[y][x + 1] = cur
+                    q.append((y, x + 1))
+    lab = np.array(lab_l, dtype=np.int32)
+    return lab
+
+
+def _dilate(mask, iters):
+    m = mask.copy()
+    for _ in range(iters):
+        out = m.copy()
+        out[1:, :] |= m[:-1, :]
+        out[:-1, :] |= m[1:, :]
+        out[:, 1:] |= m[:, :-1]
+        out[:, :-1] |= m[:, 1:]
+        m = out
+    return m
+
+
+def _dot_label(mask, lab):
+    ys, xs = np.nonzero(mask)
+    if xs.size < 40:
+        return None
+    vals, counts = np.unique(lab[ys, xs], return_counts=True)
+    keep = [(c, v) for v, c in zip(vals.tolist(), counts.tolist()) if v != 0]
+    if not keep:
+        return None
+    keep.sort(reverse=True)
+    if keep[0][0] < 0.7 * int(xs.size):
+        return None
+    return keep[0][1]
+
+
+def _door_sides(door_mask, lab, free):
+    if int(door_mask.sum()) < _MIN_DOOR_PX:
+        return None
+    ring = _dilate(door_mask, _DILATE) & free & ~door_mask
+    vals, counts = np.unique(lab[ring], return_counts=True)
+    hits = [(int(c), int(v)) for v, c in zip(vals.tolist(), counts.tolist()) if v != 0]
+    if not hits:
+        return None
+    top = max(c for c, _ in hits)
+    sides = {v for c, v in hits if c >= _MIN_SIDE_PX and c >= _SIDE_FRACTION * top}
+    if len(sides) > 2:
+        return None
+    return sides
+
+
+def decision_from_image(image: Image.Image) -> str:
+    masks = _classify(image)
+    if masks["wall"].sum() < 2000:
+        return _ABSTAIN
+    free = masks["paper"] | masks["green"] | masks["red"]
+    lab = _label(free)
+
+    g = _dot_label(masks["green"], lab)
+    r = _dot_label(masks["red"], lab)
+    if g is None or r is None or g == r:
+        return _ABSTAIN
+
+    target = {g, r}
+    winners = []
+    for name in _DOORS:
+        sides = _door_sides(masks[name], lab, free)
+        if sides is None:
+            return _ABSTAIN
+        if sides == target:
+            winners.append(name)
+    if len(winners) != 1:
+        return _ABSTAIN
+    return winners[0]

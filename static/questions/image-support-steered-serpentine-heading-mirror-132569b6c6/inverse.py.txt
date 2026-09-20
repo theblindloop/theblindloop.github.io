@@ -1,0 +1,172 @@
+"""Independent PNG-only inverse arm for the serpentine heading board.
+
+This module intentionally shares no renderer, latent, prompt, generation, or
+verification code.  It discovers the board from foreground pixels, validates
+the complete connected grid, classifies each tile from color, infers the START
+arrow from its shape, then independently replays the public rules.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_HEADINGS = ("north", "east", "south", "west")
+_INK = np.asarray((31, 42, 58), dtype=np.float32)
+_START_COLORS = np.asarray(((111, 78, 157), (126, 82, 166), (98, 75, 151)), dtype=np.float32)
+_TURN_COLORS = np.asarray(((235, 171, 48), (244, 181, 58), (224, 158, 42)), dtype=np.float32)
+_MIRROR_COLORS = np.asarray(((43, 168, 160), (38, 184, 173), (53, 153, 151)), dtype=np.float32)
+_ALL_BASES = np.concatenate((_START_COLORS, _TURN_COLORS, _MIRROR_COLORS), axis=0)
+
+
+def _distance(array: np.ndarray, color: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(array.astype(np.float32) - color, axis=2)
+
+
+def _nearest_family(pixels: np.ndarray) -> tuple[str, float, float]:
+    values = pixels.reshape(-1, 3).astype(np.float32)
+    distances = np.linalg.norm(values[:, None, :] - _ALL_BASES[None, :, :], axis=2)
+    family_distance = np.stack(
+        (
+            distances[:, 0:3].min(axis=1),
+            distances[:, 3:6].min(axis=1),
+            distances[:, 6:9].min(axis=1),
+        ),
+        axis=1,
+    )
+    labels = family_distance.argmin(axis=1)
+    counts = np.bincount(labels, minlength=3)
+    winner = int(counts.argmax())
+    ordered = np.sort(counts)
+    names = ("start", "turn_cw", "mirror_lr")
+    purity = float(counts[winner] / len(values))
+    separation = float((ordered[-1] - ordered[-2]) / len(values))
+    return names[winner], purity, separation
+
+
+def _snake_cells() -> list[tuple[int, int]]:
+    output: list[tuple[int, int]] = []
+    for row in range(4):
+        columns = range(4) if row % 2 == 0 else range(3, -1, -1)
+        output.extend((row, column) for column in columns)
+    return output
+
+
+def _arrow_heading(tile: np.ndarray) -> str:
+    bright = np.all(tile > 232, axis=2)
+    points = np.argwhere(bright)
+    if len(points) < 900:
+        raise ValueError("START arrow is missing or too small")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    height, width = int(y1 - y0 + 1), int(x1 - x0 + 1)
+    if min(height, width) < 55 or max(height, width) > tile.shape[0] * 0.86:
+        raise ValueError("START arrow bounds are ambiguous")
+
+    band_y = max(4, height // 4)
+    band_x = max(4, width // 4)
+    scores = {
+        "north": int(bright[y0 : y0 + band_y, x0 : x1 + 1].sum()),
+        "south": int(bright[y1 - band_y + 1 : y1 + 1, x0 : x1 + 1].sum()),
+        "west": int(bright[y0 : y1 + 1, x0 : x0 + band_x].sum()),
+        "east": int(bright[y0 : y1 + 1, x1 - band_x + 1 : x1 + 1].sum()),
+    }
+    vertical_gap = abs(scores["north"] - scores["south"])
+    horizontal_gap = abs(scores["west"] - scores["east"])
+    if max(vertical_gap, horizontal_gap) < 120 or abs(vertical_gap - horizontal_gap) < 80:
+        raise ValueError("START arrow has no unique head direction")
+    # The broad arrowhead tapers toward its pointing edge, so that extreme
+    # band contains fewer bright pixels than the narrow rectangular tail band.
+    if vertical_gap > horizontal_gap:
+        return "north" if scores["north"] < scores["south"] else "south"
+    return "west" if scores["west"] < scores["east"] else "east"
+
+
+def _apply(heading: int, operation: str) -> int:
+    if operation == "turn_cw":
+        return (heading + 1) % 4
+    if operation == "mirror_lr":
+        return (-heading) % 4
+    raise ValueError("unrecognized operation")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 320:
+        raise ValueError("expected a sufficiently large RGB board image")
+
+    # The border median is the observed background; no renderer constant or
+    # latent layout is consulted.
+    border = np.concatenate(
+        (array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3), array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)),
+        axis=0,
+    )
+    background = np.median(border, axis=0)
+    foreground = np.linalg.norm(array.astype(np.float32) - background, axis=2) > 38.0
+    points = np.argwhere(foreground)
+    if len(points) < array.shape[0] * array.shape[1] * 0.60:
+        raise ValueError("dense connected operation board is incomplete")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    board_h, board_w = int(y1 - y0 + 1), int(x1 - x0 + 1)
+    if abs(board_h - board_w) > 4 or not (0.84 <= board_w / array.shape[1] <= 0.94):
+        raise ValueError("operation board bounds are invalid")
+    if abs((x0 + x1 + 1) / 2 - array.shape[1] / 2) > 8 or abs((y0 + y1 + 1) / 2 - array.shape[0] / 2) > 8:
+        raise ValueError("operation board is not fully visible")
+
+    board = array[y0 : y1 + 1, x0 : x1 + 1]
+    side = board.shape[0]
+    cell = side / 4.0
+    if cell < 132:
+        raise ValueError("operation tiles are below the resolution floor")
+
+    # Validate the outer frame and all three interior grid crossings. This
+    # turns deletion of any distant board band into an explicit abstention.
+    dark = _distance(board, _INK) < 34.0
+    strip = max(3, round(cell * 0.035))
+    frame_parts = (dark[:strip], dark[-strip:], dark[:, :strip], dark[:, -strip:])
+    if any(float(part.mean()) < 0.80 for part in frame_parts):
+        raise ValueError("connected outer frame is damaged")
+    for division in (1, 2, 3):
+        position = round(division * cell)
+        vertical = dark[:, max(0, position - strip) : min(side, position + strip + 1)]
+        horizontal = dark[max(0, position - strip) : min(side, position + strip + 1), :]
+        if float(vertical.mean()) < 0.72 or float(horizontal.mean()) < 0.72:
+            raise ValueError("connected operation grid is damaged")
+
+    families: dict[tuple[int, int], str] = {}
+    tiles: dict[tuple[int, int], np.ndarray] = {}
+    inset = max(13, round(cell * 0.095))
+    for row in range(4):
+        for column in range(4):
+            xa, xb = round(column * cell) + inset, round((column + 1) * cell) - inset
+            ya, yb = round(row * cell) + inset, round((row + 1) * cell) - inset
+            tile = board[ya:yb, xa:xb]
+            if min(tile.shape[:2]) < 100:
+                raise ValueError("tile crop is incomplete")
+            family, purity, separation = _nearest_family(tile)
+            minimum_purity = 0.68 if family == "start" else 0.72
+            minimum_separation = 0.40 if family == "start" else 0.48
+            if purity < minimum_purity or separation < minimum_separation:
+                raise ValueError("operation tile color is ambiguous or erased")
+            families[(row, column)] = family
+            tiles[(row, column)] = tile
+
+    starts = [cell_key for cell_key, family in families.items() if family == "start"]
+    if starts != [(0, 0)]:
+        raise ValueError("exactly one top-left START tile is required")
+
+    initial = _arrow_heading(tiles[(0, 0)])
+    operations: list[str] = []
+    for cell_key in _snake_cells()[1:]:
+        family = families[cell_key]
+        if family not in ("turn_cw", "mirror_lr"):
+            raise ValueError("snake contains a non-operation tile")
+        operations.append(family)
+    if len(operations) != 15:
+        raise ValueError("operation replay is incomplete")
+
+    heading = _HEADINGS.index(initial)
+    for operation in operations:
+        heading = _apply(heading, operation)
+    return _HEADINGS[heading]

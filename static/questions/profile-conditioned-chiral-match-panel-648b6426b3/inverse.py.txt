@@ -1,0 +1,144 @@
+"""Pixel-only inverse arm for the chiral reference-match world.
+
+This module sees a single rendered PNG and nothing else.  It rediscovers the
+image structure from the drawn separators, isolates the reference glyph and the
+four panel glyphs, measures a rotation-invariant outline signature for each of
+them, and selects the panel whose outline matches the reference under rotation
+alone.  It never imports the renderer, the prompts, the generator, the verifier
+or any analytic gold, and it never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+BINS = 360
+ABSTAIN_MARGIN = 0.0012
+ANSWERS = ("panel-1", "panel-2", "panel-3", "panel-4")
+AMBIGUOUS = "ambiguous"
+
+
+def _modal_colour(pixels: np.ndarray) -> np.ndarray:
+    packed = (
+        pixels[:, 0].astype(np.uint32) * 65536
+        + pixels[:, 1].astype(np.uint32) * 256
+        + pixels[:, 2].astype(np.uint32)
+    )
+    values, counts = np.unique(packed, return_counts=True)
+    winner = int(values[int(np.argmax(counts))])
+    return np.array([(winner >> 16) & 255, (winner >> 8) & 255, winner & 255], dtype=np.int64)
+
+
+def _signature(mask: np.ndarray) -> np.ndarray | None:
+    ys, xs = np.nonzero(mask)
+    if ys.size < 200:
+        return None
+    cy = float(ys.mean())
+    cx = float(xs.mean())
+    dy = ys - cy
+    dx = xs - cx
+    radius = np.hypot(dx, dy)
+    angle = np.arctan2(dy, dx)
+    index = np.floor((angle + np.pi) / (2.0 * np.pi) * BINS).astype(np.int64)
+    np.clip(index, 0, BINS - 1, out=index)
+    profile = np.zeros(BINS, dtype=np.float64)
+    np.maximum.at(profile, index, radius)
+    if not profile.all():
+        filled = np.nonzero(profile)[0]
+        if filled.size < BINS // 2:
+            return None
+        empty = np.nonzero(profile == 0.0)[0]
+        nearest = filled[np.argmin(
+            np.minimum(
+                np.abs(empty[:, None] - filled[None, :]),
+                BINS - np.abs(empty[:, None] - filled[None, :]),
+            ),
+            axis=1,
+        )]
+        profile[empty] = profile[nearest]
+    kernel = np.array([1.0, 1.0, 1.0]) / 3.0
+    profile = np.real(
+        np.fft.irfft(np.fft.rfft(profile) * np.conj(np.fft.rfft(kernel, BINS)), BINS)
+    )
+    scale = float(np.sqrt(np.mean(profile * profile)))
+    if scale <= 0.0:
+        return None
+    return profile / scale
+
+
+def _match(candidate: np.ndarray, reference: np.ndarray) -> float:
+    correlation = np.real(
+        np.fft.irfft(np.fft.rfft(candidate) * np.conj(np.fft.rfft(reference)), BINS)
+    )
+    norm = float(np.linalg.norm(candidate) * np.linalg.norm(reference))
+    if norm <= 0.0:
+        return -1.0
+    return float(correlation.max() / norm)
+
+
+def _runs(flags: np.ndarray) -> list:
+    runs = []
+    start = None
+    for index, flag in enumerate(flags):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, len(flags)))
+    return runs
+
+
+def analyse(image: Image.Image) -> dict:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.int64)
+    height, width, _ = pixels.shape
+    background = _modal_colour(pixels.reshape(-1, 3))
+    from_background = np.abs(pixels - background).sum(axis=2)
+    ink = from_background > 30
+
+    row_fraction = ink.mean(axis=1)
+    separator_rows = _runs(row_fraction > 0.9)
+    if not separator_rows:
+        return {"decision": AMBIGUOUS, "margin": 0.0, "scores": []}
+    top, bottom = max(separator_rows, key=lambda run: run[1] - run[0])
+    split = (top + bottom) // 2
+
+    structure_pixels = pixels[top:bottom, :, :].reshape(-1, 3)
+    structure = _modal_colour(structure_pixels)
+    from_structure = np.abs(pixels - structure).sum(axis=2)
+    glyph = (from_background > 45) & (from_structure > 60)
+
+    lower = ink[bottom + 4 :, :]
+    column_runs = _runs(lower.mean(axis=0) > 0.8)
+    edges = [0] + [(start + stop) // 2 for start, stop in column_runs] + [width]
+    if len(edges) != 6:
+        edges = [round(width * k / 4) for k in range(5)]
+
+    reference = _signature(glyph[:top, :])
+    if reference is None:
+        return {"decision": AMBIGUOUS, "margin": 0.0, "scores": []}
+
+    scores = []
+    for index in range(4):
+        panel = np.zeros_like(glyph)
+        panel[bottom:, edges[index] : edges[index + 1]] = glyph[
+            bottom:, edges[index] : edges[index + 1]
+        ]
+        candidate = _signature(panel)
+        scores.append(-1.0 if candidate is None else _match(candidate, reference))
+
+    order = sorted(range(4), key=lambda index: scores[index], reverse=True)
+    gap = scores[order[0]] - scores[order[1]]
+    if gap < ABSTAIN_MARGIN:
+        return {"decision": AMBIGUOUS, "margin": float(gap), "scores": scores}
+    return {"decision": ANSWERS[order[0]], "margin": float(gap), "scores": scores}
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return analyse(image)["decision"]
+
+
+def margin_from_image(image: Image.Image) -> float:
+    return round(float(analyse(image)["margin"]), 9)

@@ -1,0 +1,310 @@
+"""Scene sampler and renderer for the dip-recovery counting world.
+
+One small survey inset holds a single thin black trace that is a function of the
+horizontal coordinate.  A dotted grey guide line is drawn at exactly the height
+of the trace's left end.  The trace immediately drops below that guide height and
+then wanders; the decision is how many times it comes back up through the guide
+height (a "return").  Every turning point of the trace is at least
+`CLEAR_FLOOR` px clear of the guide height, so the trace never merely grazes it
+and every return is a genuine, visible crossing.
+
+The decisive evidence is the single connected thin trace inside one small inset.
+Everything else on the sheet -- pale coloured curves, other grey frames, grey
+tick marks -- is non-black decoration that the pixel arm never segments.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "dip_recovery_count-renderer-0.1.0"
+
+CANVAS_W = 640
+CANVAS_H = 1440
+
+NODES = 11              # fixed for every scene, so node count carries no signal
+MIN_RETURNS = 1
+MAX_RETURNS = 3
+
+CLEAR_FLOOR = 16.0      # smallest turning-point clearance the sampler may emit
+QUARANTINE_CLEAR = 20.0  # below this the scene is flagged near-boundary
+NEAR_FLOOR_HI = 21.0    # deliberate near-boundary clearances land in [16, 21]
+
+TRAVEL_MIN = 300.0      # vertical-travel band shared by every answer class
+TRAVEL_MAX = 430.0
+
+BELOW_MIN, BELOW_MAX = 22.0, 50.0   # depth range of below-guide turning points
+ABOVE_MIN, ABOVE_MAX = 22.0, 32.0   # height range of above-guide turning points
+DEPTH_SPREAD = 11.0      # consecutive same-side turning points differ by this
+
+# The sheet is a tall survey strip.  The trace's ink is deliberately kept well
+# inside one horizontal band of the coarse layout the sheet is divided into and
+# well inside three of its columns, with a quarter-cell keep-out margin on every
+# side, so the decisive ink forms one thin horizontal strip rather than a filled
+# block.  The absolute band and column are randomised for every scene.
+GRID = 8
+CELL_W = CANVAS_W // GRID
+CELL_H = CANVAS_H // GRID
+KEEP_OUT_W = CELL_W // 4
+KEEP_OUT_H = CELL_H // 4
+STRIP_COLS = 3
+
+TRACE_WIDTH = 3
+FRAME_PAD = 11
+
+INK = (12, 12, 12)
+PAPER = (250, 248, 243)
+FRAME = (170, 170, 170)
+GUIDE = (156, 156, 156)
+DECOY_COLORS = (
+    (126, 156, 214),
+    (206, 148, 116),
+    (146, 190, 150),
+    (196, 156, 200),
+    (154, 178, 198),
+)
+
+
+def _composition(rng: random.Random, total: int, parts: int) -> list[int]:
+    """Split `total` nodes into `parts` runs, every run at least one node."""
+    sizes = [1] * parts
+    for _ in range(total - parts):
+        sizes[rng.randrange(parts)] += 1
+    return sizes
+
+
+def _trace_offsets(rng: random.Random, returns: int) -> list[float] | None:
+    """Signed offsets from the guide height for nodes 1..NODES-1.
+
+    Positive offsets are below the guide height (image y grows downward).  The
+    run structure starts below the guide and contains exactly `returns`
+    below->above transitions.
+    """
+    ends_below = rng.random() < 0.5
+    runs = 2 * returns + (1 if ends_below else 0)
+    if runs > NODES - 1:
+        return None
+    sizes = _composition(rng, NODES - 1, runs)
+
+    offsets: list[float] = []
+    below = True
+    for size in sizes:
+        previous: float | None = None
+        for _ in range(size):
+            for _attempt in range(24):
+                if below:
+                    value = rng.uniform(BELOW_MIN, BELOW_MAX)
+                else:
+                    value = rng.uniform(ABOVE_MIN, ABOVE_MAX)
+                if previous is None or abs(value - previous) >= DEPTH_SPREAD:
+                    break
+            previous = value
+            offsets.append(value if below else -value)
+        below = not below
+
+    # A quarter of the scenes deliberately place one turning point close to the
+    # sampler floor so the gallery carries genuine near-boundary coverage.
+    if rng.random() < 0.25:
+        index = rng.randrange(len(offsets))
+        sign = 1.0 if offsets[index] > 0 else -1.0
+        offsets[index] = sign * rng.uniform(CLEAR_FLOOR, NEAR_FLOOR_HI)
+    return offsets
+
+
+def _returns_from_offsets(offsets: list[float]) -> int:
+    count = 0
+    previous = 1.0  # node 0 sits on the guide and the trace drops first
+    for value in offsets:
+        if previous > 0 and value < 0:
+            count += 1
+        previous = value
+    return count
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one scene deterministically from `seed`."""
+    rng = random.Random(seed * 7919 + 104729)
+    target = rng.randrange(MIN_RETURNS, MAX_RETURNS + 1)
+
+    offsets: list[float] | None = None
+    for attempt in range(600):
+        candidate = _trace_offsets(rng, target)
+        if candidate is None:
+            continue
+        if _returns_from_offsets(candidate) != target:
+            continue
+        travel = abs(candidate[0])
+        travel += sum(abs(b - a) for a, b in zip(candidate, candidate[1:]))
+        band_ok = TRAVEL_MIN <= travel <= TRAVEL_MAX
+        if band_ok or attempt > 480:  # relaxed tail keeps sampling total
+            offsets = candidate
+            break
+    if offsets is None:  # pragma: no cover - defensive, structurally unreachable
+        offsets = [26.0, 44.0, 24.0, 50.0, 22.0, 46.0, -26.0, 40.0, 22.0, 48.0]
+        offsets = offsets[: NODES - 1]
+
+    above = max([-value for value in offsets if value < 0] or [0.0])
+    below = max([value for value in offsets if value > 0] or [0.0])
+    extent = above + below + TRACE_WIDTH + 2.0
+
+    # Horizontal: the ink spans exactly STRIP_COLS grid columns of the layout
+    # grid, starting at a randomly chosen column.
+    usable_w = STRIP_COLS * CELL_W - 2 * KEEP_OUT_W - 6.0
+    spacing = round(rng.uniform(17.0, 19.2), 3)
+    span = spacing * (NODES - 1)
+    column = rng.randrange(0, GRID - STRIP_COLS + 1)
+    left = round(
+        column * CELL_W + KEEP_OUT_W + 3.0 + rng.uniform(0.0, usable_w - span),
+        3,
+    )
+
+    # Vertical: the whole ink extent stays inside one grid row, so the decisive
+    # cells form a one-row strip instead of a filled block.
+    row = rng.randrange(0, GRID)
+    usable_h = CELL_H - 2 * KEEP_OUT_H - 6.0
+    top = row * CELL_H + KEEP_OUT_H + 3.0 + rng.uniform(0.0, usable_h - extent)
+    level = round(top + above + 1.0, 3)
+
+    nodes = [(round(left, 3), round(level, 3))]
+    for index, value in enumerate(offsets, start=1):
+        nodes.append((round(left + index * spacing, 3), round(level + value, 3)))
+
+    frame = [
+        round(left - FRAME_PAD, 3),
+        round(level - above - FRAME_PAD, 3),
+        round(left + span + FRAME_PAD, 3),
+        round(level + below + FRAME_PAD, 3),
+    ]
+
+    decoys = []
+    for _ in range(rng.randrange(3, 6)):
+        color = DECOY_COLORS[rng.randrange(len(DECOY_COLORS))]
+        points = []
+        base_x = rng.uniform(24.0, CANVAS_W - 150.0)
+        base_y = rng.uniform(24.0, CANVAS_H - 60.0)
+        for step in range(5):
+            points.append(
+                (
+                    round(base_x + step * rng.uniform(20.0, 34.0), 3),
+                    round(base_y + rng.uniform(-26.0, 26.0), 3),
+                )
+            )
+        if all(
+            point[0] < frame[0] - 12 or point[0] > frame[2] + 12
+            or point[1] < frame[1] - 12 or point[1] > frame[3] + 12
+            for point in points
+        ):
+            decoys.append({"color": list(color), "points": points})
+
+    spare_frames = []
+    for _ in range(rng.randrange(1, 3)):
+        fw = rng.uniform(70.0, 150.0)
+        fh = rng.uniform(50.0, 110.0)
+        fx = rng.uniform(14.0, CANVAS_W - fw - 14.0)
+        fy = rng.uniform(14.0, CANVAS_H - fh - 14.0)
+        box = [round(fx, 3), round(fy, 3), round(fx + fw, 3), round(fy + fh, 3)]
+        if box[2] < frame[0] - 14 or box[0] > frame[2] + 14 or box[3] < frame[1] - 14 or box[1] > frame[3] + 14:
+            spare_frames.append(box)
+
+    ticks = [
+        round(rng.uniform(18.0, CANVAS_W - 18.0), 3)
+        for _ in range(rng.randrange(4, 9))
+    ]
+
+    return {
+        "width": CANVAS_W,
+        "height": CANVAS_H,
+        "nodes": nodes,
+        "trace_width": TRACE_WIDTH,
+        "frame": frame,
+        "spare_frames": spare_frames,
+        "decoys": decoys,
+        "ticks": ticks,
+        "tick_row": round(rng.uniform(24.0, 40.0), 3),
+    }
+
+
+def _guide_level(scene: dict) -> float:
+    return float(scene["nodes"][0][1])
+
+
+def clearances(scene: dict) -> list[float]:
+    """Vertical clearance of every turning node from the guide height."""
+    level = _guide_level(scene)
+    return [abs(float(y) - level) for _, y in scene["nodes"][1:]]
+
+
+def crossing_columns(scene: dict) -> list[float]:
+    """Horizontal positions where the trace passes upward through the guide."""
+    level = _guide_level(scene)
+    nodes = scene["nodes"]
+    columns: list[float] = []
+    for (x0, y0), (x1, y1) in zip(nodes, nodes[1:]):
+        if y0 > level and y1 < level:
+            frac = (float(y0) - level) / (float(y0) - float(y1))
+            columns.append(float(x0) + frac * (float(x1) - float(x0)))
+    return columns
+
+
+def min_crossing_gap(scene: dict) -> float:
+    columns = crossing_columns(scene)
+    if len(columns) < 2:
+        return float(scene["frame"][2] - scene["frame"][0])
+    return min(b - a for a, b in zip(columns, columns[1:]))
+
+
+def analytic_gold(scene: dict) -> str:
+    """Number of upward returns through the guide height, from the nodes."""
+    return str(len(crossing_columns(scene)))
+
+
+def margin(scene: dict) -> float:
+    """Smallest turning-point clearance from the guide height, in pixels."""
+    return round(min(clearances(scene)), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_CLEAR or min_crossing_gap(scene) < 13.0)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases exist: every sampled field is drawn ink."""
+    return []
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), PAPER)
+    draw = ImageDraw.Draw(image)
+
+    row = float(scene["tick_row"])
+    for x in scene["ticks"]:
+        draw.line([(x, row), (x, row + 9.0)], fill=FRAME, width=1)
+
+    for box in scene["spare_frames"]:
+        draw.rectangle(box, outline=FRAME, width=1)
+
+    for decoy in scene["decoys"]:
+        draw.line(
+            [tuple(point) for point in decoy["points"]],
+            fill=tuple(decoy["color"]),
+            width=2,
+        )
+
+    frame = scene["frame"]
+    draw.rectangle(frame, outline=FRAME, width=1)
+
+    level = _guide_level(scene)
+    x = frame[0] + 4.0
+    while x < frame[2] - 4.0:
+        draw.line([(x, level), (min(x + 4.0, frame[2] - 4.0), level)], fill=GUIDE, width=1)
+        x += 9.0
+
+    draw.line(
+        [tuple(node) for node in scene["nodes"]],
+        fill=INK,
+        width=int(scene["trace_width"]),
+        joint="curve",
+    )
+    return image

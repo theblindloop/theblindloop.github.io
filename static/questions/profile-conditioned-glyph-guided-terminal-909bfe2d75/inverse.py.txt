@@ -1,0 +1,142 @@
+"""Independent inverse arm: reconstruct and navigate the graph from RGB pixels only."""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+import numpy as np
+from PIL import Image
+
+PALETTES = {
+    "green": (35, 164, 88),
+    "cyan": (25, 183, 194),
+    "yellow": (236, 180, 34),
+    "orange": (234, 116, 28),
+    "purple": (137, 73, 188),
+    "blue": (42, 105, 207),
+    "red": (205, 55, 63),
+}
+TERMINALS = {"orange", "purple", "blue", "red"}
+
+
+def _components(mask: np.ndarray, minimum: int = 12) -> list[np.ndarray]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        if seen[y, x]:
+            continue
+        stack = [(int(y), int(x))]
+        seen[y, x] = True
+        points = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy-1,cx),(cy+1,cx),(cy,cx-1),(cy,cx+1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _color_components(arr: np.ndarray, rgb: tuple[int, int, int]) -> list[np.ndarray]:
+    delta = arr.astype(np.int32) - np.asarray(rgb, dtype=np.int32)
+    return _components((delta * delta).sum(axis=2) < 55 * 55, minimum=80)
+
+
+def _centroid(component: np.ndarray) -> np.ndarray:
+    # Return x,y order.
+    return component[:, ::-1].mean(axis=0)
+
+
+def _build_markers(arr: np.ndarray):
+    markers = []
+    green = _color_components(arr, PALETTES["green"])
+    if len(green) != 1:
+        raise ValueError(f"expected one green start ring, found {len(green)}")
+    markers.append({"kind": "start", "center": _centroid(green[0])})
+
+    for color in ("cyan", "yellow"):
+        for component in _color_components(arr, PALETTES[color]):
+            ys, xs = component[:, 0], component[:, 1]
+            area_ratio = len(component) / ((xs.max()-xs.min()+1) * (ys.max()-ys.min()+1))
+            glyph = "square" if area_ratio > 0.88 else "circle"
+            markers.append({"kind": "junction", "glyph": glyph, "center": _centroid(component)})
+
+    for color in sorted(TERMINALS):
+        comps = _color_components(arr, PALETTES[color])
+        if len(comps) != 1:
+            raise ValueError(f"expected one {color} terminal, found {len(comps)}")
+        markers.append({"kind": "terminal", "color": color, "center": _centroid(comps[0])})
+    if sum(m["kind"] == "junction" for m in markers) != 3 or len(markers) != 8:
+        raise ValueError("marker reconstruction failed")
+    return markers
+
+
+def _link_graph(arr: np.ndarray, markers: list[dict]):
+    # Near-neutral dark ink only; colored marker borders and antialias blends are excluded.
+    spread = arr.max(axis=2).astype(int) - arr.min(axis=2).astype(int)
+    dark = (arr.max(axis=2) < 105) & (spread < 35)
+    links = _components(dark, minimum=80)
+    graph = {i: [] for i in range(len(markers))}
+    for pixels_yx in links:
+        pixels = pixels_yx[:, ::-1]
+        incident = []
+        for index, marker in enumerate(markers):
+            center = marker["center"]
+            d2 = ((pixels - center) ** 2).sum(axis=1)
+            nearest = float(d2.min())
+            if nearest < 29.0 ** 2:
+                close = pixels[np.argsort(d2)[: min(30, len(pixels))]]
+                vector = close.mean(axis=0) - center
+                norm = float(np.linalg.norm(vector))
+                if norm < 5:
+                    raise ValueError("unclear link tangent")
+                incident.append((index, vector / norm))
+        if len(incident) == 2:
+            (a, va), (b, vb) = incident
+            graph[a].append((b, va))
+            graph[b].append((a, vb))
+    degrees = sorted(len(values) for values in graph.values())
+    if degrees != [1, 1, 1, 1, 1, 3, 3, 3]:
+        raise ValueError(f"reconstructed graph degrees are {degrees}")
+    return graph
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    markers = _build_markers(arr)
+    graph = _link_graph(arr, markers)
+    current = next(i for i, m in enumerate(markers) if m["kind"] == "start")
+    previous = None
+    incoming = None
+    for _step in range(4):
+        marker = markers[current]
+        if marker["kind"] == "terminal":
+            return marker["color"]
+        options = [(n, v) for n, v in graph[current] if n != previous]
+        if previous is None:
+            if len(options) != 1:
+                raise ValueError("start does not have one outgoing link")
+            chosen, outward = options[0]
+        else:
+            if marker["kind"] != "junction" or len(options) != 2:
+                raise ValueError("route did not enter a binary junction")
+            # The outward vector of the incoming edge points back toward the previous node.
+            back = next(v for n, v in graph[current] if n == previous)
+            travel = -back
+            scored = []
+            for neighbor, outward in options:
+                cross = travel[0] * outward[1] - travel[1] * outward[0]
+                scored.append((cross, neighbor, outward))
+            # Image y grows downward: negative cross is a left turn.
+            scored.sort(key=lambda item: item[0])
+            selected = scored[0] if marker["glyph"] == "circle" else scored[-1]
+            if abs(scored[1][0] - scored[0][0]) < 1.2:
+                raise ValueError("junction turn margin is too small")
+            _score, chosen, outward = selected
+        previous, current = current, chosen
+        incoming = outward
+    raise ValueError("navigation did not terminate")

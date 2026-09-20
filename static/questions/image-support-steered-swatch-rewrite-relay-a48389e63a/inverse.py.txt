@@ -1,0 +1,163 @@
+"""Pixel-only oracle for the swatch_rewrite_relay world.
+
+Receives one RGB image and nothing else: no scene, no renderer, no gold.  It
+segments the saturated swatches, groups them into two horizontal bands of three
+tiles, finds the badge as the single swatch wrapped by a dark ring, reads every
+other tile as a two-swatch rewrite card (left swatch = guard colour, right
+swatch = result colour), replays the cards in reading order from the badge
+colour, and names the colour carried at the end.
+
+It abstains whenever the board is not fully legible: wrong number of bands or
+tiles, malformed swatches, an ambiguous colour, a missing or duplicated ring.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "swatch_rewrite_relay-oracle-0.1.0"
+
+_SATURATION = 55
+_DARK_MAX = 110
+_MIN_AREA = 90
+_MIN_SIDE = 9
+_MAX_SIDE = 26
+_BAND_TOLERANCE = 20
+_TILE_GAP = 20
+_RING_HALO = 16
+_RING_PIXELS = 16
+_COLOUR_ACCEPT = 60.0
+_COLOUR_SEPARATION = 30.0
+
+_REFERENCE = {
+    "red": (198, 42, 42),
+    "green": (32, 138, 66),
+    "blue": (40, 84, 200),
+    "purple": (142, 48, 168),
+    "orange": (226, 132, 22),
+}
+ABSTAIN = "abstain"
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    """Four-connected components of a boolean mask, as pixel lists."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    blobs: list[list[tuple[int, int]]] = []
+    for sy, sx in np.argwhere(mask):
+        if seen[sy, sx]:
+            continue
+        stack = [(int(sy), int(sx))]
+        seen[sy, sx] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        blobs.append(pixels)
+    return blobs
+
+
+def _classify(mean: np.ndarray) -> str | None:
+    distances = sorted(
+        (float(np.linalg.norm(mean - np.array(value, dtype=np.float64))), name)
+        for name, value in _REFERENCE.items()
+    )
+    if distances[0][0] > _COLOUR_ACCEPT:
+        return None
+    if distances[1][0] - distances[0][0] < _COLOUR_SEPARATION:
+        return None
+    return distances[0][1]
+
+
+def _swatches(rgb: np.ndarray) -> list[dict] | None:
+    channel_max = rgb.max(axis=2).astype(np.int16)
+    channel_min = rgb.min(axis=2).astype(np.int16)
+    coloured = (channel_max - channel_min) >= _SATURATION
+    if not coloured.any():
+        return None
+    found: list[dict] = []
+    for pixels in _components(coloured):
+        if len(pixels) < _MIN_AREA:
+            return None
+        ys = [y for y, _x in pixels]
+        xs = [x for _y, x in pixels]
+        top, bottom = min(ys), max(ys)
+        left, right = min(xs), max(xs)
+        h, w = bottom - top + 1, right - left + 1
+        if not (_MIN_SIDE <= h <= _MAX_SIDE and _MIN_SIDE <= w <= _MAX_SIDE):
+            return None
+        if abs(h - w) > 3 or len(pixels) < int(0.85 * h * w):
+            return None
+        mean = np.array([rgb[y, x] for y, x in pixels], dtype=np.float64).mean(axis=0)
+        name = _classify(mean)
+        if name is None:
+            return None
+        found.append(
+            {"top": top, "bottom": bottom, "left": left, "right": right, "colour": name}
+        )
+    return found
+
+
+def _ringed(dark: np.ndarray, swatch: dict) -> bool:
+    height, width = dark.shape
+    y0 = max(0, swatch["top"] - _RING_HALO)
+    y1 = min(height, swatch["bottom"] + _RING_HALO + 1)
+    x0 = max(0, swatch["left"] - _RING_HALO)
+    x1 = min(width, swatch["right"] + _RING_HALO + 1)
+    window = dark[y0:y1, x0:x1]
+    total = int(window.sum())
+    inner = int(
+        dark[swatch["top"] : swatch["bottom"] + 1, swatch["left"] : swatch["right"] + 1].sum()
+    )
+    return (total - inner) >= _RING_PIXELS
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    dark = rgb.max(axis=2) < _DARK_MAX
+
+    swatches = _swatches(rgb)
+    if not swatches or len(swatches) != 11:
+        return ABSTAIN
+
+    bands: list[list[dict]] = []
+    for swatch in sorted(swatches, key=lambda item: item["top"]):
+        if bands and abs(swatch["top"] - bands[-1][0]["top"]) <= _BAND_TOLERANCE:
+            bands[-1].append(swatch)
+        else:
+            bands.append([swatch])
+    if len(bands) != 2:
+        return ABSTAIN
+
+    tiles: list[list[dict]] = []
+    for band in bands:
+        row = sorted(band, key=lambda item: item["left"])
+        groups: list[list[dict]] = [[row[0]]]
+        for swatch in row[1:]:
+            if swatch["left"] - groups[-1][-1]["right"] <= _TILE_GAP:
+                groups[-1].append(swatch)
+            else:
+                groups.append([swatch])
+        if len(groups) != 3:
+            return ABSTAIN
+        tiles.extend(groups)
+
+    ringed = [tile for tile in tiles if len(tile) == 1 and _ringed(dark, tile[0])]
+    if len(ringed) != 1 or len(tiles[0]) != 1 or tiles[0] is not ringed[0]:
+        return ABSTAIN
+    if any(len(tile) != 2 for tile in tiles[1:]):
+        return ABSTAIN
+
+    value = tiles[0][0]["colour"]
+    for tile in tiles[1:]:
+        source, target = tile[0]["colour"], tile[1]["colour"]
+        if source == target:
+            return ABSTAIN
+        if value == source:
+            value = target
+    return value

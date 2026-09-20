@@ -1,0 +1,139 @@
+"""Image-only inverse arm for the stripe-phase moire world.
+
+Receives a rasterised PNG and nothing else: no scene, no renderer, no gold, no
+prompts. It locates the two printed registration frames, recovers the 7x7 cell
+lattice of each plate from the frames alone, measures how far each cell pair's
+rulings are out of step by correlating their column profiles, and matches the
+resulting pattern against the five symbol templates named in the public
+question. It abstains when the fiducial frames or the rulings are not readable.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+GRID = 7  # stated in the public question text
+SYMBOL_NAMES = ("cross", "ring", "saltire", "tee", "wedge")
+
+_TEMPLATE_ART = {
+    "cross": ("...#...", "...#...", "...#...", "#######", "...#...", "...#...", "...#..."),
+    "ring": ("#######", "#.....#", "#.....#", "#.....#", "#.....#", "#.....#", "#######"),
+    "saltire": ("#.....#", ".#...#.", "..#.#..", "...#...", "..#.#..", ".#...#.", "#.....#"),
+    "tee": ("#######", "...#...", "...#...", "...#...", "...#...", "...#...", "...#..."),
+    "wedge": ("#.....#", "#.....#", ".#...#.", ".#...#.", "..#.#..", "..#.#..", "...#..."),
+}
+TEMPLATES = {
+    name: np.array([[1 if ch == "#" else 0 for ch in row] for row in art], dtype=int)
+    for name, art in _TEMPLATE_ART.items()
+}
+
+ABSTAIN = "abstain"
+_FLAT = 1.5  # a cell profile below this contrast carries no ruling
+
+
+def _runs(flags: np.ndarray, minimum: int) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, on in enumerate(flags):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            if i - start >= minimum:
+                out.append((start, i))
+            start = None
+    if start is not None and len(flags) - start >= minimum:
+        out.append((start, len(flags)))
+    return out
+
+
+def _strip_frame(block: np.ndarray) -> np.ndarray | None:
+    """Remove the uniform registration frame band around a plate."""
+    h, w = block.shape[:2]
+    top = 0
+    while top < h // 3 and np.all(block[top] == block[top, 0]):
+        top += 1
+    bottom = h
+    while bottom > 2 * h // 3 and np.all(block[bottom - 1] == block[bottom - 1, 0]):
+        bottom -= 1
+    left = 0
+    while left < w // 3 and np.all(block[:, left] == block[0, left]):
+        left += 1
+    right = w
+    while right > 2 * w // 3 and np.all(block[:, right - 1] == block[0, right - 1]):
+        right -= 1
+    if bottom - top < 4 * GRID or right - left < 4 * GRID:
+        return None
+    return block[top:bottom, left:right]
+
+
+def _plates(image: Image.Image) -> list[np.ndarray] | None:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+    if arr.ndim != 3 or min(arr.shape[:2]) < 4 * GRID:
+        return None
+    sheet = arr[0, 0]
+    mask = np.abs(arr - sheet).max(axis=2) > 12
+    col_runs = _runs(mask.any(axis=0), 4 * GRID)
+    if len(col_runs) != 2:
+        return None
+    plates: list[np.ndarray] = []
+    for x0, x1 in col_runs:
+        row_runs = _runs(mask[:, x0:x1].any(axis=1), 4 * GRID)
+        if len(row_runs) != 1:
+            return None
+        y0, y1 = row_runs[0]
+        inner = _strip_frame(arr[y0:y1, x0:x1])
+        if inner is None:
+            return None
+        plates.append(inner)
+    if plates[0].shape != plates[1].shape:
+        return None
+    return plates
+
+
+def _cell_profiles(plate: np.ndarray) -> list[list[np.ndarray]]:
+    """Mean-removed column profile of every cell interior, in luminance."""
+    h, w = plate.shape[:2]
+    gray = plate[:, :, 0] * 0.299 + plate[:, :, 1] * 0.587 + plate[:, :, 2] * 0.114
+    ch, cw = h / GRID, w / GRID
+    inset_y, inset_x = max(2, int(ch // 8)), max(2, int(cw // 8))
+    rows: list[list[np.ndarray]] = []
+    for r in range(GRID):
+        y0, y1 = int(round(r * ch)) + inset_y, int(round((r + 1) * ch)) - inset_y
+        row: list[np.ndarray] = []
+        for c in range(GRID):
+            x0, x1 = int(round(c * cw)) + inset_x, int(round((c + 1) * cw)) - inset_x
+            profile = gray[y0:y1, x0:x1].mean(axis=0)
+            row.append(profile - profile.mean())
+        rows.append(row)
+    return rows
+
+
+def decide_with_margin(image: Image.Image) -> tuple[str, float]:
+    """Return (symbol or abstain, decision margin in cell units)."""
+    plates = _plates(image)
+    if plates is None:
+        return ABSTAIN, 0.0
+    left, right = _cell_profiles(plates[0]), _cell_profiles(plates[1])
+    grid = np.zeros((GRID, GRID), dtype=int)
+    weakest = 1.0
+    for r in range(GRID):
+        for c in range(GRID):
+            a, b = left[r][c], right[r][c]
+            n = min(a.size, b.size)
+            a, b = a[:n], b[:n]
+            na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+            if na < _FLAT or nb < _FLAT:
+                # A cell with no readable ruling carries no evidence at all.
+                weakest = 0.0
+                continue
+            corr = float(np.dot(a, b) / (na * nb))
+            grid[r, c] = 1 if corr < 0.0 else 0
+            weakest = min(weakest, abs(corr))
+    scored = sorted((int(np.sum(grid != TEMPLATES[n])), n) for n in SYMBOL_NAMES)
+    (best, name), (runner_up, _) = scored[0], scored[1]
+    return name, float(min(10.0 * weakest, float(runner_up - best)))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return decide_with_margin(image)[0]

@@ -1,0 +1,177 @@
+"""Independent pixel-only arm for the husk-merge world.
+
+Receives the final PNG and nothing else. It segments the chip, cuts the dark
+corridor mask at the marker squares, rebuilds the marker graph, walks each green
+cap to the yellow cap and reports the colour of the first shared marker.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+PALETTE = {
+    "green": (30, 150, 70),
+    "yellow": (240, 205, 40),
+    "orange": (235, 130, 25),
+    "purple": (140, 60, 190),
+    "blue": (35, 95, 215),
+}
+ANSWER_COLORS = ("orange", "purple", "blue")
+TOLERANCE = 42
+
+
+class OracleAbstain(ValueError):
+    """Raised when the image does not present a resolvable network."""
+
+
+def _color_mask(arr: np.ndarray, rgb) -> np.ndarray:
+    diff = np.abs(arr - np.asarray(rgb, dtype=np.int16))
+    return diff.max(axis=2) <= TOLERANCE
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    height, width = mask.shape
+    out = []
+    for y0 in range(height):
+        row = mask[y0]
+        for x0 in range(width):
+            if not row[x0] or seen[y0, x0]:
+                continue
+            queue = deque([(y0, x0)])
+            seen[y0, x0] = True
+            blob = []
+            while queue:
+                y, x = queue.popleft()
+                blob.append((y, x))
+                for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] \
+                            and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+            out.append(blob)
+    return out
+
+
+def _chip_mask(arr: np.ndarray) -> np.ndarray:
+    """Flood the opaque chip outward from a green pixel."""
+
+    nonwhite = arr.min(axis=2) < 250
+    green = _color_mask(arr, PALETTE["green"]) & nonwhite
+    seeds = np.argwhere(green)
+    if not len(seeds):
+        raise OracleAbstain("no green cap pixels")
+    height, width = nonwhite.shape
+    mask = np.zeros(nonwhite.shape, dtype=bool)
+    start = tuple(int(v) for v in seeds[0])
+    queue = deque([start])
+    mask[start] = True
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and nonwhite[ny, nx] \
+                    and not mask[ny, nx]:
+                mask[ny, nx] = True
+                queue.append((ny, nx))
+    if mask.sum() < 2000:
+        raise OracleAbstain("chip region is too small to be a network chip")
+    ys, xs = np.nonzero(mask)
+    box_area = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
+    if mask.sum() < 0.9 * box_area:
+        raise OracleAbstain("chip region is not a solid block of ink")
+    return mask
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    mask = _chip_mask(arr)
+    ys, xs = np.nonzero(mask)
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    crop = arr[y0:y1 + 1, x0:x1 + 1]
+    inside = mask[y0:y1 + 1, x0:x1 + 1]
+
+    # marker blobs, one integer label per marker square
+    marker_id = np.zeros(inside.shape, dtype=np.int32)
+    markers: dict[int, str] = {}
+    next_id = 1
+    for name, rgb in PALETTE.items():
+        blobs = _components(_color_mask(crop, rgb) & inside)
+        for blob in blobs:
+            if len(blob) < 40:
+                continue
+            for y, x in blob:
+                marker_id[y, x] = next_id
+            markers[next_id] = name
+            next_id += 1
+
+    greens = [key for key, name in markers.items() if name == "green"]
+    yellows = [key for key, name in markers.items() if name == "yellow"]
+    nodes = [key for key, name in markers.items() if name in ANSWER_COLORS]
+    if len(greens) != 2 or len(yellows) != 1 or len(nodes) != 3:
+        raise OracleAbstain(
+            f"expected 2 green, 1 yellow and 3 coloured nodes, saw "
+            f"{len(greens)}/{len(yellows)}/{len(nodes)}"
+        )
+    if len({markers[key] for key in nodes}) != 3:
+        raise OracleAbstain("coloured nodes are not three distinct colours")
+
+    dark = (crop.max(axis=2) <= 90) & inside
+    height, width = dark.shape
+    adjacency: dict[int, set[int]] = {key: set() for key in markers}
+    for blob in _components(dark):
+        touched = set()
+        for y, x in blob:
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and marker_id[ny, nx]:
+                    touched.add(int(marker_id[ny, nx]))
+        if len(touched) > 2:
+            raise OracleAbstain("a corridor touches more than two markers")
+        if len(touched) == 2:
+            first, second = sorted(touched)
+            adjacency[first].add(second)
+            adjacency[second].add(first)
+
+    live = sum(len(v) for v in adjacency.values()) // 2
+    if live != len(markers) - 1:
+        raise OracleAbstain(f"marker graph has {live} corridors, not a spanning tree")
+
+    exit_key = yellows[0]
+
+    def route(start: int) -> list[int]:
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            current = queue.popleft()
+            if current == exit_key:
+                break
+            for nxt in sorted(adjacency[current]):
+                if nxt not in parent:
+                    parent[nxt] = current
+                    queue.append(nxt)
+        if exit_key not in parent:
+            raise OracleAbstain("a green cap does not reach the yellow cap")
+        path = []
+        node = start
+        # walk forward from start using the parent chain of the exit
+        back = [exit_key]
+        while parent[back[-1]] is not None:
+            back.append(parent[back[-1]])
+        path = list(reversed(back))
+        if path[0] != node:
+            raise OracleAbstain("route reconstruction failed")
+        return path
+
+    first_path = route(greens[0])
+    second = set(route(greens[1]))
+    for key in first_path:
+        if key in second:
+            if markers[key] not in ANSWER_COLORS:
+                raise OracleAbstain("the first shared marker is not a coloured node")
+            return markers[key]
+    raise OracleAbstain("the two routes share no marker")

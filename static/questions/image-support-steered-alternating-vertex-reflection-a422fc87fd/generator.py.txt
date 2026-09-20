@@ -1,0 +1,168 @@
+"""Deterministic scene sampler and raster renderer for an alternating-reflection trail."""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 640
+HEIGHT = 360
+QUARANTINE_MARGIN = 20.0
+
+# Seven internal offsets. Positive is the left-hand screen normal while moving
+# from the red endpoint toward the gold endpoint. All classes have equal peak
+# magnitude and equal L1 displacement, blocking total-offset and extent cues.
+TEMPLATES: dict[str, tuple[float, ...]] = {
+    "arch": (1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0),
+    "cup": (-1.0, -2.0, -3.0, -4.0, -3.0, -2.0, -1.0),
+    "wave": (2.0, 4.0, 2.0, 0.0, -2.0, -4.0, -2.0),
+}
+
+THEMES = (
+    {"background": (246, 243, 234), "trail": (34, 45, 58), "pale": (226, 223, 214)},
+    {"background": (240, 247, 244), "trail": (52, 42, 69), "pale": (220, 230, 226)},
+    {"background": (247, 241, 246), "trail": (35, 61, 49), "pale": (229, 218, 227)},
+)
+MARKER = (35, 174, 186)
+RED = (222, 62, 72)
+GOLD = (239, 174, 45)
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    pattern = ("arch", "cup", "wave")[int(seed) % 3]
+    distractors = []
+    for band_y in (30.0, 326.0):
+        for _ in range(4):
+            distractors.append(
+                [
+                    round(rng.uniform(35.0, 605.0), 4),
+                    round(band_y + rng.uniform(-10.0, 10.0), 4),
+                    round(rng.uniform(10.0, 27.0), 4),
+                    round(rng.uniform(-70.0, 70.0), 4),
+                ]
+            )
+    return {
+        "pattern": pattern,
+        "wave_polarity": rng.choice((-1, 1)) if pattern == "wave" else 1,
+        "angle_deg": round(rng.uniform(-16.0, 16.0), 6),
+        "center_x": round(rng.uniform(312.0, 328.0), 6),
+        "center_y": round(rng.uniform(171.0, 189.0), 6),
+        "chord_length": round(rng.uniform(458.0, 498.0), 6),
+        "amplitude": round(rng.uniform(11.0, 13.5), 6),
+        "jitter": [round(rng.uniform(-0.10, 0.10), 6) for _ in range(7)],
+        "stroke_width": rng.choice((7, 8, 9)),
+        "theme": rng.randrange(len(THEMES)),
+        "distractors": distractors,
+    }
+
+
+def _target_offsets(scene: dict) -> list[float]:
+    values = np.asarray(TEMPLATES[scene["pattern"]], dtype=float)
+    if scene["pattern"] == "wave":
+        values = values * int(scene["wave_polarity"])
+    values = values + np.asarray(scene["jitter"], dtype=float)
+    return (values * float(scene["amplitude"])).tolist()
+
+
+def _station_points(scene: dict) -> list[tuple[float, float]]:
+    angle = math.radians(float(scene["angle_deg"]))
+    along = np.asarray((math.cos(angle), math.sin(angle)), dtype=float)
+    # In screen coordinates this is the visual left-hand normal for red->gold.
+    normal = np.asarray((along[1], -along[0]), dtype=float)
+    center = np.asarray((float(scene["center_x"]), float(scene["center_y"])), dtype=float)
+    length = float(scene["chord_length"])
+    target = [0.0, *_target_offsets(scene), 0.0]
+    points = []
+    for index, offset in enumerate(target):
+        displayed = -offset if index in (2, 4, 6) else offset
+        station = center + along * (length * (index / 8.0 - 0.5)) + normal * displayed
+        points.append((float(station[0]), float(station[1])))
+    return points
+
+
+def _fit_distance(values: np.ndarray, prototype: np.ndarray, *, allow_sign: bool) -> float:
+    trials: Iterable[np.ndarray] = (prototype, -prototype) if allow_sign else (prototype,)
+    energy = max(float(values @ values), 1e-9)
+    best = float("inf")
+    for trial in trials:
+        scale = max(0.0, float(values @ trial) / float(trial @ trial))
+        residual = values - scale * trial
+        best = min(best, float(residual @ residual) / energy)
+    return best
+
+
+def _distances_from_transformed(values: list[float]) -> dict[str, float]:
+    vector = np.asarray(values, dtype=float)
+    return {
+        name: _fit_distance(vector, np.asarray(template, dtype=float), allow_sign=(name == "wave"))
+        for name, template in TEMPLATES.items()
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    theme = THEMES[int(scene["theme"])]
+    ss = 3
+    image = Image.new("RGB", (WIDTH * ss, HEIGHT * ss), theme["background"])
+    draw = ImageDraw.Draw(image)
+
+    # Pale marks are visible nuisances but remain far below the carrier contrast.
+    for x, y, length, degrees in scene["distractors"]:
+        theta = math.radians(float(degrees))
+        dx, dy = math.cos(theta) * float(length) / 2.0, math.sin(theta) * float(length) / 2.0
+        draw.line(
+            ((x - dx) * ss, (y - dy) * ss, (x + dx) * ss, (y + dy) * ss),
+            fill=theme["pale"],
+            width=2 * ss,
+        )
+
+    points = _station_points(scene)
+    scaled = [(x * ss, y * ss) for x, y in points]
+    draw.line(scaled, fill=theme["trail"], width=int(scene["stroke_width"]) * ss, joint="curve")
+
+    marker_radius = 6.2 * ss
+    for x, y in scaled[1:-1]:
+        draw.ellipse(
+            (x - marker_radius, y - marker_radius, x + marker_radius, y + marker_radius),
+            fill=MARKER,
+            outline=theme["trail"],
+            width=2 * ss,
+        )
+
+    # Red ring at the first endpoint.
+    x0, y0 = scaled[0]
+    outer, inner = 13.0 * ss, 6.2 * ss
+    draw.ellipse((x0 - outer, y0 - outer, x0 + outer, y0 + outer), fill=RED)
+    draw.ellipse((x0 - inner, y0 - inner, x0 + inner, y0 + inner), fill=theme["background"])
+
+    # Gold triangle whose centroid is exactly the final endpoint.
+    x1, y1 = np.asarray(scaled[-1], dtype=float)
+    theta = math.radians(float(scene["angle_deg"]))
+    along = np.asarray((math.cos(theta), math.sin(theta)), dtype=float) * ss
+    normal = np.asarray((along[1], -along[0]), dtype=float)
+    center = np.asarray((x1, y1), dtype=float)
+    triangle = [center + 14.0 * along, center - 7.0 * along + 10.5 * normal, center - 7.0 * along - 10.5 * normal]
+    draw.polygon([tuple(point) for point in triangle], fill=GOLD)
+
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["pattern"])
+
+
+def margin(scene: dict) -> float:
+    distances = sorted(_distances_from_transformed(_target_offsets(scene)).values())
+    return round((distances[1] - distances[0]) * 100.0, 9)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

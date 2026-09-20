@@ -1,0 +1,109 @@
+"""Independent image-only inverse arm for stable color-to-edge replay."""
+
+from __future__ import annotations
+
+from collections import deque
+import numpy as np
+from PIL import Image
+
+
+class AmbiguousImage(ValueError):
+    pass
+
+
+PALETTE = {
+    "red": np.array((220, 64, 62)),
+    "green": np.array((43, 157, 92)),
+    "blue": np.array((54, 112, 203)),
+}
+
+
+def _components(mask: np.ndarray, minimum: int = 100) -> list[np.ndarray]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result = []
+    for y, x in zip(*np.nonzero(mask), strict=True):
+        if seen[y, x]:
+            continue
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points = []
+        while queue:
+            yy, xx = queue.popleft()
+            points.append((yy, xx))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = yy + dy, xx + dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            result.append(np.asarray(points, dtype=np.int32))
+    return result
+
+
+def _color_masks(arr: np.ndarray) -> dict[str, np.ndarray]:
+    rgb = arr.astype(np.int16)
+    distances = {name: np.max(np.abs(rgb - value), axis=2) for name, value in PALETTE.items()}
+    masks = {name: distance < 24 for name, distance in distances.items()}
+    if any(np.count_nonzero(mask) < 1000 for mask in masks.values()):
+        raise AmbiguousImage("one or more color categories are missing")
+    return masks
+
+
+def _parse_colored_components(arr: np.ndarray):
+    initial, commands = [], []
+    for color, mask in _color_masks(arr).items():
+        for points in _components(mask, 500):
+            ys, xs = points[:, 0], points[:, 1]
+            width = int(xs.max() - xs.min() + 1)
+            height = int(ys.max() - ys.min() + 1)
+            cx, cy = float(xs.mean()), float(ys.mean())
+            if width >= 65 and height >= 65 and cy < arr.shape[0] * 0.48:
+                initial.append((cx, cy, color))
+            elif width >= 80 and height >= 50 and cy > arr.shape[0] * 0.55:
+                midpoint = (float(xs.min()) + float(xs.max())) / 2
+                left = int(np.count_nonzero(xs < midpoint))
+                right = int(np.count_nonzero(xs > midpoint))
+                asymmetry = abs(left - right) / len(xs)
+                if asymmetry < 0.05:
+                    raise AmbiguousImage("command arrow direction is ambiguous")
+                commands.append((cx, color, "L" if left > right else "R"))
+    initial.sort()
+    commands.sort()
+    if len(initial) != 6:
+        raise AmbiguousImage(f"expected six initial tokens, found {len(initial)}")
+    if len(commands) != 5:
+        raise AmbiguousImage(f"expected five command arrows, found {len(commands)}")
+    if min(np.diff([item[0] for item in initial])) < 80:
+        raise AmbiguousImage("initial token order is unresolved")
+    if min(np.diff([item[0] for item in commands])) < 100:
+        raise AmbiguousImage("command order is unresolved")
+    return initial, commands
+
+
+def _marked_index(arr: np.ndarray, initial) -> int:
+    magenta = ((arr[..., 0] > 155) & (arr[..., 1] < 85) &
+               (arr[..., 2] > 90) & (arr[..., 2] < 165))
+    points = np.argwhere(magenta)
+    if len(points) < 800:
+        raise AmbiguousImage("magenta marker is missing")
+    x = float(points[:, 1].mean())
+    distances = [abs(x - token[0]) for token in initial]
+    order = np.argsort(distances)
+    if distances[int(order[0])] > 25 or distances[int(order[1])] - distances[int(order[0])] < 50:
+        raise AmbiguousImage("marker is not bound to exactly one token")
+    return int(order[0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or min(arr.shape[:2]) < 300:
+        raise AmbiguousImage("unsupported raster")
+    initial, commands = _parse_colored_components(arr)
+    marked = _marked_index(arr, initial)
+    row = [(color, index) for index, (_, _, color) in enumerate(initial)]
+    for _, color, edge in commands:
+        selected = [token for token in row if token[0] == color]
+        others = [token for token in row if token[0] != color]
+        row = selected + others if edge == "L" else others + selected
+    return str(next(index for index, token in enumerate(row) if token[1] == marked) + 1)

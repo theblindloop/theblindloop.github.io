@@ -1,0 +1,327 @@
+"""Renderer for the port-weave world.
+
+A scene holds several opaque square plates. Every plate carries four colored
+edge ports and two thick dark bands that join those ports in two non-crossing
+pairs entirely inside the plate. Exactly one plate carries a green port; that
+plate is the hub and its internal weave decides the answer. Every other plate
+is a decoy with the same visual grammar and no green port.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 640
+HEIGHT = 512
+LATTICE = 12
+STEP = 7
+TILE = LATTICE * STEP + 1  # 85 px inclusive square
+
+BG = (255, 255, 255)
+PLATE = (214, 214, 214)
+DARK = (38, 38, 46)
+BAND_HALF = 3  # 7 px band
+PORT_HALF_LONG = 8
+PORT_DEPTH = 13
+
+COLORS = {
+    "green": (30, 150, 70),
+    "orange": (235, 130, 25),
+    "purple": (140, 60, 190),
+    "blue": (35, 95, 215),
+    "yellow": (235, 200, 35),
+    "red": (210, 45, 45),
+    "cyan": (25, 175, 185),
+}
+ANSWER_COLORS = ("orange", "purple", "blue")
+DECOY_COLORS = ("orange", "purple", "blue", "yellow", "red", "cyan")
+
+# canonical port lattice points, indexed by side 0=N 1=E 2=S 3=W
+PORTS = ((6, 0), (LATTICE, 6), (6, LATTICE), (0, 6))
+QUARANTINE_MARGIN = 18.0
+
+
+# --------------------------------------------------------------------------- geometry
+def _transform(point, rot: int, mirror: int):
+    c, r = point
+    if mirror:
+        c = LATTICE - c
+    for _ in range(rot):
+        c, r = LATTICE - r, c
+    return (c, r)
+
+
+def _canonical_routes(a1: int, b1: int, a2: int, b2: int):
+    """Two non-crossing lattice polylines: N->E above the diagonal, S->W below."""
+
+    route_ne = [(6, 0), (6, a1), (b1, a1), (b1, 6), (LATTICE, 6)]
+    route_sw = [
+        (6, LATTICE),
+        (6, LATTICE - a2),
+        (LATTICE - b2, LATTICE - a2),
+        (LATTICE - b2, 6),
+        (0, 6),
+    ]
+    return route_ne, route_sw
+
+
+def _tile_routes(tile: dict):
+    route_ne, route_sw = _canonical_routes(tile["a1"], tile["b1"], tile["a2"], tile["b2"])
+    rot, mirror = tile["rot"], tile["mirror"]
+    moved = [
+        [_transform(p, rot, mirror) for p in route_ne],
+        [_transform(p, rot, mirror) for p in route_sw],
+    ]
+    return moved
+
+
+def _side_of(point) -> int:
+    return PORTS.index(point)
+
+
+def pair_map(rot: int, mirror: int) -> dict:
+    """Side -> partner side after a dihedral transform of the canonical weave.
+
+    The canonical weave joins N to E and S to W, so only the orientation of the
+    plate decides which sides end up paired.
+    """
+
+    mapping = {}
+    for first, last in ((0, 1), (2, 3)):
+        a = _side_of(_transform(PORTS[first], rot, mirror))
+        b = _side_of(_transform(PORTS[last], rot, mirror))
+        mapping[a] = b
+        mapping[b] = a
+    return mapping
+
+
+def _pixel(tile: dict, point):
+    return (tile["x"] + point[0] * STEP, tile["y"] + point[1] * STEP)
+
+
+def _band_rects(tile: dict, route):
+    """Band segments, clipped to the plate so no ink leaves the opaque square."""
+
+    left, top, right, bottom = _tile_rect(tile)
+    rects = []
+    for start, end in zip(route, route[1:]):
+        x0, y0 = _pixel(tile, start)
+        x1, y1 = _pixel(tile, end)
+        rects.append(
+            (
+                max(left, min(x0, x1) - BAND_HALF),
+                max(top, min(y0, y1) - BAND_HALF),
+                min(right, max(x0, x1) + BAND_HALF),
+                min(bottom, max(y0, y1) + BAND_HALF),
+            )
+        )
+    return rects
+
+
+def _port_rect(tile: dict, side: int):
+    cx, cy = _pixel(tile, PORTS[side])
+    if side == 0:
+        return (cx - PORT_HALF_LONG, cy, cx + PORT_HALF_LONG, cy + PORT_DEPTH)
+    if side == 2:
+        return (cx - PORT_HALF_LONG, cy - PORT_DEPTH, cx + PORT_HALF_LONG, cy)
+    if side == 1:
+        return (cx - PORT_DEPTH, cy - PORT_HALF_LONG, cx, cy + PORT_HALF_LONG)
+    return (cx, cy - PORT_HALF_LONG, cx + PORT_DEPTH, cy + PORT_HALF_LONG)
+
+
+def _tile_rect(tile: dict):
+    return (tile["x"], tile["y"], tile["x"] + TILE - 1, tile["y"] + TILE - 1)
+
+
+# --------------------------------------------------------------------------- sampling
+def _sample_tile(rng: random.Random, x: int, y: int, palette: list[str]) -> dict:
+    tile = {
+        "x": int(x),
+        "y": int(y),
+        "rot": rng.randrange(4),
+        "mirror": rng.randrange(2),
+        "a1": rng.choice((2, 3)),
+        "b1": rng.choice((9, 10)),
+        "a2": rng.choice((2, 3)),
+        "b2": rng.choice((9, 10)),
+        "port_colors": list(palette),
+    }
+    return tile
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed) * 6_700_417 + 11)
+
+    slots = [(col, row) for col in range(4) for row in range(3)]
+    rng.shuffle(slots)
+    count = rng.choice((3, 4, 4, 5))
+    chosen = slots[:count]
+
+    placed = []
+    for col, row in chosen:
+        x = col * 160 + 38 + rng.randint(-35, 35)
+        y = row * 170 + 43 + rng.randint(-33, 33)
+        placed.append((max(2, min(WIDTH - TILE - 2, x)), max(2, min(HEIGHT - TILE - 2, y))))
+
+    hub_slot = rng.randrange(count)
+
+    # hub colouring: the answer colour is drawn first, so it is uniform over
+    # classes and independent of orientation, position and plate count
+    answer_color = rng.choice(ANSWER_COLORS)
+    rest = [name for name in ANSWER_COLORS if name != answer_color]
+    rng.shuffle(rest)
+    green_side = rng.randrange(4)
+
+    decoys = []
+    hub = None
+    for index, (x, y) in enumerate(placed):
+        if index == hub_slot:
+            hub = _sample_tile(rng, x, y, ["green"] * 4)
+            partner = pair_map(hub["rot"], hub["mirror"])[green_side]
+            colors = [None, None, None, None]
+            colors[green_side] = "green"
+            colors[partner] = answer_color
+            spare = [side for side in range(4) if colors[side] is None]
+            for side, name in zip(spare, rest):
+                colors[side] = name
+            hub["port_colors"] = colors
+        else:
+            palette = list(DECOY_COLORS)
+            rng.shuffle(palette)
+            decoys.append(_sample_tile(rng, x, y, palette[:4]))
+
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "tile_side": TILE,
+        "hub_x": hub["x"],
+        "hub_y": hub["y"],
+        "hub_rot": hub["rot"],
+        "hub_mirror": hub["mirror"],
+        "hub_a1": hub["a1"],
+        "hub_b1": hub["b1"],
+        "hub_a2": hub["a2"],
+        "hub_b2": hub["b2"],
+        "hub_port_colors": hub["port_colors"],
+        "decoys": decoys,
+    }
+
+
+def hub_tile(scene: dict) -> dict:
+    return {
+        "x": scene["hub_x"],
+        "y": scene["hub_y"],
+        "rot": scene["hub_rot"],
+        "mirror": scene["hub_mirror"],
+        "a1": scene["hub_a1"],
+        "b1": scene["hub_b1"],
+        "a2": scene["hub_a2"],
+        "b2": scene["hub_b2"],
+        "port_colors": scene["hub_port_colors"],
+    }
+
+
+# --------------------------------------------------------------------------- gold
+def analytic_gold(scene: dict) -> str:
+    colors = scene["hub_port_colors"]
+    green_side = colors.index("green")
+    partner = pair_map(scene["hub_rot"], scene["hub_mirror"])[green_side]
+    return colors[partner]
+
+
+def _polyline_points(tile: dict, route) -> np.ndarray:
+    points = []
+    for start, end in zip(route, route[1:]):
+        x0, y0 = _pixel(tile, start)
+        x1, y1 = _pixel(tile, end)
+        steps = max(abs(x1 - x0), abs(y1 - y0))
+        for i in range(steps + 1):
+            t = i / steps if steps else 0.0
+            points.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+    return np.asarray(points, dtype=np.float64)
+
+
+def _rect_gap(a, b) -> float:
+    dx = max(a[0] - b[2], b[0] - a[2])
+    dy = max(a[1] - b[3], b[1] - a[3])
+    if dx >= 0 and dy >= 0:
+        return math.hypot(dx, dy)
+    return float(max(dx, dy))
+
+
+def margin(scene: dict) -> float:
+    values = []
+    hub = hub_tile(scene)
+    rects = [_tile_rect(tile) for tile in [hub] + list(scene["decoys"])]
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            values.append(_rect_gap(rects[i], rects[j]))
+
+    routes = _tile_routes(hub)
+    samples = [_polyline_points(hub, route) for route in routes]
+    distances = np.linalg.norm(samples[0][:, None, :] - samples[1][None, :, :], axis=2)
+    values.append(float(distances.min()) - 2 * BAND_HALF - 1)
+
+    for index, route in enumerate(routes):
+        endpoints = {_side_of(route[0]), _side_of(route[-1])}
+        other = samples[1 - index]
+        for side in range(4):
+            if side in endpoints:
+                continue
+            cx, cy = _pixel(hub, PORTS[side])
+            point = np.asarray([[cx, cy]], dtype=np.float64)
+            gap = float(np.linalg.norm(samples[index] - point, axis=1).min())
+            values.append(gap - BAND_HALF - PORT_HALF_LONG)
+    return round(float(min(values)), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Reordering the disjoint decoy plates is a pixel-identical latent rewrite."""
+
+    out = []
+    decoys = list(scene["decoys"])
+    if len(decoys) >= 2:
+        orders = (
+            ("reverse_decoy_order", list(reversed(decoys))),
+            ("rotate_decoy_order", decoys[1:] + decoys[:1]),
+        )
+    else:
+        orders = (("identity_decoy_order", decoys),)
+    for name, order in orders:
+        other = dict(scene)
+        other["decoys"] = order
+        out.append((name, other))
+    return out
+
+
+# --------------------------------------------------------------------------- render
+def _draw_tile(draw: ImageDraw.ImageDraw, tile: dict) -> None:
+    draw.rectangle(_tile_rect(tile), fill=PLATE)
+    for route in _tile_routes(tile):
+        for rect in _band_rects(tile, route):
+            draw.rectangle(rect, fill=DARK)
+    for side in range(4):
+        draw.rectangle(_port_rect(tile, side), fill=COLORS[tile["port_colors"][side]])
+
+
+def render(scene: dict) -> Image.Image:
+    """Decoy plates are painted first and the wired plate last.
+
+    The plates are pairwise disjoint, so the order is not visible; it keeps the
+    wired-plate selector an ordinary rendered field rather than a label-only one.
+    """
+
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BG)
+    draw = ImageDraw.Draw(image)
+    for tile in scene["decoys"]:
+        _draw_tile(draw, tile)
+    _draw_tile(draw, hub_tile(scene))
+    return image

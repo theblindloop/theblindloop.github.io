@@ -1,0 +1,170 @@
+"""Pixel-only inverse arm for the rule-pair turn transfer world.
+
+Receives one rendered RGB image and nothing else. It segments the framed tiles
+by their exact frame colour, recovers each tile's 5x5 dot pattern from the
+raster, infers which of the four declared operations carries the navy BEFORE
+tile onto the brown AFTER tile, applies that operation to the graphite QUERY
+tile, and returns the frame colour of the unique palette-framed candidate equal
+to the result. Anything ambiguous, damaged or under-determined raises, which the
+harness treats as abstention.
+
+Every constant below is a public question-contract fact stated in the prompt
+text: the grid size, the cell pitch, the frame stroke, the tile counts, the four
+declared operations and the named inks. No renderer code, latent scene,
+coordinate table, filename or metadata is consulted.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+GRID = 5
+CELL = 24
+STROKE = 7
+TILE_SIDE = GRID * CELL + 2 * STROKE
+
+CELL_BG = (253, 252, 249)
+INK = (28, 30, 36)
+BEFORE_FRAME = (32, 62, 118)
+AFTER_FRAME = (124, 86, 22)
+QUERY_FRAME = (58, 60, 68)
+
+FRAME_COLOURS = {
+    "red": (204, 54, 48),
+    "orange": (228, 130, 24),
+    "green": (52, 148, 64),
+    "teal": (28, 150, 158),
+    "blue": (60, 94, 204),
+    "purple": (138, 64, 176),
+}
+
+N_CELLS = GRID * GRID
+N_CANDIDATES = 4
+MIN_FRAME_AREA = 900
+
+OPERATIONS = (
+    "quarter_turn_clockwise",
+    "half_turn",
+    "mirror_left_right",
+    "mirror_top_bottom",
+)
+
+
+def _permutation(operation: str) -> tuple[int, ...]:
+    perm = [0] * N_CELLS
+    for row in range(GRID):
+        for col in range(GRID):
+            if operation == "quarter_turn_clockwise":
+                new_row, new_col = col, GRID - 1 - row
+            elif operation == "half_turn":
+                new_row, new_col = GRID - 1 - row, GRID - 1 - col
+            elif operation == "mirror_left_right":
+                new_row, new_col = row, GRID - 1 - col
+            else:
+                new_row, new_col = GRID - 1 - row, col
+            perm[new_row * GRID + new_col] = row * GRID + col
+    return tuple(perm)
+
+
+PERMUTATIONS = {name: _permutation(name) for name in OPERATIONS}
+
+
+def _apply(operation: str, cells: list[int]) -> list[int]:
+    return [cells[source] for source in PERMUTATIONS[operation]]
+
+
+def _mask(array: np.ndarray, colour) -> np.ndarray:
+    return np.all(array == np.asarray(colour, dtype=np.uint8), axis=-1)
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Bounding boxes of 4-connected true components."""
+    points = np.argwhere(mask)
+    if points.size == 0:
+        return []
+    todo = {(int(y), int(x)) for y, x in points}
+    boxes = []
+    while todo:
+        start = todo.pop()
+        stack = [start]
+        ys = [start[0]]
+        xs = [start[1]]
+        while stack:
+            y, x = stack.pop()
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if (ny, nx) in todo:
+                    todo.discard((ny, nx))
+                    stack.append((ny, nx))
+                    ys.append(ny)
+                    xs.append(nx)
+        boxes.append((min(ys), min(xs), max(ys), max(xs)))
+    return boxes
+
+
+def _tile_boxes(array: np.ndarray, colour) -> list[tuple[int, int, int, int]]:
+    return [
+        box
+        for box in _components(_mask(array, colour))
+        if (box[2] - box[0] + 1) * (box[3] - box[1] + 1) >= MIN_FRAME_AREA
+    ]
+
+
+def _read_tile(array: np.ndarray, box) -> list[int]:
+    """Dot pattern of one framed tile: 1 filled, 0 empty."""
+    top, left, bottom, right = box
+    if abs(bottom - top + 1 - TILE_SIDE) > 2 or abs(right - left + 1 - TILE_SIDE) > 2:
+        raise ValueError("framed tile has an unexpected size")
+    cells: list[int] = []
+    for index in range(N_CELLS):
+        row, col = divmod(index, GRID)
+        cy = top + STROKE + row * CELL + CELL // 2
+        cx = left + STROKE + col * CELL + CELL // 2
+        patch = array[cy - 2 : cy + 3, cx - 2 : cx + 3].reshape(-1, 3)
+        first = patch[0]
+        if not np.all(patch == first):
+            raise ValueError("cell centre is not a uniform colour")
+        value = tuple(int(v) for v in first)
+        if value == INK:
+            cells.append(1)
+        elif value == CELL_BG:
+            cells.append(0)
+        else:
+            raise ValueError(f"unreadable cell colour {value}")
+    return cells
+
+
+def _single_tile(array: np.ndarray, colour, label: str) -> list[int]:
+    boxes = _tile_boxes(array, colour)
+    if len(boxes) != 1:
+        raise ValueError(f"expected exactly one {label} tile, found {len(boxes)}")
+    return _read_tile(array, boxes[0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+    before = _single_tile(array, BEFORE_FRAME, "navy BEFORE")
+    after = _single_tile(array, AFTER_FRAME, "brown AFTER")
+    query = _single_tile(array, QUERY_FRAME, "graphite QUERY")
+
+    rules = [name for name in OPERATIONS if _apply(name, before) == after]
+    if len(rules) != 1:
+        raise ValueError(f"the rule pair admits {len(rules)} declared operations")
+    target = _apply(rules[0], query)
+
+    tiles: list[tuple[str, list[int]]] = []
+    for name, colour in FRAME_COLOURS.items():
+        boxes = _tile_boxes(array, colour)
+        if not boxes:
+            continue
+        if len(boxes) != 1:
+            raise ValueError(f"colour {name} frames more than one tile")
+        tiles.append((name, _read_tile(array, boxes[0])))
+    if len(tiles) != N_CANDIDATES:
+        raise ValueError(f"expected {N_CANDIDATES} candidate tiles, found {len(tiles)}")
+
+    survivors = [name for name, cells in tiles if cells == target]
+    if len(survivors) != 1:
+        raise ValueError(f"the transferred pattern matches {len(survivors)} candidates")
+    return survivors[0]

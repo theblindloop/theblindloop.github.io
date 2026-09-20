@@ -1,0 +1,212 @@
+"""Deterministic latent sampler and renderer for one-per-ring search."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH, HEIGHT = 760, 560
+BACKGROUND = (248, 247, 242)
+PANEL_BORDER = (170, 180, 192)
+RING_COLOR = (24, 58, 90)
+DOT_COLOR = (242, 142, 43)
+TEXT_COLOR = (32, 37, 43)
+RING_WIDTH = 5.0
+QUARANTINE_CLEARANCE_PX = 4.0
+LABELS = "ABCD"
+PANEL_BOUNDS = (
+    (20, 55, 370, 280),
+    (390, 55, 740, 280),
+    (20, 315, 370, 540),
+    (390, 315, 740, 540),
+)
+
+
+def _dot_group(
+    rng: random.Random,
+    cx: float,
+    cy: float,
+    count: int,
+    *,
+    near_boundary: bool,
+) -> list[list[float]]:
+    """Place zero, one, or two radius-eight dots wholly inside one ring."""
+
+    dot_radius = 8.0
+    angle = rng.uniform(0.0, 2.0 * math.pi)
+    if count == 0:
+        return []
+    if count == 1:
+        radial = 18.0 if near_boundary else rng.uniform(1.0, 10.0)
+        return [[cx + radial * math.cos(angle), cy + radial * math.sin(angle), dot_radius]]
+    if count == 2:
+        radial = 13.0
+        return [
+            [cx + radial * math.cos(angle), cy + radial * math.sin(angle), dot_radius],
+            [cx - radial * math.cos(angle), cy - radial * math.sin(angle), dot_radius],
+        ]
+    raise ValueError("ring occupancy must be 0, 1, or 2")
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Sample four balanced panels with a seed-counterbalanced winner."""
+
+    rng = random.Random(int(seed))
+    # The same ring geometry is repeated in every panel, eliminating a panel-size cue.
+    common_rings = [
+        [82.0 + rng.uniform(-4.0, 4.0), 138.0 + rng.uniform(-5.0, 5.0), 34.0],
+        [175.0 + rng.uniform(-4.0, 4.0), 113.0 + rng.uniform(-5.0, 5.0), 34.0],
+        [268.0 + rng.uniform(-4.0, 4.0), 138.0 + rng.uniform(-5.0, 5.0), 34.0],
+    ]
+    target_index = int(seed) % 4
+    distractor_patterns = [[2, 1, 0], [0, 2, 1], [1, 0, 2]]
+    rng.shuffle(distractor_patterns)
+    patterns: list[list[int]] = []
+    cursor = 0
+    for panel_index in range(4):
+        if panel_index == target_index:
+            patterns.append([1, 1, 1])
+        else:
+            patterns.append(distractor_patterns[cursor])
+            cursor += 1
+
+    near_index = int(seed) % 3
+    rings_by_panel = []
+    dots_by_panel = []
+    for panel_index, pattern in enumerate(patterns):
+        rings = copy.deepcopy(common_rings)
+        dots: list[list[float]] = []
+        for ring_index, ((cx, cy, _), count) in enumerate(zip(rings, pattern, strict=True)):
+            dots.extend(
+                _dot_group(
+                    rng,
+                    cx,
+                    cy,
+                    count,
+                    near_boundary=(panel_index == target_index and ring_index == near_index and seed % 6 == 0),
+                )
+            )
+        rng.shuffle(dots)
+        rings_by_panel.append(rings)
+        dots_by_panel.append(dots)
+    return {"rings": rings_by_panel, "dots": dots_by_panel}
+
+
+def _panel_occupancies(rings: list[list[float]], dots: list[list[float]]) -> list[int]:
+    counts = [0 for _ in rings]
+    for dx, dy, dr in dots:
+        owners = []
+        for ring_index, (cx, cy, radius) in enumerate(rings):
+            center_distance = math.hypot(dx - cx, dy - cy)
+            if center_distance + dr < radius - RING_WIDTH / 2.0:
+                owners.append(ring_index)
+        if len(owners) == 1:
+            counts[owners[0]] += 1
+    return counts
+
+
+def _scores(
+    rings_by_panel: list[list[list[float]]],
+    dots_by_panel: list[list[list[float]]],
+) -> list[int]:
+    return [
+        sum(value == 1 for value in _panel_occupancies(rings, dots))
+        for rings, dots in zip(rings_by_panel, dots_by_panel, strict=True)
+    ]
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    scores = _scores(scene["rings"], scene["dots"])
+    best = max(scores)
+    winners = [index for index, score in enumerate(scores) if score == best]
+    if best != 3 or len(winners) != 1:
+        raise ValueError("scene has no unique exact-one-per-ring panel")
+    return LABELS[winners[0]]
+
+
+def margin(scene: dict[str, Any]) -> float:
+    """Discrete winner-versus-runner-up gap in correctly occupied rings."""
+
+    scores = sorted(_scores(scene["rings"], scene["dots"]), reverse=True)
+    return float(scores[0] - scores[1])
+
+
+def minimum_clearance(scene: dict[str, Any]) -> float:
+    """Minimum whole-dot clearance to the inner edge of its owning ring."""
+
+    clearances = []
+    for rings, dots in zip(scene["rings"], scene["dots"], strict=True):
+        for dx, dy, dr in dots:
+            distances = [
+                (radius - RING_WIDTH / 2.0) - (math.hypot(dx - cx, dy - cy) + dr)
+                for cx, cy, radius in rings
+            ]
+            clearances.append(max(distances))
+    return float(min(clearances))
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    try:
+        return margin(scene) <= 0.0 or minimum_clearance(scene) < QUARANTINE_CLEARANCE_PX
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """No render-invariant latent aliases are part of this world."""
+
+    return []
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    rings_by_panel = scene["rings"]
+    dots_by_panel = scene["dots"]
+    if len(rings_by_panel) != 4 or len(dots_by_panel) != 4:
+        raise ValueError("exactly four panels are required")
+    scale = 3
+    image = Image.new("RGB", (WIDTH * scale, HEIGHT * scale), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.load_default(size=25 * scale)
+    except TypeError:  # pragma: no cover - compatibility with older Pillow
+        font = ImageFont.load_default()
+
+    for panel_index, (rings, dots, bounds) in enumerate(
+        zip(rings_by_panel, dots_by_panel, PANEL_BOUNDS, strict=True)
+    ):
+        x0, y0, x1, y1 = bounds
+        sb = tuple(int(value * scale) for value in bounds)
+        draw.rounded_rectangle(
+            sb,
+            radius=15 * scale,
+            outline=PANEL_BORDER,
+            width=4 * scale,
+            fill=BACKGROUND,
+        )
+        draw.text(
+            ((x0 + 15) * scale, (y0 + 10) * scale),
+            LABELS[panel_index],
+            fill=TEXT_COLOR,
+            font=font,
+        )
+        for cx, cy, radius in rings:
+            box = (
+                int((x0 + cx - radius) * scale),
+                int((y0 + cy - radius) * scale),
+                int((x0 + cx + radius) * scale),
+                int((y0 + cy + radius) * scale),
+            )
+            draw.ellipse(box, outline=RING_COLOR, width=int(RING_WIDTH * scale))
+        for cx, cy, radius in dots:
+            box = (
+                int((x0 + cx - radius) * scale),
+                int((y0 + cy - radius) * scale),
+                int((x0 + cx + radius) * scale),
+                int((y0 + cy + radius) * scale),
+            )
+            draw.ellipse(box, fill=DOT_COLOR)
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)

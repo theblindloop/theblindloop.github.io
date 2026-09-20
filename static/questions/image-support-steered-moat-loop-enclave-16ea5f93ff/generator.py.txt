@@ -1,0 +1,402 @@
+"""Renderer for moat_loop_enclave.
+
+One thin dark wall is drawn as a single simple closed rectilinear curve that
+hugs a long one-cell-wide snake of lattice cells. The wall therefore forms one
+connected corridor-shaped ring that reaches widely separated parts of the
+canvas. Two equal dots sit in the picture: one stands inside the ring (in the
+corridor) and one stands outside it, in a one-cell fjord between two parallel
+runs of the same corridor. Locally the two sites are indistinguishable -- both
+are a lane bounded by a wall on two opposite sides -- so telling them apart
+requires following the wall.
+
+Public interface: sample_scene, render, analytic_gold, margin, is_quarantined,
+latent_symmetries.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "moat_loop_enclave-renderer-0.1.0"
+
+WIDTH = 704
+HEIGHT = 520
+CELL = 46
+ORIGIN = (30, 30)
+COLS = 14
+ROWS = 10
+WALL_WIDTH = 5
+DOT_RADIUS = 6
+
+BG = (255, 255, 255)
+WALL = (34, 36, 42)
+ORANGE = (232, 124, 26)
+PURPLE = (150, 90, 220)
+
+SNAKE_MIN = 20
+SNAKE_MAX = 28
+SPAN_MIN_COLS = 11
+BAND_MAX_ROWS = 3
+QUARANTINE_MARGIN = 6.0
+
+# clearance tiers, in pixels, used to place the two dots inside their cells
+TIER_NORMAL = (11.0, 14.0)
+TIER_NEAR = (6.0, 10.0)
+TIER_QUARANTINE = (2.0, 5.0)
+
+_DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+# --------------------------------------------------------------------------
+# lattice snake
+# --------------------------------------------------------------------------
+def _interior_cells() -> list[tuple[int, int]]:
+    return [(x, y) for x in range(1, COLS - 1) for y in range(1, ROWS - 1)]
+
+
+def _diagonal_pinch(cells: set, c: tuple[int, int]) -> bool:
+    """True when adding ``c`` makes a 2x2 block hold exactly one diagonal pair."""
+    x, y = c
+    trial = cells | {c}
+    for bx in (x - 1, x):
+        for by in (y - 1, y):
+            block = [(bx, by), (bx + 1, by), (bx, by + 1), (bx + 1, by + 1)]
+            inside = [p in trial for p in block]
+            if sum(inside) != 2:
+                continue
+            # block indices 0,3 and 1,2 are the two diagonals
+            if (inside[0] and inside[3]) or (inside[1] and inside[2]):
+                return True
+    return False
+
+
+def _extendable(path: list, cells: set, c: tuple[int, int]) -> bool:
+    if c in cells:
+        return False
+    if not (1 <= c[0] <= COLS - 2 and 1 <= c[1] <= ROWS - 2):
+        return False
+    # the induced subgraph must stay a simple path: c may touch only the tip
+    touch = 0
+    for dx, dy in _DIRS:
+        if (c[0] + dx, c[1] + dy) in cells:
+            touch += 1
+    if touch != 1:
+        return False
+    if _diagonal_pinch(cells, c):
+        return False
+    return True
+
+
+def _grow_snake(rng: random.Random, target: int) -> list | None:
+    start = (rng.randrange(1, COLS - 1), rng.randrange(1, ROWS - 1))
+    path = [start]
+    cells = {start}
+    heading = rng.choice(_DIRS)
+    stalls = 0
+    while len(path) < target:
+        tip = path[-1]
+        options = [d for d in _DIRS if _extendable(path, cells, (tip[0] + d[0], tip[1] + d[1]))]
+        if not options:
+            stalls += 1
+            if stalls > 0:
+                return None
+        weights = [3.0 if d == heading else 1.0 for d in options]
+        d = rng.choices(options, weights=weights, k=1)[0]
+        heading = d
+        nxt = (tip[0] + d[0], tip[1] + d[1])
+        path.append(nxt)
+        cells.add(nxt)
+    return path
+
+
+def _fjords(cells: set) -> list:
+    """Outside cells wedged between two opposite runs of the corridor."""
+    out = []
+    for x in range(1, COLS - 1):
+        for y in range(1, ROWS - 1):
+            c = (x, y)
+            if c in cells:
+                continue
+            horiz = ((x - 1, y) in cells) and ((x + 1, y) in cells)
+            vert = ((x, y - 1) in cells) and ((x, y + 1) in cells)
+            if horiz != vert:  # exactly one opposite pair, so it looks like a lane
+                if horiz and (((x, y - 1) in cells) or ((x, y + 1) in cells)):
+                    continue
+                if vert and (((x - 1, y) in cells) or ((x + 1, y) in cells)):
+                    continue
+                out.append(c)
+    return out
+
+
+def _lane_cells(path: list) -> list:
+    """Corridor cells that are a straight run, so they look like a fjord."""
+    out = []
+    for i in range(1, len(path) - 1):
+        a, b, c = path[i - 1], path[i], path[i + 1]
+        if (a[0] == c[0]) or (a[1] == c[1]):
+            out.append(b)
+    return out
+
+
+# --------------------------------------------------------------------------
+# boundary loop of the snake
+# --------------------------------------------------------------------------
+def _boundary_loop(cells: set) -> list | None:
+    edges: dict = {}
+
+    def add(v1, v2):
+        edges.setdefault(v1, []).append(v2)
+        edges.setdefault(v2, []).append(v1)
+
+    for (x, y) in sorted(cells):
+        if (x + 1, y) not in cells:
+            add((x + 1, y), (x + 1, y + 1))
+        if (x - 1, y) not in cells:
+            add((x, y), (x, y + 1))
+        if (x, y + 1) not in cells:
+            add((x, y + 1), (x + 1, y + 1))
+        if (x, y - 1) not in cells:
+            add((x, y), (x + 1, y))
+
+    if any(len(v) != 2 for v in edges.values()):
+        return None
+    start = min(edges)
+    loop = [start]
+    prev = None
+    cur = start
+    while True:
+        a, b = edges[cur]
+        nxt = a if a != prev else b
+        if nxt == start:
+            break
+        loop.append(nxt)
+        prev, cur = cur, nxt
+        if len(loop) > 4 * len(edges):
+            return None
+    if len(loop) != len(edges):  # more than one loop: reject the sample
+        return None
+
+    # compress collinear runs into corners
+    corners = []
+    n = len(loop)
+    for i in range(n):
+        p, q, r = loop[i - 1], loop[i], loop[(i + 1) % n]
+        if (p[0] == q[0] == r[0]) or (p[1] == q[1] == r[1]):
+            continue
+        corners.append(list(q))
+    return corners
+
+
+def _pix(v: Iterable) -> tuple[float, float]:
+    i, j = v
+    return (ORIGIN[0] + i * CELL, ORIGIN[1] + j * CELL)
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    for _attempt in range(4000):
+        target = rng.randint(SNAKE_MIN, SNAKE_MAX)
+        path = _grow_snake(rng, target)
+        if path is None:
+            continue
+        cells = set(path)
+        xs = [c[0] for c in path]
+        ys = [c[1] for c in path]
+        bw, bh = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+        # keep the corridor an elongated trace rather than a blob: it must reach
+        # across the canvas while staying a shallow band
+        if bw < SPAN_MIN_COLS or bh > BAND_MAX_ROWS:
+            continue
+        loop = _boundary_loop(cells)
+        if loop is None:
+            continue
+        fjords = _fjords(cells)
+        lanes = _lane_cells(path)
+        if not fjords or not lanes:
+            continue
+        out_cell = rng.choice(fjords)
+        far = [c for c in lanes if abs(c[0] - out_cell[0]) + abs(c[1] - out_cell[1]) >= 5]
+        if not far:
+            continue
+        in_cell = rng.choice(far)
+        break
+    else:  # pragma: no cover - the sampler always succeeds on the used seeds
+        raise RuntimeError(f"no valid scene for seed {seed}")
+
+    tier = rng.choices((0, 1, 2), weights=(0.60, 0.25, 0.15), k=1)[0]
+    lo, hi = (TIER_NORMAL, TIER_NEAR, TIER_QUARANTINE)[tier]
+    reach = CELL / 2.0 - WALL_WIDTH / 2.0 - DOT_RADIUS  # 14.5 px
+    targets = []
+    for _ in range(2):
+        t = rng.uniform(lo, hi)
+        targets.append(min(t, reach))
+    # the tighter of the two dots defines the tier; the other is never looser
+    offs = [round(reach - t, 1) for t in targets]
+
+    dots = []
+    for cell, off in ((in_cell, offs[0]), (out_cell, offs[1])):
+        cx = ORIGIN[0] + cell[0] * CELL + CELL / 2.0
+        cy = ORIGIN[1] + cell[1] * CELL + CELL / 2.0
+        dx, dy = rng.choice(((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)))
+        dots.append([round(cx + dx * off, 1), round(cy + dy * off, 1)])
+
+    # colour assignment is an independent bit tied to seed parity, so answer
+    # identity is decorrelated from every positional or structural cue
+    inside_is_orange = (seed % 2) == 0
+    if inside_is_orange:
+        painted = [{"color": "orange", "center": dots[0]}, {"color": "purple", "center": dots[1]}]
+    else:
+        painted = [{"color": "purple", "center": dots[0]}, {"color": "orange", "center": dots[1]}]
+    painted.sort(key=lambda d: d["color"])
+
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "cell": CELL,
+        "origin": list(ORIGIN),
+        "wall_width": WALL_WIDTH,
+        "dot_radius": DOT_RADIUS,
+        "boundary": loop,
+        "dots": painted,
+    }
+    o = next(d for d in painted if d["color"] == "orange")["center"]
+    p = next(d for d in painted if d["color"] == "purple")["center"]
+    scene["_cues"] = {
+        "orange_left": "orange" if o[0] < p[0] else "purple",
+        "orange_higher": "orange" if o[1] < p[1] else "purple",
+        "nearer_image_centre": (
+            "orange"
+            if (o[0] - WIDTH / 2) ** 2 + (o[1] - HEIGHT / 2) ** 2
+            < (p[0] - WIDTH / 2) ** 2 + (p[1] - HEIGHT / 2) ** 2
+            else "purple"
+        ),
+        "tier": tier,
+        "snake_cells": len(path),
+        "loop_corners": len(loop),
+    }
+    return scene
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BG)
+    draw = ImageDraw.Draw(img)
+    hw = scene["wall_width"] / 2.0
+    loop = scene["boundary"]
+    n = len(loop)
+    for i in range(n):
+        a = _pix(loop[i])
+        b = _pix(loop[(i + 1) % n])
+        x0, x1 = sorted((a[0], b[0]))
+        y0, y1 = sorted((a[1], b[1]))
+        draw.rectangle([x0 - hw, y0 - hw, x1 + hw, y1 + hw], fill=WALL)
+    r = scene["dot_radius"]
+    for dot in sorted(scene["dots"], key=lambda d: d["color"]):
+        cx, cy = dot["center"]
+        col = ORANGE if dot["color"] == "orange" else PURPLE
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
+    return img
+
+
+# --------------------------------------------------------------------------
+# analytic gold and margins
+# --------------------------------------------------------------------------
+def _inside_polygon(point, loop) -> bool:
+    px, py = point
+    inside = False
+    n = len(loop)
+    for i in range(n):
+        x1, y1 = _pix(loop[i])
+        x2, y2 = _pix(loop[(i + 1) % n])
+        if (y1 > py) != (y2 > py):
+            xc = x1 + (py - y1) * (x2 - x1) / (y2 - y1)
+            if px < xc:
+                inside = not inside
+    return inside
+
+
+def analytic_gold(scene: dict) -> str:
+    """The colour of the dot enclosed by the wall ring."""
+    loop = scene["boundary"]
+    enclosed = [d["color"] for d in scene["dots"] if _inside_polygon(d["center"], loop)]
+    if len(enclosed) != 1:
+        raise ValueError("a scene must enclose exactly one dot")
+    return enclosed[0]
+
+
+def _point_segment(p, a, b) -> float:
+    px, py = p
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    L2 = vx * vx + vy * vy
+    t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / L2))
+    qx, qy = ax + t * vx, ay + t * vy
+    return ((px - qx) ** 2 + (py - qy) ** 2) ** 0.5
+
+
+def _segment_segment(a, b, c, d) -> float:
+    return min(
+        _point_segment(a, c, d),
+        _point_segment(b, c, d),
+        _point_segment(c, a, b),
+        _point_segment(d, a, b),
+    )
+
+
+def margin(scene: dict) -> float:
+    loop = scene["boundary"]
+    n = len(loop)
+    segs = [(_pix(loop[i]), _pix(loop[(i + 1) % n])) for i in range(n)]
+    hw = scene["wall_width"] / 2.0
+
+    gap = float("inf")
+    for i in range(n):
+        for j in range(i + 1, n):
+            if j == i + 1 or (i == 0 and j == n - 1):
+                continue  # segments that share a corner
+            gap = min(gap, _segment_segment(segs[i][0], segs[i][1], segs[j][0], segs[j][1]))
+    gap -= 2 * hw
+
+    clear = float("inf")
+    for dot in scene["dots"]:
+        near = min(_point_segment(dot["center"], s[0], s[1]) for s in segs)
+        clear = min(clear, near - hw - scene["dot_radius"])
+    return round(min(gap, clear), 2)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Rewrites of the stored loop that leave every pixel and the gold alone.
+
+    The wall is an unoriented closed curve. Its stored vertex list carries a
+    start corner and a traversal direction that the raster and the even-odd
+    enclosure test both ignore, so rotating or reversing the list is a genuine
+    latent rewrite rather than an invented nuisance field.
+    """
+    loop = scene["boundary"]
+    n = len(loop)
+    if n < 4:
+        return []
+    k = 1 + (n // 3)
+    out = []
+    for name, seq in (
+        ("loop_traversal_reversed", list(reversed(loop))),
+        ("loop_start_corner_rotated", loop[k:] + loop[:k]),
+        ("loop_reversed_and_rotated", list(reversed(loop))[k:] + list(reversed(loop))[:k]),
+    ):
+        alias = {key: value for key, value in scene.items() if not key.startswith("_")}
+        alias["boundary"] = [list(v) for v in seq]
+        out.append((name, alias))
+    return out

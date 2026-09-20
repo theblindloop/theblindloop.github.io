@@ -1,0 +1,138 @@
+"""Independent inverse arm using only final RGB pixels."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+NAVY = np.array((28, 47, 68), dtype=np.int16)
+CYAN = np.array((46, 190, 196), dtype=np.int16)
+CREAM = np.array((244, 222, 164), dtype=np.int16)
+TAG_COLORS = {
+    "red": np.array((215, 72, 73), dtype=np.int16),
+    "green": np.array((69, 166, 104), dtype=np.int16),
+    "blue": np.array((62, 112, 202), dtype=np.int16),
+}
+
+
+def _mask(arr: np.ndarray, rgb: np.ndarray, tolerance: int = 8) -> np.ndarray:
+    return np.max(np.abs(arr.astype(np.int16) - rgb), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 20) -> list[tuple[int, int, int, int, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        points = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            ys = [p[0] for p in points]
+            xs = [p[1] for p in points]
+            found.append((min(xs), min(ys), max(xs), max(ys), len(points)))
+    return found
+
+
+def _cluster(values: list[float], gap: float) -> list[list[float]]:
+    groups: list[list[float]] = []
+    for value in sorted(values):
+        if not groups or value - groups[-1][-1] > gap:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    return groups
+
+
+def _read_cells(arr: np.ndarray) -> tuple[list[list[int]], list[list[list[int]]]]:
+    boxes = []
+    for value, rgb in ((1, CYAN), (0, CREAM)):
+        for x0, y0, x1, y1, area in _components(_mask(arr, rgb), minimum=150):
+            width, height = x1 - x0 + 1, y1 - y0 + 1
+            if 16 <= width <= 24 and 16 <= height <= 24 and area >= 0.90 * width * height:
+                boxes.append((value, (x0 + x1) / 2, (y0 + y1) / 2, width, height))
+    source_boxes = [box for box in boxes if box[3] >= 21 and box[4] >= 21]
+    result_boxes = [box for box in boxes if box[3] <= 19 and box[4] <= 19]
+    if len(source_boxes) != 25 or len(result_boxes) != 27:
+        raise ValueError("damaged or incomplete tile inventory")
+
+    source_rows = _cluster([box[2] for box in source_boxes], 8)
+    source_cols = _cluster([box[1] for box in source_boxes], 8)
+    if [len(group) for group in source_rows] != [5] * 5 or [len(group) for group in source_cols] != [5] * 5:
+        raise ValueError("source grid is not 5 by 5")
+    source = [[0] * 5 for _ in range(5)]
+    row_centers = [sum(group) / len(group) for group in source_rows]
+    col_centers = [sum(group) / len(group) for group in source_cols]
+    for value, x, y, _, _ in source_boxes:
+        r = min(range(5), key=lambda index: abs(row_centers[index] - y))
+        c = min(range(5), key=lambda index: abs(col_centers[index] - x))
+        source[r][c] = value
+
+    card_groups = _cluster([box[1] for box in result_boxes], 28)
+    if len(card_groups) != 3 or any(len(group) != 9 for group in card_groups):
+        raise ValueError("result grids are not three separate 3 by 3 cards")
+    cards = []
+    for group in card_groups:
+        lo, hi = min(group) - 12, max(group) + 12
+        card_boxes = [box for box in result_boxes if lo <= box[1] <= hi]
+        rows = _cluster([box[2] for box in card_boxes], 8)
+        cols = _cluster([box[1] for box in card_boxes], 8)
+        if len(rows) != 3 or len(cols) != 3:
+            raise ValueError("malformed result card")
+        rc = [sum(row) / len(row) for row in rows]
+        cc = [sum(col) / len(col) for col in cols]
+        card = [[0] * 3 for _ in range(3)]
+        for value, x, y, _, _ in card_boxes:
+            r = min(range(3), key=lambda index: abs(rc[index] - y))
+            c = min(range(3), key=lambda index: abs(cc[index] - x))
+            card[r][c] = value
+        cards.append(card)
+    return source, cards
+
+
+def _majority(source: list[list[int]]) -> list[list[int]]:
+    return [[int(sum(source[y + dy][x + dx] for dy in range(3) for dx in range(3)) >= 5)
+             for x in range(3)] for y in range(3)]
+
+
+def _tag_centers(arr: np.ndarray) -> list[tuple[float, str]]:
+    tags = []
+    for name, rgb in TAG_COLORS.items():
+        parts = _components(_mask(arr, rgb), minimum=200)
+        if len(parts) != 1:
+            raise ValueError(f"missing or duplicated {name} tag")
+        x0, y0, x1, y1, area = parts[0]
+        if area < 250:
+            raise ValueError(f"damaged {name} tag")
+        tags.append(((x0 + x1) / 2, name))
+    return sorted(tags)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+    navy_area = int(_mask(arr, NAVY).sum())
+    # The uninterrupted visible plaque has a constant ink budget; destructive
+    # regional erasures must produce abstention instead of a guessed answer.
+    if navy_area < 65500:
+        raise ValueError("connected seal is torn")
+    source, cards = _read_cells(arr)
+    target = _majority(source)
+    distances = [sum(a != b for ra, rb in zip(card, target) for a, b in zip(ra, rb))
+                 for card in cards]
+    if distances.count(0) != 1 or sorted(distances)[1] < 2:
+        raise ValueError("ambiguous candidate assignment")
+    winner = distances.index(0)
+    tags = _tag_centers(arr)
+    return tags[winner][1]

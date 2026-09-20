@@ -1,0 +1,142 @@
+"""Independent raster-only inverse arm.
+
+It finds cards by their border ink, extracts colored endpoints and black bend
+components, rebuilds each navy path as a graph, then compares turn words.  No
+renderer, scene, prompt, generator, or verifier module is imported.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_NAVY = (28, 53, 84)
+_BLACK = (20, 23, 28)
+_YELLOW = (246, 194, 38)
+_CYAN = (31, 184, 202)
+_BORDERS = {
+    "gray": (102, 108, 119),
+    "red": (205, 55, 65),
+    "green": (35, 150, 82),
+    "blue": (43, 98, 205),
+}
+
+
+def _mask(arr: np.ndarray, rgb) -> np.ndarray:
+    return np.all(arr == np.asarray(rgb, dtype=np.uint8), axis=2)
+
+
+def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 500:
+        raise ValueError("required border ink is missing")
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _components(mask: np.ndarray) -> list[tuple[float, float, int]]:
+    work = mask.copy()
+    height, width = work.shape
+    result = []
+    for y0, x0 in np.argwhere(work):
+        if not work[y0, x0]:
+            continue
+        work[y0, x0] = False
+        queue = deque([(int(y0), int(x0))])
+        xs, ys = [], []
+        while queue:
+            y, x = queue.popleft()
+            xs.append(x)
+            ys.append(y)
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and work[yy, xx]:
+                    work[yy, xx] = False
+                    queue.append((yy, xx))
+        if len(xs) >= 40:
+            result.append((float(sum(xs)) / len(xs), float(sum(ys)) / len(ys), len(xs)))
+    return result
+
+
+def _card_signature(arr: np.ndarray, box) -> tuple[int, ...]:
+    x0, y0, x1, y1 = box
+    crop = arr[y0:y1, x0:x1]
+    yellow = _components(_mask(crop, _YELLOW))
+    cyan = _components(_mask(crop, _CYAN))
+    bends = _components(_mask(crop, _BLACK))
+    if len(yellow) != 1 or len(cyan) != 1 or len(bends) != 4:
+        raise ValueError("endpoint or bend evidence is missing")
+    vertices = [(yellow[0][0], yellow[0][1], "start")]
+    vertices += [(x, y, "bend") for x, y, _ in bends]
+    vertices += [(cyan[0][0], cyan[0][1], "end")]
+    navy = _mask(crop, _NAVY)
+
+    def joined(left, right) -> bool:
+        ax, ay, _ = left
+        bx, by, _ = right
+        if abs(ay - by) <= 1.0:
+            lo, hi = sorted((int(round(ax)), int(round(bx))))
+            lo += 9
+            hi -= 9
+            if hi <= lo:
+                return False
+            y = int(round((ay + by) / 2))
+            patch = navy[max(0, y - 3): y + 4, lo:hi + 1]
+            return patch.size > 0 and float(patch.mean()) > 0.72
+        if abs(ax - bx) <= 1.0:
+            lo, hi = sorted((int(round(ay)), int(round(by))))
+            lo += 9
+            hi -= 9
+            if hi <= lo:
+                return False
+            x = int(round((ax + bx) / 2))
+            patch = navy[lo:hi + 1, max(0, x - 3): x + 4]
+            return patch.size > 0 and float(patch.mean()) > 0.72
+        return False
+
+    graph = {index: [] for index in range(len(vertices))}
+    for i in range(len(vertices)):
+        for j in range(i + 1, len(vertices)):
+            if joined(vertices[i], vertices[j]):
+                graph[i].append(j)
+                graph[j].append(i)
+    if len(graph[0]) != 1 or len(graph[len(vertices) - 1]) != 1:
+        raise ValueError("path endpoints do not form a chain")
+    if sorted(len(value) for value in graph.values()) != [1, 1, 2, 2, 2, 2]:
+        raise ValueError("visible path graph is ambiguous")
+
+    order = [0]
+    previous = None
+    while order[-1] != len(vertices) - 1:
+        options = [node for node in graph[order[-1]] if node != previous]
+        if len(options) != 1 or len(order) > len(vertices):
+            raise ValueError("could not trace path from yellow to cyan")
+        previous, current = order[-1], options[0]
+        order.append(current)
+    if len(order) != len(vertices):
+        raise ValueError("path reaches cyan before all bends")
+
+    points = [(vertices[index][0], vertices[index][1]) for index in order]
+    turns = []
+    for a, b, c in zip(points, points[1:], points[2:]):
+        dx1, dy1 = b[0] - a[0], b[1] - a[1]
+        dx2, dy2 = c[0] - b[0], c[1] - b[1]
+        cross = dx1 * dy2 - dy1 * dx2
+        if abs(cross) < 100.0:
+            raise ValueError("a marked bend is not visibly perpendicular")
+        turns.append(1 if cross > 0 else -1)
+    return tuple(turns)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    boxes = {name: _bbox(_mask(arr, rgb)) for name, rgb in _BORDERS.items()}
+    reference = _card_signature(arr, boxes["gray"])
+    matches = [
+        name
+        for name in ("red", "green", "blue")
+        if _card_signature(arr, boxes[name]) == reference
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one raster match, found {len(matches)}")
+    return matches[0]

@@ -1,0 +1,233 @@
+"""Independent pixel-only inverse arm for the pan-balance makeweight world.
+
+Reads nothing but the rendered PNG.  It segments the black ink into connected
+components with a run-length union-find pass, classifies every glyph by how much
+of its bounding box it fills, recovers the two drawn equalities as a coupled
+linear system, solves that system for the worth of a triangle and of a square,
+totals the two gray pans, and returns the frame colour of the single purse whose
+contents are worth exactly the difference.  It never imports the renderer, the
+prompts, the generator or the verifier, and it never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_PALETTE = {
+    "blue": (37, 86, 196),
+    "green": (24, 140, 66),
+    "orange": (232, 124, 20),
+    "purple": (128, 52, 168),
+}
+_PAN_INK = (120, 120, 120)
+
+_CIRCLE, _TRIANGLE, _SQUARE = "circle", "triangle", "square"
+
+
+def _components(mask: np.ndarray) -> list:
+    """Connected components of a boolean mask via row runs and union-find."""
+    height, width = mask.shape
+    parent = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs = []  # (y, x0, x1_exclusive, label)
+    previous = []
+    for y in range(height):
+        row = mask[y]
+        if not row.any():
+            previous = []
+            continue
+        flags = np.concatenate(([0], row.astype(np.int8), [0]))
+        edges = np.flatnonzero(np.diff(flags))
+        starts = edges[0::2]
+        stops = edges[1::2]
+        current = []
+        for x0, x1 in zip(starts.tolist(), stops.tolist()):
+            label = None
+            for px0, px1, plabel in previous:
+                if px0 < x1 and x0 < px1:
+                    if label is None:
+                        label = find(plabel)
+                    else:
+                        union(label, plabel)
+                        label = find(label)
+            if label is None:
+                label = len(parent)
+                parent.append(label)
+            current.append((x0, x1, label))
+            runs.append((y, x0, x1, label))
+        previous = current
+
+    boxes = {}
+    for y, x0, x1, label in runs:
+        root = find(label)
+        box = boxes.get(root)
+        if box is None:
+            boxes[root] = [x0, y, x1 - 1, y, x1 - x0]
+        else:
+            box[0] = min(box[0], x0)
+            box[1] = min(box[1], y)
+            box[2] = max(box[2], x1 - 1)
+            box[3] = max(box[3], y)
+            box[4] += x1 - x0
+    parts = []
+    for x0, y0, x1, y1, area in boxes.values():
+        parts.append(
+            {
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+                "w": x1 - x0 + 1,
+                "h": y1 - y0 + 1,
+                "area": area,
+                "cx": (x0 + x1) / 2.0,
+                "cy": (y0 + y1) / 2.0,
+            }
+        )
+    return parts
+
+
+def _classify(part: dict) -> str:
+    ratio = part["w"] / float(part["h"])
+    if ratio > 2.0 or ratio < 0.5:
+        return "bar"
+    fill = part["area"] / float(part["w"] * part["h"])
+    if fill >= 0.90:
+        return _SQUARE
+    if 0.66 <= fill <= 0.88:
+        return _CIRCLE
+    if 0.38 <= fill <= 0.64:
+        return _TRIANGLE
+    raise ValueError(f"unclassifiable glyph with fill {fill:.3f}")
+
+
+def _bbox(mask: np.ndarray) -> tuple:
+    ys, xs = np.nonzero(mask)
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _pan_boxes(mask: np.ndarray) -> list:
+    """The two gray pans, split at the widest empty column band."""
+    cols = np.flatnonzero(mask.any(axis=0))
+    if cols.size == 0:
+        raise ValueError("no gray pans found")
+    gaps = np.diff(cols)
+    cut = int(np.argmax(gaps))
+    if gaps[cut] < 40:
+        raise ValueError("expected two separated gray pans")
+    split = int(cols[cut])
+    boxes = []
+    for lo, hi in ((int(cols[0]), split), (int(cols[cut + 1]), int(cols[-1]))):
+        band = np.zeros_like(mask)
+        band[:, lo : hi + 1] = mask[:, lo : hi + 1]
+        boxes.append(_bbox(band))
+    return boxes
+
+
+def _inside(part: dict, box) -> bool:
+    x0, y0, x1, y1 = box
+    return x0 <= part["cx"] <= x1 and y0 <= part["cy"] <= y1
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB")).astype(np.int16)
+
+    purses = {}
+    for name, hue in _PALETTE.items():
+        mask = np.all(rgb == np.array(hue, dtype=np.int16), axis=-1)
+        if mask.any():
+            purses[name] = _bbox(mask)
+    if len(purses) != 4:
+        raise ValueError("expected exactly four colour-framed purses")
+
+    pan_mask = np.all(rgb == np.array(_PAN_INK, dtype=np.int16), axis=-1)
+    pans = _pan_boxes(pan_mask)
+
+    black = np.all(rgb <= 40, axis=-1)
+    parts = _components(black)
+    if not parts:
+        raise ValueError("no black ink found")
+
+    purse_glyphs = {name: [] for name in purses}
+    pan_glyphs = [[], []]
+    strip = []
+    for part in parts:
+        kind = _classify(part)
+        placed = False
+        for name, box in purses.items():
+            if _inside(part, box):
+                purse_glyphs[name].append(kind)
+                placed = True
+                break
+        if placed:
+            continue
+        for side, box in enumerate(pans):
+            if _inside(part, box):
+                pan_glyphs[side].append(kind)
+                placed = True
+                break
+        if not placed:
+            strip.append((part, kind))
+
+    bars = [part for part, kind in strip if kind == "bar"]
+    glyphs = [(part, kind) for part, kind in strip if kind != "bar"]
+    if len(bars) != 4:
+        raise ValueError("expected two equality signs above the balance")
+
+    bars.sort(key=lambda part: part["cy"])
+    relations = []
+    for pair in (bars[0:2], bars[2:4]):
+        eq_x = sum(part["cx"] for part in pair) / 2.0
+        eq_y = sum(part["cy"] for part in pair) / 2.0
+        band = [(p, k) for p, k in glyphs if abs(p["cy"] - eq_y) < 45]
+        left = [k for p, k in band if p["cx"] < eq_x]
+        right = [k for p, k in band if p["cx"] > eq_x]
+        if not left or not right:
+            raise ValueError("malformed equality row")
+        if set(right) != {_CIRCLE}:
+            raise ValueError("an equality row is not priced in circles")
+        squares = left.count(_SQUARE)
+        triangles = left.count(_TRIANGLE)
+        if squares + triangles != len(left):
+            raise ValueError("an equality row mixes a circle into its left side")
+        relations.append((squares, triangles, len(right)))
+
+    (a1, b1, n1), (a2, b2, n2) = relations
+    det = a1 * b2 - a2 * b1
+    if det == 0:
+        raise ValueError("the two equalities are not independent")
+    square_num = n1 * b2 - n2 * b1
+    triangle_num = a1 * n2 - a2 * n1
+    if square_num % det or triangle_num % det:
+        raise ValueError("the equality system has no integer solution")
+    worth = {
+        _CIRCLE: 1,
+        _SQUARE: square_num // det,
+        _TRIANGLE: triangle_num // det,
+    }
+    if worth[_SQUARE] <= 0 or worth[_TRIANGLE] <= 0:
+        raise ValueError("the equality system has no positive solution")
+
+    deficit = abs(
+        sum(worth[k] for k in pan_glyphs[0]) - sum(worth[k] for k in pan_glyphs[1])
+    )
+    matches = [
+        name
+        for name, kinds in purse_glyphs.items()
+        if sum(worth[k] for k in kinds) == deficit
+    ]
+    if len(matches) != 1:
+        raise ValueError("no unique makeweight purse")
+    return matches[0]

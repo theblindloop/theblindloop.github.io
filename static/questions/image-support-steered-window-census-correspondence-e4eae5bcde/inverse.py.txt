@@ -1,0 +1,170 @@
+"""Independent pixel-only inverse arm for Window Census Correspondence."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+DARK_TILE = np.asarray((43, 47, 52), dtype=np.int16)
+LIGHT_TILE = np.asarray((205, 211, 218), dtype=np.int16)
+PIP_BLUE = np.asarray((42, 111, 207), dtype=np.int16)
+TAG_RGB = {
+    "amber": np.asarray((244, 151, 28), dtype=np.int16),
+    "cyan": np.asarray((33, 186, 222), dtype=np.int16),
+    "violet": np.asarray((166, 69, 190), dtype=np.int16),
+}
+
+
+def _mask(array: np.ndarray, rgb: np.ndarray, tolerance: int = 4) -> np.ndarray:
+    return np.max(np.abs(array.astype(np.int16) - rgb), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    remaining = {tuple(map(int, point)) for point in np.argwhere(mask)}
+    output = []
+    while remaining:
+        start = remaining.pop()
+        queue = deque([start])
+        points = [start]
+        while queue:
+            y, x = queue.popleft()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    queue.append(neighbor)
+                    points.append(neighbor)
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _cluster_three(values: list[float]) -> list[float]:
+    ordered = sorted(values)
+    if len(ordered) != 9:
+        raise ValueError("the source must expose exactly nine tiles")
+    groups = [ordered[index : index + 3] for index in range(0, 9, 3)]
+    centers = [float(np.mean(group)) for group in groups]
+    if any(max(group) - min(group) > 3.0 for group in groups):
+        raise ValueError("source tiles do not form three aligned rows or columns")
+    if min(np.diff(centers)) < 35.0:
+        raise ValueError("source tile spacing is malformed")
+    return centers
+
+
+def _extract_source(array: np.ndarray) -> list[list[int]]:
+    dark = _mask(array, DARK_TILE)
+    light = _mask(array, LIGHT_TILE)
+    pieces = _components(dark | light)
+    if len(pieces) != 9:
+        raise ValueError("the complete three-by-three source board is not recoverable")
+    records = []
+    for points in pieces:
+        ys, xs = points[:, 0], points[:, 1]
+        height = int(ys.max() - ys.min() + 1)
+        width = int(xs.max() - xs.min() + 1)
+        if len(points) < 2000 or not (44 <= width <= 48 and 44 <= height <= 48):
+            raise ValueError("a source tile is missing or malformed")
+        dark_fraction = float(dark[ys, xs].mean())
+        if dark_fraction not in (0.0, 1.0):
+            raise ValueError("a source tile mixes light and dark ink")
+        records.append((float(xs.mean()), float(ys.mean()), int(dark_fraction > 0.5)))
+    x_centers = _cluster_three([record[0] for record in records])
+    y_centers = _cluster_three([record[1] for record in records])
+    board = [[-1] * 3 for _ in range(3)]
+    for x, y, value in records:
+        column = int(np.argmin([abs(x - center) for center in x_centers]))
+        row = int(np.argmin([abs(y - center) for center in y_centers]))
+        if board[row][column] != -1:
+            raise ValueError("two source tiles occupy one grid location")
+        board[row][column] = value
+    if any(value < 0 for row in board for value in row):
+        raise ValueError("a source grid location is empty")
+    counts = _window_counts(board)
+    if sorted(counts) != [1, 2, 3, 4]:
+        raise ValueError("source window counts lack the declared visible separation")
+    return board
+
+
+def _window_counts(source: list[list[int]]) -> list[int]:
+    return [
+        sum(source[row + dy][column + dx] for dy in range(2) for dx in range(2))
+        for row, column in ((0, 0), (0, 1), (1, 0), (1, 1))
+    ]
+
+
+def _frame_records(array: np.ndarray) -> list[tuple[float, str, tuple[int, int, int, int]]]:
+    records = []
+    for name, rgb in TAG_RGB.items():
+        mask = _mask(array, rgb)
+        points = np.argwhere(mask)
+        if len(points) < 4800:
+            raise ValueError(f"the {name} candidate frame is missing or damaged")
+        y0, x0 = points.min(axis=0)
+        y1, x1 = points.max(axis=0)
+        if not (210 <= x1 - x0 + 1 <= 222 and 105 <= y1 - y0 + 1 <= 116):
+            raise ValueError(f"the {name} candidate frame has malformed bounds")
+        records.append(((float(y0) + float(y1)) / 2.0, name, (int(x0), int(y0), int(x1), int(y1))))
+    records.sort()
+    if min(np.diff([record[0] for record in records])) < 100.0:
+        raise ValueError("candidate frames overlap or are not separately ordered")
+    return records
+
+
+def _count_pips(mask: np.ndarray) -> int:
+    pieces = _components(mask)
+    if not 1 <= len(pieces) <= 4:
+        raise ValueError("a candidate cell must contain one to four separate pips")
+    for points in pieces:
+        ys, xs = points[:, 0], points[:, 1]
+        height = int(ys.max() - ys.min() + 1)
+        width = int(xs.max() - xs.min() + 1)
+        if len(points) < 155 or not (14 <= width <= 16 and 14 <= height <= 16):
+            raise ValueError("a pip is missing or malformed")
+    return len(pieces)
+
+
+def _extract_proposals(
+    array: np.ndarray, records: list[tuple[float, str, tuple[int, int, int, int]]]
+) -> tuple[list[list[int]], list[str]]:
+    blue = _mask(array, PIP_BLUE)
+    proposals = []
+    tags = []
+    claimed = np.zeros_like(blue)
+    for _, tag, (left, top, right, bottom) in records:
+        mid_x = (left + right) // 2
+        mid_y = (top + bottom) // 2
+        boxes = (
+            (left + 9, top + 9, mid_x - 2, mid_y - 2),
+            (mid_x + 2, top + 9, right - 9, mid_y - 2),
+            (left + 9, mid_y + 2, mid_x - 2, bottom - 9),
+            (mid_x + 2, mid_y + 2, right - 9, bottom - 9),
+        )
+        values = []
+        for x0, y0, x1, y1 in boxes:
+            crop = blue[y0 : y1 + 1, x0 : x1 + 1]
+            values.append(_count_pips(crop))
+            claimed[y0 : y1 + 1, x0 : x1 + 1] |= crop
+        if sorted(values) != [1, 2, 3, 4]:
+            raise ValueError("every proposal must visibly use the same four count values")
+        proposals.append(values)
+        tags.append(tag)
+    if int((blue & ~claimed).sum()) != 0:
+        raise ValueError("unbound blue pips appear outside the candidate cells")
+    return proposals, tags
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected an RGB raster")
+    source = _extract_source(array)
+    frame_records = _frame_records(array)
+    proposals, tags = _extract_proposals(array, frame_records)
+    target = _window_counts(source)
+    distances = [sum(a != b for a, b in zip(target, proposal)) for proposal in proposals]
+    winners = [index for index, distance in enumerate(distances) if distance == 0]
+    if len(winners) != 1 or sorted(distances)[1] < 2:
+        raise ValueError("proposal assignment is non-unique or below the visible margin")
+    return tags[winners[0]]

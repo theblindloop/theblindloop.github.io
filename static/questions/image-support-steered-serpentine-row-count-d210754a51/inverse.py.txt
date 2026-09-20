@@ -1,0 +1,149 @@
+"""Pixel-only inverse arm for the serpentine route row-count world.
+
+Receives ONLY a rendered PIL image. Extracts the distinctive blue route ink,
+verifies it forms a single connected stroke, then recovers the number of
+distinct horizontal rows the stroke sweeps through by locating long horizontal
+runs. Returns that row count as the decision.
+
+Independence: imports only numpy and PIL and ships its own tiny utility code, so
+it cannot reach the renderer, generator, verifier, prompts, or analytic gold.
+
+Abstention policy: the row count is only meaningful when the route is ONE
+connected stroke. If the blue ink is absent or split into multiple connected
+components (e.g. an interior ablation cut the stroke), the oracle raises
+``RouteAbstentionError`` rather than guessing. This is what makes any interior
+portion of the route decisive for the quality-diversity ablation probe.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+class RouteAbstentionError(Exception):
+    """The route could not be read as a single connected stroke from the pixels."""
+
+
+def _is_route(array: np.ndarray) -> np.ndarray:
+    r = array[:, :, 0].astype(np.int16)
+    g = array[:, :, 1].astype(np.int16)
+    b = array[:, :, 2].astype(np.int16)
+    return (b > 120) & (b > r + 60) & (b > g + 60) & (r < 120)
+
+
+def _label_4connected(mask: np.ndarray) -> np.ndarray:
+    """Union-find 4-connectivity labels; returns (int32 labels, count_of_labels)."""
+    ys, xs = np.nonzero(mask)
+    if len(ys) == 0:
+        return np.zeros(mask.shape, dtype=np.int32), 0
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    h, w = y1 - y0, x1 - x0
+    sub = mask[y0:y1, x0:x1]
+    labels = np.zeros((h, w), dtype=np.int32)
+    next_label = 1
+    parent = {}
+    row_run = np.zeros(w, dtype=np.int32)  # label of the run ending at each col
+    for yy in range(h):
+        run_label = 0
+        for xx in range(w):
+            if not sub[yy, xx]:
+                run_label = 0
+                continue
+            up = labels[yy - 1, xx] if yy > 0 else 0
+            left = run_label
+            if up and left:
+                if up != left:
+                    a, b = up, left
+                    while parent[a] != a:
+                        a = parent[a]
+                    while parent[b] != b:
+                        b = parent[b]
+                    if a != b:
+                        parent[max(a, b)] = min(a, b)
+                lab = up if up < left else left
+            elif up:
+                lab = up
+            elif left:
+                lab = left
+            else:
+                lab = next_label
+                next_label += 1
+                parent[lab] = lab
+            labels[yy, xx] = lab
+            run_label = lab
+    root_map = {}
+    for lab in list(parent):
+        root = lab
+        while parent[root] != root:
+            root = parent[root]
+        root_map[lab] = root
+    for yy in range(h):
+        for xx in range(w):
+            lab = labels[yy, xx]
+            if lab:
+                labels[yy, xx] = root_map[lab]
+    # Compact labels to 1..K.
+    out = np.zeros(mask.shape, dtype=np.int32)
+    mapping = {}
+    k = 0
+    for yy in np.unique(labels):
+        vals = labels[yy]
+        for v in np.unique(vals[vals > 0]):
+            if v not in mapping:
+                k += 1
+                mapping[v] = k
+    # Vectorised remap.
+    keys = np.array(list(mapping.keys()), dtype=np.int32)
+    remap = np.zeros(int(keys.max()) + 1, dtype=np.int32) if len(keys) else np.zeros(0, dtype=np.int32)
+    for key, val in mapping.items():
+        remap[key] = val
+    out[y0:y1, x0:x1] = remap[labels]
+    return out, k
+
+
+def _count_rows(route: np.ndarray, width: int, run_frac: float = 0.40) -> int:
+    """Count distinct horizontal row bands by long-run detection across y."""
+    run_thresh = run_frac * width
+    band = np.zeros(route.shape[0], dtype=bool)
+    mask = route
+    for yy in range(route.shape[0]):
+        row = mask[yy]
+        if not row.any():
+            continue
+        # longest contiguous True run on this horizontal scanline
+        idx = np.flatnonzero(row)
+        breaks = np.where(np.diff(idx) > 1)[0]
+        starts = np.concatenate(([idx[0]], idx[breaks + 1]))
+        ends = np.concatenate((idx[breaks], [idx[-1]]))
+        longest = int((ends - starts + 1).max())
+        if longest >= run_thresh:
+            band[yy] = True
+    if not band.any():
+        return 0
+    # count maximal contiguous groups of qualifying y
+    groups = 0
+    prev = False
+    for flag in band:
+        if flag and not prev:
+            groups += 1
+        prev = flag
+    return groups
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+    route = _is_route(array)
+    labels, k = _label_4connected(route)
+    if k == 0:
+        raise RouteAbstentionError("no route ink found")
+    # The route must be exactly one connected stroke.
+    sizes = [(labels == lab).sum() for lab in range(1, k + 1)]
+    big = [s for s in sizes if s >= 40]
+    if len(big) != 1:
+        raise RouteAbstentionError(f"route not a single connected stroke (k={k})")
+    rows = _count_rows(route, array.shape[1])
+    if rows < 2 or rows > 4:
+        raise RouteAbstentionError(f"recovered {rows} rows outside expected range")
+    return str(rows)

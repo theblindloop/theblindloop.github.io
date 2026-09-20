@@ -1,0 +1,298 @@
+"""Renderer and analytic arm for a connected-board contour correspondence world."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "board-contour-attribute-correspondence-0.1.0"
+WIDTH = 512
+HEIGHT = 512
+SCALE = 4
+
+BOARD = (42, 85, 96)
+BOARD_EDGE = (25, 58, 69)
+WINDOW = (201, 219, 211)
+CARD_NEUTRAL = (87, 148, 155)
+HALO_AMBER = (238, 163, 57)
+HALO_VIOLET = (166, 104, 201)
+PAPER = (247, 243, 226)
+BACKGROUND = (247, 246, 241)
+TEXT = (59, 70, 76)
+WINDOW_EDGE = (147, 177, 171)
+
+GRID = 7
+TARGET_CELLS = 26
+CELL = 8
+CARD_SIZE = 66
+BOARD_WIDTH = 320
+BOARD_HEIGHT = 250
+PANEL_X_OFFSETS = (10, 108, 206)
+PANEL_Y_OFFSET = 38
+CARD_X_OFFSET = 15
+CARD_Y_OFFSET = 74
+QUARANTINE_MARGIN = 4.0 / float(GRID * GRID)
+
+
+def _font(size: int):
+    for name in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ):
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size=size * SCALE)
+    return ImageFont.load_default()
+
+
+def _rotate_cw(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> list[list[int]]:
+    return [list(row) for row in zip(*pattern[::-1])]
+
+
+def _rotate_ccw(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> list[list[int]]:
+    return [list(row) for row in zip(*pattern)][::-1]
+
+
+def _mismatch(left: list[list[int]] | tuple[tuple[int, ...], ...], right: list[list[int]] | tuple[tuple[int, ...], ...]) -> int:
+    return sum(int(a != b) for row_a, row_b in zip(left, right, strict=True) for a, b in zip(row_a, row_b, strict=True))
+
+
+def _canonical(pattern: list[list[int]]) -> tuple[tuple[int, ...], ...]:
+    variants = []
+    current = pattern
+    for _ in range(4):
+        variants.append(tuple(tuple(int(v) for v in row) for row in current))
+        current = _rotate_cw(current)
+    return min(variants)
+
+
+def _grow_pattern(seed: int) -> list[list[int]]:
+    """Grow a connected equal-area occupancy shape in a seven-by-seven field."""
+
+    rng = random.Random(seed)
+    cells = {(3, 3)}
+    while len(cells) < TARGET_CELLS:
+        frontier = set()
+        for y, x in cells:
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < GRID and 0 <= nx < GRID and (ny, nx) not in cells:
+                    frontier.add((ny, nx))
+        choices = sorted(frontier)
+        if not choices:
+            raise RuntimeError("pattern growth reached no frontier")
+        # A seed-specific choice among the whole frontier yields connected but
+        # visibly different silhouettes without introducing a latent shortcut.
+        cells.add(choices[rng.randrange(len(choices))])
+    return [[1 if (y, x) in cells else 0 for x in range(GRID)] for y in range(GRID)]
+
+
+def _make_pattern_pool() -> tuple[tuple[tuple[int, ...], ...], ...]:
+    pool: list[tuple[tuple[int, ...], ...]] = []
+    seen: set[tuple[tuple[int, ...], ...]] = set()
+    for seed in range(200):
+        pattern = _grow_pattern(1009 + seed * 7919)
+        key = _canonical(pattern)
+        if key in seen:
+            continue
+        seen.add(key)
+        pool.append(key)
+        if len(pool) >= 40:
+            break
+    if len(pool) < 12:
+        raise RuntimeError("pattern pool is too small")
+    return tuple(pool)
+
+
+_PATTERN_POOL = _make_pattern_pool()
+
+
+def _panel_map(scene: dict) -> dict[str, dict]:
+    panels: dict[str, dict] = {}
+    for record in scene["candidate_panels"]:
+        slot = str(record["slot"])
+        if slot in panels:
+            raise ValueError("candidate slots must be unique")
+        if slot not in {"A", "B"}:
+            raise ValueError("candidate slots must be A and B")
+        panels[slot] = record
+    if set(panels) != {"A", "B"}:
+        raise ValueError("candidate slots must be A and B")
+    return panels
+
+
+def _pattern_tuple(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> tuple[tuple[int, ...], ...]:
+    if len(pattern) != GRID or any(len(row) != GRID for row in pattern):
+        raise ValueError("contour must be a seven-by-seven grid")
+    values = tuple(tuple(int(value) for value in row) for row in pattern)
+    if any(value not in (0, 1) for row in values for value in row):
+        raise ValueError("contour cells must be binary")
+    if sum(sum(row) for row in values) != TARGET_CELLS:
+        raise ValueError("contour has the wrong equalized area")
+    return values
+
+
+def _validate_scene(scene: dict) -> tuple[tuple[int, ...], dict[str, dict]]:
+    reference = _pattern_tuple(scene["reference_pattern"])
+    panels = _panel_map(scene)
+    for record in panels.values():
+        _pattern_tuple(record["pattern"])
+        if record["halo"] not in {"amber", "violet"}:
+            raise ValueError("candidate halo must be amber or violet")
+    return reference, panels
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample equal-area contours, shuffled slot records, and nuisance placement."""
+
+    rng = random.Random(int(seed))
+    reference_key = rng.choice(_PATTERN_POOL)
+    reference = [list(row) for row in reference_key]
+    transformed_match = _rotate_ccw(reference)
+    wrong_pool = []
+    for candidate_key in _PATTERN_POOL:
+        candidate = [list(row) for row in candidate_key]
+        error = _mismatch(_rotate_cw(candidate), reference)
+        if error >= 4:
+            wrong_pool.append((error, candidate))
+    if not wrong_pool:
+        raise RuntimeError("no separated wrong contour")
+    # The lower-error choices provide a small set of observable near-boundary
+    # examples; others make the same rule easy to verify far from the boundary.
+    near = [item for item in wrong_pool if item[0] <= 10]
+    source = near if near and rng.randrange(3) == 0 else wrong_pool
+    wrong = [list(row) for row in rng.choice(source)[1]]
+    matching_slot = "A" if rng.randrange(2) == 0 else "B"
+    matching_halo = "amber" if rng.randrange(2) == 0 else "violet"
+    wrong_halo = "violet" if matching_halo == "amber" else "amber"
+    records = [
+        {
+            "slot": "A",
+            "pattern": transformed_match if matching_slot == "A" else wrong,
+            "halo": matching_halo if matching_slot == "A" else wrong_halo,
+        },
+        {
+            "slot": "B",
+            "pattern": transformed_match if matching_slot == "B" else wrong,
+            "halo": matching_halo if matching_slot == "B" else wrong_halo,
+        },
+    ]
+    rng.shuffle(records)
+    anchor = [82 + rng.randrange(26), 126 + rng.randrange(20)]
+    return {
+        "reference_pattern": reference,
+        "candidate_panels": records,
+        "board_anchor": anchor,
+    }
+
+
+def _errors(reference: tuple[tuple[int, ...], ...], panels: dict[str, dict]) -> dict[str, int]:
+    return {
+        slot: _mismatch(_rotate_cw(_pattern_tuple(panels[slot]["pattern"])), reference)
+        for slot in ("A", "B")
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    """Select the halo attribute attached to the uniquely matching slot."""
+
+    reference, panels = _validate_scene(scene)
+    errors = _errors(reference, panels)
+    if errors["A"] == errors["B"]:
+        raise ValueError("candidate contour errors are tied")
+    best = "A" if errors["A"] < errors["B"] else "B"
+    return str(panels[best]["halo"])
+
+
+def margin(scene: dict) -> float:
+    """Return the transformed contour mismatch gap normalized by 49 cells."""
+
+    reference, panels = _validate_scene(scene)
+    errors = sorted(_errors(reference, panels).values())
+    return float(errors[1] - errors[0]) / float(GRID * GRID)
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        reference, panels = _validate_scene(scene)
+        errors = _errors(reference, panels)
+        return errors["A"] == errors["B"] or margin(scene) < QUARANTINE_MARGIN
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _scaled_box(box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SCALE)) for value in box)  # type: ignore[return-value]
+
+
+def _draw_text(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, font, fill=TEXT) -> None:
+    draw.text((int(round(xy[0] * SCALE)), int(round(xy[1] * SCALE))), text, font=font, fill=fill)
+
+
+def _draw_card(draw: ImageDraw.ImageDraw, x: float, y: float, pattern: list[list[int]] | tuple[tuple[int, ...], ...], fill) -> None:
+    draw.rectangle(_scaled_box((x, y, x + CARD_SIZE - 1, y + CARD_SIZE - 1)), fill=fill)
+    origin_x = x + 5.0
+    origin_y = y + 5.0
+    for row, values in enumerate(pattern):
+        for col, value in enumerate(values):
+            if int(value):
+                left = origin_x + col * CELL
+                top = origin_y + row * CELL
+                draw.rectangle(_scaled_box((left, top, left + CELL, top + CELL)), fill=PAPER)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one antialiased RGB board containing all correspondence evidence."""
+
+    reference, panels = _validate_scene(scene)
+    anchor = scene["board_anchor"]
+    ax, ay = float(anchor[0]), float(anchor[1])
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    title_font = _font(15)
+    note_font = _font(10)
+    label_font = _font(12)
+
+    _draw_text(draw, (42, 34), "QUARTER-TURN CONTOUR MATCH", title_font)
+    _draw_text(draw, (42, 55), "Rotate A and B clockwise by 90 degrees; compare the complete filled contour.", note_font)
+    _draw_text(draw, (42, 470), "The dark board is one connected evidence region; candidate color is read only after matching.", note_font)
+
+    board_box = (ax, ay, ax + BOARD_WIDTH, ay + BOARD_HEIGHT)
+    draw.rounded_rectangle(_scaled_box(board_box), radius=12 * SCALE, fill=BOARD, outline=BOARD_EDGE, width=2 * SCALE)
+
+    for index, slot in enumerate(("R", "A", "B")):
+        px = ax + PANEL_X_OFFSETS[index]
+        py = ay + PANEL_Y_OFFSET
+        # The three slots are outlined on one uninterrupted board.  Keeping
+        # the backing connected is part of the visual world, not a metadata
+        # hint: all contour cards sit inside this shared evidence region.
+        draw.rounded_rectangle(
+            _scaled_box((px, py, px + 96, py + 140)),
+            radius=8 * SCALE,
+            outline=WINDOW_EDGE,
+            width=1 * SCALE,
+        )
+        _draw_text(draw, (px + 44, py + 8), slot, label_font, fill=TEXT)
+        card_x = px + CARD_X_OFFSET
+        card_y = ay + CARD_Y_OFFSET
+        if slot == "R":
+            _draw_card(draw, card_x, card_y, reference, CARD_NEUTRAL)
+        else:
+            record = panels[slot]
+            halo_fill = HALO_AMBER if record["halo"] == "amber" else HALO_VIOLET
+            _draw_card(draw, card_x, card_y, record["pattern"], halo_fill)
+        _draw_text(draw, (px + 18, py + 120), "contour", note_font, fill=TEXT)
+
+    _draw_text(draw, (ax + 14, ay + 222), "R = reference     A/B = candidates     CW 90°", note_font, fill=(224, 235, 228))
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Reorder slot-addressed records without changing the rendered board."""
+
+    twin = copy.deepcopy(scene)
+    twin["candidate_panels"] = list(reversed(twin["candidate_panels"]))
+    return [("candidate_record_order", twin)]

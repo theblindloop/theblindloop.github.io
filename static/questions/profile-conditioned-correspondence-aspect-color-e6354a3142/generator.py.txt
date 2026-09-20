@@ -1,0 +1,199 @@
+"""Cross-panel aspect-ratio correspondence renderer (paper-semantic family).
+
+A neutral gray axis-aligned filled rectangle is shown at the top (the
+reference). Below a horizontal divider sit three colored rectangles
+(red / green / blue), each a solid filled rectangle with a different width-to-
+height aspect ratio. Exactly one candidate has the same aspect ratio as the
+reference. The question asks for that candidate's color.
+
+The pixel-only inverse arm must, for every panel, recover the filled
+rectangle's width and height from its axis-aligned pixel bounding box, compute
+its width/height aspect ratio, solve the cross-panel correspondence by matching
+the candidate whose aspect ratio equals the gray reference, and only then read
+out the bound color of the single matched rectangle.
+
+Latent state z (every field that influences the gold is rendered -- nothing
+hidden):
+
+    ref_ratio  : width/height aspect ratio of the gray reference rectangle,
+                 drawn from the canonical coprime set CANONICAL_RATIOS.
+    cand_ratios: length-3 list of candidate aspect ratios; exactly one equals
+                 ``ref_ratio``, the other two are distinct and different.
+    cand_colors: the fixed 3-color palette bound one-to-one to the candidates.
+                 Each candidate rectangle is filled in its bound color, one
+                 color per candidate.
+    ref_scale, cand_scales : integer scale factors (geometry). For a canonical
+                 coprime pair (a, b), width = a*scale, height = b*scale, so the
+                 rendered ratio is exactly a/b; scale only changes absolute size
+                 and never the gold.
+    width, height, divider_y, ref_center, cand_centers : fixed + jittered
+                 geometry so absolute size and position are not bound to the
+                 answer.
+
+The analytic gold is the color of the candidate whose aspect ratio equals the
+reference's. Because the reference ratio, each candidate ratio, and the bound
+colors are all rendered verbatim as filled rectangles, the gold is recoverable
+from the pixels alone.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "correspondence_aspect_color-0.1.0"
+
+BACKGROUND = "white"
+DIVIDER = (70, 70, 70)
+GRAY = (150, 150, 150)
+
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (235, 40, 40),
+    "green": (0, 170, 70),
+    "blue": (40, 60, 235),
+}
+
+# Canonical width:height ratios as coprime integer pairs. Rendered with
+# width = a*scale, height = b*scale so the measured ratio is exactly a/b.
+CANONICAL_RATIOS: tuple[tuple[int, int], ...] = (
+    (1, 2),  # 0.5
+    (2, 3),  # 0.667
+    (1, 1),  # 1.0
+    (3, 2),  # 1.5
+    (2, 1),  # 2.0
+)
+
+WIDTH = 880
+HEIGHT = 720
+DIVIDER_Y = 190
+DIVIDER_THICK = 3
+HMIN = 70
+HMAX = 130
+REF_CENTER = (440, 100)
+CAND_CENTERS = [(440, 320), (440, 470), (440, 620)]
+
+_QUARANTINE_FLOOR = 0.05  # ratio-difference floor for an unambiguous scene
+
+
+def ratio_values() -> list[float]:
+    return [a / b for a, b in CANONICAL_RATIOS]
+
+
+def _dims(ratio: float, scale: int) -> tuple[int, int]:
+    """Return (width, height) realizing ``ratio`` exactly at integer scale."""
+    for a, b in CANONICAL_RATIOS:
+        if abs(ratio - a / b) < 1e-9:
+            return a * scale, b * scale
+    raise ValueError(f"unknown ratio {ratio!r}")
+
+
+def _pick_scale(rng: random.Random, ratio: float) -> int:
+    """Pick an integer scale so rendered height stays within [HMIN, HMAX]."""
+    for a, b in CANONICAL_RATIOS:
+        if abs(ratio - a / b) < 1e-9:
+            lo = max(1, (HMIN + b - 1) // b)
+            hi = HMAX // b
+            return rng.randint(lo, hi)
+    raise ValueError(f"unknown ratio {ratio!r}")
+
+
+def _jitter_center(rng: random.Random, lane_x: int, lane_y: int, width: int) -> list[int]:
+    lo = width // 2 + 24
+    hi = WIDTH - width // 2 - 24
+    cx = rng.randint(lo, hi)
+    return [cx, lane_y]
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a balanced, deterministic latent scene (dict)."""
+    rng = random.Random(seed)
+    values = ratio_values()
+    ref_ratio = rng.choice(values)
+    pool = [r for r in values if abs(r - ref_ratio) > 1e-9]
+    rng.shuffle(pool)
+    distractors = pool[:2]
+    cand_ratios = [ref_ratio] + distractors
+    rng.shuffle(cand_ratios)
+
+    ref_scale = _pick_scale(rng, ref_ratio)
+    cand_scales = [_pick_scale(rng, r) for r in cand_ratios]
+
+    ref_width, _ = _dims(ref_ratio, ref_scale)
+    ref_center = _jitter_center(rng, REF_CENTER[0], REF_CENTER[1], ref_width)
+
+    cand_centers = []
+    for i in range(3):
+        width, _ = _dims(cand_ratios[i], cand_scales[i])
+        cand_centers.append(_jitter_center(rng, CAND_CENTERS[i][0], CAND_CENTERS[i][1], width))
+
+    return {
+        "ref_ratio": ref_ratio,
+        "cand_ratios": cand_ratios,
+        "cand_colors": list(PALETTE.keys()),
+        "ref_scale": ref_scale,
+        "cand_scales": cand_scales,
+        "ref_center": ref_center,
+        "cand_centers": cand_centers,
+        "divider_y": DIVIDER_Y,
+        "width": WIDTH,
+        "height": HEIGHT,
+    }
+
+
+def _draw_rect(draw, center, ratio: float, scale: int, fill_rgb) -> None:
+    cx, cy = center
+    width, height = _dims(ratio, scale)
+    x0 = cx - width // 2
+    y0 = cy - height // 2
+    draw.rectangle([x0, y0, x0 + width - 1, y0 + height - 1], fill=fill_rgb)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render I = R(z) deterministically at pixel resolution."""
+    w = int(scene["width"])
+    h = int(scene["height"])
+    img = Image.new("RGB", (w, h), BACKGROUND)
+    draw = ImageDraw.Draw(img)
+    _draw_rect(
+        draw, tuple(scene["ref_center"]), scene["ref_ratio"], scene["ref_scale"], GRAY
+    )
+    for i in range(3):
+        color = scene["cand_colors"][i]
+        _draw_rect(
+            draw,
+            tuple(scene["cand_centers"][i]),
+            scene["cand_ratios"][i],
+            scene["cand_scales"][i],
+            PALETTE[color],
+        )
+    draw.rectangle([0, scene["divider_y"], w, scene["divider_y"] + DIVIDER_THICK - 1], fill=DIVIDER)
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Decision: color (red/green/blue) of the rectangle with the ref ratio."""
+    idx = scene["cand_ratios"].index(scene["ref_ratio"])
+    return scene["cand_colors"][idx]
+
+
+def margin(scene: dict) -> float:
+    """Runner-up margin: minimum absolute ratio difference between the
+    reference rectangle and any distractor candidate."""
+    ref = scene["ref_ratio"]
+    diffs = [abs(ref - r) for r in scene["cand_ratios"] if abs(r - ref) > 1e-9]
+    return float(min(diffs)) if diffs else 0.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine only an ambiguous scene where a distractor ratio comes within
+    _QUARANTINE_FLOOR of the reference (never produced because canonical ratios
+    are separated by at least ~0.167)."""
+    return margin(scene) < _QUARANTINE_FLOOR
+
+
+def latent_symmetries(scene: dict) -> list:
+    """not_applicable: every label-influencing field (reference ratio, each
+    candidate ratio, and the bound colors) is rendered verbatim, so the raster
+    uniquely determines the gold; no pixel-identical transform exists."""
+    return []

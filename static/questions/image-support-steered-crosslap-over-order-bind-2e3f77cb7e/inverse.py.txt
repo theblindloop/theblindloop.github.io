@@ -1,0 +1,157 @@
+"""Pixel-only inverse arm for crosslap_over_order_bind.
+
+Receives the final PNG and the public question contract only.  It segments the
+slab, locates the pale key tray and the three grey candidate trays, recovers the
+three bars of every pile as flat colour components, decides each over/under fact
+from the colour that survives inside a bar-pair overlap, solves the cross-tray
+correspondence by colour, and only then reads the marker of the tray whose two
+over/under facts repeat the key's.  It never sees the latent scene.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, deque
+
+import numpy as np
+from PIL import Image
+
+SLAB_COLOR = (60, 66, 78)
+KEY_TRAY = (232, 226, 210)
+CAND_TRAY = (150, 156, 168)
+BAR_COLORS = {
+    "red": (214, 52, 48),
+    "blue": (40, 86, 200),
+    "green": (28, 140, 70),
+    "purple": (128, 52, 168),
+    "yellow": (228, 180, 30),
+}
+MARKER_COLORS = {
+    "orange": (240, 124, 20),
+    "teal": (0, 150, 152),
+    "magenta": (206, 44, 140),
+    "olive": (120, 124, 20),
+}
+
+
+class OracleAbstain(Exception):
+    """Raised when the image does not present a readable crossing-pile slab."""
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    return np.all(np.abs(arr.astype(np.int16) - np.array(rgb, dtype=np.int16)) <= 12, axis=-1)
+
+
+def _components(mask: np.ndarray, min_pixels: int) -> list[tuple[int, int, int, int]]:
+    """Bounding boxes (y0, x0, y1, x1) of 4-connected components of a mask."""
+    seen = np.zeros(mask.shape, dtype=bool)
+    boxes: list[tuple[int, int, int, int]] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        y0 = y1 = sy
+        x0 = x1 = sx
+        count = 0
+        while queue:
+            y, x = queue.popleft()
+            count += 1
+            y0, y1 = min(y0, y), max(y1, y)
+            x0, x1 = min(x0, x), max(x1, x)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1] and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if count >= min_pixels:
+            boxes.append((y0, x0, y1, x1))
+    return boxes
+
+
+def _bar_boxes(arr: np.ndarray, tray: tuple[int, int, int, int]) -> dict:
+    y0, x0, y1, x1 = tray
+    crop = arr[y0 : y1 + 1, x0 : x1 + 1]
+    boxes = {}
+    for name, rgb in BAR_COLORS.items():
+        mask = _mask(crop, rgb)
+        if mask.sum() < 200:
+            continue
+        ys, xs = np.nonzero(mask)
+        boxes[name] = (int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max()))
+    if len(boxes) != 3:
+        raise OracleAbstain(f"tray does not carry exactly three bar colours ({len(boxes)})")
+    return boxes
+
+
+def _overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]):
+    y0, x0 = max(a[0], b[0]), max(a[1], b[1])
+    y1, x1 = min(a[2], b[2]), min(a[3], b[3])
+    if y1 < y0 or x1 < x0:
+        return None
+    return (y0, x0, y1, x1)
+
+
+def _pile_relation(arr: np.ndarray, tray: tuple[int, int, int, int]) -> frozenset:
+    boxes = _bar_boxes(arr, tray)
+    crop = arr[tray[0] : tray[2] + 1, tray[1] : tray[3] + 1]
+    names = sorted(boxes)
+    facts = []
+    for i in range(3):
+        for j in range(i + 1, 3):
+            a, b = names[i], names[j]
+            region = _overlap(boxes[a], boxes[b])
+            if region is None:
+                continue
+            y0, x0, y1, x1 = region
+            patch = crop[y0 : y1 + 1, x0 : x1 + 1]
+            counts = {
+                name: int(_mask(patch, BAR_COLORS[name]).sum()) for name in (a, b)
+            }
+            total = patch.shape[0] * patch.shape[1]
+            top, bottom = (a, b) if counts[a] >= counts[b] else (b, a)
+            if counts[top] < 0.75 * total or counts[bottom] != 0:
+                raise OracleAbstain("bar overlap is not a clean single-colour patch")
+            facts.append((top, bottom))
+    if len(facts) != 2:
+        raise OracleAbstain(f"pile does not show exactly two bar overlaps ({len(facts)})")
+    spine_candidates = {f[0] for f in facts} | {f[1] for f in facts}
+    counts = Counter([n for f in facts for n in f])
+    if counts.most_common(1)[0][1] != 2 or len(spine_candidates) != 3:
+        raise OracleAbstain("pile does not show one spine crossing two separate bars")
+    return frozenset(facts)
+
+
+def _marker(arr: np.ndarray, tray: tuple[int, int, int, int]) -> str:
+    crop = arr[tray[0] : tray[2] + 1, tray[1] : tray[3] + 1]
+    found = [name for name, rgb in MARKER_COLORS.items() if _mask(crop, rgb).sum() >= 25]
+    if len(found) != 1:
+        raise OracleAbstain(f"candidate tray does not carry exactly one marker ({len(found)})")
+    return found[0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+
+    slab = _components(_mask(arr, SLAB_COLOR), 5000)
+    if len(slab) != 1:
+        raise OracleAbstain(f"expected exactly one slate slab, found {len(slab)}")
+    sy0, sx0, sy1, sx1 = slab[0]
+    if sy0 <= 0 or sx0 <= 0 or sy1 >= arr.shape[0] - 1 or sx1 >= arr.shape[1] - 1:
+        raise OracleAbstain("slab touches the image border")
+    inner = arr[sy0 : sy1 + 1, sx0 : sx1 + 1]
+
+    key_trays = _components(_mask(inner, KEY_TRAY), 3000)
+    cand_trays = _components(_mask(inner, CAND_TRAY), 3000)
+    if len(key_trays) != 1:
+        raise OracleAbstain(f"expected exactly one pale key tray, found {len(key_trays)}")
+    if len(cand_trays) != 3:
+        raise OracleAbstain(f"expected exactly three grey candidate trays, found {len(cand_trays)}")
+
+    key_relation = _pile_relation(inner, key_trays[0])
+    winners = []
+    for tray in cand_trays:
+        if _pile_relation(inner, tray) == key_relation:
+            winners.append(tray)
+    if len(winners) != 1:
+        raise OracleAbstain(f"expected exactly one matching candidate pile, found {len(winners)}")
+    return _marker(inner, winners[0])

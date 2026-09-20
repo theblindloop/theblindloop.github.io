@@ -1,0 +1,168 @@
+"""Image-only inverse arm for snake_side_tally.
+
+Receives a rendered PNG and nothing else.  It segments the four declared inks,
+takes the wire as a single connected component, propagates a geodesic walk
+distance outward from the ringed port, reads the local direction of travel at
+each orange square as the gradient of that walk distance, and tallies how many
+squares fall on the walker's left hand.
+
+It must not import the renderer, prompts, generator, verifier or gold code, and
+it never sees latent scene data.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+
+ORACLE_VERSION = "snake_side_tally-oracle-0.1.0"
+
+# Declared inks of the public question contract.
+ROUTE_INK = (13, 110, 110)
+PORT_INK = (108, 32, 158)
+MARKER_INK = (240, 138, 20)
+
+TOL = 20
+PATCH_RADIUS = 22.0
+MIN_PATCH = 40
+MIN_SQUARE = 60
+ABSTAIN = "abstain"
+
+
+class OracleReadError(RuntimeError):
+    """The published precondition does not hold in pixels."""
+
+
+def _mask(arr, color):
+    ref = np.array(color, dtype=np.int16)
+    return np.abs(arr - ref).max(axis=2) <= TOL
+
+
+def _components(mask):
+    """4-connected labelling; returns (labels, sizes) with 0 = background."""
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    sizes = [0]
+    nxt = 0
+    h, w = mask.shape
+    for sy in range(h):
+        row = mask[sy]
+        if not row.any():
+            continue
+        for sx in np.nonzero(row)[0]:
+            if labels[sy, sx]:
+                continue
+            nxt += 1
+            count = 0
+            labels[sy, sx] = nxt
+            q = deque([(sy, int(sx))])
+            while q:
+                y, x = q.popleft()
+                count += 1
+                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not labels[ny, nx]:
+                        labels[ny, nx] = nxt
+                        q.append((ny, nx))
+            sizes.append(count)
+    return labels, np.array(sizes)
+
+
+def _geodesic(mask, seed):
+    dist = np.full(mask.shape, -1, dtype=np.int32)
+    h, w = mask.shape
+    dist[seed] = 0
+    q = deque([seed])
+    while q:
+        y, x = q.popleft()
+        d = dist[y, x] + 1
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and dist[ny, nx] < 0:
+                dist[ny, nx] = d
+                q.append((ny, nx))
+    return dist
+
+
+def read_image(image) -> str:
+    """Return 'left', 'right' or raise OracleReadError."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    wire = _mask(arr, ROUTE_INK)
+    port = _mask(arr, PORT_INK)
+    squares = _mask(arr, MARKER_INK)
+
+    if wire.sum() < 400:
+        raise OracleReadError("no wire ink")
+    if port.sum() < 40:
+        raise OracleReadError("no port ring")
+    if squares.sum() < 3 * MIN_SQUARE:
+        raise OracleReadError("too little marker ink")
+
+    pys, pxs = np.nonzero(port)
+    pcx, pcy = float(pxs.mean()), float(pys.mean())
+
+    labels, sizes = _components(wire)
+    biggest = int(np.argmax(sizes))
+    if sizes[biggest] < 0.9 * int(wire.sum()):
+        raise OracleReadError("wire is not one connected component")
+    comp = labels == biggest
+
+    cys, cxs = np.nonzero(comp)
+    d2 = (cxs - pcx) ** 2 + (cys - pcy) ** 2
+    k = int(np.argmin(d2))
+    if math.sqrt(float(d2[k])) > 40.0:
+        raise OracleReadError("ringed port does not sit on the wire")
+    walk = _geodesic(comp, (int(cys[k]), int(cxs[k])))
+
+    slabels, ssizes = _components(squares)
+    ids = [i for i in range(1, len(ssizes)) if ssizes[i] >= MIN_SQUARE]
+    if len(ids) < 3:
+        raise OracleReadError("fewer than three orange squares")
+
+    h, w = wire.shape
+    rad = int(math.ceil(PATCH_RADIUS))
+    left = 0
+    right = 0
+    for sid in ids:
+        sy, sx = np.nonzero(slabels == sid)
+        mx, my = float(sx.mean()), float(sy.mean())
+        y0, y1 = max(0, int(my) - rad), min(h, int(my) + rad + 1)
+        x0, x1 = max(0, int(mx) - rad), min(w, int(mx) + rad + 1)
+        sub = comp[y0:y1, x0:x1]
+        sw = walk[y0:y1, x0:x1]
+        yy, xx = np.nonzero(sub)
+        if yy.size == 0:
+            raise OracleReadError("orange square has no wire nearby")
+        gy = yy + y0
+        gx = xx + x0
+        keep = ((gx - mx) ** 2 + (gy - my) ** 2) <= PATCH_RADIUS ** 2
+        gy, gx = gy[keep], gx[keep]
+        dv = sw[yy[keep], xx[keep]].astype(np.float64)
+        if gy.size < MIN_PATCH or (dv < 0).any():
+            raise OracleReadError("wire beside a square is unreachable from the port")
+        cx, cy = float(gx.mean()), float(gy.mean())
+        design = np.stack([np.ones_like(dv), gx - cx, gy - cy], axis=1)
+        coef, *_ = np.linalg.lstsq(design, dv, rcond=None)
+        gvec = np.array([coef[1], coef[2]])
+        norm = float(np.hypot(*gvec))
+        if norm < 0.1:
+            raise OracleReadError("no direction of travel beside a square")
+        ux, uy = gvec / norm
+        dx, dy = mx - cx, my - cy
+        handed = dx * uy - dy * ux
+        if abs(handed) < 1.0:
+            raise OracleReadError("square sits on the wire centreline")
+        if handed > 0:
+            left += 1
+        else:
+            right += 1
+
+    if left == right:
+        raise OracleReadError("the two hands tie")
+    return "left" if left > right else "right"
+
+
+def decision_from_image(image) -> str:
+    try:
+        return read_image(image)
+    except OracleReadError:
+        return ABSTAIN

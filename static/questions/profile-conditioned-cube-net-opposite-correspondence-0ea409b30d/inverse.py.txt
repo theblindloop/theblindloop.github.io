@@ -1,0 +1,174 @@
+"""Independent pixel-only inverse for the cube-net world."""
+
+from __future__ import annotations
+
+from collections import deque
+
+from PIL import Image
+
+FACE_RGB = (232, 237, 244)
+MAGENTA_RGB = (205, 45, 146)
+COLOR_RGB = {
+    "red": (214, 56, 68),
+    "green": (38, 157, 90),
+    "blue": (54, 105, 210),
+}
+FILL_VALUES = {FACE_RGB, MAGENTA_RGB, *COLOR_RGB.values()}
+
+
+def _components(mask: list[list[bool]]) -> list[list[tuple[int, int]]]:
+    height = len(mask)
+    width = len(mask[0]) if height else 0
+    visited: set[tuple[int, int]] = set()
+    groups: list[list[tuple[int, int]]] = []
+    for y in range(height):
+        for x in range(width):
+            if not mask[y][x] or (x, y) in visited:
+                continue
+            visited.add((x, y))
+            queue = deque([(x, y)])
+            group: list[tuple[int, int]] = []
+            while queue:
+                px, py = queue.popleft()
+                group.append((px, py))
+                for nx, ny in ((px + 1, py), (px - 1, py), (px, py + 1), (px, py - 1)):
+                    if 0 <= nx < width and 0 <= ny < height and mask[ny][nx] and (nx, ny) not in visited:
+                        visited.add((nx, ny))
+                        queue.append((nx, ny))
+            groups.append(group)
+    return groups
+
+
+def _negative(vector: tuple[int, int, int]) -> tuple[int, int, int]:
+    return (-vector[0], -vector[1], -vector[2])
+
+
+def _fold_neighbor(frame, dx: int, dy: int):
+    horizontal, vertical, normal = frame
+    if (dx, dy) == (1, 0):
+        return (_negative(normal), vertical, horizontal)
+    if (dx, dy) == (-1, 0):
+        return (normal, vertical, _negative(horizontal))
+    if (dx, dy) == (0, 1):
+        return (horizontal, _negative(normal), vertical)
+    if (dx, dy) == (0, -1):
+        return (horizontal, normal, _negative(vertical))
+    raise ValueError("non-adjacent face step")
+
+
+def _recover_faces(image: Image.Image) -> list[dict]:
+    rgb = image.convert("RGB")
+    pixels = rgb.load()
+    width, height = rgb.size
+    mask = [[pixels[x, y] in FILL_VALUES for x in range(width)] for y in range(height)]
+    candidates = []
+    for group in _components(mask):
+        if len(group) < 900:
+            continue
+        xs = [point[0] for point in group]
+        ys = [point[1] for point in group]
+        box_width = max(xs) - min(xs) + 1
+        box_height = max(ys) - min(ys) + 1
+        ratio = box_width / box_height
+        density = len(group) / (box_width * box_height)
+        if 0.86 <= ratio <= 1.16 and density >= 0.72:
+            candidates.append(
+                {
+                    "points": group,
+                    "cx": (min(xs) + max(xs)) / 2.0,
+                    "cy": (min(ys) + max(ys)) / 2.0,
+                    "width": box_width,
+                    "height": box_height,
+                }
+            )
+    if len(candidates) != 6:
+        raise ValueError(f"expected six recoverable net faces, found {len(candidates)}")
+
+    for face in candidates:
+        counts = {
+            name: sum(pixels[x, y] == value for x, y in face["points"])
+            for name, value in COLOR_RGB.items()
+        }
+        best_name, best_count = max(counts.items(), key=lambda item: item[1])
+        face["color"] = best_name if best_count > 500 else None
+        face["marker_pixels"] = sum(
+            pixels[x, y] == MAGENTA_RGB for x, y in face["points"]
+        )
+    if sorted(face["color"] for face in candidates if face["color"] is not None) != [
+        "blue",
+        "green",
+        "red",
+    ]:
+        raise ValueError("net does not contain exactly one face of each answer color")
+    marked = [index for index, face in enumerate(candidates) if face["marker_pixels"] > 40]
+    if len(marked) != 1:
+        raise ValueError("magenta marker is missing or ambiguous")
+    candidates[marked[0]]["marked"] = True
+    return candidates
+
+
+def _grid_coordinates(faces: list[dict]) -> list[tuple[int, int]]:
+    typical = sum((face["width"] + face["height"]) / 2 for face in faces) / len(faces)
+    aligned_distances = []
+    for left_index, left in enumerate(faces):
+        for right in faces[left_index + 1 :]:
+            dx = abs(left["cx"] - right["cx"])
+            dy = abs(left["cy"] - right["cy"])
+            if dy < typical * 0.18 and dx > typical * 0.7:
+                aligned_distances.append(dx)
+            if dx < typical * 0.18 and dy > typical * 0.7:
+                aligned_distances.append(dy)
+    if not aligned_distances:
+        raise ValueError("cannot infer net grid spacing")
+    spacing = min(aligned_distances)
+    min_x = min(face["cx"] for face in faces)
+    min_y = min(face["cy"] for face in faces)
+    coordinates = [
+        (round((face["cx"] - min_x) / spacing), round((face["cy"] - min_y) / spacing))
+        for face in faces
+    ]
+    if len(set(coordinates)) != 6:
+        raise ValueError("face centers do not form six distinct grid cells")
+    for face, (grid_x, grid_y) in zip(faces, coordinates):
+        predicted_x = min_x + grid_x * spacing
+        predicted_y = min_y + grid_y * spacing
+        if abs(face["cx"] - predicted_x) > spacing * 0.12 or abs(face["cy"] - predicted_y) > spacing * 0.12:
+            raise ValueError("face centers do not lie on a regular square grid")
+    return coordinates
+
+
+def _orient(coordinates: list[tuple[int, int]]):
+    by_cell = {cell: index for index, cell in enumerate(coordinates)}
+    frames = {0: ((1, 0, 0), (0, 1, 0), (0, 0, 1))}
+    queue = deque([0])
+    while queue:
+        index = queue.popleft()
+        x, y = coordinates[index]
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            neighbor = by_cell.get((x + dx, y + dy))
+            if neighbor is None:
+                continue
+            proposed = _fold_neighbor(frames[index], dx, dy)
+            if neighbor in frames and frames[neighbor] != proposed:
+                raise ValueError("visible cells do not fold consistently")
+            if neighbor not in frames:
+                frames[neighbor] = proposed
+                queue.append(neighbor)
+    if len(frames) != 6 or len({frame[2] for frame in frames.values()}) != 6:
+        raise ValueError("visible cells are not a non-overlapping cube net")
+    return frames
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the opposite face color using only pixels in ``image``."""
+
+    faces = _recover_faces(image)
+    coordinates = _grid_coordinates(faces)
+    frames = _orient(coordinates)
+    marker_index = next(index for index, face in enumerate(faces) if face.get("marked"))
+    target = _negative(frames[marker_index][2])
+    opposite_index = next(index for index, frame in frames.items() if frame[2] == target)
+    answer = faces[opposite_index]["color"]
+    if answer not in COLOR_RGB:
+        raise ValueError("opposite face is not one of the declared answer colors")
+    return str(answer)

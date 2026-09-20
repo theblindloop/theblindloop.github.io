@@ -1,0 +1,161 @@
+"""Independent image-only inverse for compact rotational signatures.
+
+This file intentionally repeats the small amount of geometry needed by the
+inverse arm instead of importing the renderer.  It sees only an RGB image,
+segments the largest foreground component, and compares its recovered radial
+boundary profile at 180 and 120 degrees.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+ORACLE_VERSION = "compact_turn_signature-pixel-oracle-0.1.0"
+PROFILE_BINS = 120
+MIN_COMPONENT_PIXELS = 900
+MIN_RESIDUAL_GAP = 1.15
+MIN_RADIAL_SOLIDITY = 0.997
+
+
+def _background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:3].reshape(-1, 3),
+            array[-3:].reshape(-1, 3),
+            array[:, :3].reshape(-1, 3),
+            array[:, -3:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    return np.median(border, axis=0)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    """Return the largest 8-connected component of a boolean mask."""
+
+    points = np.argwhere(mask)
+    if not len(points):
+        raise ValueError("no foreground component")
+    seen = np.zeros(mask.shape, dtype=bool)
+    best: list[tuple[int, int]] = []
+    height, width = mask.shape
+    for y0, x0 in points:
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        queue = deque([(y0, x0)])
+        component: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            component.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    if len(best) < MIN_COMPONENT_PIXELS:
+        raise ValueError("foreground component is too small")
+    result = np.zeros(mask.shape, dtype=bool)
+    ys, xs = zip(*best)
+    result[np.asarray(ys), np.asarray(xs)] = True
+    return result
+
+
+def _interpolate_missing(profile: np.ndarray) -> np.ndarray:
+    valid = profile > 0.0
+    if int(valid.sum()) < int(0.55 * len(profile)):
+        raise ValueError("boundary profile is too sparse")
+    if valid.all():
+        return profile
+    indices = np.arange(len(profile))
+    valid_indices = indices[valid]
+    extended_x = np.concatenate(
+        ([valid_indices[-1] - len(profile)], valid_indices, [valid_indices[0] + len(profile)])
+    )
+    extended_y = np.concatenate(([profile[valid_indices[-1]]], profile[valid], [profile[valid_indices[0]]]))
+    return np.interp(indices, extended_x, extended_y)
+
+
+def _boundary_profile(component: np.ndarray) -> np.ndarray:
+    ys, xs = np.nonzero(component)
+    cy = float(ys.mean())
+    cx = float(xs.mean())
+    dy = ys.astype(np.float64) - cy
+    dx = xs.astype(np.float64) - cx
+    radii = np.hypot(dx, dy)
+    angles = (np.arctan2(dy, dx) + 2.0 * math.pi) % (2.0 * math.pi)
+    bins = np.floor(angles / (2.0 * math.pi) * PROFILE_BINS).astype(np.int64) % PROFILE_BINS
+    profile = np.zeros(PROFILE_BINS, dtype=np.float64)
+    np.maximum.at(profile, bins, radii)
+    profile = _interpolate_missing(profile)
+    # A short circular average suppresses one-pixel polygon stair-steps without
+    # erasing the 120/180 degree structure being measured.
+    kernel = np.ones(5, dtype=np.float64) / 5.0
+    profile = np.convolve(
+        np.concatenate((profile[-2:], profile, profile[:2])), kernel, mode="valid"
+    )
+    return profile
+
+
+def _radial_solidity(component: np.ndarray) -> float:
+    """Estimate whether the foreground is a filled radial contour.
+
+    The boundary profile supplies the expected polar area; a rectangular
+    ablation through the emblem removes area without changing the outermost
+    radius in every affected angle, so this independent fill check notices the
+    missing interior rather than silently treating it as a clean contour.
+    """
+
+    ys, xs = np.nonzero(component)
+    cy = float(ys.mean())
+    cx = float(xs.mean())
+    dy = ys.astype(np.float64) - cy
+    dx = xs.astype(np.float64) - cx
+    radii = np.hypot(dx, dy)
+    angles = (np.arctan2(dy, dx) + 2.0 * math.pi) % (2.0 * math.pi)
+    bins = np.floor(angles / (2.0 * math.pi) * PROFILE_BINS).astype(np.int64) % PROFILE_BINS
+    profile = np.zeros(PROFILE_BINS, dtype=np.float64)
+    np.maximum.at(profile, bins, radii)
+    profile = _interpolate_missing(profile)
+    expected_area = math.pi / PROFILE_BINS * float(np.sum(profile * profile))
+    if expected_area <= 0.0:
+        raise ValueError("filled contour has no measurable radial area")
+    return float(len(ys) / expected_area)
+
+
+def _residual(profile: np.ndarray, shift: int) -> float:
+    return float(np.sqrt(np.mean((profile - np.roll(profile, shift)) ** 2)))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the lower whole-contour rotation residual from final pixels."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float64)
+    background = _background(array)
+    distance = np.linalg.norm(array - background.reshape(1, 1, 3), axis=2)
+    component = _largest_component(distance > 22.0)
+    if _radial_solidity(component) < MIN_RADIAL_SOLIDITY:
+        raise ValueError("foreground contour has an erased area")
+    profile = _boundary_profile(component)
+    half_residual = _residual(profile, PROFILE_BINS // 2)
+    third_residual = _residual(profile, PROFILE_BINS // 3)
+    gap = abs(half_residual - third_residual)
+    if gap < MIN_RESIDUAL_GAP:
+        raise ValueError("half-turn and third-turn residuals are too close")
+    return "half-turn" if half_residual < third_residual else "third-turn"

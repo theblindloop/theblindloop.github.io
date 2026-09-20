@@ -1,0 +1,369 @@
+"""Nested closed loops: how many loops enclose each colored dot.
+
+The scene is an unordered bag of closed rectilinear loops drawn on a cell
+lattice.  Every loop is the boundary of a simply connected, pinch-free
+polyomino, so each loop is one simple closed curve and no two loops touch.
+One loop sits strictly inside another, a third loop stands on its own, and
+three colored dots sit at separation depths 2, 1 and 0 from the outside.
+
+The label is the color of the dot that two loops enclose.  Nothing in the
+raster names a depth: the depth of a point is the number of loops that
+separate it from the border, which is a count of nested Jordan curves, not a
+walk and not a region-membership test against a single seeded component.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+GRID = 12
+PITCH = 68
+MARGIN = 40
+THICK = 14
+FIELD = GRID * PITCH
+SIZE = FIELD + 2 * MARGIN
+DOT_R = 14
+
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+COLORS: dict[str, tuple[int, int, int]] = {
+    "teal": (0, 150, 150),
+    "orange": (255, 140, 0),
+    "violet": (140, 60, 200),
+}
+COLOR_NAMES = tuple(sorted(COLORS))
+
+MIN_MARGIN = 11.0
+MIN_DOT_SEPARATION = 130.0
+MIN_OPEN_SPACE = 34.0
+DENSITY_WINDOW = 150
+
+
+# ---------------------------------------------------------------- lattice ---
+def _n4(cell):
+    r, c = cell
+    return ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1))
+
+
+def _n8(cell):
+    r, c = cell
+    return tuple(
+        (r + dr, c + dc)
+        for dr in (-1, 0, 1)
+        for dc in (-1, 0, 1)
+        if dr or dc
+    )
+
+
+def _pinch_free(cells: set) -> bool:
+    """No 2x2 block may hold exactly the two diagonal cells of the shape."""
+    rows = [r for r, _ in cells]
+    cols = [c for _, c in cells]
+    for r in range(min(rows) - 1, max(rows) + 1):
+        for c in range(min(cols) - 1, max(cols) + 1):
+            a = (r, c) in cells
+            b = (r, c + 1) in cells
+            d = (r + 1, c) in cells
+            e = (r + 1, c + 1) in cells
+            if a and e and not b and not d:
+                return False
+            if b and d and not a and not e:
+                return False
+    return True
+
+
+def _simply_connected(cells: set) -> bool:
+    """The complement of the shape inside a padded box must be connected."""
+    lo, hi = -1, GRID
+    total = (hi - lo + 1) ** 2 - len(cells)
+    start = (lo, lo)
+    seen = {start}
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        for nxt in _n4(cur):
+            r, c = nxt
+            if lo <= r <= hi and lo <= c <= hi and nxt not in cells and nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return len(seen) == total
+
+
+def _valid_shape(cells: set) -> bool:
+    return _pinch_free(cells) and _simply_connected(cells)
+
+
+def _grow(rng: random.Random, allowed: set, target: int, prefer: set | None = None) -> set:
+    if not allowed:
+        return set()
+    pool = sorted(allowed & prefer) if prefer else []
+    cur = {rng.choice(pool or sorted(allowed))}
+    if not _valid_shape(cur):
+        return set()
+    while len(cur) < target:
+        frontier = sorted({n for c in cur for n in _n4(c) if n in allowed and n not in cur})
+        rng.shuffle(frontier)
+        grew = False
+        for cand in frontier:
+            trial = cur | {cand}
+            if _valid_shape(trial):
+                cur = trial
+                grew = True
+                break
+        if not grew:
+            break
+    return cur
+
+
+def _strict_interior(cells: set) -> set:
+    return {c for c in cells if all(n in cells for n in _n8(c))}
+
+
+# ---------------------------------------------------------------- geometry --
+def _cell_box(cell):
+    r, c = cell
+    x0 = MARGIN + c * PITCH
+    y0 = MARGIN + r * PITCH
+    return x0, y0, x0 + PITCH, y0 + PITCH
+
+
+def _cell_center(cell):
+    x0, y0, x1, y1 = _cell_box(cell)
+    return (x0 + x1) / 2.0, (y0 + y1) / 2.0
+
+
+def loop_rects(cells) -> list:
+    """Thick axis-aligned strokes covering every boundary edge of a shape."""
+    shape = {tuple(c) for c in cells}
+    half = THICK // 2
+    rects = []
+    for cell in sorted(shape):
+        x0, y0, x1, y1 = _cell_box(cell)
+        r, c = cell
+        if (r - 1, c) not in shape:
+            rects.append((x0 - half, y0 - half, x1 + half, y0 + half))
+        if (r + 1, c) not in shape:
+            rects.append((x0 - half, y1 - half, x1 + half, y1 + half))
+        if (r, c - 1) not in shape:
+            rects.append((x0 - half, y0 - half, x0 + half, y1 + half))
+        if (r, c + 1) not in shape:
+            rects.append((x1 - half, y0 - half, x1 + half, y1 + half))
+    return rects
+
+
+def _point_rect_gap(px, py, rect) -> float:
+    x0, y0, x1, y1 = rect
+    dx = max(x0 - px, 0.0, px - x1)
+    dy = max(y0 - py, 0.0, py - y1)
+    return math.hypot(dx, dy)
+
+
+def _rect_rect_gap(a, b) -> float:
+    dx = max(a[0] - b[2], b[0] - a[2], 0.0)
+    dy = max(a[1] - b[3], b[1] - a[3], 0.0)
+    return math.hypot(dx, dy)
+
+
+def _ink_distance(px, py, rects) -> float:
+    return min(_point_rect_gap(px, py, rect) for rect in rects)
+
+
+def _local_ink(px, py, rects) -> float:
+    x0, y0 = px - DENSITY_WINDOW, py - DENSITY_WINDOW
+    x1, y1 = px + DENSITY_WINDOW, py + DENSITY_WINDOW
+    total = 0.0
+    for rx0, ry0, rx1, ry1 in rects:
+        w = min(x1, rx1) - max(x0, rx0)
+        h = min(y1, ry1) - max(y0, ry0)
+        if w > 0 and h > 0:
+            total += w * h
+    return total
+
+
+# ----------------------------------------------------------------- sampling --
+def _depth_of(cell, loops) -> int:
+    cell = tuple(cell)
+    return sum(1 for loop in loops if cell in {tuple(c) for c in loop})
+
+
+def _try_scene(rng: random.Random):
+    outer = _grow(rng, {(r, c) for r in range(GRID) for c in range(GRID)}, rng.randint(34, 46))
+    if len(outer) < 30:
+        return None
+    interior = _strict_interior(outer)
+    if len(interior) < 9:
+        return None
+    inner = _grow(rng, interior, rng.randint(6, 12))
+    if len(inner) < 5:
+        return None
+    blocked = set(outer) | {n for c in outer for n in _n8(c)}
+    free = {(r, c) for r in range(GRID) for c in range(GRID)} - blocked
+    if len(free) < 5:
+        return None
+    rows = [r for r, _ in outer]
+    cols = [c for _, c in outer]
+    bbox = (min(rows), min(cols), max(rows), max(cols))
+    pocket = {
+        c
+        for c in free
+        if bbox[0] <= c[0] <= bbox[2] and bbox[1] <= c[1] <= bbox[3]
+    }
+    extra = _grow(rng, free, rng.randint(4, 9), prefer=pocket)
+    if len(extra) < 4:
+        return None
+
+    loops = [sorted(outer), sorted(inner), sorted(extra)]
+    rects = [rect for loop in loops for rect in loop_rects(loop)]
+
+    def clearance(cell):
+        px, py = _cell_center(cell)
+        edge = min(px, py, SIZE - px, SIZE - py) - DOT_R
+        return min(_ink_distance(px, py, rects) - DOT_R, edge)
+
+    deep = [c for c in sorted(inner) if clearance(c) >= MIN_MARGIN
+            and _ink_distance(*_cell_center(c), rects) >= MIN_OPEN_SPACE]
+    mid = [c for c in sorted(set(outer) - set(inner)) if clearance(c) >= MIN_MARGIN]
+    outside = {(r, c) for r in range(GRID) for c in range(GRID)} - set(outer) - set(extra)
+    pocketed = [
+        c
+        for c in sorted(outside)
+        if bbox[0] <= c[0] <= bbox[2]
+        and bbox[1] <= c[1] <= bbox[3]
+        and clearance(c) >= MIN_MARGIN
+    ]
+    deep_pocket = [c for c in pocketed if sum(1 for n in _n4(c) if n in outer) >= 3]
+    out = deep_pocket or [c for c in pocketed if sum(1 for n in _n4(c) if n in outer) >= 2]
+    if not deep or not mid or not out:
+        return None
+
+    centre = SIZE / 2.0
+
+    def to_centre(cell):
+        px, py = _cell_center(cell)
+        return math.hypot(px - centre, py - centre)
+
+    rng.shuffle(deep)
+    rng.shuffle(mid)
+    rng.shuffle(out)
+    tries = 0
+    for d2 in deep[:8]:
+        p2 = _cell_center(d2)
+        ink2 = _local_ink(*p2, rects)
+        for d1 in mid[:12]:
+            p1 = _cell_center(d1)
+            if math.dist(p2, p1) < MIN_DOT_SEPARATION:
+                continue
+            if to_centre(d1) >= to_centre(d2):
+                continue
+            if _local_ink(*p1, rects) < ink2:
+                continue
+            for d0 in out[:12]:
+                tries += 1
+                if tries > 400:
+                    return None
+                p0 = _cell_center(d0)
+                if math.dist(p2, p0) < MIN_DOT_SEPARATION:
+                    continue
+                if math.dist(p1, p0) < MIN_DOT_SEPARATION:
+                    continue
+                if to_centre(d0) >= to_centre(d2):
+                    continue
+                if _local_ink(*p0, rects) < ink2:
+                    continue
+                names = list(COLOR_NAMES)
+                rng.shuffle(names)
+                dots = [
+                    {"color": names[0], "cell": list(d2)},
+                    {"color": names[1], "cell": list(d1)},
+                    {"color": names[2], "cell": list(d0)},
+                ]
+                dots.sort(key=lambda d: d["color"])
+                return {"loops": [[list(c) for c in loop] for loop in loops], "dots": dots}
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    for attempt in range(400):
+        rng = random.Random((seed * 1_000_003 + attempt * 7_919) & 0xFFFFFFFF)
+        scene = _try_scene(rng)
+        if scene is None:
+            continue
+        if is_quarantined(scene):
+            continue
+        return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+# ------------------------------------------------------------------ render --
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (SIZE, SIZE), WHITE)
+    draw = ImageDraw.Draw(image)
+    for loop in scene["loops"]:
+        for x0, y0, x1, y1 in loop_rects(loop):
+            draw.rectangle([x0, y0, x1 - 1, y1 - 1], fill=BLACK)
+    for dot in sorted(scene["dots"], key=lambda d: d["color"]):
+        px, py = _cell_center(tuple(dot["cell"]))
+        draw.ellipse(
+            [px - DOT_R, py - DOT_R, px + DOT_R - 1, py + DOT_R - 1],
+            fill=COLORS[dot["color"]],
+        )
+    return image
+
+
+# -------------------------------------------------------------------- label --
+def analytic_gold(scene: dict) -> str:
+    loops = scene["loops"]
+    winners = [d["color"] for d in scene["dots"] if _depth_of(d["cell"], loops) == 2]
+    if len(winners) != 1:
+        raise ValueError("scene does not have a unique doubly enclosed dot")
+    return winners[0]
+
+
+def margin(scene: dict) -> float:
+    per_loop = [loop_rects(loop) for loop in scene["loops"]]
+    rects = [rect for group in per_loop for rect in group]
+    value = float(THICK)
+    for i in range(len(per_loop)):
+        for j in range(i + 1, len(per_loop)):
+            for a in per_loop[i]:
+                for b in per_loop[j]:
+                    value = min(value, _rect_rect_gap(a, b))
+    centres = []
+    for dot in scene["dots"]:
+        px, py = _cell_center(tuple(dot["cell"]))
+        centres.append((px, py))
+        value = min(value, _ink_distance(px, py, rects) - DOT_R)
+        value = min(value, min(px, py, SIZE - px, SIZE - py) - DOT_R)
+    for i in range(len(centres)):
+        for j in range(i + 1, len(centres)):
+            value = min(value, math.dist(centres[i], centres[j]) - 2 * DOT_R)
+    return float(value)
+
+
+def is_quarantined(scene: dict) -> bool:
+    loops = scene["loops"]
+    dots = scene["dots"]
+    if len({d["color"] for d in dots}) != 3:
+        return True
+    depths = sorted(_depth_of(d["cell"], loops) for d in dots)
+    if depths != [0, 1, 2]:
+        return True
+    return margin(scene) < MIN_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    reversed_loops = {
+        "loops": [list(reversed(loop)) for loop in reversed(scene["loops"])],
+        "dots": [dict(d) for d in scene["dots"]],
+    }
+    rotated_dots = {
+        "loops": [list(loop) for loop in scene["loops"]],
+        "dots": [dict(d) for d in (scene["dots"][1:] + scene["dots"][:1])],
+    }
+    return [
+        ("reversed_loop_records", reversed_loops),
+        ("rotated_dot_records", rotated_dots),
+    ]

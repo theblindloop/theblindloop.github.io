@@ -1,0 +1,113 @@
+"""Independent inverse arm: only the final RGB image enters this module."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+ORIENTATIONS = ("vertical", "horizontal", "diag_down", "diag_up")
+AXIS_RGB = {
+    "red": (211, 55, 48),
+    "blue": (42, 104, 177),
+    "green": (34, 139, 78),
+    "orange": (225, 126, 35),
+}
+DOT_RGB = (27, 32, 43)
+
+
+@dataclass(frozen=True)
+class Measurement:
+    decision: str
+    margin: float
+    center: tuple[int, int]
+    scores: dict[str, float]
+
+
+def _angular_distance(a: float, b: float) -> float:
+    delta = abs(a - b) % math.pi
+    return min(delta, math.pi - delta)
+
+
+def _orientation(coords_xy: np.ndarray) -> str:
+    centered = coords_xy - coords_xy.mean(axis=0)
+    covariance = centered.T @ centered
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    angle = math.atan2(float(direction[1]), float(direction[0])) % math.pi
+    references = {
+        "horizontal": 0.0,
+        "diag_down": math.pi / 4,
+        "vertical": math.pi / 2,
+        "diag_up": 3 * math.pi / 4,
+    }
+    return min(references, key=lambda name: _angular_distance(angle, references[name]))
+
+
+def _reflect_pixels(mask: np.ndarray, center: tuple[int, int], orientation: str) -> np.ndarray:
+    ys, xs = np.nonzero(mask)
+    cx, cy = center
+    dx, dy = xs - cx, ys - cy
+    if orientation == "vertical":
+        rx, ry = cx - dx, cy + dy
+    elif orientation == "horizontal":
+        rx, ry = cx + dx, cy - dy
+    elif orientation == "diag_down":
+        rx, ry = cx + dy, cy + dx
+    elif orientation == "diag_up":
+        rx, ry = cx - dy, cy - dx
+    else:
+        raise ValueError(f"unknown orientation {orientation!r}")
+    reflected = np.zeros_like(mask)
+    valid = (rx >= 0) & (rx < mask.shape[1]) & (ry >= 0) & (ry < mask.shape[0])
+    reflected[ry[valid], rx[valid]] = True
+    return reflected
+
+
+def measure(image: Image.Image) -> Measurement:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    line_data: dict[str, tuple[str, np.ndarray]] = {}
+    for color, rgb in AXIS_RGB.items():
+        mask = np.all(array == np.asarray(rgb, dtype=np.uint8), axis=2)
+        yx = np.argwhere(mask)
+        if len(yx) < 80:
+            raise ValueError(f"insufficient visible {color} guide ink")
+        xy = yx[:, ::-1].astype(np.float64)
+        line_data[color] = (_orientation(xy), xy)
+
+    by_orientation = {orientation: (color, xy) for color, (orientation, xy) in line_data.items()}
+    if set(by_orientation) != set(ORIENTATIONS):
+        raise ValueError("colored guides do not expose four distinct candidate axes")
+    vertical_xy = by_orientation["vertical"][1]
+    horizontal_xy = by_orientation["horizontal"][1]
+    cx = int(round(float(np.median(vertical_xy[:, 0]))))
+    cy = int(round(float(np.median(horizontal_xy[:, 1]))))
+
+    dot_mask = np.all(array == np.asarray(DOT_RGB, dtype=np.uint8), axis=2)
+    if int(dot_mask.sum()) < 300:
+        raise ValueError("insufficient dark-dot evidence")
+
+    scores_by_orientation: dict[str, float] = {}
+    for orientation in ORIENTATIONS:
+        reflected = _reflect_pixels(dot_mask, (cx, cy), orientation)
+        union = np.logical_or(dot_mask, reflected).sum()
+        mismatch = np.logical_xor(dot_mask, reflected).sum()
+        scores_by_orientation[orientation] = float(mismatch / max(1, union))
+
+    ordered = sorted(ORIENTATIONS, key=lambda name: (scores_by_orientation[name], name))
+    best, runner = ordered[:2]
+    margin = scores_by_orientation[runner] - scores_by_orientation[best]
+    if scores_by_orientation[best] > 0.04 or margin < 0.08:
+        raise ValueError("reflection evidence is erased, weak, or ambiguous")
+    winning_color = by_orientation[best][0]
+    scores_by_color = {
+        by_orientation[orientation][0]: scores_by_orientation[orientation]
+        for orientation in ORIENTATIONS
+    }
+    return Measurement(winning_color, float(margin), (cx, cy), scores_by_color)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure(image).decision

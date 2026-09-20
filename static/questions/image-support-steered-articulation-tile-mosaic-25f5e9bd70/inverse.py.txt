@@ -1,0 +1,156 @@
+"""Independent pixel-only inverse for the articulation-tile predicate.
+
+The inverse segments teal tile interiors, certifies 24 equal filled squares on
+a regular 6x6 lattice, reconstructs their side-adjacency graph, and tests every
+single-tile deletion.  It has no access to renderer state or scene payloads.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """Raised when the raster does not certify the declared mosaic rules."""
+
+
+def _teal_mask(array: np.ndarray) -> np.ndarray:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    return (red < 80) & (green > 88) & (blue > 72) & ((green + blue - 2 * red) > 105)
+
+
+def _pixel_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components: list[list[tuple[int, int]]] = []
+    for raw_y, raw_x in np.argwhere(mask):
+        y, x = int(raw_y), int(raw_x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        components.append(points)
+    return components
+
+
+def _connected(cells: set[tuple[int, int]], removed: tuple[int, int] | None = None) -> bool:
+    remaining = set(cells)
+    if removed is not None:
+        remaining.discard(removed)
+    if not remaining:
+        return True
+    start = next(iter(remaining))
+    seen = {start}
+    queue: deque[tuple[int, int]] = deque([start])
+    while queue:
+        row, col = queue.popleft()
+        for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if neighbor in remaining and neighbor not in seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+    return len(seen) == len(remaining)
+
+
+def _hole_count(cells: set[tuple[int, int]]) -> int:
+    background = {
+        (row, col)
+        for row in range(-1, 7)
+        for col in range(-1, 7)
+        if (row, col) not in cells
+    }
+    seen: set[tuple[int, int]] = set()
+    holes = 0
+    for start in background:
+        if start in seen:
+            continue
+        seen.add(start)
+        queue = deque([start])
+        touches_border = False
+        while queue:
+            row, col = queue.popleft()
+            touches_border |= row in (-1, 6) or col in (-1, 6)
+            for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+                if neighbor in background and neighbor not in seen:
+                    seen.add(neighbor)
+                    queue.append(neighbor)
+        if not touches_border:
+            holes += 1
+    return holes
+
+
+def _recover_cells(image: Image.Image) -> set[tuple[int, int]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or min(array.shape[:2]) < 200:
+        raise OracleAbstention("image is too small for the certified mosaic")
+    components = _pixel_components(_teal_mask(array))
+    if len(components) != 24:
+        raise OracleAbstention(f"expected 24 teal tile interiors, found {len(components)}")
+
+    centers: list[tuple[float, float]] = []
+    widths: list[int] = []
+    heights: list[int] = []
+    for points in components:
+        ys = [point[0] for point in points]
+        xs = [point[1] for point in points]
+        y0, y1 = min(ys), max(ys)
+        x0, x1 = min(xs), max(xs)
+        height, width = y1 - y0 + 1, x1 - x0 + 1
+        if not 20 <= width <= 28 or not 20 <= height <= 28 or abs(width - height) > 1:
+            raise OracleAbstention("a teal interior is not an equal square in the certified size band")
+        if len(points) != width * height:
+            raise OracleAbstention("a teal tile interior is clipped or not solid")
+        widths.append(width)
+        heights.append(height)
+        centers.append(((y0 + y1) / 2.0, (x0 + x1) / 2.0))
+    if max(widths) != min(widths) or max(heights) != min(heights):
+        raise OracleAbstention("tile interiors do not have one common size")
+
+    row_centers = sorted({center[0] for center in centers})
+    col_centers = sorted({center[1] for center in centers})
+    if len(row_centers) != 6 or len(col_centers) != 6:
+        raise OracleAbstention("tile centers do not occupy a complete 6 by 6 lattice extent")
+    row_steps = [row_centers[index + 1] - row_centers[index] for index in range(5)]
+    col_steps = [col_centers[index + 1] - col_centers[index] for index in range(5)]
+    if max(row_steps + col_steps) - min(row_steps + col_steps) > 0.01:
+        raise OracleAbstention("tile-center spacing is not regular")
+    pitch = sum(row_steps + col_steps) / 10.0
+    if not 25.5 <= pitch <= 30.5:
+        raise OracleAbstention("tile-center pitch is outside the certified band")
+
+    row_index = {value: index for index, value in enumerate(row_centers)}
+    col_index = {value: index for index, value in enumerate(col_centers)}
+    cells = {(row_index[y], col_index[x]) for y, x in centers}
+    if len(cells) != 24 or not _connected(cells):
+        raise OracleAbstention("recovered tile graph is duplicated or disconnected")
+    degrees = Counter(
+        sum(
+            neighbor in cells
+            for neighbor in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1))
+        )
+        for row, col in cells
+    )
+    if degrees != Counter({2: 12, 3: 10, 4: 2}):
+        raise OracleAbstention(f"tile degree controls are damaged: {dict(degrees)}")
+    if _hole_count(cells) != 1:
+        raise OracleAbstention("the controlled mosaic must contain exactly one grid hole")
+    return cells
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return yes iff at least one recovered tile is an articulation vertex."""
+
+    cells = _recover_cells(image)
+    return "yes" if any(not _connected(cells, cell) for cell in cells) else "no"

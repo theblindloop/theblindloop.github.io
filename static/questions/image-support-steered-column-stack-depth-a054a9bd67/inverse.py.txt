@@ -1,0 +1,157 @@
+"""Pixel-only inverse arm for the column-stack-depth world.
+
+Input is a single rasterised PNG. No latent scene, renderer code, analytic gold,
+manifest row, file name or metadata reaches this module; it imports only numpy
+and Pillow.
+
+Method
+------
+1. Segment pure-black ink by colour alone (all channels dark and nearly equal),
+   which discards every coloured decoration mark.
+2. Label the black ink into connected components with a run-based union-find,
+   and read each component's bounding box.
+3. Check the raster against the public contract: every black component must be a
+   horizontal bar of legible size, there must be exactly six of them, and they
+   must sit on exactly three separated levels of two bars each.
+4. Take each bar's column range from its bounding box and report the largest
+   number of ranges that cover one common image column.
+
+The arm abstains when the raster is not a legible instance of the contract: a
+black component that is not a bar, a bar count other than six, a level structure
+other than three levels of two, bars of one level that touch, or a stacking
+depth whose deepest column is not clearly resolved.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "column_stack_depth-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+_MIN_BAR_WIDTH = 50
+_MIN_BAR_HEIGHT = 5
+_MAX_BAR_HEIGHT = 18
+_MIN_ASPECT = 3.0
+_DECLARED_BARS = 6
+_DECLARED_LEVELS = 3
+_LEVEL_GAP_PX = 20
+
+
+def _black(image: Image.Image) -> np.ndarray:
+    rgb = np.asarray(image.convert("RGB")).astype(np.int16)
+    hi = rgb.max(axis=2)
+    lo = rgb.min(axis=2)
+    return (hi < 90) & ((hi - lo) < 40)
+
+
+def _row_runs(row: np.ndarray) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start = None
+    for x in range(row.shape[0] + 1):
+        here = bool(row[x]) if x < row.shape[0] else False
+        if here and start is None:
+            start = x
+        elif not here and start is not None:
+            runs.append((start, x - 1))
+            start = None
+    return runs
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Bounding boxes (x0, y0, x1, y1) of 4-connected black components."""
+    parent: list[int] = []
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    runs: list[tuple[int, int, int]] = []  # (y, x0, x1)
+    previous: list[tuple[int, int, int]] = []
+    for y in range(mask.shape[0]):
+        current: list[tuple[int, int, int]] = []
+        for x0, x1 in _row_runs(mask[y]):
+            index = len(parent)
+            parent.append(index)
+            runs.append((y, x0, x1))
+            for px0, px1, pindex in previous:
+                if px0 <= x1 and x0 <= px1:
+                    union(pindex, index)
+            current.append((x0, x1, index))
+        previous = current
+
+    boxes: dict[int, list[int]] = {}
+    for index, (y, x0, x1) in enumerate(runs):
+        root = find(index)
+        box = boxes.get(root)
+        if box is None:
+            boxes[root] = [x0, y, x1, y]
+        else:
+            box[0] = min(box[0], x0)
+            box[1] = min(box[1], y)
+            box[2] = max(box[2], x1)
+            box[3] = max(box[3], y)
+    return [tuple(box) for box in boxes.values()]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    boxes = _components(_black(image))
+    if not boxes:
+        return ABSTAIN
+
+    bars: list[tuple[int, int, float]] = []
+    for x0, y0, x1, y1 in boxes:
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        legible = (
+            width >= _MIN_BAR_WIDTH
+            and _MIN_BAR_HEIGHT <= height <= _MAX_BAR_HEIGHT
+            and width >= _MIN_ASPECT * height
+        )
+        if not legible:
+            # A black mark that is not a legible bar means the raster is not an
+            # instance of the declared contract.
+            return ABSTAIN
+        bars.append((x0, x1, (y0 + y1) / 2.0))
+
+    if len(bars) != _DECLARED_BARS:
+        return ABSTAIN
+
+    # Exactly three separated levels carrying two bars each.
+    levels: list[list[tuple[int, int, float]]] = []
+    for bar in sorted(bars, key=lambda item: item[2]):
+        if levels and abs(bar[2] - levels[-1][-1][2]) <= 3.0:
+            levels[-1].append(bar)
+        elif levels and abs(bar[2] - levels[-1][-1][2]) < _LEVEL_GAP_PX:
+            return ABSTAIN  # levels not clearly separated
+        else:
+            levels.append([bar])
+    if len(levels) != _DECLARED_LEVELS or any(len(level) != 2 for level in levels):
+        return ABSTAIN
+    for level in levels:
+        first, second = sorted(level, key=lambda item: item[0])
+        if second[0] <= first[1] + 4:
+            return ABSTAIN  # bars of one level must be separated by paper
+
+    intervals = [(x0, x1) for x0, x1, _ in bars]
+    depth = 0
+    for left, _ in intervals:
+        count = sum(1 for x0, x1 in intervals if x0 <= left <= x1)
+        depth = max(depth, count)
+
+    # The deepest column must be clearly resolved: every pair of bars is either
+    # plainly overlapping or plainly separated at raster scale.
+    for i in range(len(intervals)):
+        for j in range(i + 1, len(intervals)):
+            a, b = intervals[i], intervals[j]
+            if abs(min(a[1], b[1]) - max(a[0], b[0])) < 2.0:
+                return ABSTAIN
+    return str(depth)

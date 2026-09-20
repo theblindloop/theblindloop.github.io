@@ -1,0 +1,312 @@
+"""Renderer for the rose-frame bearing world.
+
+One small compass rose sits in one corner of the canvas; one long solid arrow
+sits in the diagonally opposite corner.  The rose carries the only orientation
+frame in the picture: its solid triangular tip marks north, and the three
+square tips mark east/south/west clockwise from it.  The decision is the name of
+the rose direction closest to the arrow's heading.
+
+Screen-up is deliberately *not* north in most scenes, so the familiar
+"up = north" prior conflicts with the visible frame.  Control scenes (rose north
+pointing up) and counterfactual scenes (rose north rotated away from up) are
+drawn with identical styling, palette, sizes and wording.
+
+Nothing in this module is read by ``oracle.py``.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "rose_frame_bearing-renderer-0.1.0"
+
+CANVAS = 640
+SUPERSAMPLE = 3
+
+WHITE = (255, 255, 255)
+NAVY = (30, 45, 120)
+CRIMSON = (200, 30, 60)
+GREY = (150, 150, 150)
+
+ROSE_RADIUS = 62.0
+ROSE_SQUARE_SIDE = 16.0
+ROSE_TRI_BASE = 34.0
+ROSE_TRI_HEIGHT = 30.0
+
+ARROW_LENGTH = 150.0
+ARROW_HEAD_LENGTH = 40.0
+ARROW_HEAD_HALFWIDTH = 22.0
+ARROW_SHAFT_HALFWIDTH = 4.5
+
+QUARANTINE_MARGIN_DEG = 8.0
+
+DIRECTIONS = ("north", "east", "south", "west")
+
+# Diagonally opposite anchor pairs: the rose and the arrow never share a half of
+# the canvas, so the two pieces of decisive evidence stay far apart.
+_ANCHORS = ((128.0, 128.0), (512.0, 128.0), (512.0, 512.0), (128.0, 512.0))
+_OPPOSITE = {0: 2, 1: 3, 2: 0, 3: 1}
+
+
+# -- pure geometry helpers (never touch a scene dict) --------------------------
+
+
+def _quantize_angle(value: float) -> float:
+    """Snap an angle to a half-degree grid so +/-360 shifts are exact floats."""
+    return round(value * 2.0) / 2.0
+
+
+def _wrap360(value: float) -> float:
+    return math.fmod(math.fmod(value, 360.0) + 360.0, 360.0)
+
+
+def _label_for(rose_rot_deg: float, arrow_heading_deg: float) -> str:
+    """Name of the rose arm closest in angle to the arrow heading."""
+    offset = _wrap360(arrow_heading_deg - rose_rot_deg)
+    index = int(math.floor(offset / 90.0 + 0.5)) % 4
+    return DIRECTIONS[index]
+
+
+def _boundary_gap(rose_rot_deg: float, arrow_heading_deg: float) -> float:
+    """Degrees from the 45-degree bisector between two neighbouring arms."""
+    offset = math.fmod(_wrap360(arrow_heading_deg - rose_rot_deg), 90.0)
+    if offset > 45.0:
+        offset = 90.0 - offset
+    return 45.0 - offset
+
+
+def _unit(bearing_deg: float) -> tuple[float, float]:
+    """Screen vector for a bearing measured clockwise from screen-up.
+
+    The bearing is folded into [0, 360) with exact ``fmod`` arithmetic first, so
+    two half-degree-grid representations of the same direction (for example 12.5
+    and 372.5) reach the rasteriser as bit-identical floats.
+    """
+    folded = math.fmod(bearing_deg, 360.0)
+    if folded < 0.0:
+        folded += 360.0
+    radians = math.radians(folded)
+    return (math.sin(radians), -math.cos(radians))
+
+
+def _polygon(points, scale):
+    return [(x * scale, y * scale) for x, y in points]
+
+
+def _square_points(cx: float, cy: float, half: float, bearing_deg: float):
+    ux, uy = _unit(bearing_deg)
+    px, py = -uy, ux
+    return [
+        (cx + ux * half + px * half, cy + uy * half + py * half),
+        (cx + ux * half - px * half, cy + uy * half - py * half),
+        (cx - ux * half - px * half, cy - uy * half - py * half),
+        (cx - ux * half + px * half, cy - uy * half + py * half),
+    ]
+
+
+def _triangle_points(cx: float, cy: float, bearing_deg: float, base: float, height: float):
+    """Isoceles triangle whose *centroid* is exactly (cx, cy)."""
+    ux, uy = _unit(bearing_deg)
+    px, py = -uy, ux
+    apex = (cx + ux * (2.0 * height / 3.0), cy + uy * (2.0 * height / 3.0))
+    back_x = cx - ux * (height / 3.0)
+    back_y = cy - uy * (height / 3.0)
+    left = (back_x + px * (base / 2.0), back_y + py * (base / 2.0))
+    right = (back_x - px * (base / 2.0), back_y - py * (base / 2.0))
+    return [apex, left, right]
+
+
+def _arrow_polygons(cx: float, cy: float, bearing_deg: float, length: float):
+    ux, uy = _unit(bearing_deg)
+    px, py = -uy, ux
+    tail_x = cx - ux * (length / 2.0)
+    tail_y = cy - uy * (length / 2.0)
+    apex_x = cx + ux * (length / 2.0)
+    apex_y = cy + uy * (length / 2.0)
+    shaft_len = length - ARROW_HEAD_LENGTH
+    neck_x = tail_x + ux * shaft_len
+    neck_y = tail_y + uy * shaft_len
+    shaft = [
+        (tail_x + px * ARROW_SHAFT_HALFWIDTH, tail_y + py * ARROW_SHAFT_HALFWIDTH),
+        (neck_x + px * ARROW_SHAFT_HALFWIDTH, neck_y + py * ARROW_SHAFT_HALFWIDTH),
+        (neck_x - px * ARROW_SHAFT_HALFWIDTH, neck_y - py * ARROW_SHAFT_HALFWIDTH),
+        (tail_x - px * ARROW_SHAFT_HALFWIDTH, tail_y - py * ARROW_SHAFT_HALFWIDTH),
+    ]
+    head = [
+        (apex_x, apex_y),
+        (neck_x + px * ARROW_HEAD_HALFWIDTH, neck_y + py * ARROW_HEAD_HALFWIDTH),
+        (neck_x - px * ARROW_HEAD_HALFWIDTH, neck_y - py * ARROW_HEAD_HALFWIDTH),
+    ]
+    return shaft, head
+
+
+# -- scene sampling ------------------------------------------------------------
+
+
+def _sample_delta(rng: random.Random) -> float:
+    """Signed offset of the heading from an exact rose arm, in degrees."""
+    roll = rng.random()
+    if roll < 0.12:
+        gap = rng.uniform(1.0, QUARANTINE_MARGIN_DEG - 0.6)  # quarantined band
+    elif roll < 0.34:
+        gap = rng.uniform(QUARANTINE_MARGIN_DEG + 1.0, 16.0)  # near-boundary
+    else:
+        gap = rng.uniform(18.0, 44.0)  # comfortable
+    magnitude = 45.0 - gap
+    return magnitude if rng.random() < 0.5 else -magnitude
+
+
+def _sample_decor(rng: random.Random, blocked):
+    decor = []
+    attempts = 0
+    wanted = rng.randint(4, 7)
+    while len(decor) < wanted and attempts < 400:
+        attempts += 1
+        x = float(rng.randint(90, CANVAS - 90))
+        y = float(rng.randint(90, CANVAS - 90))
+        if any(math.hypot(x - bx, y - by) < 132.0 for bx, by in blocked):
+            continue
+        if any(math.hypot(x - dx, y - dy) < 70.0 for _, dx, dy, _, _ in decor):
+            continue
+        kind = rng.choice(("square", "triangle", "ring", "bar"))
+        size = float(rng.randint(12, 26))
+        angle = _quantize_angle(rng.uniform(0.0, 360.0))
+        decor.append((kind, x, y, size, angle))
+    return [list(item) for item in decor]
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 1000003 + 17)
+
+    corner = rng.randrange(4)
+    rose_cx, rose_cy = _ANCHORS[corner]
+    arrow_cx, arrow_cy = _ANCHORS[_OPPOSITE[corner]]
+    rose_cx += rng.randint(-16, 16)
+    rose_cy += rng.randint(-16, 16)
+    arrow_cx += rng.randint(-14, 14)
+    arrow_cy += rng.randint(-14, 14)
+
+    control = rng.random() < 0.4
+    if control:
+        rose_rot = 0.0
+    else:
+        rose_rot = _quantize_angle(rng.uniform(14.0, 346.0))
+
+    label_index = rng.randrange(4)
+    delta = _sample_delta(rng)
+    heading = _quantize_angle(_wrap360(rose_rot + 90.0 * label_index + delta))
+
+    blocked = ((rose_cx, rose_cy), (arrow_cx, arrow_cy))
+    decor = _sample_decor(rng, blocked)
+
+    return {
+        "seed": int(seed),
+        "rose_cx": float(rose_cx),
+        "rose_cy": float(rose_cy),
+        "rose_radius": ROSE_RADIUS,
+        "rose_rot_deg": float(rose_rot),
+        "arrow_cx": float(arrow_cx),
+        "arrow_cy": float(arrow_cy),
+        "arrow_heading_deg": float(heading),
+        "arrow_len": ARROW_LENGTH,
+        "decor": decor,
+        "variant": "control" if control else "counterfactual",
+    }
+
+
+# -- rendering -----------------------------------------------------------------
+
+
+def render(scene: dict) -> Image.Image:
+    scale = SUPERSAMPLE
+    size = CANVAS * scale
+    image = Image.new("RGB", (size, size), WHITE)
+    draw = ImageDraw.Draw(image)
+
+    for kind, x, y, item_size, angle in scene["decor"]:
+        x = float(x)
+        y = float(y)
+        item_size = float(item_size)
+        angle = float(angle)
+        if kind == "square":
+            draw.polygon(_polygon(_square_points(x, y, item_size / 2.0, angle), scale), fill=GREY)
+        elif kind == "triangle":
+            points = _triangle_points(x, y, angle, item_size, item_size)
+            draw.polygon(_polygon(points, scale), fill=GREY)
+        elif kind == "ring":
+            radius = item_size / 2.0
+            box = [
+                (x - radius) * scale,
+                (y - radius) * scale,
+                (x + radius) * scale,
+                (y + radius) * scale,
+            ]
+            draw.ellipse(box, outline=GREY, width=max(1, int(round(3 * scale))))
+        else:
+            points = _square_points(x, y, item_size / 2.0, angle)
+            mid = [
+                (points[0][0] * 0.5 + points[3][0] * 0.5, points[0][1] * 0.5 + points[3][1] * 0.5),
+                (points[1][0] * 0.5 + points[2][0] * 0.5, points[1][1] * 0.5 + points[2][1] * 0.5),
+            ]
+            draw.line(_polygon(mid, scale), fill=GREY, width=max(1, int(round(4 * scale))))
+
+    rose_cx = float(scene["rose_cx"])
+    rose_cy = float(scene["rose_cy"])
+    radius = float(scene["rose_radius"])
+    rose_rot = float(scene["rose_rot_deg"])
+    for index in range(4):
+        bearing = rose_rot + 90.0 * index
+        ux, uy = _unit(bearing)
+        tip_x = rose_cx + ux * radius
+        tip_y = rose_cy + uy * radius
+        if index == 0:
+            points = _triangle_points(tip_x, tip_y, bearing, ROSE_TRI_BASE, ROSE_TRI_HEIGHT)
+        else:
+            points = _square_points(tip_x, tip_y, ROSE_SQUARE_SIDE / 2.0, bearing)
+        draw.polygon(_polygon(points, scale), fill=NAVY)
+
+    shaft, head = _arrow_polygons(
+        float(scene["arrow_cx"]),
+        float(scene["arrow_cy"]),
+        float(scene["arrow_heading_deg"]),
+        float(scene["arrow_len"]),
+    )
+    draw.polygon(_polygon(shaft, scale), fill=CRIMSON)
+    draw.polygon(_polygon(head, scale), fill=CRIMSON)
+
+    return image.resize((CANVAS, CANVAS), Image.BOX)
+
+
+# -- analytic consequences ------------------------------------------------------
+
+
+def analytic_gold(scene: dict) -> str:
+    return _label_for(float(scene["rose_rot_deg"]), float(scene["arrow_heading_deg"]))
+
+
+def margin(scene: dict) -> float:
+    return float(_boundary_gap(float(scene["rose_rot_deg"]), float(scene["arrow_heading_deg"])))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN_DEG)
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Angle representations that are pixel-identical and answer-preserving.
+
+    All sampled angles live on a half-degree grid, so adding or subtracting a
+    whole turn is an exact floating-point operation and the rasteriser receives
+    numerically identical trigonometric arguments.
+    """
+    full_turn = dict(scene)
+    full_turn["rose_rot_deg"] = float(scene["rose_rot_deg"]) + 360.0
+    full_turn["arrow_heading_deg"] = float(scene["arrow_heading_deg"]) + 360.0
+
+    negative_wrap = dict(scene)
+    negative_wrap["arrow_heading_deg"] = float(scene["arrow_heading_deg"]) - 360.0
+
+    return [("whole_turn_both", full_turn), ("negative_wrap_arrow", negative_wrap)]

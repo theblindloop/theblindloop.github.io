@@ -1,0 +1,109 @@
+"""Independent PNG-only inverse arm for visible radiation-sign blades."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+@dataclass(frozen=True)
+class Component:
+    area: int
+    cx: float
+    cy: float
+    bbox: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class Measurement:
+    decision: str
+    count: int
+    runner_up_margin: float
+    plaque_bbox: tuple[int, int, int, int] | None
+    blade_boxes: tuple[tuple[int, int, int, int], ...]
+
+
+def _components(mask: np.ndarray) -> list[Component]:
+    """Extract 8-connected foreground components without external CV packages."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[Component] = []
+    for y, x in zip(*np.nonzero(mask), strict=True):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue = deque([(y, x)])
+        seen[y, x] = True
+        area = 0
+        sum_x = 0.0
+        sum_y = 0.0
+        x0 = x1 = x
+        y0 = y1 = y
+        while queue:
+            yy, xx = queue.popleft()
+            area += 1
+            sum_x += xx + 0.5
+            sum_y += yy + 0.5
+            x0, x1 = min(x0, xx), max(x1, xx)
+            y0, y1 = min(y0, yy), max(y1, yy)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not dx and not dy:
+                        continue
+                    ny, nx = yy + dy, xx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        found.append(Component(area, sum_x / area, sum_y / area, (x0, y0, x1 + 1, y1 + 1)))
+    return found
+
+
+def measure_image(image: Image.Image) -> Measurement:
+    """Locate the yellow plaque, classify annular dark components, and count them."""
+    # int32 prevents the fixed-point luminance products from overflowing.
+    arr = np.asarray(image.convert("RGB"), dtype=np.int32)
+    red, green, blue = arr[..., 0], arr[..., 1], arr[..., 2]
+    plaque = (red > 155) & (green > 115) & (blue < 165) & ((red - blue) > 55)
+    py, px = np.nonzero(plaque)
+    if len(px) < 20000:
+        return Measurement("abstain", 0, 0.0, None, ())
+    bbox = (int(px.min()), int(py.min()), int(px.max()) + 1, int(py.max()) + 1)
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy = (bbox[1] + bbox[3]) / 2.0
+    half = ((bbox[2] - bbox[0]) + (bbox[3] - bbox[1])) / 4.0
+
+    luminance = (299 * red + 587 * green + 114 * blue) / 1000.0
+    dark = luminance < 105
+    comps = [item for item in _components(dark) if item.area >= 35]
+    scored: list[tuple[float, Component]] = []
+    for comp in comps:
+        rho = float(np.hypot(comp.cx - cx, comp.cy - cy) / half)
+        area_ratio = comp.area / float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+        score = min(
+            (rho - 0.27) / 0.10,
+            (0.72 - rho) / 0.10,
+            (area_ratio - 0.009) / 0.009,
+        )
+        scored.append((score, comp))
+    chosen = [comp for score, comp in scored if score > 0.0]
+    rejected = [score for score, _ in scored if score <= 0.0]
+    if not chosen:
+        return Measurement("abstain", 0, 0.0, bbox, ())
+    weakest = min(score for score, _ in scored if score > 0.0)
+    strongest_rejected = max(rejected, default=-1.0)
+    runner_up_margin = weakest - strongest_rejected
+    count = len(chosen)
+    if count not in (2, 3, 4, 5) or runner_up_margin < 0.35:
+        decision = "abstain"
+    else:
+        decision = str(count)
+    boxes = tuple(sorted((comp.bbox for comp in chosen)))
+    return Measurement(decision, count, float(runner_up_margin), bbox, boxes)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return only a visible count, or abstain when component classification is ambiguous."""
+    return measure_image(image).decision

@@ -1,0 +1,110 @@
+"""Independent pixel-only inverse for the visible music-staff line count.
+
+Only the final RGB raster enters this module.  The inverse segments the public
+staff-color vocabulary, verifies one wide bracket-connected trace, and counts
+only uninterrupted full-width horizontal runs.  Gray note glyphs and short
+ledger marks are ignored by color and by their limited horizontal span.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """Raised when the raster no longer exposes an unambiguous staff count."""
+
+
+_STAFF_COLORS = np.asarray(
+    ((31, 78, 128), (126, 47, 72), (27, 112, 105)), dtype=np.int16
+)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for raw_y, raw_x in np.argwhere(mask):
+        y, x = int(raw_y), int(raw_x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy, cx))
+            for ny, nx in (
+                (cy - 1, cx),
+                (cy + 1, cx),
+                (cy, cx - 1),
+                (cy, cx + 1),
+            ):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _clusters(indices: np.ndarray) -> list[np.ndarray]:
+    if len(indices) == 0:
+        return []
+    breaks = np.where(np.diff(indices) > 1)[0] + 1
+    return [part for part in np.split(indices, breaks) if len(part)]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.shape != (512, 512, 3):
+        raise OracleAbstention("expected a 512 by 512 RGB raster")
+
+    distances = np.sum((array[:, :, None, :] - _STAFF_COLORS[None, None, :, :]) ** 2, axis=3)
+    mask = np.min(distances, axis=2) <= 18**2
+    pieces = _components(mask)
+    substantial = [piece for piece in pieces if len(piece) >= 80]
+    speckle = sum(len(piece) for piece in pieces if len(piece) < 80)
+    if speckle > 20 or len(substantial) != 1:
+        raise OracleAbstention("staff-colored ink is fragmented or contaminated")
+
+    component = substantial[0]
+    ys, xs = component[:, 0], component[:, 1]
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    span_x = x1 - x0 + 1
+    span_y = y1 - y0 + 1
+    if span_x < 445 or not 20 <= x0 <= 45 or not 470 <= x1 <= 492:
+        raise OracleAbstention("colored trace does not span the declared staff width")
+    if not 50 <= span_y <= 100 or span_x / span_y < 4.4:
+        raise OracleAbstention("colored support is not a thin wide staff")
+    if not 6_500 <= len(component) <= 15_500:
+        raise OracleAbstention("staff-colored ink area is outside the supported range")
+
+    # Ignore the left joining barline and find rows whose colored run covers
+    # nearly the entire remaining width.  Every true rail is uninterrupted.
+    core0 = x0 + 10
+    core_width = x1 - core0 + 1
+    row_coverage = mask[:, core0 : x1 + 1].sum(axis=1)
+    full_rows = np.flatnonzero(row_coverage >= 0.985 * core_width)
+    bands = _clusters(full_rows)
+    if any(not 4 <= len(band) <= 6 for band in bands):
+        raise OracleAbstention("a full-width rail has unsupported thickness")
+    count = len(bands)
+    if count not in (4, 5, 6):
+        raise OracleAbstention("could not recover four, five, or six long rails")
+
+    centers = np.asarray([float(part.mean()) for part in bands])
+    gaps = np.diff(centers)
+    if len(gaps) and (float(gaps.min()) < 15.0 or float(gaps.max()) > 20.0):
+        raise OracleAbstention("rail spacing is ambiguous or a rail is missing")
+
+    # The left barline must visibly connect all counted rails.  This also makes
+    # remote erasures causally detectable rather than permitting a local count.
+    join = mask[y0 : y1 + 1, x0 : min(x1 + 1, x0 + 8)]
+    if int(np.count_nonzero(join.sum(axis=0) >= 0.96 * span_y)) < 4:
+        raise OracleAbstention("the staff rails are not joined by one continuous barline")
+
+    return str(count)

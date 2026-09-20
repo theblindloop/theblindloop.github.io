@@ -1,0 +1,170 @@
+"""Independent pixel-only inverse for the winding filmstrip.
+
+This module intentionally duplicates only the public palette and glyph legend.
+It receives a raster, finds visible fiducials, recovers a connected seven-frame
+chain, rectifies green-to-orange cross-sections, and reports the top Hamming
+template decision. It imports no renderer or scene-bearing module.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+
+import numpy as np
+from PIL import Image
+
+_GREEN = np.array((38, 166, 91), dtype=np.float32)
+_ORANGE = np.array((238, 133, 42), dtype=np.float32)
+_START = np.array((171, 66, 187), dtype=np.float32)
+_END = np.array((236, 194, 42), dtype=np.float32)
+_BLUES = (np.array((38, 105, 168), dtype=np.float32), np.array((27, 126, 151), dtype=np.float32))
+_TEMPLATES = {
+    "X": ("1000001", "0100010", "0010100", "0001000", "0010100", "0100010", "1000001"),
+    "plus": ("0001000", "0001000", "0001000", "1111111", "0001000", "0001000", "0001000"),
+    "T": ("1111111", "0001000", "0001000", "0001000", "0001000", "0001000", "0001000"),
+    "L": ("1000000", "1000000", "1000000", "1000000", "1000000", "1000000", "1111111"),
+}
+
+
+def _mask_near(array: np.ndarray, color: np.ndarray, radius: float = 34.0) -> np.ndarray:
+    return np.linalg.norm(array.astype(np.float32) - color, axis=2) <= radius
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[tuple[float, float, int]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= minimum:
+            ys = np.fromiter((p[0] for p in points), dtype=float)
+            xs = np.fromiter((p[1] for p in points), dtype=float)
+            output.append((float(xs.mean()), float(ys.mean()), len(points)))
+    return output
+
+
+def _single_centroid(mask: np.ndarray, minimum: int) -> tuple[float, float]:
+    comps = _components(mask, minimum)
+    if len(comps) != 1:
+        raise ValueError(f"expected one visible endpoint component, found {len(comps)}")
+    return comps[0][0], comps[0][1]
+
+
+def _pair_markers(greens: list[tuple[float, float, int]], oranges: list[tuple[float, float, int]]):
+    if len(greens) != 7 or len(oranges) != 7:
+        raise ValueError("all seven green and orange frame fiducials must be visible")
+    best = None
+    for permutation in itertools.permutations(range(7)):
+        costs = []
+        for green, orange_index in zip(greens, permutation, strict=True):
+            orange = oranges[orange_index]
+            costs.append(abs(math.hypot(green[0] - orange[0], green[1] - orange[1]) - 48.0))
+        score = sum(costs)
+        if best is None or score < best[0]:
+            best = (score, permutation, max(costs))
+    assert best is not None
+    if best[0] > 12.0 or best[2] > 3.0:
+        raise ValueError("green/orange frame pairing is geometrically ambiguous")
+    return [(greens[i], oranges[j]) for i, j in enumerate(best[1])]
+
+
+def _blue_mask(array: np.ndarray) -> np.ndarray:
+    masks = [_mask_near(array, color, 38.0) for color in _BLUES]
+    return np.logical_or.reduce(masks)
+
+
+def _link_coverage(mask: np.ndarray, first: tuple[float, float], second: tuple[float, float]) -> float:
+    hits = []
+    for t in np.linspace(0.22, 0.78, 17):
+        x = first[0] * (1 - t) + second[0] * t
+        y = first[1] * (1 - t) + second[1] * t
+        x0, y0 = int(round(x)), int(round(y))
+        patch = mask[max(0, y0 - 2):y0 + 3, max(0, x0 - 2):x0 + 3]
+        hits.append(bool(patch.any()))
+    return float(np.mean(hits))
+
+
+def _ordered_chain(centers, blue, start, end):
+    adjacency = {index: [] for index in range(7)}
+    for i in range(7):
+        for j in range(i + 1, 7):
+            distance = math.hypot(centers[i][0] - centers[j][0], centers[i][1] - centers[j][1])
+            # Opaque cross-section frames interrupt the under-painted carrier;
+            # the remaining inter-frame blue windows must still be present.
+            if 51.0 <= distance <= 65.0 and _link_coverage(blue, centers[i], centers[j]) >= 0.12:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+    endpoints = [index for index, neighbors in adjacency.items() if len(neighbors) == 1]
+    if len(endpoints) != 2 or any(len(neighbors) not in (1, 2) for neighbors in adjacency.values()):
+        raise ValueError("visible blue carrier is not one unbranched seven-frame chain")
+    start_index = min(range(7), key=lambda i: math.hypot(centers[i][0] - start[0], centers[i][1] - start[1]))
+    end_index = min(range(7), key=lambda i: math.hypot(centers[i][0] - end[0], centers[i][1] - end[1]))
+    if start_index not in endpoints or end_index not in endpoints or start_index == end_index:
+        raise ValueError("endpoint caps do not identify opposite route ends")
+    order, previous, current = [], None, start_index
+    while True:
+        order.append(current)
+        options = [item for item in adjacency[current] if item != previous]
+        if not options:
+            break
+        if len(options) != 1:
+            raise ValueError("route traversal is ambiguous")
+        previous, current = current, options[0]
+    if len(order) != 7 or order[-1] != end_index:
+        raise ValueError("route does not connect START to END through all frames")
+    return order
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 64 or array.shape[1] < 64:
+        raise ValueError("raster is too small")
+    greens = _components(_mask_near(array, _GREEN), 24)
+    oranges = _components(_mask_near(array, _ORANGE), 24)
+    pairs = _pair_markers(greens, oranges)
+    centers = [((g[0] + o[0]) / 2.0, (g[1] + o[1]) / 2.0) for g, o in pairs]
+    start = _single_centroid(_mask_near(array, _START), 45)
+    end = _single_centroid(_mask_near(array, _END), 55)
+    order = _ordered_chain(centers, _blue_mask(array), start, end)
+
+    recovered_columns = []
+    for index in order:
+        green, orange = pairs[index]
+        dx, dy = orange[0] - green[0], orange[1] - green[1]
+        length = math.hypot(dx, dy)
+        ux, uy = dx / length, dy / length
+        cx, cy = centers[index]
+        column = []
+        for row in range(7):
+            distance = (row - 3) * 5.0
+            x, y = int(round(cx + ux * distance)), int(round(cy + uy * distance))
+            patch = array[max(0, y - 1):y + 2, max(0, x - 1):x + 2].astype(np.float32)
+            if patch.shape[:2] != (3, 3):
+                raise ValueError("sample lies at raster boundary")
+            luminance = float(np.mean(0.2126 * patch[:, :, 0] + 0.7152 * patch[:, :, 1] + 0.0722 * patch[:, :, 2]))
+            if 105.0 <= luminance <= 180.0:
+                raise ValueError("sample luminance is ambiguous")
+            column.append(1 if luminance < 105.0 else 0)
+        recovered_columns.append(column)
+    recovered_rows = ["".join(str(recovered_columns[col][row]) for col in range(7)) for row in range(7)]
+    scores = {
+        name: sum(a != b for row_a, row_b in zip(recovered_rows, template, strict=True) for a, b in zip(row_a, row_b, strict=True))
+        for name, template in _TEMPLATES.items()
+    }
+    ranking = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    if ranking[0][1] > 3 or ranking[1][1] - ranking[0][1] < 2:
+        raise ValueError("rectified symbol has insufficient runner-up margin")
+    return ranking[0][0]

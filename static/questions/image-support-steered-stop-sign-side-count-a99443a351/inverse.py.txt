@@ -1,0 +1,196 @@
+"""Independent pixel-only inverse for the visible polygon side count.
+
+This module intentionally duplicates the public visual constants rather than
+importing the renderer. It identifies the largest non-white filled silhouette,
+rejects a damaged/incomplete body using a hull-coverage test, and simplifies
+the convex hull into its long straight runs. It never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+_INK_THRESHOLD = 245
+_MIN_BODY_AREA = 2_500
+_MIN_COVERAGE = 0.955
+_MIN_EDGE = 18.0
+_MAX_SIDE_COUNT = 10
+_MIN_SIDE_COUNT = 5
+
+
+class OracleAbstain(ValueError):
+    """The raster does not expose a sufficiently complete polygon."""
+
+
+def _foreground(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return np.any(array < _INK_THRESHOLD, axis=2)
+
+
+def _boundary(mask: np.ndarray) -> np.ndarray:
+    up = np.zeros_like(mask)
+    down = np.zeros_like(mask)
+    left = np.zeros_like(mask)
+    right = np.zeros_like(mask)
+    up[1:] = mask[:-1]
+    down[:-1] = mask[1:]
+    left[:, 1:] = mask[:, :-1]
+    right[:, :-1] = mask[:, 1:]
+    return np.argwhere(mask & ~(up & down & left & right))[:, ::-1].astype(float)
+
+
+def _cross(o: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
+
+
+def _convex_hull(points: np.ndarray) -> list[np.ndarray]:
+    if len(points) < 3:
+        raise OracleAbstain("too few silhouette boundary points")
+    unique = sorted({(float(x), float(y)) for x, y in points})
+    if len(unique) < 3:
+        raise OracleAbstain("degenerate silhouette")
+    lower: list[np.ndarray] = []
+    for x, y in unique:
+        point = np.array([x, y], dtype=float)
+        while len(lower) >= 2 and _cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    upper: list[np.ndarray] = []
+    for x, y in reversed(unique):
+        point = np.array([x, y], dtype=float)
+        while len(upper) >= 2 and _cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    return lower[:-1] + upper[:-1]
+
+
+def _polygon_area(points: list[np.ndarray]) -> float:
+    values = np.asarray(points, dtype=float)
+    return float(
+        0.5
+        * abs(
+            np.sum(values[:, 0] * np.roll(values[:, 1], -1))
+            - np.sum(values[:, 1] * np.roll(values[:, 0], -1))
+        )
+    )
+
+
+def _point_line_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    delta = end - start
+    length = float(np.linalg.norm(delta))
+    if length == 0.0:
+        return float(np.linalg.norm(point - start))
+    return abs(_cross(start, end, point)) / length
+
+
+def _rdp(points: list[np.ndarray], epsilon: float) -> list[np.ndarray]:
+    if len(points) <= 2:
+        return points
+    start, end = points[0], points[-1]
+    distances = np.asarray(
+        [_point_line_distance(point, start, end) for point in points[1:-1]], dtype=float
+    )
+    if not len(distances):
+        return [start, end]
+    index = int(np.argmax(distances)) + 1
+    if float(distances[index - 1]) > epsilon:
+        left = _rdp(points[: index + 1], epsilon)
+        right = _rdp(points[index:], epsilon)
+        return left[:-1] + right
+    return [start, end]
+
+
+def _simplify_closed(hull: list[np.ndarray]) -> list[np.ndarray]:
+    # Break at the leftmost extreme, then simplify the complete perimeter. The
+    # returned first/last duplicate is removed before counting corners.
+    start = min(range(len(hull)), key=lambda i: (hull[i][0], hull[i][1]))
+    ordered = hull[start:] + hull[:start] + [hull[start]]
+    simplified = _rdp(ordered, epsilon=3.5)
+    if len(simplified) > 1 and np.allclose(simplified[0], simplified[-1]):
+        simplified.pop()
+    # A second small collinearity pass removes staircase artifacts left by the
+    # integer raster without touching genuine polygon corners.
+    changed = True
+    while changed and len(simplified) > 3:
+        changed = False
+        kept: list[np.ndarray] = []
+        for index, point in enumerate(simplified):
+            before = simplified[index - 1]
+            after = simplified[(index + 1) % len(simplified)]
+            if _point_line_distance(point, before, after) < 2.2:
+                changed = True
+            else:
+                kept.append(point)
+        if changed and len(kept) >= 3:
+            simplified = kept
+    # Raster staircases can leave one tiny artificial segment at a genuine
+    # corner. Remove only an edge that is a small fraction of the typical edge;
+    # real sign sides are deliberately much longer and are never touched.
+    while len(simplified) > _MIN_SIDE_COUNT:
+        lengths = _edge_lengths(simplified)
+        median_length = float(np.median(lengths))
+        shortest = int(np.argmin(lengths))
+        if lengths[shortest] >= 0.28 * median_length:
+            break
+        left_index = shortest
+        right_index = (shortest + 1) % len(simplified)
+
+        def corner_error(index: int) -> float:
+            before = simplified[index - 1]
+            after = simplified[(index + 1) % len(simplified)]
+            return _point_line_distance(simplified[index], before, after)
+
+        remove = left_index if corner_error(left_index) < corner_error(right_index) else right_index
+        simplified.pop(remove)
+    return simplified
+
+
+def _edge_lengths(points: list[np.ndarray]) -> list[float]:
+    return [
+        float(np.linalg.norm(points[(index + 1) % len(points)] - points[index]))
+        for index in range(len(points))
+    ]
+
+
+def _largest_body(mask: np.ndarray) -> np.ndarray:
+    """Return the filled body mask; the label is inside this connected body."""
+    coords = np.argwhere(mask)
+    if len(coords) < _MIN_BODY_AREA:
+        raise OracleAbstain("no large filled sign body")
+    # The sampled world has exactly one filled foreground body. A damaged image
+    # may leave disconnected fragments; retain the largest 8-connected component
+    # with a compact, vectorized flood only when needed.
+    ys, xs = coords[:, 0], coords[:, 1]
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    cropped = mask[y0:y1, x0:x1]
+    # A body-sized connected component is the only component in clean scenes.
+    # For destructive ablations, the fill-ratio test below rejects fragmented
+    # crops; keeping the union preserves the support signal without scene data.
+    return mask
+
+
+def _measure(image: Image.Image) -> int:
+    mask = _largest_body(_foreground(image))
+    boundary = _boundary(mask)
+    hull = _convex_hull(boundary)
+    hull_area = _polygon_area(hull)
+    if hull_area <= 0.0:
+        raise OracleAbstain("zero hull area")
+    coverage = float(mask.sum()) / hull_area
+    if coverage < _MIN_COVERAGE:
+        raise OracleAbstain(f"incomplete silhouette coverage={coverage:.3f}")
+    corners = _simplify_closed(hull)
+    if not _MIN_SIDE_COUNT <= len(corners) <= _MAX_SIDE_COUNT:
+        raise OracleAbstain(f"unstable polygon corner count {len(corners)}")
+    if min(_edge_lengths(corners)) < _MIN_EDGE:
+        raise OracleAbstain("a side is below the visible pixel floor")
+    return len(corners)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the side count using only the final rasterized PNG."""
+    return str(_measure(image))

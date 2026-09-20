@@ -1,0 +1,169 @@
+"""Independent PNG-only inverse arm for Sliding Tile Exit.
+
+The oracle knows only the public palette semantics and question rule. It
+segments the visible floor and three square markers, measures the blue tile,
+constructs the square tile's configuration space by binary erosion, and traces
+the reachable component to the red and gold exits. It receives no latent scene.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_BACKGROUND = np.array((246, 242, 234), dtype=np.int16)
+_FLOOR = np.array((25, 63, 77), dtype=np.int16)
+_BLUE = np.array((40, 103, 214), dtype=np.int16)
+_RED = np.array((223, 63, 76), dtype=np.int16)
+_GOLD = np.array((225, 165, 27), dtype=np.int16)
+_COLOR_TOL = 12
+
+
+def _near(array: np.ndarray, color: np.ndarray) -> np.ndarray:
+    delta = array.astype(np.int16) - color
+    return np.max(np.abs(delta), axis=2) <= _COLOR_TOL
+
+
+def _marker(mask: np.ndarray, name: str) -> tuple[tuple[int, int], int]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 100:
+        raise ValueError(f"missing {name} square")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if abs(width - height) > 1 or len(xs) != width * height:
+        raise ValueError(f"damaged {name} square")
+    if name == "blue" and not (36 <= width <= 48):
+        raise ValueError("blue tile has unsupported size")
+    if name != "blue" and not (20 <= width <= 28):
+        raise ValueError(f"{name} exit has unsupported size")
+    return ((x0 + x1) // 2, (y0 + y1) // 2), width
+
+
+def _single_floor_component(mask: np.ndarray, start: tuple[int, int]) -> None:
+    """Certify one intact floor component without using expected coordinates."""
+
+    height, width = mask.shape
+    sx, sy = start
+    if not (0 <= sx < width and 0 <= sy < height and mask[sy, sx]):
+        raise ValueError("blue start is not on the floor")
+    seen = np.zeros_like(mask, dtype=bool)
+    queue: deque[tuple[int, int]] = deque([(sy, sx)])
+    seen[sy, sx] = True
+    while queue:
+        y, x = queue.popleft()
+        if y and mask[y - 1, x] and not seen[y - 1, x]:
+            seen[y - 1, x] = True
+            queue.append((y - 1, x))
+        if y + 1 < height and mask[y + 1, x] and not seen[y + 1, x]:
+            seen[y + 1, x] = True
+            queue.append((y + 1, x))
+        if x and mask[y, x - 1] and not seen[y, x - 1]:
+            seen[y, x - 1] = True
+            queue.append((y, x - 1))
+        if x + 1 < width and mask[y, x + 1] and not seen[y, x + 1]:
+            seen[y, x + 1] = True
+            queue.append((y, x + 1))
+    if int(seen.sum()) != int(mask.sum()):
+        raise ValueError("floor is broken into multiple components")
+
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 45000:
+        raise ValueError("floor has insufficient area")
+    box_area = (int(xs.max()) - int(xs.min()) + 1) * (int(ys.max()) - int(ys.min()) + 1)
+    if len(xs) / box_area < 0.52:
+        raise ValueError("floor is not a broad filled structure")
+
+    # The public world contains one orthogonal trunk, two branches, and two
+    # doorway necks: its union has 28 visible right-angle boundary corners.
+    # Counting topology rather than checking coordinates makes translations and
+    # all sampled doorway widths invariant, while an erased boundary patch is
+    # correctly treated as a new/ambiguous wall rather than silently ignored.
+    blocks = (
+        mask[:-1, :-1].astype(np.uint8)
+        + mask[1:, :-1]
+        + mask[:-1, 1:]
+        + mask[1:, 1:]
+    )
+    corners = int(np.count_nonzero((blocks == 1) | (blocks == 3)))
+    if corners != 28:
+        raise ValueError("floor boundary topology is damaged")
+
+    # Every baseline row intersects the orthogonal floor in at most two
+    # intervals (the wall beside a narrow doorway creates the second). A
+    # removed interior patch that adds another cutout is quarantined.
+    for row in mask[int(ys.min()) : int(ys.max()) + 1]:
+        line = row.astype(np.int8)
+        starts = int(np.count_nonzero(np.diff(np.pad(line, (1, 1))) == 1))
+        if starts > 2:
+            raise ValueError("floor contains an ambiguous interior cutout")
+
+
+def _square_configuration_space(floor: np.ndarray, size: int) -> np.ndarray:
+    """Return centers where a size-by-size unrotated square stays on floor."""
+
+    if size < 2:
+        raise ValueError("tile too small")
+    height, width = floor.shape
+    if size >= min(height, width):
+        raise ValueError("tile too large")
+    integral = np.pad(floor.astype(np.int32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    sums = integral[size:, size:] - integral[:-size, size:] - integral[size:, :-size] + integral[:-size, :-size]
+    valid = sums == size * size
+    top = size // 2
+    left = size // 2
+    output = np.zeros_like(floor, dtype=bool)
+    output[top : top + valid.shape[0], left : left + valid.shape[1]] = valid
+    return output
+
+
+def _reachable(mask: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = mask.shape
+    sx, sy = start
+    if not (0 <= sx < width and 0 <= sy < height and mask[sy, sx]):
+        raise ValueError("tile cannot occupy its visible start")
+    seen = np.zeros_like(mask, dtype=bool)
+    queue: deque[tuple[int, int]] = deque([(sy, sx)])
+    seen[sy, sx] = True
+    while queue:
+        y, x = queue.popleft()
+        if y and mask[y - 1, x] and not seen[y - 1, x]:
+            seen[y - 1, x] = True
+            queue.append((y - 1, x))
+        if y + 1 < height and mask[y + 1, x] and not seen[y + 1, x]:
+            seen[y + 1, x] = True
+            queue.append((y + 1, x))
+        if x and mask[y, x - 1] and not seen[y, x - 1]:
+            seen[y, x - 1] = True
+            queue.append((y, x - 1))
+        if x + 1 < width and mask[y, x + 1] and not seen[y, x + 1]:
+            seen[y, x + 1] = True
+            queue.append((y, x + 1))
+    return seen
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover ``red`` or ``gold`` from final pixels and nothing else."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 128:
+        raise ValueError("unsupported raster")
+    floor_ink = _near(array, _FLOOR)
+    blue_mask = _near(array, _BLUE)
+    red_mask = _near(array, _RED)
+    gold_mask = _near(array, _GOLD)
+    # A colored marker sits on, and therefore remains part of, the walkable floor.
+    floor = floor_ink | blue_mask | red_mask | gold_mask
+    blue, tile_size = _marker(blue_mask, "blue")
+    red, _ = _marker(red_mask, "red")
+    gold, _ = _marker(gold_mask, "gold")
+    _single_floor_component(floor, blue)
+    configuration = _square_configuration_space(floor, tile_size)
+    reached = _reachable(configuration, blue)
+    red_reached = bool(reached[red[1], red[0]])
+    gold_reached = bool(reached[gold[1], gold[0]])
+    if red_reached == gold_reached:
+        raise ValueError("clearance result is ambiguous")
+    return "red" if red_reached else "gold"

@@ -1,0 +1,186 @@
+"""Independent image-only inverse for route-ordered checkpoint intervals.
+
+The code knows the public ink palette but has no latent input.  It segments all
+candidate rings, requires one unbroken dark component, orders ring centers by
+graph distance along that component, and evaluates every color's interval.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+COLOR_RGB = {
+    "red": (207, 66, 62),
+    "blue": (45, 111, 181),
+    "green": (49, 143, 91),
+    "purple": (132, 76, 173),
+}
+DARK_RGB = (35, 40, 47)
+NEIGHBORS = (
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1), (0, 1),
+    (1, -1), (1, 0), (1, 1),
+)
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose one certifiable route sequence."""
+
+
+def _components(mask: np.ndarray, minimum: int = 12) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for start_y, start_x in np.argwhere(mask):
+        start_y, start_x = int(start_y), int(start_x)
+        if visited[start_y, start_x]:
+            continue
+        visited[start_y, start_x] = True
+        queue = deque([(start_y, start_x)])
+        pixels = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy, dx in NEIGHBORS:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            components.append(np.asarray(pixels, dtype=np.int32))
+    return components
+
+
+def _ring_centers(mask: np.ndarray, color: str) -> list[tuple[float, float]]:
+    """Pair the two route-separated arcs belonging to each of two color rings."""
+
+    components = _components(mask, minimum=24)
+    if len(components) != 4:
+        raise OracleAbstention(f"{color}: expected four visible ring arcs, found {len(components)}")
+    features = []
+    for pixels in components:
+        centroid_yx = pixels.mean(axis=0)
+        features.append((float(centroid_yx[1]), float(centroid_yx[0]), len(pixels)))
+    remaining = list(range(4))
+    pairs: list[tuple[int, int]] = []
+    while remaining:
+        best = None
+        for offset, left in enumerate(remaining):
+            for right in remaining[offset + 1 :]:
+                dx = features[left][0] - features[right][0]
+                dy = features[left][1] - features[right][1]
+                distance2 = dx * dx + dy * dy
+                if best is None or distance2 < best[0]:
+                    best = (distance2, left, right)
+        if best is None or best[0] > 38.0**2:
+            raise OracleAbstention(f"{color}: ring arc pairing is ambiguous")
+        _, left, right = best
+        pairs.append((left, right))
+        remaining.remove(left)
+        remaining.remove(right)
+    centers = []
+    for left, right in pairs:
+        lx, ly, la = features[left]
+        rx, ry, ra = features[right]
+        total = la + ra
+        centers.append(((lx * la + rx * ra) / total, (ly * la + ry * ra) / total))
+    if len(centers) != 2:
+        raise OracleAbstention(f"{color}: expected two checkpoints")
+    return centers
+
+
+def _bfs_distances(mask: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = mask.shape
+    distances = np.full((height, width), -1, dtype=np.int32)
+    distances[start] = 0
+    queue = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distances[y, x]) + 1
+        for dy, dx in NEIGHBORS:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and distances[ny, nx] < 0:
+                distances[ny, nx] = next_distance
+                queue.append((ny, nx))
+    return distances
+
+
+def _farthest(distances: np.ndarray) -> tuple[int, int]:
+    maximum = int(distances.max())
+    if maximum < 0:
+        raise OracleAbstention("dark route has no traversable pixels")
+    y, x = np.argwhere(distances == maximum)[0]
+    return int(y), int(x)
+
+
+def _distance_at_center(
+    route_mask: np.ndarray, distances: np.ndarray, center: tuple[float, float]
+) -> int:
+    cx, cy = center
+    x0, y0 = int(round(cx)), int(round(cy))
+    choices = []
+    height, width = route_mask.shape
+    for radius in range(0, 9):
+        for y in range(max(0, y0 - radius), min(height, y0 + radius + 1)):
+            for x in range(max(0, x0 - radius), min(width, x0 + radius + 1)):
+                if route_mask[y, x] and distances[y, x] >= 0:
+                    choices.append(((x - cx) ** 2 + (y - cy) ** 2, int(distances[y, x])))
+        if choices:
+            break
+    if not choices:
+        raise OracleAbstention("a checkpoint is detached from the dark route")
+    nearest2 = min(item[0] for item in choices)
+    local = [distance for distance2, distance in choices if distance2 <= nearest2 + 2.0]
+    return int(round(float(np.median(local))))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the unique qualifying color, or raise on broken/ambiguous evidence."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if rgb.shape[:2] != (512, 768):
+        raise OracleAbstention(f"unexpected raster size {image.size}")
+    route_mask = np.all(rgb == np.asarray(DARK_RGB, dtype=np.uint8), axis=2)
+    route_components = _components(route_mask, minimum=12)
+    if len(route_components) != 1:
+        raise OracleAbstention(f"expected one unbroken dark route, found {len(route_components)}")
+    route_pixels = route_components[0]
+    span_x = int(route_pixels[:, 1].max() - route_pixels[:, 1].min())
+    span_y = int(route_pixels[:, 0].max() - route_pixels[:, 0].min())
+    if span_x < 620 or span_y < 300:
+        raise OracleAbstention("dark route does not span the visual field")
+
+    arbitrary = (int(route_pixels[0, 0]), int(route_pixels[0, 1]))
+    first_endpoint = _farthest(_bfs_distances(route_mask, arbitrary))
+    distances = _bfs_distances(route_mask, first_endpoint)
+    if int(distances.max()) < 850:
+        raise OracleAbstention("dark route is too short to certify checkpoint order")
+
+    ordered = []
+    for color, value in COLOR_RGB.items():
+        color_mask = np.all(rgb == np.asarray(value, dtype=np.uint8), axis=2)
+        for center in _ring_centers(color_mask, color):
+            ordered.append((_distance_at_center(route_mask, distances, center), color))
+    ordered.sort()
+    if len(ordered) != 8:
+        raise OracleAbstention("expected eight checkpoint centers")
+    gaps = [ordered[index + 1][0] - ordered[index][0] for index in range(7)]
+    if min(gaps) < 45:
+        raise OracleAbstention("checkpoint route order is not separated at pixel resolution")
+    sequence = [color for _, color in ordered]
+
+    scores = {}
+    for color in COLOR_RGB:
+        positions = [index for index, value in enumerate(sequence) if value == color]
+        if len(positions) != 2:
+            raise OracleAbstention(f"{color}: expected exactly two checkpoints")
+        intervening = positions[1] - positions[0] - 1
+        scores[color] = -abs(intervening - 2)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    winners = [color for color, score in ranked if score == 0]
+    if len(winners) != 1 or ranked[0][1] - ranked[1][1] < 1:
+        raise OracleAbstention("interval search has no unique one-step winner margin")
+    return winners[0]

@@ -1,0 +1,139 @@
+"""Independent pixel-only inverse for threshold-qualified bubble markers.
+
+This module intentionally repeats only public visual constants and geometry. It
+receives one raster image, segments the common bubble ink, fits components from
+their bounding boxes, recovers the dashed cross, and classifies the centered
+marker by its raster shape. It has no import path to renderer or latent scenes.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 640
+HEIGHT = 480
+BACKGROUND = np.array((250.0, 252.0, 255.0), dtype=np.float32)
+BUBBLE_FILL = np.array((39.0, 147.0, 167.0), dtype=np.float32)
+THRESHOLD_INK = np.array((70.0, 83.0, 105.0), dtype=np.float32)
+MARKERS = ("circle", "square", "triangle", "diamond")
+MARKER_AREA = 180.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    ys, xs = np.nonzero(mask)
+    if len(ys) == 0:
+        return []
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    local = mask[y0:y1, x0:x1]
+    visited = np.zeros(local.shape, dtype=bool)
+    found: list[np.ndarray] = []
+    h, w = local.shape
+    for yy, xx in zip(*np.nonzero(local)):
+        if visited[yy, xx]:
+            continue
+        queue = deque([(int(yy), int(xx))])
+        visited[yy, xx] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            points.append((cy + y0, cx + x0))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < h and 0 <= nx < w and local[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(points) >= 500:
+            component = np.zeros(mask.shape, dtype=bool)
+            py, px = np.asarray(points).T
+            component[py, px] = True
+            found.append(component)
+    return found
+
+
+def _marker_template(shape: str, dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
+    circle_radius = math.sqrt(MARKER_AREA / math.pi)
+    square_half = math.sqrt(MARKER_AREA) / 2.0
+    triangle_side = math.sqrt(4.0 * MARKER_AREA / math.sqrt(3.0))
+    diamond_half = math.sqrt(MARKER_AREA / 2.0)
+    if shape == "circle":
+        return dx * dx + dy * dy <= circle_radius * circle_radius
+    if shape == "square":
+        return (np.abs(dx) <= square_half) & (np.abs(dy) <= square_half)
+    if shape == "diamond":
+        return np.abs(dx) + np.abs(dy) <= diamond_half * 1.01
+    height = triangle_side * math.sqrt(3.0) / 2.0
+    # Upright triangle with centroid at the origin, matching the public scene.
+    y_ok = (dy >= -2.0 * height / 3.0) & (dy <= height / 3.0)
+    half_width = triangle_side * (dy + 2.0 * height / 3.0) / (2.0 * height)
+    return y_ok & (np.abs(dx) <= half_width)
+
+
+def _classify_marker(arr: np.ndarray, cx: float, cy: float) -> str:
+    radius = 19.0
+    x0 = max(0, int(math.floor(cx - radius - 2)))
+    x1 = min(arr.shape[1], int(math.ceil(cx + radius + 3)))
+    y0 = max(0, int(math.floor(cy - radius - 2)))
+    y1 = min(arr.shape[0], int(math.ceil(cy + radius + 3)))
+    crop = arr[y0:y1, x0:x1]
+    d_bg = np.linalg.norm(crop - BACKGROUND, axis=-1)
+    d_fill = np.linalg.norm(crop - BUBBLE_FILL, axis=-1)
+    scores = {shape: float("inf") for shape in MARKERS}
+    # The component box gives a centre within about one pixel.  Search a small
+    # raster-only subpixel neighbourhood so a half-pixel raster phase cannot
+    # turn a flat-sided square into a circle.
+    yy, xx = np.indices((y1 - y0, x1 - x0), dtype=np.float32)
+    for offset_x in np.arange(-1.0, 1.01, 0.5):
+        for offset_y in np.arange(-1.0, 1.01, 0.5):
+            dx = xx + x0 + 0.5 - float(cx) - offset_x
+            dy = yy + y0 + 0.5 - float(cy) - offset_y
+            region = dx * dx + dy * dy < 17.0 * 17.0
+            # White marker cores are very close to the paper colour; the region
+            # mask excludes the outside white canvas and the bubble ring.
+            observed = (d_bg < 32.0) & (d_bg < d_fill) & region
+            for shape in MARKERS:
+                expected = _marker_template(shape, dx, dy) & region
+                disagreement = float(np.logical_xor(observed, expected).sum()) / max(1, int(region.sum()))
+                scores[shape] = min(scores[shape], disagreement)
+    return min(scores, key=scores.get)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the marker on the largest bubble passing both visible thresholds."""
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if arr.shape[:2] != (HEIGHT, WIDTH):
+        raise ValueError(f"unexpected image size {arr.shape[:2][::-1]}")
+    fill_distance = np.linalg.norm(arr - BUBBLE_FILL, axis=-1)
+    fill_mask = fill_distance < 82.0
+    comps = _components(fill_mask)
+    if len(comps) != 4:
+        raise ValueError(f"expected four separated bubble components, recovered {len(comps)}")
+
+    bubbles: list[tuple[float, float, float, str]] = []
+    for comp in comps:
+        ys, xs = np.nonzero(comp)
+        cx = (float(xs.min()) + float(xs.max()) + 1.0) / 2.0
+        cy = (float(ys.min()) + float(ys.max()) + 1.0) / 2.0
+        radius = (float(xs.max()) - float(xs.min()) + 1.0 + float(ys.max()) - float(ys.min()) + 1.0) / 4.0
+        marker = _classify_marker(arr, cx, cy)
+        bubbles.append((cx, cy, radius, marker))
+
+    threshold_distance = np.linalg.norm(arr - THRESHOLD_INK, axis=-1)
+    threshold_mask = threshold_distance < 55.0
+    column_counts = threshold_mask.sum(axis=0)
+    row_counts = threshold_mask.sum(axis=1)
+    tx = float(int(np.argmax(column_counts))) + 0.5
+    ty = float(int(np.argmax(row_counts))) + 0.5
+    qualifying = [bubble for bubble in bubbles if bubble[0] > tx and bubble[1] < ty]
+    if len(qualifying) < 2:
+        raise ValueError("fewer than two bubbles pass the visible thresholds")
+    qualifying.sort(key=lambda item: item[2], reverse=True)
+    return qualifying[0][3]

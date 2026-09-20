@@ -1,0 +1,211 @@
+"""Independent pixel-only inverse arm for the bracket-cord partner world.
+
+Receives the final PNG and the public question contract only. It never imports
+the renderer, the generator, the prompt module, the verifier or any analytic
+gold, and it never sees latent scene data. It abstains by raising.
+
+Pipeline: segment the flat palette; recover the beads as colour blobs and decide
+solid vs hollow from their windows; find the black cap and the magenta frame;
+walk the cord geodesically from the cap to put the beads in cord order; parse
+the resulting bracket word; then, and only then, read the colour bound to the
+bead that closes the framed one.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+# Public question-contract facts: the six answer colours and the three fixed
+# structural inks named by the question text.
+PALETTE = {
+    "red": (206, 42, 42),
+    "orange": (232, 124, 28),
+    "green": (46, 150, 62),
+    "teal": (26, 158, 168),
+    "blue": (48, 86, 208),
+    "purple": (140, 58, 180),
+}
+CORD_INK = (92, 100, 112)
+CAP_INK = (18, 18, 18)
+FRAME_INK = (214, 16, 140)
+
+BLOCK = 4
+MIN_BEAD_SIDE = 26
+MAX_BEAD_SIDE = 46
+MIN_BEAD_PIXELS = 300
+EXPECTED_BEADS = 12  # declared by the public question contract
+MIN_CAP_PIXELS = 200
+MIN_FRAME_PIXELS = 300
+
+
+class Abstain(RuntimeError):
+    """Raised when the picture does not support a confident reading."""
+
+
+def _mask(array: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    return (
+        (array[:, :, 0] == rgb[0]) & (array[:, :, 1] == rgb[1]) & (array[:, :, 2] == rgb[2])
+    )
+
+
+def _components(mask: np.ndarray, min_pixels: int) -> list[tuple[int, int, int, int]]:
+    """Four-connected components of a boolean mask as bounding boxes."""
+    coords = np.argwhere(mask)
+    if not len(coords):
+        return []
+    remaining = {(int(y), int(x)) for y, x in coords}
+    boxes = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        ys = [start[0]]
+        xs = [start[1]]
+        while stack:
+            cy, cx = stack.pop()
+            for neighbour in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if neighbour in remaining:
+                    remaining.discard(neighbour)
+                    stack.append(neighbour)
+                    ys.append(neighbour[0])
+                    xs.append(neighbour[1])
+        if len(ys) >= min_pixels:
+            boxes.append((min(ys), min(xs), max(ys), max(xs)))
+    return boxes
+
+
+def _geodesic(structure: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    """Block-resolution geodesic distance from ``start`` over the structure."""
+    height, width = structure.shape
+    bh, bw = height // BLOCK, width // BLOCK
+    blocks = structure[: bh * BLOCK, : bw * BLOCK].reshape(bh, BLOCK, bw, BLOCK).any(axis=(1, 3))
+    sy, sx = start[0] // BLOCK, start[1] // BLOCK
+    sy = min(max(sy, 0), bh - 1)
+    sx = min(max(sx, 0), bw - 1)
+    if not blocks[sy, sx]:
+        found = None
+        for radius in range(1, 5):
+            y0, y1 = max(0, sy - radius), min(bh, sy + radius + 1)
+            x0, x1 = max(0, sx - radius), min(bw, sx + radius + 1)
+            window = np.argwhere(blocks[y0:y1, x0:x1])
+            if len(window):
+                found = (int(window[0][0]) + y0, int(window[0][1]) + x0)
+                break
+        if found is None:
+            raise Abstain("the cap does not touch any structure")
+        sy, sx = found
+    distance = np.full((bh, bw), -1, dtype=np.int32)
+    visited = np.zeros((bh, bw), dtype=bool)
+    frontier = np.zeros((bh, bw), dtype=bool)
+    frontier[sy, sx] = True
+    visited[sy, sx] = True
+    distance[sy, sx] = 0
+    step = 0
+    while frontier.any():
+        step += 1
+        nxt = np.zeros((bh, bw), dtype=bool)
+        nxt[1:, :] |= frontier[:-1, :]
+        nxt[:-1, :] |= frontier[1:, :]
+        nxt[:, 1:] |= frontier[:, :-1]
+        nxt[:, :-1] |= frontier[:, 1:]
+        nxt &= blocks & ~visited
+        distance[nxt] = step
+        visited |= nxt
+        frontier = nxt
+        if step > bh * bw:
+            raise Abstain("cord walk did not terminate")
+    return distance
+
+
+def _match(word: list[bool]) -> dict[int, int]:
+    stack: list[int] = []
+    pairs: dict[int, int] = {}
+    for index, is_open in enumerate(word):
+        if is_open:
+            stack.append(index)
+        else:
+            if not stack:
+                raise Abstain("bead word closes a group that was never opened")
+            pairs[stack.pop()] = index
+    if stack:
+        raise Abstain("bead word leaves a group open")
+    return pairs
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or min(array.shape[:2]) < 64:
+        raise Abstain("image is too small to read")
+
+    beads = []
+    palette_mask = np.zeros(array.shape[:2], dtype=bool)
+    for name, rgb in PALETTE.items():
+        mask = _mask(array, rgb)
+        palette_mask |= mask
+        for y0, x0, y1, x1 in _components(mask, MIN_BEAD_PIXELS):
+            height, width = y1 - y0 + 1, x1 - x0 + 1
+            if not (MIN_BEAD_SIDE <= height <= MAX_BEAD_SIDE):
+                raise Abstain("a coloured blob is not bead-shaped")
+            if not (MIN_BEAD_SIDE <= width <= MAX_BEAD_SIDE):
+                raise Abstain("a coloured blob is not bead-shaped")
+            cy, cx = (y0 + y1) // 2, (x0 + x1) // 2
+            core = mask[cy - 2 : cy + 3, cx - 2 : cx + 3]
+            if core.size == 0:
+                raise Abstain("bead centre could not be inspected")
+            beads.append(
+                {
+                    "color": name,
+                    "box": (y0, x0, y1, x1),
+                    "centre": (cy, cx),
+                    "open": bool(core.all()),
+                }
+            )
+    if len(beads) != EXPECTED_BEADS:
+        raise Abstain(
+            f"the contract declares {EXPECTED_BEADS} beads but {len(beads)} are readable"
+        )
+
+    cap_boxes = _components(_mask(array, CAP_INK), MIN_CAP_PIXELS)
+    if len(cap_boxes) != 1:
+        raise Abstain("the black cord cap is missing or duplicated")
+    cy0, cx0, cy1, cx1 = cap_boxes[0]
+    cap_centre = ((cy0 + cy1) // 2, (cx0 + cx1) // 2)
+
+    frame_mask = _mask(array, FRAME_INK)
+    frame_boxes = _components(frame_mask, MIN_FRAME_PIXELS)
+    if len(frame_boxes) != 1:
+        raise Abstain("the magenta frame is missing or duplicated")
+    fy0, fx0, fy1, fx1 = frame_boxes[0]
+    frame_centre = ((fy0 + fy1) // 2, (fx0 + fx1) // 2)
+
+    structure = palette_mask | _mask(array, CORD_INK) | _mask(array, CAP_INK) | frame_mask
+    distance = _geodesic(structure, cap_centre)
+
+    for bead in beads:
+        y0, x0, y1, x1 = bead["box"]
+        window = distance[y0 // BLOCK : y1 // BLOCK + 1, x0 // BLOCK : x1 // BLOCK + 1]
+        reachable = window[window >= 0]
+        if not reachable.size:
+            raise Abstain("a bead cannot be reached by walking the cord")
+        bead["along"] = int(reachable.min())
+
+    order = sorted(range(len(beads)), key=lambda i: beads[i]["along"])
+    if len({beads[i]["along"] for i in order}) != len(order):
+        raise Abstain("two beads sit at the same place along the cord")
+
+    marked = min(
+        range(len(beads)),
+        key=lambda i: abs(beads[i]["centre"][0] - frame_centre[0])
+        + abs(beads[i]["centre"][1] - frame_centre[1]),
+    )
+    my, mx = beads[marked]["centre"]
+    if abs(my - frame_centre[0]) > 8 or abs(mx - frame_centre[1]) > 8:
+        raise Abstain("the magenta frame does not surround any bead")
+    if not beads[marked]["open"]:
+        raise Abstain("the framed bead is hollow, so it opens no group")
+
+    pairs = _match([beads[i]["open"] for i in order])
+    slot = order.index(marked)
+    if slot not in pairs:
+        raise Abstain("the framed bead has no closing partner")
+    return str(beads[order[pairs[slot]]]["color"])

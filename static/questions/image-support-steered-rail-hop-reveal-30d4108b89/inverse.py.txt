@@ -1,0 +1,212 @@
+"""Pixel-only inverse arm for the rail-hop reveal world.
+
+Input is one rasterised PNG and the public question contract. The arm isolates
+the single longest connected stroke in the picture, recovers that stroke's five
+horizontal passes and its beaded starting end, reads which crossings carry an
+arch, replays the declared walk, and classifies the resulting 5x5 pattern
+against the four declared glyphs. It imports no renderer, prompt, generator,
+verifier or gold code and never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "rail_hop_reveal-oracle-0.1.0"
+
+ABSTAIN = "abstain"
+PASSES = 5
+CROSSINGS = 5
+
+# Public rendering conventions restated by the question contract.
+FRAC_FIRST_CROSSING = 28.0 / 176.0
+FRAC_CROSSING_STEP = 30.0 / 176.0
+ARCH_LO = 8          # window above a pass, near side (clears the start bead)
+ARCH_HI = 17         # window above a pass, far side
+ARCH_MIN_RUN = 9     # narrowest accepted arch footprint
+SNAP_TOL = 9         # crossing-centre snap tolerance in pixels
+INK_DELTA = 40       # per-channel separation from the background tone
+BEAD_INSET = 10
+BEAD_HALF = 8
+
+DECLARED_GLYPHS: dict[str, tuple[str, ...]] = {
+    "ell": ("#....", "#....", "#....", "#....", "#####"),
+    "zed": ("###..", "...#.", "..#..", ".#...", "..###"),
+    "eff": ("####.", "#....", "###..", "#....", "....."),
+    "tee": ("#####", "..#..", "..#..", "..#..", "..#.."),
+}
+
+
+def _glyph_mask(name: str) -> np.ndarray:
+    rows = DECLARED_GLYPHS[name]
+    return np.array([[1 if ch == "#" else 0 for ch in row] for row in rows], dtype=np.int8)
+
+
+def _background(arr: np.ndarray) -> np.ndarray:
+    flat = arr.reshape(-1, 3)
+    colors, counts = np.unique(flat, axis=0, return_counts=True)
+    return colors[int(np.argmax(counts))]
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    """Largest 8-connected component of a boolean mask."""
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return np.zeros_like(mask)
+    seen = np.zeros_like(mask, dtype=bool)
+    height, width = mask.shape
+    best: list[tuple[int, int]] = []
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = deque([(sy, sx)])
+        seen[sy, sx] = True
+        blob: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            blob.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(blob) > len(best):
+            best = blob
+    out = np.zeros_like(mask)
+    for cy, cx in best:
+        out[cy, cx] = True
+    return out
+
+
+def _wire_mask(arr: np.ndarray) -> np.ndarray | None:
+    """The longest single connected stroke, chosen across rendered colours."""
+    bg = _background(arr)
+    ink = (np.abs(arr.astype(np.int16) - bg.astype(np.int16)) > INK_DELTA).any(axis=2)
+    if not ink.any():
+        return None
+    flat = arr[ink].reshape(-1, 3)
+    colors, counts = np.unique(flat, axis=0, return_counts=True)
+    best: np.ndarray | None = None
+    best_size = 0
+    for color, count in zip(colors, counts.tolist()):
+        if count < 400:
+            continue
+        same = ink & (arr == color).all(axis=2)
+        component = _largest_component(same)
+        size = int(component.sum())
+        if size > best_size:
+            best_size, best = size, component
+    if best is None or best_size < 800:
+        return None
+    return best
+
+
+def _row_bands(mask: np.ndarray, span: int) -> list[int] | None:
+    counts = mask.sum(axis=1)
+    hot = counts >= max(40, span // 2)
+    bands: list[list[int]] = []
+    for y in range(mask.shape[0]):
+        if hot[y]:
+            if bands and y - bands[-1][-1] <= 1:
+                bands[-1].append(y)
+            else:
+                bands.append([y])
+    if len(bands) != PASSES:
+        return None
+    return [int(round(sum(band) / len(band))) for band in bands]
+
+
+def _arch_columns(mask: np.ndarray, y: int, x_lo: int, x_hi: int, centres: list[float]) -> list[int] | None:
+    top = max(0, y - ARCH_HI)
+    bottom = max(0, y - ARCH_LO)
+    if bottom <= top:
+        return None
+    strip = mask[top:bottom, x_lo:x_hi + 1].any(axis=0)
+    hits: list[int] = []
+    run_start: int | None = None
+    for i in range(strip.size + 1):
+        on = bool(strip[i]) if i < strip.size else False
+        if on and run_start is None:
+            run_start = i
+        elif not on and run_start is not None:
+            if i - run_start >= ARCH_MIN_RUN:
+                hits.append((run_start + i - 1) // 2 + x_lo)
+            run_start = None
+    columns: list[int] = []
+    for hit in hits:
+        distances = [abs(hit - c) for c in centres]
+        index = int(np.argmin(distances))
+        if distances[index] > SNAP_TOL or index in columns:
+            return None
+        columns.append(index)
+    return columns
+
+
+def _start_corner(mask: np.ndarray, x0: int, x1: int, y_top: int, y_bottom: int) -> tuple[str, str] | None:
+    corners = [
+        ("top", "left", x0 + BEAD_INSET, y_top),
+        ("top", "right", x1 - BEAD_INSET, y_top),
+        ("bottom", "left", x0 + BEAD_INSET, y_bottom),
+        ("bottom", "right", x1 - BEAD_INSET, y_bottom),
+    ]
+    scores = []
+    for _, _, cx, cy in corners:
+        window = mask[
+            max(0, cy - BEAD_HALF): cy + BEAD_HALF + 1,
+            max(0, cx - BEAD_HALF): cx + BEAD_HALF + 1,
+        ]
+        scores.append(int(window.sum()))
+    order = sorted(range(4), key=lambda i: -scores[i])
+    if scores[order[0]] < 1.4 * max(scores[order[1]], 1):
+        return None
+    return corners[order[0]][0], corners[order[0]][1]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the declared glyph from the final pixels alone."""
+    arr = np.asarray(image.convert("RGB"))
+    mask = _wire_mask(arr)
+    if mask is None:
+        return ABSTAIN
+    ys, xs = np.nonzero(mask)
+    x_lo, x_hi = int(xs.min()), int(xs.max())
+    x0, x1 = x_lo + 1, x_hi - 1
+    span = x1 - x0
+    if span < 120:
+        return ABSTAIN
+    rows = _row_bands(mask, span)
+    if rows is None:
+        return ABSTAIN
+    centres = [x0 + span * (FRAC_FIRST_CROSSING + FRAC_CROSSING_STEP * c) for c in range(CROSSINGS)]
+
+    physical = np.zeros((PASSES, CROSSINGS), dtype=np.int8)
+    for r, y in enumerate(rows):
+        columns = _arch_columns(mask, y, x_lo, x_hi, centres)
+        if columns is None:
+            return ABSTAIN
+        for column in columns:
+            physical[r, column] = 1
+
+    corner = _start_corner(mask, x0, x1, rows[0], rows[-1])
+    if corner is None:
+        return ABSTAIN
+    start_row, start_side = corner
+
+    row_order = list(range(PASSES)) if start_row == "top" else list(range(PASSES - 1, -1, -1))
+    travel = np.zeros((PASSES, CROSSINGS), dtype=np.int8)
+    for k, physical_row in enumerate(row_order):
+        side = start_side if k % 2 == 0 else ("right" if start_side == "left" else "left")
+        for c in range(CROSSINGS):
+            column = c if side == "left" else CROSSINGS - 1 - c
+            travel[k, c] = physical[physical_row, column]
+
+    scored = sorted(
+        (int(np.sum(travel != _glyph_mask(name))), name) for name in DECLARED_GLYPHS
+    )
+    if scored[0][0] == scored[1][0]:
+        return ABSTAIN
+    return scored[0][1]

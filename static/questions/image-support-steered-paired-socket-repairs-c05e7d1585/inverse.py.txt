@@ -1,0 +1,162 @@
+"""Independent pixel-only inverse for paired socket repairs."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+TAB_COLORS = [
+    np.array((224, 76, 67), dtype=np.int32),
+    np.array((42, 157, 105), dtype=np.int32),
+    np.array((54, 111, 202), dtype=np.int32),
+    np.array((153, 83, 184), dtype=np.int32),
+]
+TAG_COLORS = {
+    "red": np.array((191, 43, 50), dtype=np.int32),
+    "green": np.array((24, 128, 71), dtype=np.int32),
+    "blue": np.array((35, 82, 166), dtype=np.int32),
+}
+
+
+@dataclass(frozen=True)
+class Part:
+    color: int
+    area: int
+    cx: float
+    cy: float
+
+
+def _mask_near(array: np.ndarray, color: np.ndarray, tolerance: float = 8.0) -> np.ndarray:
+    delta = array.astype(np.int32) - color
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[tuple[int, float, float]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[tuple[int, float, float]] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        queue = deque([(y0, x0)])
+        seen[y0, x0] = True
+        xs: list[int] = []
+        ys: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            xs.append(x)
+            ys.append(y)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(xs) >= minimum:
+            output.append((len(xs), float(sum(xs) / len(xs)), float(sum(ys) / len(ys))))
+    return output
+
+
+def _groups(parts: list[Part]) -> list[list[Part]]:
+    # Adjacent tabs within a patch are about 84 px apart, while the nearest tabs
+    # on distinct patches are more than 100 px apart. Connectivity clustering
+    # therefore avoids any fixed canvas coordinates.
+    remaining = set(range(len(parts)))
+    groups: list[list[Part]] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        indices = [start]
+        while stack:
+            current = stack.pop()
+            for other in list(remaining):
+                dx = parts[current].cx - parts[other].cx
+                dy = parts[current].cy - parts[other].cy
+                if dx * dx + dy * dy < 98.0 * 98.0:
+                    remaining.remove(other)
+                    stack.append(other)
+                    indices.append(other)
+        group = [parts[index] for index in indices]
+        if len(group) != 4:
+            raise ValueError(f"every socket or patch must expose four tabs, found {len(group)}")
+        if len({part.color for part in group}) != 4:
+            raise ValueError("every code must use four distinct tab colors")
+        groups.append(group)
+    if len(groups) != 8:
+        raise ValueError(f"expected two sockets and six patches, found {len(groups)} groups")
+    return groups
+
+
+def _center(group: list[Part]) -> tuple[float, float]:
+    return (sum(part.cx for part in group) / 4.0, sum(part.cy for part in group) / 4.0)
+
+
+def _code(group: list[Part]) -> tuple[int, int, int, int]:
+    cx, cy = _center(group)
+    oriented: dict[str, int] = {}
+    for part in group:
+        dx, dy = part.cx - cx, part.cy - cy
+        if abs(dx) > abs(dy):
+            side = "right" if dx > 0 else "left"
+        else:
+            side = "bottom" if dy > 0 else "top"
+        if side in oriented or max(abs(dx), abs(dy)) < 38:
+            raise ValueError("tab orientation is ambiguous")
+        oriented[side] = part.color
+    if set(oriented) != {"top", "right", "bottom", "left"}:
+        raise ValueError("code lacks a unique tab on each edge")
+    return tuple(oriented[side] for side in ("top", "right", "bottom", "left"))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    parts: list[Part] = []
+    for color_index, color in enumerate(TAB_COLORS):
+        for area, cx, cy in _components(_mask_near(array, color), minimum=180):
+            if area < 300:
+                raise ValueError("a color tab is incomplete")
+            parts.append(Part(color_index, area, cx, cy))
+    if len(parts) != 32:
+        raise ValueError(f"expected 32 colored tabs, found {len(parts)}")
+
+    groups = _groups(parts)
+    ordered_y = sorted(groups, key=lambda group: _center(group)[1])
+    centers_y = [_center(group)[1] for group in ordered_y]
+    sockets, candidates = ordered_y[:2], ordered_y[2:]
+    if len(candidates) != 6 or abs(centers_y[1] - centers_y[0]) > 18 or centers_y[2] - centers_y[1] < 90:
+        raise ValueError("could not infer detached socket and candidate fields")
+    sockets.sort(key=lambda group: _center(group)[0])
+    socket_codes = [_code(group) for group in sockets]
+
+    candidates.sort(key=lambda group: _center(group)[1])
+    rows: list[list[list[Part]]] = []
+    for start in (0, 2, 4):
+        row = sorted(candidates[start : start + 2], key=lambda group: _center(group)[0])
+        if abs(_center(row[0])[1] - _center(row[1])[1]) > 18:
+            raise ValueError("candidate patches do not form clear ordered pairs")
+        rows.append(row)
+    matches = [
+        index
+        for index, row in enumerate(rows)
+        if [_code(row[0]), _code(row[1])] == socket_codes
+    ]
+    if len(matches) != 1:
+        raise ValueError("image does not expose one unique paired repair")
+
+    tags: list[tuple[str, float, float]] = []
+    for name, color in TAG_COLORS.items():
+        components = _components(_mask_near(array, color), minimum=600)
+        if len(components) != 1:
+            raise ValueError(f"expected one intact {name} tag")
+        area, cx, cy = components[0]
+        if area < 900:
+            raise ValueError(f"{name} tag is incomplete")
+        tags.append((name, cx, cy))
+    tags.sort(key=lambda item: item[2])
+    for index, row in enumerate(rows):
+        row_y = sum(_center(group)[1] for group in row) / 2.0
+        if abs(tags[index][2] - row_y) > 28:
+            raise ValueError("tag-to-row binding is ambiguous")
+    return tags[matches[0]][0]

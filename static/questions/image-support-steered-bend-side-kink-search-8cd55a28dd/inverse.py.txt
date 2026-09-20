@@ -1,0 +1,238 @@
+"""Pixel-only inverse arm for the bend-side kink world.
+
+Route, from the final PNG alone:
+
+1. the modal colour is the page; everything far from it is ink;
+2. the largest connected ink component is the folded thread (isolated specks are
+   dropped as smaller components);
+3. a double breadth-first sweep over that component returns the pixel chain
+   between its two extreme ends, i.e. the thread traversed end to end;
+4. the chain is resampled and its local travel direction quantised to the four
+   axis directions, giving eight straight runs; the walk is oriented to start
+   from whichever end lies further to the left;
+5. each of the seven corners is signed by the cross product of the travel
+   directions before and after it, and the candidate turn whose sign opposes
+   both neighbouring signs wins;
+6. the runner-up margin is the smallest same-side support among the losing
+   candidate turns, measured in pixels of corner offset.
+
+The module never imports renderer, prompts, generate or verify code and never
+receives latent scene data.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "bend_side_kink_search-oracle-0.1.0"
+ABSTAIN = "abstain"
+
+WORDS = ("second", "third", "fourth", "fifth", "sixth")
+FIRST_CANDIDATE_TURN = 2
+CANDIDATE_TURNS = tuple(range(FIRST_CANDIDATE_TURN, FIRST_CANDIDATE_TURN + len(WORDS)))
+RUN_COUNT = 8
+
+INK_DELTA = 40
+MIN_COMPONENT = 250
+SPAN = 7             # path lag used to read a local travel direction
+MIN_GROUP = 6        # a genuine run contributes at least this many samples
+MIN_RUN_PIXELS = 5
+MIN_END_DX = 8
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    flat = array.reshape(-1, 3)
+    colours, counts = np.unique(flat, axis=0, return_counts=True)
+    page = colours[int(np.argmax(counts))]
+    return (np.abs(array - page.reshape(1, 1, 3)).max(axis=2) > INK_DELTA)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray | None:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    best: list[tuple[int, int]] = []
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if seen[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        seen[y0, x0] = True
+        blob = []
+        while stack:
+            y, x = stack.pop()
+            blob.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(blob) > len(best):
+            best = blob
+    if len(best) < MIN_COMPONENT:
+        return None
+    out = np.zeros(mask.shape, dtype=bool)
+    for y, x in best:
+        out[y, x] = True
+    return out
+
+
+def _bfs(mask: np.ndarray, start: tuple[int, int]):
+    height, width = mask.shape
+    parent = {start: None}
+    order = [start]
+    queue = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and (ny, nx) not in parent:
+                    parent[(ny, nx)] = (y, x)
+                    order.append((ny, nx))
+                    queue.append((ny, nx))
+    return parent, order
+
+
+def _chain(mask: np.ndarray) -> list[tuple[int, int]] | None:
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return None
+    seed = (int(ys[0]), int(xs[0]))
+    _, order = _bfs(mask, seed)
+    far_a = order[-1]
+    parent, order_b = _bfs(mask, far_a)
+    far_b = order_b[-1]
+    path = []
+    node = far_b
+    while node is not None:
+        path.append(node)
+        node = parent[node]
+    path.reverse()
+    return [(x, y) for y, x in path]
+
+
+def _runs(path: list[tuple[int, int]]):
+    if len(path) < SPAN + MIN_GROUP * 2:
+        return None
+    groups: list[list[int]] = []
+    dirs: list[tuple[int, int]] = []
+    for index in range(len(path) - SPAN):
+        (x1, y1), (x2, y2) = path[index], path[index + SPAN]
+        dx, dy = x2 - x1, y2 - y1
+        if abs(dx) >= abs(dy):
+            direction = (1 if dx > 0 else -1, 0) if dx != 0 else None
+        else:
+            direction = (0, 1 if dy > 0 else -1)
+        if direction is None:
+            continue
+        if dirs and dirs[-1] == direction:
+            groups[-1].append(index)
+        else:
+            dirs.append(direction)
+            groups.append([index])
+    # drop corner artefacts, then merge neighbours that agree again
+    changed = True
+    while changed:
+        changed = False
+        for position, group in enumerate(groups):
+            if len(group) < MIN_GROUP:
+                del groups[position]
+                del dirs[position]
+                if 0 < position < len(dirs) and dirs[position - 1] == dirs[position]:
+                    groups[position - 1].extend(groups[position])
+                    del groups[position]
+                    del dirs[position]
+                changed = True
+                break
+    if len(dirs) != RUN_COUNT:
+        return None
+    for index in range(RUN_COUNT - 1):
+        if (dirs[index][0] == 0) == (dirs[index + 1][0] == 0):
+            return None
+    consts = []
+    for direction, group in zip(dirs, groups):
+        axis = 1 if direction[0] != 0 else 0   # horizontal run -> constant y
+        values = sorted(path[index][axis] for index in group)
+        consts.append(values[len(values) // 2])
+    return dirs, consts
+
+
+def measure_from_image(image: Image.Image) -> dict | None:
+    """Pixel-only measurement report, or ``None`` when the picture is unreadable."""
+
+    component = _largest_component(_ink_mask(image))
+    if component is None:
+        return None
+    path = _chain(component)
+    if path is None:
+        return None
+    found = _runs(path)
+    if found is None:
+        return None
+    dirs, consts = found
+    corners = []
+    for index in range(RUN_COUNT - 1):
+        if dirs[index][0] != 0:                     # horizontal then vertical
+            corners.append((consts[index + 1], consts[index]))
+        else:                                       # vertical then horizontal
+            corners.append((consts[index], consts[index + 1]))
+    stops = [path[0]] + corners + [path[-1]]
+    lengths = []
+    for index in range(RUN_COUNT):
+        (x1, y1), (x2, y2) = stops[index], stops[index + 1]
+        lengths.append(abs(x2 - x1) if dirs[index][0] != 0 else abs(y2 - y1))
+    if min(lengths) < MIN_RUN_PIXELS:
+        return None
+    if abs(path[0][0] - path[-1][0]) < MIN_END_DX:
+        return None
+    if path[0][0] > path[-1][0]:
+        dirs = [(-dx, -dy) for dx, dy in dirs[::-1]]
+        lengths = lengths[::-1]
+    signs = []
+    for index in range(RUN_COUNT - 1):
+        (ax, ay), (bx, by) = dirs[index], dirs[index + 1]
+        signs.append(1 if ax * by - ay * bx > 0 else -1)
+    isolated = [
+        turn
+        for turn in CANDIDATE_TURNS
+        if signs[turn - 1] != signs[turn - 2] and signs[turn - 1] != signs[turn]
+    ]
+    if len(isolated) != 1:
+        return None
+    winner = isolated[0]
+    offsets = {}
+    for turn in range(1, RUN_COUNT):
+        a, b = lengths[turn - 1], lengths[turn]
+        offsets[turn] = a * b / math.hypot(a, b)
+    scores = {}
+    for turn in CANDIDATE_TURNS:
+        total = 0.0
+        for other in (turn - 1, turn + 1):
+            if signs[other - 1] == signs[turn - 1]:
+                total += offsets[other]
+        scores[turn] = total
+    runner_up = min(score for turn, score in scores.items() if turn != winner)
+    if runner_up <= 0:
+        return None
+    return {
+        "decision": WORDS[winner - FIRST_CANDIDATE_TURN],
+        "kink_turn": winner,
+        "run_lengths": lengths,
+        "bend_signs": signs,
+        "pixel_margin": float(runner_up),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    report = measure_from_image(image)
+    if report is None:
+        return ABSTAIN
+    return report["decision"]

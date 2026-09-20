@@ -1,0 +1,156 @@
+"""Scene-free pixel inverse arm for slide_blank_replay.
+
+Receives only the rendered RGB image. It re-discovers the 3x3 board from the
+drawn cell borders, reads the drawn colour of every cell and so finds the empty
+gap, re-discovers the marked cell from the red ring, re-discovers the cards from
+their cream backgrounds in drawn left-to-right order, reads each card's arrow
+direction from the offset between the triangle's centroid and its bounding-box
+centre, replays the slides, and returns the final content of the marked cell
+together with the number of the cell the gap ends in.
+
+It imports no renderer, prompt, generator, verifier or gold code and never sees
+latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "slide_blank_replay-oracle-0.1.0"
+
+_GRID_EDGE = (90, 90, 90)
+_CARD_BG = (252, 246, 228)
+_RED = (214, 38, 38)
+_BLACK = (15, 15, 15)
+
+_SWATCHES: tuple[tuple[str, tuple[int, int, int]], ...] = (
+    ("blue", (36, 72, 204)),
+    ("brown", (140, 84, 40)),
+    ("green", (26, 150, 72)),
+    ("orange", (240, 140, 20)),
+    ("pink", (240, 130, 180)),
+    ("purple", (128, 48, 178)),
+    ("teal", (24, 168, 168)),
+    ("yellow", (238, 214, 44)),
+    ("empty", (236, 236, 236)),
+)
+
+_STEP = {"up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1)}
+_UNREADABLE = "unreadable|0"
+
+
+def _mask(arr: np.ndarray, ref, tol: int) -> np.ndarray:
+    return (
+        (np.abs(arr[:, :, 0] - ref[0]) <= tol)
+        & (np.abs(arr[:, :, 1] - ref[1]) <= tol)
+        & (np.abs(arr[:, :, 2] - ref[2]) <= tol)
+    )
+
+
+def _runs(flags: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, on in enumerate(flags):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            if i - start >= min_len:
+                out.append((start, i - 1))
+            start = None
+    if start is not None and len(flags) - start >= min_len:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def _centres(runs: list[tuple[int, int]]) -> list[float]:
+    return [(a + b) / 2.0 for a, b in runs]
+
+
+def _nearest(value: float, centres: list[float]) -> int:
+    return min(range(len(centres)), key=lambda i: abs(value - centres[i]))
+
+
+def _classify(patch: np.ndarray) -> str | None:
+    mean = patch.reshape(-1, 3).mean(axis=0)
+    best, best_d = None, None
+    for name, rgb in _SWATCHES:
+        d = float(np.sum((mean - np.array(rgb, dtype=float)) ** 2))
+        if best_d is None or d < best_d:
+            best, best_d = name, d
+    if best_d is None or best_d > 3000.0:
+        return None
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int32)
+
+    # 1. the board lattice, from the cell borders drawn in one reserved grey
+    grid = _mask(arr, _GRID_EDGE, 12)
+    col_runs = _runs(grid.any(axis=0), min_len=20)
+    row_runs = _runs(grid.any(axis=1), min_len=20)
+    if len(col_runs) != 3 or len(row_runs) != 3:
+        return _UNREADABLE
+    col_c, row_c = _centres(col_runs), _centres(row_runs)
+
+    # 2. the drawn content of every cell; exactly one must read as the gap
+    board: dict[tuple[int, int], str] = {}
+    blank: tuple[int, int] | None = None
+    for r in range(3):
+        for c in range(3):
+            py, px = int(round(row_c[r])), int(round(col_c[c]))
+            patch = arr[py - 4 : py + 5, px - 4 : px + 5, :]
+            if patch.size == 0:
+                return _UNREADABLE
+            name = _classify(patch)
+            if name is None:
+                return _UNREADABLE
+            if name == "empty":
+                if blank is not None:
+                    return _UNREADABLE
+                blank = (r, c)
+            else:
+                board[(r, c)] = name
+    if blank is None or len(board) != 8:
+        return _UNREADABLE
+
+    # 3. the marked cell: nearest cell centre to the drawn red ring's centre
+    ys, xs = np.nonzero(_mask(arr, _RED, 40))
+    if ys.size < 60:
+        return _UNREADABLE
+    mr = _nearest((float(ys.min()) + float(ys.max())) / 2.0, row_c)
+    mc = _nearest((float(xs.min()) + float(xs.max())) / 2.0, col_c)
+
+    # 4. the cards, in drawn left-to-right order
+    card = _mask(arr, _CARD_BG, 8)
+    card_cols = _runs(card.any(axis=0), min_len=30)
+    card_rows = _runs(card.any(axis=1), min_len=30)
+    if not card_cols or len(card_rows) != 1:
+        return _UNREADABLE
+    ry0, ry1 = card_rows[0]
+
+    for cx0, cx1 in card_cols:
+        sub = arr[ry0 : ry1 + 1, cx0 : cx1 + 1, :]
+        tri = _mask(sub, _BLACK, 40)
+        tys, txs = np.nonzero(tri)
+        if tys.size < 200:
+            return _UNREADABLE
+        dy = float(tys.mean()) - (float(tys.min()) + float(tys.max())) / 2.0
+        dx = float(txs.mean()) - (float(txs.min()) + float(txs.max())) / 2.0
+        if abs(abs(dy) - abs(dx)) < 3.0:
+            return _UNREADABLE
+        if abs(dy) > abs(dx):
+            direction = "up" if dy > 0 else "down"
+        else:
+            direction = "left" if dx > 0 else "right"
+
+        drr, dcc = _STEP[direction]
+        target = (blank[0] + drr, blank[1] + dcc)
+        if not (0 <= target[0] < 3 and 0 <= target[1] < 3):
+            return _UNREADABLE
+        board[blank] = board.pop(target)
+        blank = target
+
+    content = board.get((mr, mc), "empty")
+    return f"{content}|{3 * blank[0] + blank[1] + 1}"

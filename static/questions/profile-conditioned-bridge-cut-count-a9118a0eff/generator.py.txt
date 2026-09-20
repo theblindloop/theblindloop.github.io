@@ -1,0 +1,232 @@
+"""Bridge-cut-count world renderer.
+
+The image shows a small network of colored circular nodes connected by thick
+black links on a white background. Each black link connects exactly two nodes.
+A link is a *bridge* (cut-edge) when removing it breaks the network into two or
+more disconnected parts, i.e. its two endpoint nodes become unreachable from
+each other through the remaining links. The decision is: how many of the black
+links are bridges? (a whole-number count).
+
+The scene is a plain dict so the verifier's AST reachability audit stays free of
+side effects:
+
+    z = {
+        "nodes": [ {"color": str, "x": .., "y": ..}, ... ],   # unique colors
+        "edges": [ [i, j], ... ],                              # node-index pairs
+        "width": 400,
+        "height": 400,
+        "background": "white",
+    }
+
+Only four node colors (one per node, permuted across scenes) are used; links are
+near-black and the background is white. All geometry is integer and drawn at 1x
+with hard edges, so the exposure below the four palette colours, the near-black
+links and white is exact on every robust scene.
+
+A small set of *skeletons* (fixed connected graph layouts with a known bridge
+count) supplies the on-/off-quarantine classes. Randomisation within a scene
+performs a permutation of the four node colours over the fixed node slots plus a
+small integer translation of the whole skeleton, which keeps the connectivity
+structure and therefore the bridge count unchanged. The bridge count is computed
+independently from the graph in analytic_gold (never stored), so the answer is
+always a pure consequence of the visible graph.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import deque
+from collections.abc import Iterator
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "bridge_cut_count-0.4.0"
+
+W = 400
+H = 400
+
+# Up to six distinct node colours (one per node), all far from black and white.
+PALETTE = ["red", "green", "blue", "purple", "orange", "teal"]
+_COLOR_RGBS = {
+    "red": (220, 30, 60),
+    "green": (40, 200, 60),
+    "blue": (40, 90, 230),
+    "purple": (160, 40, 210),
+    "orange": (255, 150, 0),
+    "teal": (0, 170, 170),
+}
+_LINK_RGB = (20, 20, 20)
+_BACKGROUND = "white"
+
+RADIUS = 16
+LINK_WIDTH = 10
+QUARANTINE_MIN = 1.0
+MARGIN = 1.0
+PAD = 8
+
+# Skeleton layouts: (node positions, edge index pairs). Each is a connected
+# graph; the declared bridge count follows from its structure alone.
+_SKELETONS = [
+    # 0 bridges: a 4-cycle.
+    {
+        "slots": [(120, 120), (280, 120), (280, 280), (120, 280)],
+        "edges": [[0, 1], [1, 2], [2, 3], [3, 0]],
+        "bridges": 0,
+    },
+    # 1 bridge: 4-cycle plus one leaf node attached by a single link.
+    {
+        "slots": [(120, 130), (280, 130), (280, 270), (120, 270), (120, 60)],
+        "edges": [[0, 1], [1, 2], [2, 3], [3, 0], [0, 4]],
+        "bridges": 1,
+    },
+    # 2 bridges: 4-cycle plus a two-node chain attached to one node.
+    {
+        "slots": [(120, 150), (280, 150), (280, 270), (120, 270), (120, 96), (120, 40)],
+        "edges": [[0, 1], [1, 2], [2, 3], [3, 0], [0, 4], [4, 5]],
+        "bridges": 2,
+    },
+    # 3 bridges: an open path (a tree), every link is a bridge.
+    {
+        "slots": [(100, 150), (200, 150), (300, 150), (300, 250)],
+        "edges": [[0, 1], [1, 2], [2, 3]],
+        "bridges": 3,
+    },
+]
+
+
+def _skeleton_bounds(slots: list[tuple[int, int]]) -> tuple[int, int, int, int]:
+    xs = [p[0] for p in slots]
+    ys = [p[1] for p in slots]
+    return min(xs) - int(RADIUS), max(xs) + int(RADIUS), min(ys) - int(RADIUS), max(ys) + int(RADIUS)
+
+
+def _bridge_count(nodes: list[dict], edges: list[list[int]]) -> int:
+    """Number of cut-edges in the graph (edges whose removal disconnects it)."""
+    n = len(nodes)
+    adj: list[set[int]] = [set() for _ in range(n)]
+    for i, j in edges:
+        adj[i].add(j)
+        adj[j].add(i)
+
+    def is_bridge(a: int, b: int) -> bool:
+        seen = {a}
+        stack = [a]
+        while stack:
+            u = stack.pop()
+            for v in adj[u]:
+                if (u == a and v == b) or (u == b and v == a):
+                    continue
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        return b not in seen
+
+    count = 0
+    for i, j in edges:
+        if is_bridge(i, j):
+            count += 1
+    return count
+
+
+def sample_scene(rng: random.Random, width: int = W, height: int = H) -> dict:
+    """Sample a scene: pick a skeleton, permute colours, translate it. Robust."""
+    skeleton = rng.choice(_SKELETONS)
+    slots = list(skeleton["slots"])
+    edges = skeleton["edges"]
+    minx, maxx, miny, maxy = _skeleton_bounds(slots)
+
+    dx = rng.randint(int(PAD) - minx, (width - int(PAD)) - maxx)
+    dy = rng.randint(int(PAD) - miny, (height - int(PAD)) - maxy)
+
+    colors = PALETTE[:]
+    rng.shuffle(colors)
+    nodes = [
+        {"color": colors[i], "x": slots[i][0] + dx, "y": slots[i][1] + dy}
+        for i in range(len(slots))
+    ]
+    return {
+        "nodes": nodes,
+        "edges": [list(e) for e in edges],
+        "width": width,
+        "height": height,
+        "background": _BACKGROUND,
+    }
+
+
+def render(scene: dict, supersample: int = 1) -> Image.Image:
+    """Render I = R(z). Links first (under nodes), then coloured node disks."""
+    width = int(scene["width"])
+    height = int(scene["height"])
+    img = Image.new("RGB", (width, height), scene["background"])
+    draw = ImageDraw.Draw(img)
+    nodes = scene["nodes"]
+    for a, b in scene["edges"]:
+        ax, ay = nodes[a]["x"], nodes[a]["y"]
+        bx, by = nodes[b]["x"], nodes[b]["y"]
+        draw.line([ax, ay, bx, by], fill=_LINK_RGB, width=int(LINK_WIDTH))
+    for node in nodes:
+        x, y = int(node["x"]), int(node["y"])
+        r = int(RADIUS)
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=_COLOR_RGBS[node["color"]])
+    return img
+
+
+def _graph(scene: dict) -> tuple[list[dict], list[list[int]]]:
+    return scene["nodes"], scene["edges"]
+
+
+def analytic_gold(scene: dict) -> str:
+    """Number of cut-edges as a string, computed only from the visible graph.
+
+    Self-contained (no calls into module-level helpers) so the PIXEL-oracle
+    independence / latent-alias AST audit sees it reading only scene["nodes"]
+    and scene["edges"].
+    """
+    nodes = scene["nodes"]
+    edges = scene["edges"]
+    n = len(nodes)
+    adj: list[set[int]] = [set() for _ in range(n)]
+    for i, j in edges:
+        adj[i].add(j)
+        adj[j].add(i)
+
+    def cut(a: int, b: int) -> bool:
+        seen = {a}
+        stack = [a]
+        while stack:
+            u = stack.pop()
+            for v in adj[u]:
+                if (u == a and v == b) or (u == b and v == a):
+                    continue
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        return b not in seen
+
+    count = 0
+    for i, j in edges:
+        if cut(i, j):
+            count += 1
+    return str(count)
+
+
+def margin(scene: dict) -> float:
+    """Decision margin: separation to the nearest other bridge-count class."""
+    return MARGIN
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Scenes with an ambiguous bridge count (or broken layout) are quarantined.
+
+    The fixed skeletons are always clean, so every generated scene is
+    off-quarantine. This guard exists for structural robustness (a scene whose
+    graph is malformed) and mirrors the fixed margin.
+    """
+    return margin(scene) < QUARANTINE_MIN
+
+
+def latent_symmetries(scene: dict) -> Iterator[dict]:
+    """No render-invariant label symmetry: colours are unique, geometry is fixed
+    and every field changes the picture; the bridge count is recovered purely
+    from pixels. Declared not_applicable."""
+    return iter(())

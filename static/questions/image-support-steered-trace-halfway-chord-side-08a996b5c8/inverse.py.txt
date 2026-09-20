@@ -1,0 +1,124 @@
+"""Independent image-only inverse arm for Trace Halfway Chord Side.
+
+The implementation receives only a final PIL image. It estimates the border
+background, segments the saturated trace without assuming a palette, verifies
+that the evidence is one unbroken long component, recovers one center y for
+each occupied x column, then independently performs cumulative arc-length
+bisection and the endpoint-chord side test.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """The raster does not contain one measurable, unbroken long trace."""
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[list[tuple[int, int]]] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        stack = [(y0, x0)]
+        points: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        output.append(points)
+    output.sort(key=len, reverse=True)
+    return output
+
+
+def _recover_centerline(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise OracleAbstention("RGB raster required")
+    border = np.concatenate(
+        [array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3),
+         array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)],
+        axis=0,
+    )
+    background = np.median(border, axis=0)
+    distance = np.linalg.norm(array - background, axis=2)
+    mask = distance > 52.0
+    components = [points for points in _components(mask) if len(points) >= 12]
+    if not components:
+        raise OracleAbstention("no colored trace found")
+    if len(components) != 1:
+        raise OracleAbstention("trace is broken into multiple components")
+    points = components[0]
+    if len(points) < 1200:
+        raise OracleAbstention("too little trace ink")
+    component_mask = np.zeros(mask.shape, dtype=bool)
+    yy, xx = zip(*points)
+    component_mask[np.asarray(yy), np.asarray(xx)] = True
+
+    occupied = np.flatnonzero(component_mask.any(axis=0))
+    if len(occupied) < int(image.width * 0.72):
+        raise OracleAbstention("trace does not span the image")
+    if np.max(np.diff(occupied), initial=1) > 2:
+        raise OracleAbstention("trace has an erased horizontal gap")
+
+    x0, x1 = int(occupied[0]), int(occupied[-1])
+    xs = np.arange(x0, x1 + 1, dtype=np.float64)
+    ys = np.empty(len(xs), dtype=np.float64)
+    for index, x in enumerate(range(x0, x1 + 1)):
+        rows = np.flatnonzero(component_mask[:, x])
+        if not len(rows):
+            raise OracleAbstention("missing centerline column")
+        ys[index] = float(np.median(rows))
+
+    # Suppress subpixel antialias stair-steps while retaining the visible bends.
+    kernel = np.asarray([1, 2, 3, 4, 3, 2, 1], dtype=np.float64)
+    kernel /= kernel.sum()
+    padded = np.pad(ys, (3, 3), mode="edge")
+    ys = np.convolve(padded, kernel, mode="valid")
+    return xs, ys
+
+
+def _signed_midpoint_gap(xs: np.ndarray, ys: np.ndarray) -> float:
+    segment_lengths = np.hypot(np.diff(xs), np.diff(ys))
+    total = float(segment_lengths.sum())
+    if not math.isfinite(total) or total <= 0:
+        raise OracleAbstention("degenerate centerline")
+    target = total / 2.0
+    cumulative = np.cumsum(segment_lengths)
+    index = int(np.searchsorted(cumulative, target, side="left"))
+    before = float(cumulative[index - 1]) if index else 0.0
+    length = float(segment_lengths[index])
+    fraction = (target - before) / length
+    half_x = float(xs[index] + fraction * (xs[index + 1] - xs[index]))
+    half_y = float(ys[index] + fraction * (ys[index + 1] - ys[index]))
+    chord_fraction = (half_x - float(xs[0])) / float(xs[-1] - xs[0])
+    chord_y = float(ys[0] + chord_fraction * (ys[-1] - ys[0]))
+    return chord_y - half_y
+
+
+def decision_from_image(image: Image.Image) -> str:
+    xs, ys = _recover_centerline(image)
+    signed = _signed_midpoint_gap(xs, ys)
+    if abs(signed) < 3.0:
+        raise OracleAbstention("midpoint is too close to the chord")
+    return "ABOVE" if signed > 0 else "BELOW"

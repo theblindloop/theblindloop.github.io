@@ -1,0 +1,228 @@
+"""Deterministic scene sampling and integer raster rendering for peak_to_trough_drop.
+
+Three stacked panels each carry one coloured trace over the same nine
+positions.  The decision is the colour of the trace with the deepest *ordered*
+fall: the largest amount by which the trace descends from an earlier high to a
+later low.  The quantity is order sensitive, which is what separates it from a
+span, a range, a minimum or an accumulated total: a trace may sweep the full
+height of its panel and still own a tiny fall if it climbs rather than
+descends, so the deepest fall cannot be read off any order-blind summary.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "peak_to_trough_drop-renderer-0.1.0"
+
+WIDTH = 920
+HEIGHT = 700
+BACKGROUND = (255, 255, 255)
+
+COLOR_NAMES = ("red", "green", "blue")
+COLOR_RGB = {
+    "red": (208, 30, 38),
+    "green": (16, 138, 60),
+    "blue": (30, 66, 208),
+}
+FRAME_RGB = (0, 0, 0)
+GRID_RGB = (206, 206, 206)
+
+PANEL_X0 = 70
+PANEL_X1 = 880
+TOP_MARGIN = 26
+PANEL_PAD = 14
+LANES = 3
+STEPS = 8
+POINTS = 9
+TRACE_WIDTH = 3
+MARKER_R = 4
+
+UNIT_MIN = 15
+UNIT_MAX = 18
+DX_MIN = 78
+DX_MAX = 88
+XPAD_MIN = 30
+XPAD_MAX = 46
+LANE_GAP_MIN = 34
+LANE_GAP_MAX = 46
+
+MIN_DROP_UNITS = 1
+QUARANTINE_MARGIN = 24.0
+
+
+def _drawdown(values: list[int]) -> int:
+    """Largest fall from an earlier value to a strictly later, lower value."""
+
+    high = int(values[0])
+    best = 0
+    for value in values[1:]:
+        best = max(best, high - int(value))
+        high = max(high, int(value))
+    return best
+
+
+def _unique_argmax(values: list[int]) -> int | None:
+    order = sorted(range(len(values)), key=lambda i: values[i], reverse=True)
+    if values[order[0]] == values[order[1]]:
+        return None
+    return order[0]
+
+
+def _unique_argmin(values: list[int]) -> int | None:
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    if values[order[0]] == values[order[1]]:
+        return None
+    return order[0]
+
+
+def _try_scene(
+    rng: random.Random,
+    phase: int,
+    colour_phase: int,
+    lane_phase: int,
+    allow_tight: bool,
+) -> dict | None:
+    series = [[rng.randrange(0, STEPS + 1) for _ in range(POINTS)] for _ in range(LANES)]
+    falls = [_drawdown(one) for one in series]
+    if min(falls) < MIN_DROP_UNITS:
+        return None
+    winner = _unique_argmax(falls)
+    if winner is None:
+        return None
+    ordered = sorted(falls, reverse=True)
+    if ordered[0] - ordered[1] < (1 if allow_tight else 2):
+        return None
+
+    spans = [max(one) - min(one) for one in series]
+    span_arg = _unique_argmax(spans)
+    if span_arg is None:
+        return None
+    lows = [min(one) for one in series]
+    low_arg = _unique_argmin(lows)
+    if low_arg is None:
+        return None
+
+    # Counterbalance the two strongest order-blind cues to an exact 50/50 by
+    # forcing agreement or disagreement from the scene seed alone.
+    if (span_arg == winner) != bool(phase % 2 == 1):
+        return None
+    if (low_arg == winner) != bool(phase in (1, 2)):
+        return None
+
+    # Answer colour and panel position are pinned to independent seed cycles so
+    # neither carries information about the decision.
+    lanes = [lane_phase] + [slot for slot in range(LANES) if slot != lane_phase]
+    colours = [COLOR_NAMES[colour_phase]] + [
+        name for name in COLOR_NAMES if name != COLOR_NAMES[colour_phase]
+    ]
+    others = [index for index in range(LANES) if index != winner]
+    rng.shuffle(others)
+    order = [winner] + others
+
+    lane_series: list[list[int]] = [[] for _ in range(LANES)]
+    lane_colors: list[str] = ["" for _ in range(LANES)]
+    for position, source in enumerate(order):
+        lane_series[lanes[position]] = series[source]
+        lane_colors[lanes[position]] = colours[position]
+
+    unit = rng.randrange(UNIT_MIN, UNIT_MAX + 1)
+    scene = {
+        "unit": unit,
+        "series": lane_series,
+        "lane_colors": lane_colors,
+        "dx": rng.randrange(DX_MIN, DX_MAX + 1),
+        "x_pad": rng.randrange(XPAD_MIN, XPAD_MAX + 1),
+        "lane_gap": rng.randrange(LANE_GAP_MIN, LANE_GAP_MAX + 1),
+    }
+    panel_h = STEPS * unit + 2 * PANEL_PAD
+    bottom = TOP_MARGIN + LANES * panel_h + (LANES - 1) * int(scene["lane_gap"])
+    if bottom > HEIGHT - 12:
+        return None
+    if PANEL_X0 + int(scene["x_pad"]) + (POINTS - 1) * int(scene["dx"]) > PANEL_X1 - 12:
+        return None
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic latent scene for one integer seed."""
+
+    value = int(seed)
+    rng = random.Random(value * 6151 + 29)
+    phase = value % 4
+    colour_phase = value % LANES
+    lane_phase = (value // LANES) % LANES
+    for _ in range(60000):
+        scene = _try_scene(rng, phase, colour_phase, lane_phase, value % 5 == 0)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+def analytic_gold(scene: dict) -> str:
+    """Colour of the trace whose deepest ordered fall is the largest."""
+
+    falls = [_drawdown(list(one)) for one in scene["series"]]
+    best = max(range(len(falls)), key=lambda index: falls[index])
+    return str(scene["lane_colors"][best])
+
+
+def margin(scene: dict) -> float:
+    """Vertical pixels the runner-up would have to gain to flip the answer."""
+
+    falls = sorted((_drawdown(list(one)) for one in scene["series"]), reverse=True)
+    return float((falls[0] - falls[1]) * int(scene["unit"]))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """One-step separations sit on the tie boundary and leave headline claims."""
+
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No pixel-identical latent alias exists; see candidate.json."""
+
+    return []
+
+
+def _panel_top(scene: dict, lane: int) -> int:
+    panel_h = STEPS * int(scene["unit"]) + 2 * PANEL_PAD
+    return TOP_MARGIN + lane * (panel_h + int(scene["lane_gap"]))
+
+
+def _point(scene: dict, lane: int, index: int, value: int) -> tuple[int, int]:
+    unit = int(scene["unit"])
+    baseline = _panel_top(scene, lane) + PANEL_PAD + STEPS * unit
+    x = PANEL_X0 + int(scene["x_pad"]) + index * int(scene["dx"])
+    return x, baseline - int(value) * unit
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize one scene with hard integer edges and no antialiasing."""
+
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    unit = int(scene["unit"])
+    panel_h = STEPS * unit + 2 * PANEL_PAD
+
+    for lane in range(LANES):
+        top = _panel_top(scene, lane)
+        draw.rectangle([PANEL_X0, top, PANEL_X1, top + panel_h], outline=FRAME_RGB, width=2)
+        baseline = top + PANEL_PAD + STEPS * unit
+        for step in range(STEPS + 1):
+            y = baseline - step * unit
+            draw.line([PANEL_X0 + 2, y, PANEL_X1 - 2, y], fill=GRID_RGB, width=1)
+
+    for lane in range(LANES):
+        rgb = COLOR_RGB[scene["lane_colors"][lane]]
+        points = [
+            _point(scene, lane, index, value)
+            for index, value in enumerate(scene["series"][lane])
+        ]
+        draw.line(points, fill=rgb, width=TRACE_WIDTH, joint="curve")
+        for x, y in points:
+            draw.ellipse([x - MARKER_R, y - MARKER_R, x + MARKER_R, y + MARKER_R], fill=rgb)
+    return image

@@ -1,0 +1,295 @@
+"""Renderer, analytic gold, margin and latent aliases for ``drop_tip_bearing``.
+
+The scene holds exactly one solid coloured blob: a round body of small span with
+a single drawn-out pointed tip, i.e. a water-drop silhouette.  The blob is one
+connected, area-like component with a large interior, and it occupies only a
+small neighbourhood of the canvas whose absolute position is randomised.
+
+The decision is which of the four picture edges the tip points at.  Nothing is
+drawn *at* the answer: the tip bearing is a property of how the blob's own area
+is distributed, so it is recovered by integrating the whole silhouette rather
+than by locating one mark.
+
+A short grey bar -- a nozzle -- is drawn well away from the blob.  It is the
+canonical-prior cue: the familiar drop icon is drawn tip-first toward whatever
+it hangs from, so the convention says the tip points back at the nozzle.
+Control scenes follow that convention; counterfactual scenes put the nozzle in a
+different direction.  The nozzle bearing is sampled independently of the answer
+and never touches analytic gold.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "drop_tip_bearing-renderer-0.1.0"
+
+CANVAS = 512
+SS = 3  # supersampling factor
+BG = (243, 243, 241)
+GREY = (108, 108, 112)
+SPECK = (150, 150, 154)
+
+# Saturated fills; hue is sampled independently of the answer.
+DROP_COLOURS: dict[str, tuple[int, int, int]] = {
+    "crimson": (186, 32, 58),
+    "teal": (16, 118, 128),
+    "amber": (200, 128, 12),
+    "violet": (120, 46, 168),
+    "forest": (34, 116, 52),
+    "indigo": (44, 62, 172),
+}
+
+# Bearings are counter-clockwise with y up: 0 = right, 90 = up.
+BEARINGS = ("right", "up", "left", "down")
+
+# Declared visible ranges used by the pixel arm; the sampler stays inside them.
+TIP_REACH_MIN = 1.95
+TIP_REACH_MAX = 2.80
+QUARANTINE_MARGIN = 6.0
+
+
+def _norm(a: float) -> float:
+    return a % 360.0
+
+
+def bearing_name(angle: float) -> str:
+    """Picture edge nearest to ``angle`` (degrees, ccw, y up)."""
+    return BEARINGS[int(math.floor(_norm(angle) / 90.0 + 0.5)) % 4]
+
+
+def tip_angle(scene: dict) -> float:
+    """Bearing of the drawn-out tip, from whichever end the scene stores.
+
+    ``param_mode`` selects which of the two ends of the drop's axis is recorded;
+    both parameterisations describe the same physical silhouette.
+    """
+    a = float(scene["axis_a"])
+    if scene["param_mode"] == "tip":
+        return _norm(a)
+    if scene["param_mode"] == "base":
+        return _norm(a + 180.0)
+    raise ValueError(f"unknown param_mode {scene['param_mode']!r}")
+
+
+def analytic_gold(scene: dict) -> str:
+    """Edge the tip points at, from the drop axis alone."""
+    return bearing_name(tip_angle(scene))
+
+
+def _diagonal_clearance_deg(scene: dict) -> float:
+    """Angular gap between the tip bearing and the nearest 45-degree diagonal."""
+    t = _norm(tip_angle(scene))
+    return min(abs(t - d) for d in (45.0, 135.0, 225.0, 315.0, 405.0, -45.0))
+
+
+def _drop_bbox(scene: dict) -> tuple[float, float, float, float]:
+    cx, cy, r = scene["cx"], scene["cy"], scene["radius"]
+    reach = scene["reach"] * r
+    t = math.radians(tip_angle(scene))
+    px, py = cx + reach * math.cos(t), cy - reach * math.sin(t)
+    return (min(cx - r, px), min(cy - r, py), max(cx + r, px), max(cy + r, py))
+
+
+def _clutter_gap(scene: dict) -> float:
+    """Smallest gap in canvas pixels between the drop and any grey decoration."""
+    cx, cy, r = scene["cx"], scene["cy"], scene["radius"]
+    reach = scene["reach"] * r
+    best = 1e9
+    for gx, gy, grad in _clutter_discs(scene):
+        d = math.hypot(gx - cx, gy - cy)
+        # Conservative: treat the drop as the disc of radius ``reach`` about its
+        # body centre, which contains the whole silhouette.
+        best = min(best, d - reach - grad)
+    return best
+
+
+def _clutter_discs(scene: dict) -> list[tuple[float, float, float]]:
+    """Bounding discs of the grey nozzle bar and the grey specks."""
+    cx, cy, r = scene["cx"], scene["cy"], scene["radius"]
+    b = math.radians(scene["nozzle_bearing"])
+    nx = cx + scene["nozzle_dist"] * r * math.cos(b)
+    ny = cy - scene["nozzle_dist"] * r * math.sin(b)
+    out = [(nx, ny, 0.5 * scene["nozzle_len"] * r + 0.5 * scene["nozzle_thick"] * r)]
+    for sx, sy, sr in scene["specks"]:
+        out.append((float(sx), float(sy), float(sr)))
+    return out
+
+
+def margin(scene: dict) -> float:
+    """Minimum distance, in canvas pixels, to any answer- or validity-changing
+    event that is visible in the raster."""
+    r = float(scene["radius"])
+    rad = math.pi / 180.0
+    x0, y0, x1, y1 = _drop_bbox(scene)
+    edge_gap = min(x0, y0, (CANVAS - 1) - x1, (CANVAS - 1) - y1)
+    return float(
+        min(
+            r * _diagonal_clearance_deg(scene) * rad,   # tip stays on one edge's side
+            r * (scene["reach"] - TIP_REACH_MIN),       # tip stays a legible point
+            r * (TIP_REACH_MAX - scene["reach"]),       # body stays the bulk of the ink
+            r - 25.0,                                   # blob stays large enough to read
+            _clutter_gap(scene),                        # decoration stays detached
+            edge_gap,                                   # support never touches an edge
+        )
+    )
+
+
+def margin_bin(value: float) -> str:
+    if value < QUARANTINE_MARGIN:
+        return "boundary"
+    if value < 12.0:
+        return "tight"
+    if value < 24.0:
+        return "clear"
+    return "wide"
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def _inside(x: float, y: float, pad: float) -> bool:
+    return pad <= x <= CANVAS - 1 - pad and pad <= y <= CANVAS - 1 - pad
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one scene.  Answer bearing, hue, geometry, blob position and the
+    canonical-prior variant are drawn independently of one another."""
+    rng = random.Random(int(seed) * 2_654_435_761 + 7919)
+    for _ in range(6000):
+        quarter = rng.randrange(4)
+        want_tight = rng.random() < 0.30
+        clearance = rng.uniform(10.0, 18.0) if want_tight else rng.uniform(22.0, 41.0)
+        jitter = (45.0 - clearance) * (1.0 if rng.random() < 0.5 else -1.0)
+        tip = _norm(90.0 * quarter + jitter)
+
+        radius = rng.uniform(36.0, 46.0)
+        reach = rng.uniform(2.24, 2.50)
+        span = reach * radius + 10.0
+        cx = rng.uniform(span, CANVAS - 1 - span)
+        cy = rng.uniform(span, CANVAS - 1 - span)
+
+        nozzle_bearing = _norm(90.0 * rng.randrange(4) + rng.uniform(-16.0, 16.0))
+        variant = ("control" if bearing_name(nozzle_bearing) == bearing_name(tip)
+                   else "counterfactual")
+        nozzle_dist = rng.uniform(3.30, 4.30)
+        nozzle_len = rng.uniform(1.35, 1.85)
+        nozzle_thick = rng.uniform(0.20, 0.30)
+
+        specks = []
+        for _ in range(rng.randrange(4, 8)):
+            for _try in range(60):
+                sx = rng.uniform(16.0, CANVAS - 17.0)
+                sy = rng.uniform(16.0, CANVAS - 17.0)
+                sr = rng.uniform(3.0, 6.0)
+                if math.hypot(sx - cx, sy - cy) > reach * radius + 46.0:
+                    specks.append((sx, sy, sr))
+                    break
+
+        scene = {
+            "width": CANVAS,
+            "height": CANVAS,
+            "cx": cx,
+            "cy": cy,
+            "radius": radius,
+            "reach": reach,
+            "param_mode": "tip",
+            "axis_a": tip,
+            "colour": rng.choice(sorted(DROP_COLOURS)),
+            "nozzle_bearing": nozzle_bearing,
+            "nozzle_dist": nozzle_dist,
+            "nozzle_len": nozzle_len,
+            "nozzle_thick": nozzle_thick,
+            "specks": specks,
+            "variant": variant,
+            "canonical_prior_answer": bearing_name(nozzle_bearing),
+        }
+        if not specks:
+            continue
+        if not _nozzle_inside(scene):
+            continue
+        if is_quarantined(scene):
+            continue
+        return scene
+    raise RuntimeError("sampler exhausted")
+
+
+def _nozzle_inside(scene: dict) -> bool:
+    cx, cy, r = scene["cx"], scene["cy"], scene["radius"]
+    b = math.radians(scene["nozzle_bearing"])
+    nx = cx + scene["nozzle_dist"] * r * math.cos(b)
+    ny = cy - scene["nozzle_dist"] * r * math.sin(b)
+    half = 0.5 * scene["nozzle_len"] * r + 0.5 * scene["nozzle_thick"] * r
+    return _inside(nx - half, ny - half, 8.0) and _inside(nx + half, ny + half, 8.0)
+
+
+def drop_polygon(scene: dict, scale: float = 1.0) -> list[tuple[float, float]]:
+    """Outline of the drop: the body circle plus the two tangents to the tip."""
+    cx, cy = scene["cx"] * scale, scene["cy"] * scale
+    r = scene["radius"] * scale
+    reach = scene["reach"] * r
+    t = math.radians(tip_angle(scene))
+    phi = math.acos(max(-1.0, min(1.0, r / reach)))
+    pts: list[tuple[float, float]] = []
+    n = 96
+    # Arc from the tangent point on one side, the long way round the body, to
+    # the tangent point on the other side.
+    a0 = t + phi
+    sweep = 2.0 * (math.pi - phi)
+    for i in range(n + 1):
+        a = a0 + sweep * i / n
+        pts.append((cx + r * math.cos(a), cy - r * math.sin(a)))
+    pts.append((cx + reach * math.cos(t), cy - reach * math.sin(t)))
+    return pts
+
+
+def render(scene: dict) -> Image.Image:
+    s = SS
+    img = Image.new("RGB", (CANVAS * s, CANVAS * s), BG)
+    draw = ImageDraw.Draw(img)
+
+    # The grey nozzle bar, perpendicular to its own bearing from the drop.
+    cx, cy, r = scene["cx"] * s, scene["cy"] * s, scene["radius"] * s
+    b = math.radians(scene["nozzle_bearing"])
+    nx = cx + scene["nozzle_dist"] * r * math.cos(b)
+    ny = cy - scene["nozzle_dist"] * r * math.sin(b)
+    half = 0.5 * scene["nozzle_len"] * r
+    ux, uy = -math.sin(b), -math.cos(b)  # perpendicular, screen coordinates
+    draw.line(
+        (nx - half * ux, ny - half * uy, nx + half * ux, ny + half * uy),
+        fill=GREY,
+        width=max(1, int(round(scene["nozzle_thick"] * r))),
+    )
+
+    # Grey specks: nondiagnostic clutter.
+    for sx, sy, sr in scene["specks"]:
+        draw.ellipse(
+            (sx * s - sr * s, sy * s - sr * s, sx * s + sr * s, sy * s + sr * s),
+            fill=SPECK,
+        )
+
+    # The drop: one solid, area-like component with a large interior.
+    draw.polygon(drop_polygon(scene, s), fill=DROP_COLOURS[scene["colour"]])
+
+    return img.resize((CANVAS, CANVAS), Image.BOX)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical re-descriptions of the same physical drop.
+
+    Both must leave the raster and the analytic gold untouched.
+    """
+    wrapped = dict(scene)
+    wrapped["axis_a"] = scene["axis_a"] + 360.0
+    flipped = dict(scene)
+    if scene["param_mode"] == "tip":
+        flipped["param_mode"] = "base"
+        flipped["axis_a"] = _norm(tip_angle(scene) + 180.0)
+    else:
+        flipped["param_mode"] = "tip"
+        flipped["axis_a"] = tip_angle(scene)
+    return [("axis_angle_wrap", wrapped), ("opposite_end_parameterisation", flipped)]

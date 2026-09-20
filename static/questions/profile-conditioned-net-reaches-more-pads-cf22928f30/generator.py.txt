@@ -1,0 +1,279 @@
+"""Deterministic latent-scene sampling and RGB rendering for net_reaches_more_pads.
+
+Two rectilinear supply networks (a spine plus horizontal teeth) share one field of
+rows. Every tooth ends at an identical orange pad. Some wires carry a visible break;
+a pad is supplied only when an unbroken dark wire runs from its source square to it.
+The decision compares how many pads each source square supplies.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+CANVAS = (760, 560)
+BACKGROUND = (255, 255, 255)
+WIRE_COLOR = (38, 38, 42)
+PAD_COLOR = (240, 142, 24)
+GREEN = (26, 148, 74)
+PURPLE = (128, 58, 178)
+STROKE = 7
+HALF = STROKE // 2
+PAD_RADIUS = 10
+SOURCE_HALF = 16
+N_ROWS = 8
+ROW_Y0 = 78
+ROW_DY = 58
+LEFT_X = 76
+RIGHT_X = 684
+TOP_SOURCE_Y = 30
+BOTTOM_SOURCE_Y = CANVAS[1] - 30
+GAP_MIN = 17
+GAP_MAX = 23
+END_CLEAR = 36
+QUARANTINE_MARGIN = 1.0
+
+
+def _row_ys() -> list[int]:
+    return [ROW_Y0 + i * ROW_DY for i in range(N_ROWS)]
+
+
+def _ordered_rows(scene: dict, side: str) -> list[int]:
+    """Row indices of one side, ordered from the source square outwards."""
+    rows = [i for i, s in enumerate(scene["sides"]) if s == side]
+    if scene["sources"][side]["at"] == "top":
+        return rows
+    return list(reversed(rows))
+
+
+def _supplied(scene: dict, side: str) -> list[int]:
+    """Row indices on `side` whose pad is reached by an unbroken wire."""
+    out = []
+    cut = scene["spine_gaps"][side]
+    for rank, row in enumerate(_ordered_rows(scene, side)):
+        if cut is not None and rank >= cut["after_rank"] + 1:
+            break
+        if scene["tooth_gaps"][row] is None:
+            out.append(row)
+    return out
+
+
+def _counts(scene: dict) -> tuple[int, int]:
+    return len(_supplied(scene, "left")), len(_supplied(scene, "right"))
+
+
+def _sample_once(rng: random.Random) -> dict:
+    row_ys = _row_ys()
+    sides = ["left"] * (N_ROWS // 2) + ["right"] * (N_ROWS // 2)
+    rng.shuffle(sides)
+
+    left_name, right_name = ("green", "purple") if rng.random() < 0.5 else ("purple", "green")
+    sources = {
+        "left": {
+            "color_name": left_name,
+            "rgb": list(GREEN if left_name == "green" else PURPLE),
+            "at": rng.choice(["top", "bottom"]),
+        },
+        "right": {
+            "color_name": right_name,
+            "rgb": list(GREEN if right_name == "green" else PURPLE),
+            "at": rng.choice(["top", "bottom"]),
+        },
+    }
+    for side in ("left", "right"):
+        sources[side]["y"] = TOP_SOURCE_Y if sources[side]["at"] == "top" else BOTTOM_SOURCE_Y
+
+    pad_xs = []
+    for side in sides:
+        if side == "left":
+            pad_xs.append(rng.randrange(250, 476, 2))
+        else:
+            pad_xs.append(rng.randrange(258, 484, 2))
+
+    scene = {
+        "canvas": list(CANVAS),
+        "background": list(BACKGROUND),
+        "wire_color": list(WIRE_COLOR),
+        "stroke_width": STROKE,
+        "row_ys": row_ys,
+        "left_x": LEFT_X,
+        "right_x": RIGHT_X,
+        "sides": sides,
+        "pad_xs": pad_xs,
+        "pad_radius": PAD_RADIUS,
+        "pad_color": list(PAD_COLOR),
+        "source_half": SOURCE_HALF,
+        "sources": sources,
+        "spine_gaps": {"left": None, "right": None},
+        "tooth_gaps": [None] * N_ROWS,
+    }
+
+    # Spine breaks: a break after rank k isolates every tooth of higher rank.
+    for side in ("left", "right"):
+        ordered = _ordered_rows(scene, side)
+        if rng.random() < 0.62:
+            rank = rng.randrange(0, len(ordered) - 1)
+            y_a, y_b = row_ys[ordered[rank]], row_ys[ordered[rank + 1]]
+            lo, hi = (y_a, y_b) if y_a < y_b else (y_b, y_a)
+            length = rng.randrange(GAP_MIN, GAP_MAX + 1)
+            mid = (lo + hi) // 2 + rng.randrange(-6, 7)
+            scene["spine_gaps"][side] = {
+                "after_rank": rank,
+                "y0": mid - length // 2,
+                "y1": mid - length // 2 + length,
+            }
+
+    # Tooth breaks: each break isolates exactly one pad.
+    for row in range(N_ROWS):
+        if rng.random() < 0.38:
+            spine_x = LEFT_X if sides[row] == "left" else RIGHT_X
+            pad_x = pad_xs[row]
+            lo, hi = (spine_x, pad_x) if spine_x < pad_x else (pad_x, spine_x)
+            length = rng.randrange(GAP_MIN, GAP_MAX + 1)
+            start = rng.randrange(lo + END_CLEAR, hi - END_CLEAR - length)
+            scene["tooth_gaps"][row] = {"x0": start, "x1": start + length}
+
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a scene, counterbalancing the winning colour, winning side and gap bias."""
+    rng = random.Random(seed * 7919 + 13)
+    want_green = (seed % 2) == 0
+    want_left = ((seed // 2) % 2) == 0
+    want_gap_bias = ((seed // 4) % 2) == 0  # winner carries at least as many breaks
+    best = None
+    for attempt in range(6000):
+        scene = _sample_once(rng)
+        c_left, c_right = _counts(scene)
+        if c_left == c_right:
+            continue
+        win_side = "left" if c_left > c_right else "right"
+        if (scene["sources"][win_side]["color_name"] == "green") != want_green:
+            continue
+        if (win_side == "left") != want_left:
+            continue
+        if margin(scene) <= QUARANTINE_MARGIN:
+            continue
+        lose_side = "right" if win_side == "left" else "left"
+        breaks = {s: _break_count(scene, s) for s in ("left", "right")}
+        if best is None:
+            best = scene
+        if (breaks[win_side] >= breaks[lose_side]) == want_gap_bias:
+            return scene
+    if best is None:  # pragma: no cover - counterbalancing always succeeds in range
+        raise RuntimeError(f"unable to sample scene for seed {seed}")
+    return best
+
+
+def _break_count(scene: dict, side: str) -> int:
+    n = 1 if scene["spine_gaps"][side] is not None else 0
+    n += sum(
+        1
+        for row in range(N_ROWS)
+        if scene["sides"][row] == side and scene["tooth_gaps"][row] is not None
+    )
+    return n
+
+
+def _spine_span(scene: dict, side: str) -> tuple[int, int]:
+    ordered = _ordered_rows(scene, side)
+    ys = [scene["row_ys"][r] for r in ordered] + [scene["sources"][side]["y"]]
+    return min(ys), max(ys)
+
+
+def _cut(a: int, b: int, gap: tuple[int, int] | None) -> list[tuple[int, int]]:
+    """Split the closed interval [a, b] around an optional removed sub-interval."""
+    if gap is None:
+        return [(a, b)]
+    g0, g1 = gap
+    out = []
+    if g0 - 1 >= a:
+        out.append((a, g0 - 1))
+    if b >= g1 + 1:
+        out.append((g1 + 1, b))
+    return out
+
+
+def render(scene: dict) -> Image.Image:
+    img = Image.new("RGB", tuple(scene["canvas"]), tuple(scene["background"]))
+    draw = ImageDraw.Draw(img)
+    wire = tuple(scene["wire_color"])
+    h = scene["stroke_width"] // 2
+
+    for side in ("left", "right"):
+        x = scene["left_x"] if side == "left" else scene["right_x"]
+        y_lo, y_hi = _spine_span(scene, side)
+        sg = scene["spine_gaps"][side]
+        gap = (sg["y0"], sg["y1"]) if sg else None
+        for a, b in _cut(y_lo, y_hi, gap):
+            draw.rectangle([x - h, a - h, x + h, b + h], fill=wire)
+
+    for row, side in enumerate(scene["sides"]):
+        y = scene["row_ys"][row]
+        spine_x = scene["left_x"] if side == "left" else scene["right_x"]
+        pad_x = scene["pad_xs"][row]
+        lo, hi = (spine_x, pad_x) if spine_x < pad_x else (pad_x, spine_x)
+        tg = scene["tooth_gaps"][row]
+        gap = (tg["x0"], tg["x1"]) if tg else None
+        for a, b in _cut(lo, hi, gap):
+            draw.rectangle([a - h, y - h, b + h, y + h], fill=wire)
+
+    for side in ("left", "right"):
+        x = scene["left_x"] if side == "left" else scene["right_x"]
+        y = scene["sources"][side]["y"]
+        s = scene["source_half"]
+        draw.rectangle([x - s, y - s, x + s, y + s], fill=tuple(scene["sources"][side]["rgb"]))
+
+    r = scene["pad_radius"]
+    for row in range(len(scene["sides"])):
+        x, y = scene["pad_xs"][row], scene["row_ys"][row]
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=tuple(scene["pad_color"]))
+
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    c_left, c_right = _counts(scene)
+    side = "left" if c_left > c_right else "right"
+    return scene["sources"][side]["color_name"]
+
+
+def margin(scene: dict) -> float:
+    """Smallest of the break legibility, the pad-count lead and the layout clearance."""
+    gap_lengths = []
+    for side in ("left", "right"):
+        sg = scene["spine_gaps"][side]
+        if sg is not None:
+            gap_lengths.append(sg["y1"] - sg["y0"])
+    for tg in scene["tooth_gaps"]:
+        if tg is not None:
+            gap_lengths.append(tg["x1"] - tg["x0"])
+    gap_margin = min(gap_lengths) - 11.0 if gap_lengths else 12.0
+
+    c_left, c_right = _counts(scene)
+    count_margin = 6.0 * abs(c_left - c_right)
+
+    h = scene["stroke_width"] / 2.0
+    clearance = 1e9
+    for row in range(len(scene["sides"])):
+        x, y = scene["pad_xs"][row], scene["row_ys"][row]
+        for other in range(len(scene["sides"])):
+            if other == row:
+                continue
+            clearance = min(clearance, abs(scene["row_ys"][other] - y) - scene["pad_radius"] - h)
+    clearance_margin = clearance - 12.0
+
+    return float(min(gap_margin, count_margin, clearance_margin))
+
+
+def is_quarantined(scene: dict) -> bool:
+    if _counts(scene)[0] == _counts(scene)[1]:
+        return True
+    return margin(scene) <= QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases exist: every scene field is painted (see latent_alias)."""
+    return []

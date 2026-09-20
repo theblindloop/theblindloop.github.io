@@ -1,0 +1,157 @@
+"""Pixel-only inverse arm for the mirror-bounce panel world.
+
+The arm sees one rendered PNG and nothing else: no scene, no renderer, no
+analytic gold. It rules the grey frames to recover the five panel interiors and
+then, inside each interior, segments four flat ink classes by hue: the orange
+source blob, the green beam, the blue mirror bar and the red disk. It fits a
+line to the beam ink and a line to the mirror ink, intersects them to locate the
+strike point, orients the beam away from the source blob, reflects that
+direction about the fitted mirror normal, and measures the signed clearance of
+the red disk from the reflected ray. The decision is the unique panel with a
+negative clearance; ties, near-ties and malformed panels abstain.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "mirror_bounce_panel-oracle-0.1.0"
+AMBIGUOUS = "ambiguous"
+
+PANELS = 5
+GREY_TOL = 14
+FRAME_LO = 130
+FRAME_HI = 170
+MIN_ABSTAIN_MARGIN = 4.0
+MIN_BEAM_PX = 90
+MIN_MIRROR_PX = 300
+MIN_TARGET_PX = 250
+MIN_SOURCE_PX = 60
+MIN_PARALLEL_SIN = 0.15
+
+
+def _masks(arr: np.ndarray) -> dict:
+    red = arr[:, :, 0].astype(np.int16)
+    green = arr[:, :, 1].astype(np.int16)
+    blue = arr[:, :, 2].astype(np.int16)
+    spread = arr.max(axis=2).astype(np.int16) - arr.min(axis=2).astype(np.int16)
+    mean = arr.mean(axis=2)
+    return {
+        "frame": (spread <= GREY_TOL) & (mean >= FRAME_LO) & (mean <= FRAME_HI),
+        "target": (red > 140) & (green < 90) & (blue < 90),
+        "source": (red > 180) & (green >= 110) & (green <= 190) & (blue < 90),
+        "beam": (green > 90) & (red < 120) & (blue < 120),
+        "mirror": (blue > 140) & (red < 120) & (green < 120),
+    }
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, flag in enumerate(flags):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            out.append((start, i))
+            start = None
+    if start is not None:
+        out.append((start, len(flags)))
+    return out
+
+
+def _bands(counts: np.ndarray) -> list[tuple[int, int]]:
+    peak = counts.max()
+    if peak <= 0:
+        return []
+    return _runs(counts >= 0.5 * peak)
+
+
+def _panel_boxes(frame: np.ndarray):
+    cols = _bands(frame.sum(axis=0))
+    rows = _bands(frame.sum(axis=1))
+    if len(cols) != 2 * PANELS or len(rows) != 2:
+        return None
+    y0, y1 = rows[0][1], rows[1][0]
+    if y1 - y0 < 40:
+        return None
+    boxes = []
+    for i in range(PANELS):
+        x0, x1 = cols[2 * i][1], cols[2 * i + 1][0]
+        if x1 - x0 < 40:
+            return None
+        boxes.append((x0, y0, x1, y1))
+    return boxes
+
+
+def _points(mask: np.ndarray, box) -> np.ndarray:
+    x0, y0, x1, y1 = box
+    ys, xs = np.nonzero(mask[y0:y1, x0:x1])
+    return np.stack([xs + x0, ys + y0], axis=1).astype(np.float64)
+
+
+def _fit_line(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    centre = points.mean(axis=0)
+    centred = points - centre
+    _, _, vectors = np.linalg.svd(centred, full_matrices=False)
+    direction = vectors[0]
+    return centre, direction / np.linalg.norm(direction)
+
+
+def _intersect(p: np.ndarray, u: np.ndarray, q: np.ndarray, v: np.ndarray):
+    det = u[0] * (-v[1]) - (-v[0]) * u[1]
+    if abs(det) < 1e-9:
+        return None
+    diff = q - p
+    t = (diff[0] * (-v[1]) - (-v[0]) * diff[1]) / det
+    return p + t * u
+
+
+def _panel_clearance(masks: dict, box) -> float | None:
+    beam = _points(masks["beam"], box)
+    mirror = _points(masks["mirror"], box)
+    target = _points(masks["target"], box)
+    source = _points(masks["source"], box)
+    if (len(beam) < MIN_BEAM_PX or len(mirror) < MIN_MIRROR_PX
+            or len(target) < MIN_TARGET_PX or len(source) < MIN_SOURCE_PX):
+        return None
+    beam_centre, beam_dir = _fit_line(beam)
+    mirror_centre, mirror_dir = _fit_line(mirror)
+    if abs(beam_dir[0] * mirror_dir[1] - beam_dir[1] * mirror_dir[0]) < MIN_PARALLEL_SIN:
+        return None
+    hit = _intersect(beam_centre, beam_dir, mirror_centre, mirror_dir)
+    if hit is None:
+        return None
+    source_centre = source.mean(axis=0)
+    if float(np.dot(hit - source_centre, beam_dir)) < 0.0:
+        beam_dir = -beam_dir
+    normal = np.array([-mirror_dir[1], mirror_dir[0]])
+    reflected = beam_dir - 2.0 * float(np.dot(beam_dir, normal)) * normal
+    target_centre = target.mean(axis=0)
+    radius = math.sqrt(len(target) / math.pi)
+    travel = max(0.0, float(np.dot(target_centre - hit, reflected)))
+    foot = hit + travel * reflected
+    return float(np.linalg.norm(target_centre - foot) - radius)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    masks = _masks(arr)
+    boxes = _panel_boxes(masks["frame"])
+    if boxes is None:
+        return AMBIGUOUS
+    clearances = []
+    for box in boxes:
+        value = _panel_clearance(masks, box)
+        if value is None:
+            return AMBIGUOUS
+        clearances.append(value)
+    order = sorted(range(PANELS), key=lambda i: clearances[i])
+    best, runner = order[0], order[1]
+    if clearances[best] >= 0.0 or clearances[runner] <= 0.0:
+        return AMBIGUOUS
+    if min(-clearances[best], clearances[runner]) < MIN_ABSTAIN_MARGIN:
+        return AMBIGUOUS
+    return f"panel-{best + 1}"

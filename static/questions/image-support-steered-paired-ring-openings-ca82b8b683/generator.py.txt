@@ -1,0 +1,207 @@
+"""Sampler, rasteriser and analytic gold for the paired-ring-openings world.
+
+Two small dark broken rings sit in one local neighbourhood of a large light
+canvas.  Each ring has exactly one gap in its outline.  The decision is the
+relation between the two gap directions and the line joining the two ring
+centres: both gaps opening towards each other, both opening away, or both
+pointing the same way along that line.
+
+Everything decisive lives in the two ring annuli, which are disconnected and
+separated by visible background; the light-grey clutter is nondiagnostic.
+All angles are measured in raster coordinates (x right, y down) so that the
+renderer and the pixel arm can agree without any shared convention beyond the
+publicly declared question.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "paired_ring_openings-0.1.0"
+
+CANVAS = 640
+CELL = 80                 # placement lattice pitch
+CORE_JITTER = 6           # keeps a ring inside one lattice core
+COLUMN_STEP = 2           # the two rings are two lattice columns apart
+R_OUT = 14
+R_IN = 8
+APERTURE_DEG = 110.0
+QUARANTINE = 0.30         # |cos| below this is an explicit 'unclear' scene
+CLEAR_MIN = 0.50
+BLUR_MAX = 0.12
+Y_JITTER = 48
+
+_DARK = ((38, 44, 58), (28, 36, 40), (46, 38, 62), (30, 48, 52))
+_LIGHT = ((206, 210, 214), (212, 206, 200), (202, 208, 200))
+_BG = ((246, 244, 240), (240, 242, 246), (244, 241, 236))
+
+_DECISIONS = ("facing", "apart", "same_way", "unclear")
+
+
+def _wrap(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random((int(seed) * 2654435761) & 0xFFFFFFFF)
+
+    column = rng.randrange(0, CANVAS // CELL - COLUMN_STEP)
+    xa = column * CELL + CELL // 2 + rng.randint(-CORE_JITTER, CORE_JITTER)
+    xb = (column + COLUMN_STEP) * CELL + CELL // 2 + rng.randint(-CORE_JITTER, CORE_JITTER)
+    ya = rng.randint(140, CANVAS - 140)
+    yb = ya + rng.randint(-Y_JITTER, Y_JITTER)
+
+    alpha = math.atan2(yb - ya, xb - xa)
+    signs = rng.choice(((1, 1), (-1, -1), (1, -1), (-1, 1)))
+    blurred = rng.random() < 0.22
+    blurred_index = rng.randrange(2) if blurred else -1
+
+    magnitudes = []
+    for index in range(2):
+        if index == blurred_index:
+            magnitudes.append(rng.uniform(0.02, BLUR_MAX))
+        else:
+            magnitudes.append(rng.uniform(CLEAR_MIN, 0.95))
+
+    cos_a = signs[0] * magnitudes[0]
+    cos_b = signs[1] * magnitudes[1]
+    theta_a = alpha + rng.choice((-1.0, 1.0)) * math.acos(max(-1.0, min(1.0, cos_a)))
+    theta_b = alpha + math.pi + rng.choice((-1.0, 1.0)) * math.acos(max(-1.0, min(1.0, cos_b)))
+
+    rings = [
+        [xa, ya, round(math.degrees(_wrap(theta_a)), 4)],
+        [xb, yb, round(math.degrees(_wrap(theta_b)), 4)],
+    ]
+
+    clutter = []
+    for _ in range(rng.randint(9, 14)):
+        for _attempt in range(40):
+            size = rng.randint(6, 19)
+            cx = rng.randint(size + 4, CANVAS - size - 4)
+            cy = rng.randint(size + 4, CANVAS - size - 4)
+            if all(math.hypot(cx - rx, cy - ry) >= size + R_OUT + 12 for rx, ry, _ in rings):
+                clutter.append([cx, cy, rng.randrange(3), size, rng.randrange(0, 360)])
+                break
+
+    return {
+        "width": CANVAS,
+        "height": CANVAS,
+        "rings": rings,
+        "r_out": R_OUT,
+        "r_in": R_IN,
+        "aperture": APERTURE_DEG,
+        "fg": list(rng.choice(_DARK)),
+        "bg": list(rng.choice(_BG)),
+        "clutter_color": list(rng.choice(_LIGHT)),
+        "clutter": clutter,
+    }
+
+
+def _window(scene: dict, cx: int, cy: int, reach: int):
+    x0 = max(0, cx - reach)
+    x1 = min(int(scene["width"]), cx + reach + 1)
+    y0 = max(0, cy - reach)
+    y1 = min(int(scene["height"]), cy + reach + 1)
+    ys = np.arange(y0, y1)[:, None].astype(np.float64)
+    xs = np.arange(x0, x1)[None, :].astype(np.float64)
+    return (y0, y1, x0, x1), (ys - cy), (xs - cx)
+
+
+def _paint_ring(array, scene, cx, cy, r_in, r_out, theta_deg, aperture_deg, colour) -> None:
+    (y0, y1, x0, x1), dy, dx = _window(scene, cx, cy, r_out + 1)
+    radius = np.hypot(dy, dx)
+    inside = (radius >= r_in) & (radius <= r_out)
+    angle = np.arctan2(np.broadcast_to(dy, inside.shape), np.broadcast_to(dx, inside.shape))
+    delta = np.abs(_wrap_array(angle - math.radians(theta_deg)))
+    mask = inside & (delta > math.radians(aperture_deg) / 2.0)
+    array[y0:y1, x0:x1][mask] = colour
+
+
+def _wrap_array(angle):
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _paint_disk(array, scene, cx, cy, radius, colour) -> None:
+    (y0, y1, x0, x1), dy, dx = _window(scene, cx, cy, radius + 1)
+    mask = np.hypot(dy, dx) <= radius
+    array[y0:y1, x0:x1][mask] = colour
+
+
+def _paint_square(array, scene, cx, cy, half, colour) -> None:
+    (y0, y1, x0, x1), dy, dx = _window(scene, cx, cy, half)
+    mask = (np.abs(dy) <= half) & (np.abs(dx) <= half)
+    array[y0:y1, x0:x1][np.broadcast_to(mask, (y1 - y0, x1 - x0))] = colour
+
+
+def render(scene: dict) -> Image.Image:
+    height = int(scene["height"])
+    width = int(scene["width"])
+    array = np.empty((height, width, 3), dtype=np.uint8)
+    array[:, :] = np.asarray(scene["bg"], dtype=np.uint8)
+
+    light = np.asarray(scene["clutter_color"], dtype=np.uint8)
+    for cx, cy, kind, size, angle in scene["clutter"]:
+        if kind == 0:
+            _paint_disk(array, scene, int(cx), int(cy), int(size), light)
+        elif kind == 1:
+            _paint_ring(
+                array, scene, int(cx), int(cy), max(3, int(size) - 5), int(size),
+                float(angle), APERTURE_DEG, light,
+            )
+        else:
+            _paint_square(array, scene, int(cx), int(cy), max(4, int(size) - 6), light)
+
+    dark = np.asarray(scene["fg"], dtype=np.uint8)
+    for cx, cy, theta in scene["rings"]:
+        _paint_ring(
+            array, scene, int(cx), int(cy), int(scene["r_in"]), int(scene["r_out"]),
+            float(theta), float(scene["aperture"]), dark,
+        )
+    return Image.fromarray(array, mode="RGB")
+
+
+def _signed_alignments(scene: dict) -> tuple[float, float]:
+    (xa, ya, theta_a), (xb, yb, theta_b) = scene["rings"]
+    length = math.hypot(xb - xa, yb - ya)
+    ux, uy = (xb - xa) / length, (yb - ya) / length
+    ax, ay = math.cos(math.radians(theta_a)), math.sin(math.radians(theta_a))
+    bx, by = math.cos(math.radians(theta_b)), math.sin(math.radians(theta_b))
+    return ax * ux + ay * uy, bx * (-ux) + by * (-uy)
+
+
+def analytic_gold(scene: dict) -> str:
+    cos_a, cos_b = _signed_alignments(scene)
+    if min(abs(cos_a), abs(cos_b)) < QUARANTINE:
+        return "unclear"
+    if cos_a > 0.0 and cos_b > 0.0:
+        return "facing"
+    if cos_a < 0.0 and cos_b < 0.0:
+        return "apart"
+    return "same_way"
+
+
+def margin(scene: dict) -> float:
+    cos_a, cos_b = _signed_alignments(scene)
+    return float(min(abs(cos_a), abs(cos_b)))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical, label-preserving re-orderings of same-coloured paint.
+
+    Both rings share one flat colour and are disjoint, and all clutter shares a
+    second flat colour, so permuting either group is a set union that leaves the
+    raster byte-identical.  The decision is symmetric in the two rings.
+    """
+    swapped = dict(scene)
+    swapped["rings"] = [list(scene["rings"][1]), list(scene["rings"][0])]
+    reordered = dict(scene)
+    reordered["clutter"] = [list(item) for item in reversed(scene["clutter"])]
+    return [("swap_ring_order", swapped), ("reverse_clutter_order", reordered)]

@@ -1,0 +1,128 @@
+"""Independent image-only inverse for the median rank-filter world."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+MARK_SIZE = 16
+MARK_GAP = 8
+FILTER_SIZE = 7
+TEMPLATE_SIZE = 128
+LOW_TONE = 42
+HIGH_TONE = 214
+SYMBOLS = ("fan", "gate", "orb", "sail")
+
+
+def _line(draw: ImageDraw.ImageDraw, points: list[tuple[int, int]], width: int) -> None:
+    draw.line(points, fill=255, width=width, joint="curve")
+
+
+def _symbol_mask(symbol: str, size: int) -> np.ndarray:
+    """A separately written copy of the public template geometry."""
+
+    if symbol not in SYMBOLS:
+        raise ValueError(f"unknown symbol {symbol!r}")
+    image = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(image)
+    width = max(7, int(round(size * 0.075)))
+    p = lambda value: int(round(value * (size - 1)))
+    if symbol == "fan":
+        hub = (p(0.50), p(0.78))
+        for endpoint in ((0.22, 0.22), (0.50, 0.14), (0.78, 0.22)):
+            _line(draw, [hub, (p(endpoint[0]), p(endpoint[1]))], width)
+        _line(draw, [(p(0.34), p(0.80)), (p(0.66), p(0.80))], width)
+    elif symbol == "gate":
+        _line(draw, [(p(0.28), p(0.82)), (p(0.28), p(0.40)), (p(0.50), p(0.18)),
+                     (p(0.72), p(0.40)), (p(0.72), p(0.82))], width)
+        _line(draw, [(p(0.22), p(0.82)), (p(0.78), p(0.82))], width)
+        _line(draw, [(p(0.33), p(0.55)), (p(0.67), p(0.55))], width)
+    elif symbol == "orb":
+        draw.ellipse([p(0.23), p(0.18), p(0.77), p(0.72)], outline=255, width=width)
+        _line(draw, [(p(0.50), p(0.72)), (p(0.50), p(0.88))], width)
+        _line(draw, [(p(0.38), p(0.88)), (p(0.62), p(0.88))], width)
+    elif symbol == "sail":
+        _line(draw, [(p(0.50), p(0.14)), (p(0.50), p(0.86))], width)
+        _line(draw, [(p(0.47), p(0.20)), (p(0.22), p(0.72)), (p(0.47), p(0.72)),
+                     (p(0.47), p(0.20))], width)
+        _line(draw, [(p(0.53), p(0.36)), (p(0.78), p(0.72)), (p(0.53), p(0.72))], width)
+        _line(draw, [(p(0.30), p(0.86)), (p(0.70), p(0.86))], width)
+    return np.asarray(image, dtype=np.uint8) > 127
+
+
+def _median_filter(values: np.ndarray) -> np.ndarray:
+    radius = FILTER_SIZE // 2
+    padded = np.pad(values, ((radius, radius), (radius, radius)), mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(
+        padded, (FILTER_SIZE, FILTER_SIZE)
+    )
+    return np.median(windows, axis=(-1, -2)).astype(np.uint8)
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    if values.size == 0:
+        return []
+    runs: list[tuple[int, int]] = []
+    start = int(values[0])
+    previous = start
+    for value in values[1:]:
+        value = int(value)
+        if value != previous + 1:
+            runs.append((start, previous + 1))
+            start = value
+        previous = value
+    runs.append((start, previous + 1))
+    return runs
+
+
+def _locate_tile(array: np.ndarray) -> np.ndarray:
+    saturation = array.max(axis=2).astype(np.int16) - array.min(axis=2).astype(np.int16)
+    colored = (saturation > 50) & (array.min(axis=2) < 230)
+    x_runs = _runs(np.flatnonzero(colored.any(axis=0)))
+    y_runs = _runs(np.flatnonzero(colored.any(axis=1)))
+    if len(x_runs) != 2 or len(y_runs) != 2:
+        raise ValueError("expected two horizontal and two vertical fiducial runs")
+    left, right = x_runs
+    top, bottom = y_runs
+    if left[1] - left[0] != MARK_SIZE or right[1] - right[0] != MARK_SIZE:
+        raise ValueError("fiducial width is ambiguous")
+    if top[1] - top[0] != MARK_SIZE or bottom[1] - bottom[0] != MARK_SIZE:
+        raise ValueError("fiducial height is ambiguous")
+    x0 = left[1] + MARK_GAP
+    x1 = right[0] - MARK_GAP
+    y0 = top[1] + MARK_GAP
+    y1 = bottom[0] - MARK_GAP
+    if x1 - x0 < 96 or x1 - x0 != y1 - y0:
+        raise ValueError("fiducials do not enclose a square raster")
+    tile = array[y0:y1, x0:x1, :]
+    if tile.shape[0] != tile.shape[1] or tile.size == 0:
+        raise ValueError("empty or nonsquare raster")
+    if np.max(np.abs(tile[:, :, 0].astype(int) - tile[:, :, 1].astype(int))) > 2:
+        raise ValueError("enclosed raster is not grayscale")
+    return tile[:, :, 0]
+
+
+def _scores(tile: np.ndarray) -> dict[str, float]:
+    restored = _median_filter(tile)
+    small = Image.fromarray(restored, mode="L").resize(
+        (TEMPLATE_SIZE, TEMPLATE_SIZE), Image.Resampling.BILINEAR
+    )
+    values = np.asarray(small, dtype=np.float32)
+    darkness = np.clip((HIGH_TONE - values) / (HIGH_TONE - LOW_TONE), 0.0, 1.0)
+    return {
+        symbol: float(1.0 - np.mean(np.abs(darkness - _symbol_mask(symbol, TEMPLATE_SIZE))))
+        for symbol in SYMBOLS
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover one symbol from only the final RGB PNG."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tile = _locate_tile(array)
+    scores = _scores(tile)
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    if len(ordered) < 2 or ordered[0][1] - ordered[1][1] < 0.01:
+        raise ValueError("median-filter classification is ambiguous")
+    return ordered[0][0]

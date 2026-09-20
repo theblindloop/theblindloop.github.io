@@ -1,0 +1,187 @@
+"""Independent pixel-only inverse for the gated route interval question."""
+
+from __future__ import annotations
+
+import heapq
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ROUTE_RGB = np.asarray((30, 55, 78), dtype=np.float32)
+GREEN_RGB = np.asarray((36, 174, 103), dtype=np.float32)
+RED_RGB = np.asarray((218, 64, 62), dtype=np.float32)
+AMBER_RGB = np.asarray((234, 150, 31), dtype=np.float32)
+VIOLET_RGB = np.asarray((145, 77, 190), dtype=np.float32)
+GATE_RGB = np.asarray((128, 151, 168), dtype=np.float32)
+
+
+class OracleFitError(ValueError):
+    """The raster does not expose one complete, ordered route."""
+
+
+def _mask(array: np.ndarray, color: np.ndarray, tolerance: float) -> np.ndarray:
+    return np.linalg.norm(array.astype(np.float32) - color[None, None, :], axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(y, x)])
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= minimum:
+            found.append(np.asarray(pixels, dtype=np.int32))
+    return sorted(found, key=len, reverse=True)
+
+
+def _center(array: np.ndarray, color: np.ndarray, minimum: int = 24) -> np.ndarray:
+    points = np.argwhere(_mask(array, color, 66.0))
+    if len(points) < minimum:
+        raise OracleFitError("required colored marker is absent")
+    # A color appears once except for the gray gates, so the mean is stable
+    # even though the centerline cuts through each marker interior.
+    return points[:, ::-1].astype(np.float64).mean(axis=0)
+
+
+def _two_centers(array: np.ndarray, color: np.ndarray) -> list[np.ndarray]:
+    # The gray gate color is close to antialiased route edges; use the solid
+    # core only so the two marker clusters do not absorb the whole trace.
+    points = np.argwhere(_mask(array, color, 10.0))[:, ::-1].astype(np.float64)
+    if len(points) < 48:
+        raise OracleFitError("both gate rings are not visible")
+    first = points[0]
+    far_index = int(np.argmax(np.sum((points - first[None, :]) ** 2, axis=1)))
+    centers = np.asarray([first, points[far_index]], dtype=np.float64)
+    for _ in range(12):
+        distances = np.sum((points[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        labels = np.argmin(distances, axis=1)
+        updated = np.asarray(
+            [points[labels == index].mean(axis=0) for index in range(2)], dtype=np.float64
+        )
+        if any(len(points[labels == index]) < 12 for index in range(2)):
+            raise OracleFitError("gate-ring clustering is ambiguous")
+        centers = updated
+    if float(np.linalg.norm(centers[0] - centers[1])) < 40.0:
+        raise OracleFitError("gate rings are too close")
+    return [centers[0], centers[1]]
+
+
+def _route_component(array: np.ndarray) -> np.ndarray:
+    route = _mask(array, ROUTE_RGB, 52.0)
+    components = _components(route, 250)
+    if len(components) != 1:
+        raise OracleFitError(f"expected one complete route component, found {len(components)}")
+    component = np.zeros_like(route, dtype=bool)
+    component[components[0][:, 0], components[0][:, 1]] = True
+    ys, xs = np.where(component)
+    if int(xs.max() - xs.min()) < 260 or int(ys.max() - ys.min()) < 220:
+        raise OracleFitError("route does not span the required distributed extent")
+    return component
+
+
+def _nearest_route_pixel(mask: np.ndarray, center: np.ndarray, radius: float = 18.0) -> tuple[int, int]:
+    ys, xs = np.where(mask)
+    distances = (xs.astype(np.float64) - center[0]) ** 2 + (ys.astype(np.float64) - center[1]) ** 2
+    order = np.argsort(distances)
+    if not len(order) or float(distances[order[0]]) > radius * radius:
+        raise OracleFitError("marker is not attached to the route")
+    index = int(order[0])
+    return int(ys[index]), int(xs[index])
+
+
+def _distance_map(mask: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = mask.shape
+    distances = np.full((height, width), np.inf, dtype=np.float64)
+    sy, sx = start
+    distances[sy, sx] = 0.0
+    heap: list[tuple[float, int, int]] = [(0.0, sy, sx)]
+    moves = (
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
+    )
+    while heap:
+        current, y, x = heapq.heappop(heap)
+        if current != distances[y, x]:
+            continue
+        for dy, dx, weight in moves:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx]:
+                candidate = current + weight
+                if candidate < distances[ny, nx]:
+                    distances[ny, nx] = candidate
+                    heapq.heappush(heap, (candidate, ny, nx))
+    return distances
+
+
+def _route_position(distances: np.ndarray, mask: np.ndarray, center: np.ndarray) -> float:
+    ys, xs = np.where(mask)
+    radius = 17.0
+    local = (xs.astype(np.float64) - center[0]) ** 2 + (ys.astype(np.float64) - center[1]) ** 2
+    keep = (local <= radius * radius) & np.isfinite(distances[ys, xs])
+    if int(keep.sum()) < 6:
+        raise OracleFitError("marker has no stable route projection")
+    values = distances[ys[keep], xs[keep]]
+    # The central route pixels have the least projection variance; use a
+    # trimmed median so the thick raster edge cannot alter marker order.
+    values = np.sort(values)
+    trim = max(1, len(values) // 5)
+    return float(np.median(values[trim:-trim] if len(values) > 2 * trim else values))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Select the checkpoint whose route position lies between both gate positions."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    green = _center(array, GREEN_RGB)
+    red = _center(array, RED_RGB)
+    amber = _center(array, AMBER_RGB)
+    violet = _center(array, VIOLET_RGB)
+    gates = _two_centers(array, GATE_RGB)
+    route = _route_component(array)
+    start = _nearest_route_pixel(route, green)
+    finish = _nearest_route_pixel(route, red)
+    distances = _distance_map(route, start)
+    if not np.isfinite(distances[finish]):
+        raise OracleFitError("route does not connect green to red")
+    total = float(distances[finish])
+    if total < 500.0:
+        raise OracleFitError("recovered route is too short")
+    gate_positions = sorted(_route_position(distances, route, center) for center in gates)
+    checkpoint_positions = {
+        "amber": _route_position(distances, route, amber),
+        "violet": _route_position(distances, route, violet),
+    }
+    if gate_positions[1] - gate_positions[0] < 120.0:
+        raise OracleFitError("gate interval is too narrow in the raster")
+    inside = [
+        label
+        for label, position in checkpoint_positions.items()
+        if gate_positions[0] + 14.0 < position < gate_positions[1] - 14.0
+    ]
+    if len(inside) != 1:
+        raise OracleFitError("checkpoint interval membership is ambiguous")
+    # Both endpoints must be real route endpoints, not a partial component.
+    if min(float(np.linalg.norm(green - np.asarray(start[::-1]))), float(np.linalg.norm(red - np.asarray(finish[::-1])))) > 18.0:
+        raise OracleFitError("endpoint binding is unstable")
+    return inside[0]

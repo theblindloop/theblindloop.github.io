@@ -1,0 +1,151 @@
+"""Independent image-only inverse arm for the Fold-Cover board.
+
+The solver knows only the public visual vocabulary. It locates tile runs from
+palette pixels, validates all 36 tile interiors, recovers both half-matrices,
+applies the visible left-to-right reflection, and returns the uniquely complete
+color set. It deliberately raises when destructive erasure makes the board
+incomplete or ambiguous.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import numpy as np
+from PIL import Image
+
+ROWS = 6
+HALF_COLS = 3
+COLORS = ("amber", "cyan", "violet")
+
+INK = (37, 45, 56)
+PALE = (224, 232, 238)
+COLOR_RGBS = {
+    "amber": ((232, 158, 38), (218, 143, 26), (241, 174, 53)),
+    "cyan": ((34, 171, 190), (26, 151, 174), (45, 181, 198)),
+    "violet": ((135, 86, 184), (151, 91, 190), (122, 75, 173)),
+}
+
+
+class OracleAbstention(ValueError):
+    """The raster no longer contains one complete, unambiguous board."""
+
+
+def _exact_mask(array: np.ndarray, rgbs: Iterable[tuple[int, int, int]]) -> np.ndarray:
+    masks = [np.all(array == np.asarray(rgb, dtype=np.uint8), axis=2) for rgb in rgbs]
+    if not masks:
+        return np.zeros(array.shape[:2], dtype=bool)
+    return np.logical_or.reduce(masks)
+
+
+def _runs(projection: np.ndarray, *, minimum: int = 8) -> list[tuple[int, int]]:
+    padded = np.pad(projection.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1) - 1
+    return [
+        (int(start), int(end))
+        for start, end in zip(starts, ends, strict=True)
+        if end - start + 1 >= minimum
+    ]
+
+
+def _grid_runs(mask: np.ndarray, expected_x: int, expected_y: int, name: str):
+    x_runs = _runs(mask.any(axis=0))
+    y_runs = _runs(mask.any(axis=1))
+    if len(x_runs) != expected_x or len(y_runs) != expected_y:
+        raise OracleAbstention(
+            f"{name} grid has {len(x_runs)} columns and {len(y_runs)} rows"
+        )
+    widths = [end - start + 1 for start, end in x_runs]
+    heights = [end - start + 1 for start, end in y_runs]
+    if max(widths) - min(widths) > 1 or max(heights) - min(heights) > 1:
+        raise OracleAbstention(f"{name} tile runs have inconsistent extents")
+    return x_runs, y_runs
+
+
+def _cell_mask(
+    source: np.ndarray,
+    x_run: tuple[int, int],
+    y_run: tuple[int, int],
+) -> np.ndarray:
+    x0, x1 = x_run
+    y0, y1 = y_run
+    return source[y0 : y1 + 1, x0 : x1 + 1]
+
+
+def _validate_filled(cell: np.ndarray, name: str) -> None:
+    if cell.size == 0 or not bool(cell.all()):
+        raise OracleAbstention(f"{name} tile is erased or incomplete")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise OracleAbstention("expected an RGB raster")
+
+    answer_masks = {
+        name: _exact_mask(array, rgbs) for name, rgbs in COLOR_RGBS.items()
+    }
+    answer_union = np.logical_or.reduce(list(answer_masks.values()))
+    stencil_ink = _exact_mask(array, (INK,))
+    stencil_pale = _exact_mask(array, (PALE,))
+    stencil_union = stencil_ink | stencil_pale
+
+    left_x, left_y = _grid_runs(stencil_union, HALF_COLS, ROWS, "stencil")
+    right_x, right_y = _grid_runs(answer_union, HALF_COLS, ROWS, "color")
+    if left_x[-1][1] >= right_x[0][0]:
+        raise OracleAbstention("the two half-grids are not spatially ordered")
+
+    left_y_centers = np.asarray([(a + b) / 2 for a, b in left_y])
+    right_y_centers = np.asarray([(a + b) / 2 for a, b in right_y])
+    if float(np.max(np.abs(left_y_centers - right_y_centers))) > 1.0:
+        raise OracleAbstention("stencil and color rows are not aligned")
+
+    left_values: list[list[bool]] = []
+    for row, y_run in enumerate(left_y):
+        values = []
+        for col, x_run in enumerate(left_x):
+            union_cell = _cell_mask(stencil_union, x_run, y_run)
+            _validate_filled(union_cell, f"stencil[{row},{col}]")
+            ink_count = int(_cell_mask(stencil_ink, x_run, y_run).sum())
+            pale_count = int(_cell_mask(stencil_pale, x_run, y_run).sum())
+            if (ink_count == union_cell.size) == (pale_count == union_cell.size):
+                raise OracleAbstention(f"stencil[{row},{col}] has mixed or unknown fill")
+            values.append(ink_count == union_cell.size)
+        left_values.append(values)
+
+    right_values: list[list[str]] = []
+    color_counts = {name: 0 for name in COLORS}
+    for row, y_run in enumerate(right_y):
+        values = []
+        for col, x_run in enumerate(right_x):
+            union_cell = _cell_mask(answer_union, x_run, y_run)
+            _validate_filled(union_cell, f"color[{row},{col}]")
+            matches = [
+                name
+                for name in COLORS
+                if bool(_cell_mask(answer_masks[name], x_run, y_run).all())
+            ]
+            if len(matches) != 1:
+                raise OracleAbstention(f"color[{row},{col}] has mixed or unknown fill")
+            label = matches[0]
+            values.append(label)
+            color_counts[label] += 1
+        right_values.append(values)
+
+    if set(color_counts.values()) != {6}:
+        raise OracleAbstention(f"answer color counts are not balanced: {color_counts}")
+    if sum(sum(row) for row in left_values) != 14:
+        raise OracleAbstention("stencil ink count is not the declared fourteen tiles")
+
+    covered = {name: 0 for name in COLORS}
+    for row in range(ROWS):
+        for right_col in range(HALF_COLS):
+            left_col = HALF_COLS - 1 - right_col
+            if left_values[row][left_col]:
+                covered[right_values[row][right_col]] += 1
+    complete = [name for name in COLORS if covered[name] == 6]
+    if len(complete) != 1:
+        raise OracleAbstention(f"expected one complete color set, found {complete}")
+    return complete[0]

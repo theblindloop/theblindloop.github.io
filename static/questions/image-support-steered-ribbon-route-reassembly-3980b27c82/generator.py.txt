@@ -1,0 +1,302 @@
+"""Deterministic latent sampler, renderer, and analytic arm.
+
+The scene stores the visible panel bits rather than a hidden intended class.  Gold
+is therefore a consequence of exactly the sequence painted into the image.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+GRID_SIDE = 5
+PANEL_COUNT = GRID_SIDE * GRID_SIDE
+LABELS = ("corner", "tee", "chevron")
+
+_TEMPLATES = {
+    "corner": np.asarray(
+        [
+            [1, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1],
+        ],
+        dtype=np.uint8,
+    ),
+    "tee": np.asarray(
+        [
+            [1, 1, 1, 1, 1],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    ),
+    "chevron": np.asarray(
+        [
+            [1, 0, 0, 0, 1],
+            [1, 0, 0, 0, 1],
+            [0, 1, 0, 1, 0],
+            [0, 1, 0, 1, 0],
+            [0, 0, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    ),
+}
+
+_PALETTES = (
+    {
+        "background": (249, 247, 241),
+        "route": (24, 153, 168),
+        "dark": (43, 47, 55),
+        "light": (205, 212, 218),
+        "start": (220, 45, 70),
+        "end": (241, 169, 34),
+    },
+    {
+        "background": (247, 249, 245),
+        "route": (47, 119, 190),
+        "dark": (55, 49, 61),
+        "light": (218, 206, 214),
+        "start": (207, 53, 82),
+        "end": (228, 151, 29),
+    },
+    {
+        "background": (250, 246, 248),
+        "route": (119, 84, 184),
+        "dark": (37, 48, 50),
+        "light": (198, 213, 207),
+        "start": (231, 63, 64),
+        "end": (245, 181, 44),
+    },
+)
+
+
+def _variants(array: np.ndarray) -> list[np.ndarray]:
+    variants: list[np.ndarray] = []
+    seen: set[bytes] = set()
+    for reflected in (array, np.fliplr(array)):
+        for quarter_turns in range(4):
+            candidate = np.rot90(reflected, quarter_turns).copy()
+            key = candidate.tobytes()
+            if key not in seen:
+                seen.add(key)
+                variants.append(candidate)
+    return variants
+
+
+_ORBITS = {label: _variants(template) for label, template in _TEMPLATES.items()}
+
+
+def _scores(bits: Iterable[int]) -> dict[str, int]:
+    observed = np.asarray(list(bits), dtype=np.uint8).reshape(GRID_SIDE, GRID_SIDE)
+    return {
+        label: min(int(np.count_nonzero(observed != variant)) for variant in variants)
+        for label, variants in _ORBITS.items()
+    }
+
+
+def _classify_bits(bits: Iterable[int]) -> tuple[str, float, dict[str, int]]:
+    scores = _scores(bits)
+    ordered = sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    if ordered[0][1] == ordered[1][1]:
+        return "ambiguous", 0.0, scores
+    return ordered[0][0], float(ordered[1][1] - ordered[0][1]), scores
+
+
+def _closest_rival(base: np.ndarray, label: str) -> np.ndarray:
+    rivals = [
+        variant
+        for other in LABELS
+        if other != label
+        for variant in _ORBITS[other]
+    ]
+    return min(rivals, key=lambda item: int(np.count_nonzero(base != item))).copy()
+
+
+def _balanced_two_flip(base: np.ndarray, label: str, rng: random.Random) -> np.ndarray:
+    rival = _closest_rival(base, label)
+    flat = base.reshape(-1).copy()
+    other = rival.reshape(-1)
+    down = [index for index in range(PANEL_COUNT) if flat[index] == 1 and other[index] == 0]
+    up = [index for index in range(PANEL_COUNT) if flat[index] == 0 and other[index] == 1]
+    flat[rng.choice(down)] = 0
+    flat[rng.choice(up)] = 1
+    decision, gap, _ = _classify_bits(flat)
+    if decision != label or gap <= 0 or int(flat.sum()) != 9:
+        raise AssertionError("balanced perturbation crossed the declared boundary")
+    return flat.reshape(GRID_SIDE, GRID_SIDE)
+
+
+def _ambiguous_midpoint(transform_index: int, rng: random.Random) -> np.ndarray:
+    corners = _ORBITS["corner"]
+    corner = corners[transform_index % len(corners)].copy()
+    tee = min(
+        _ORBITS["tee"],
+        key=lambda item: int(np.count_nonzero(corner != item)),
+    )
+    flat = corner.reshape(-1).copy()
+    other = tee.reshape(-1)
+    down = [index for index in range(PANEL_COUNT) if flat[index] == 1 and other[index] == 0]
+    up = [index for index in range(PANEL_COUNT) if flat[index] == 0 and other[index] == 1]
+    down_pairs = list(itertools.combinations(down, len(down) // 2))
+    up_pairs = list(itertools.combinations(up, len(up) // 2))
+    rng.shuffle(down_pairs)
+    rng.shuffle(up_pairs)
+    for removed in down_pairs:
+        for added in up_pairs:
+            candidate = flat.copy()
+            candidate[list(removed)] = 0
+            candidate[list(added)] = 1
+            decision, gap, _ = _classify_bits(candidate)
+            if decision == "ambiguous" and gap == 0 and int(candidate.sum()) == 9:
+                return candidate.reshape(GRID_SIDE, GRID_SIDE)
+    raise AssertionError("could not construct the intended visible tie")
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced scene from an integer seed.
+
+    Consecutive triples share every nuisance variable and differ in target class,
+    so answer identity is exactly counterbalanced against pose, size, palette, and
+    route direction in every complete triple.
+    """
+
+    seed = int(seed)
+    group = seed // len(LABELS)
+    label = LABELS[seed % len(LABELS)]
+    nuisance_rng = random.Random(0x5A17C9 ^ group)
+    bit_rng = random.Random(0x1F3D5B ^ (group * 17 + seed % len(LABELS)))
+
+    transform_index = nuisance_rng.randrange(8)
+    orbit = _ORBITS[label]
+    base = orbit[transform_index % len(orbit)].copy()
+    difficulty = group % 5
+    if difficulty in (1, 3):
+        grid = _balanced_two_flip(base, label, bit_rng)
+    elif difficulty == 4:
+        grid = _ambiguous_midpoint(transform_index, bit_rng)
+    else:
+        grid = base
+
+    center_x = 256 + nuisance_rng.randint(-34, 34)
+    center_y = 256 + nuisance_rng.randint(-34, 34)
+    scene = {
+        "bits": [int(value) for value in grid.reshape(-1)],
+        "center_x": center_x,
+        "center_y": center_y,
+        "step": (18, 19, 20)[(group // 3) % 3],
+        "angle_degrees": 30 * (group % 12),
+        "reverse": bool(group % 2),
+        "palette_index": group % len(_PALETTES),
+        "width": WIDTH,
+        "height": HEIGHT,
+    }
+    return scene
+
+
+def _travel_positions(scene: dict) -> list[tuple[int, int]]:
+    center_x = int(scene["center_x"])
+    center_y = int(scene["center_y"])
+    step = int(scene["step"])
+    angle = math.radians(float(scene["angle_degrees"]))
+
+    # Twenty-four equal edges form one tall, narrow switchback.  Its visible
+    # support is elongated but does not span the canvas: 3 steps wide by 15 high.
+    base: list[tuple[float, float]] = []
+    base.extend(((-1.5 + index) * step, -7.5 * step) for index in range(4))
+    base.extend((1.5 * step, (-7.5 + index) * step) for index in range(1, 6))
+    base.extend(((1.5 - index) * step, -2.5 * step) for index in range(1, 4))
+    base.extend((-1.5 * step, (-2.5 + index) * step) for index in range(1, 6))
+    base.extend(((-1.5 + index) * step, 2.5 * step) for index in range(1, 4))
+    base.extend((1.5 * step, (2.5 + index) * step) for index in range(1, 6))
+    if len(base) != PANEL_COUNT:
+        raise AssertionError("route must contain exactly 25 panels")
+
+    cosine, sine = math.cos(angle), math.sin(angle)
+    positions = [
+        (
+            int(round(center_x + x * cosine - y * sine)),
+            int(round(center_y + x * sine + y * cosine)),
+        )
+        for x, y in base
+    ]
+    if bool(scene["reverse"]):
+        positions.reverse()
+    return positions
+
+
+def render(scene: dict) -> Image.Image:
+    width = int(scene["width"])
+    height = int(scene["height"])
+    palette = _PALETTES[int(scene["palette_index"])]
+    bits = [int(value) for value in scene["bits"]]
+    if len(bits) != PANEL_COUNT or any(value not in (0, 1) for value in bits):
+        raise ValueError("bits must be a binary sequence of length 25")
+    positions = _travel_positions(scene)
+    if not all(18 <= x < width - 18 and 18 <= y < height - 18 for x, y in positions):
+        raise ValueError("route leaves the visible canvas")
+
+    image = Image.new("RGB", (width, height), palette["background"])
+    draw = ImageDraw.Draw(image)
+    draw.line(positions, fill=palette["route"], width=5, joint="curve")
+
+    start_x, start_y = positions[0]
+    end_x, end_y = positions[-1]
+    marker_radius = 12
+    draw.ellipse(
+        (
+            start_x - marker_radius,
+            start_y - marker_radius,
+            start_x + marker_radius,
+            start_y + marker_radius,
+        ),
+        outline=palette["start"],
+        width=3,
+    )
+    triangle_radius = 15
+    triangle = [
+        (
+            int(round(end_x + triangle_radius * math.cos(-math.pi / 2 + k * 2 * math.pi / 3))),
+            int(round(end_y + triangle_radius * math.sin(-math.pi / 2 + k * 2 * math.pi / 3))),
+        )
+        for k in range(3)
+    ]
+    draw.line([*triangle, triangle[0]], fill=palette["end"], width=3, joint="curve")
+
+    half = 6
+    for bit, (x, y) in zip(bits, positions, strict=True):
+        fill = palette["dark"] if bit else palette["light"]
+        draw.rounded_rectangle(
+            (x - half, y - half, x + half, y + half),
+            radius=2,
+            fill=fill,
+        )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    decision, _, _ = _classify_bits(scene["bits"])
+    return decision
+
+
+def margin(scene: dict) -> float:
+    _, gap, _ = _classify_bits(scene["bits"])
+    return gap
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 0.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    return []

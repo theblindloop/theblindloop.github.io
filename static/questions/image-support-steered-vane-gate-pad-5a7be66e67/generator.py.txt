@@ -1,0 +1,453 @@
+"""Renderer, sampler and analytic gold for the vane-gate world.
+
+A compact dark tee-shaped conduit sits somewhere on a plain background.  A green
+port feeds a stem into a junction where the conduit splits into two arms.  Each
+arm leaves the junction along its own base segment, turns once, and doubles back
+so that the arm which departs the junction upstream ends at the pad lying
+downstream, and vice versa.  Two small solid vanes float beside the two base
+segments.  A vane that points away from the junction opens its arm; a vane that
+points back at the junction seals it.  Exactly one arm is open, and the decision
+is the colour of the pad that the open arm terminates on.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 640
+HEIGHT = 480
+STROKE_HALF = 2
+VANE_HEIGHT = 16
+VANE_HALF_BASE = 6
+PAD_HALF = 6
+PORT_HALF = 6
+
+BACKGROUND = (255, 255, 255)
+INK = (38, 38, 46)
+DECOY = (188, 188, 194)
+PORT = (0, 150, 80)
+PADS = {"blue": (30, 85, 205), "orange": (232, 124, 26)}
+
+MIN_MARGIN = 9.0
+
+
+# --------------------------------------------------------------------------
+# small geometric helpers
+# --------------------------------------------------------------------------
+def _seg_points(seg: list[int]) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = seg
+    steps = max(abs(x1 - x0), abs(y1 - y0))
+    if steps == 0:
+        return [(float(x0), float(y0))]
+    return [
+        (x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps)
+        for i in range(steps + 1)
+    ]
+
+
+def _poly_points(poly: list[list[int]]) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for index in range(len(poly)):
+        ax, ay = poly[index]
+        bx, by = poly[(index + 1) % len(poly)]
+        out.extend(_seg_points([ax, ay, bx, by]))
+    return out
+
+
+def _cloud_gap(one: list[tuple[float, float]], other: list[tuple[float, float]]) -> float:
+    best = 1e9
+    for ax, ay in one:
+        for bx, by in other:
+            gap = math.hypot(ax - bx, ay - by)
+            if gap < best:
+                best = gap
+    return best
+
+
+def _rot(point: tuple[float, float], quarter: int, mirror: bool) -> tuple[float, float]:
+    x, y = point
+    if mirror:
+        x = -x
+    for _ in range(quarter):
+        x, y = -y, x
+    return x, y
+
+
+def _centroid(poly: list[list[int]]) -> tuple[float, float]:
+    return (
+        sum(p[0] for p in poly) / len(poly),
+        sum(p[1] for p in poly) / len(poly),
+    )
+
+
+def _apex(poly: list[list[int]]) -> tuple[float, float]:
+    cx, cy = _centroid(poly)
+    return max(poly, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _draw_layout(rng: random.Random, tight: bool) -> dict | None:
+    stem_len = rng.randint(20, 26)
+    up_len = rng.randint(46, 54)
+    down_len = rng.randint(46, 54)
+    hook_a = rng.randint(40, 46)
+    hook_b = hook_a + rng.randint(20, 26)
+    back_a = up_len + rng.randint(18, max(19, down_len - 22))
+    back_b = down_len + rng.randint(18, max(19, up_len - 22))
+
+    # local frame: junction at the origin, stem entering from -x
+    stem = [-stem_len, 0, 0, 0]
+    arm_up = [
+        [0, 0, 0, -up_len],
+        [0, -up_len, hook_a, -up_len],
+        [hook_a, -up_len, hook_a, -up_len + back_a],
+    ]
+    arm_down = [
+        [0, 0, 0, down_len],
+        [0, down_len, hook_b, down_len],
+        [hook_b, down_len, hook_b, down_len - back_b],
+    ]
+
+    vanes = []
+    tight_index = rng.randint(0, 1)
+    for index, (length, sign) in enumerate(((up_len, -1), (down_len, 1))):
+        offset = rng.randint(15, 17)
+        if tight and index == tight_index:
+            along = rng.uniform(13.0, 16.0)
+        else:
+            along = rng.uniform(20.0, max(21.0, length - 24.0))
+        outward = None  # filled in by the caller
+        vanes.append(
+            {
+                "arm": index,
+                "cx": float(offset),
+                "cy": float(sign * along),
+                "axis": sign,
+                "jitter": rng.uniform(-9.0, 9.0),
+                "outward": outward,
+            }
+        )
+    open_arm = rng.randint(0, 1)
+    for index, vane in enumerate(vanes):
+        vane["outward"] = index == open_arm
+
+    return {
+        "stem": stem,
+        "arms": [arm_up, arm_down],
+        "vanes": vanes,
+        "pad_local": [
+            (hook_a, -up_len + back_a),
+            (hook_b, down_len - back_b),
+        ],
+        "port_local": (-stem_len, 0),
+    }
+
+
+def _vane_polygon(vane: dict) -> list[list[float]]:
+    """Isoceles triangle whose apex lies along the arm axis."""
+    axis = vane["axis"] if vane["outward"] else -vane["axis"]
+    angle = math.radians(vane["jitter"])
+    base_angle = math.atan2(float(axis), 0.0)  # apex direction in local frame
+    theta = base_angle + angle
+    ux, uy = math.cos(theta), math.sin(theta)
+    px, py = -uy, ux
+    cx, cy = vane["cx"], vane["cy"]
+    apex = (cx + ux * VANE_HEIGHT * 2.0 / 3.0, cy + uy * VANE_HEIGHT * 2.0 / 3.0)
+    left = (
+        cx - ux * VANE_HEIGHT / 3.0 + px * VANE_HALF_BASE,
+        cy - uy * VANE_HEIGHT / 3.0 + py * VANE_HALF_BASE,
+    )
+    right = (
+        cx - ux * VANE_HEIGHT / 3.0 - px * VANE_HALF_BASE,
+        cy - uy * VANE_HEIGHT / 3.0 - py * VANE_HALF_BASE,
+    )
+    return [list(apex), list(left), list(right)]
+
+
+def _place(layout: dict, rng: random.Random) -> dict | None:
+    quarter = rng.randint(0, 3)
+    mirror = rng.random() < 0.5
+
+    def xform(point) -> tuple[float, float]:
+        return _rot((float(point[0]), float(point[1])), quarter, mirror)
+
+    raw_points: list[tuple[float, float]] = []
+    segs_local = [layout["stem"]] + [s for arm in layout["arms"] for s in arm]
+    for seg in segs_local:
+        raw_points.append(xform((seg[0], seg[1])))
+        raw_points.append(xform((seg[2], seg[3])))
+    polys_local = [_vane_polygon(v) for v in layout["vanes"]]
+    for poly in polys_local:
+        raw_points.extend(xform(p) for p in poly)
+    raw_points.append(xform(layout["port_local"]))
+    raw_points.extend(xform(p) for p in layout["pad_local"])
+
+    pad = PAD_HALF + 4
+    min_x = min(p[0] for p in raw_points) - pad
+    max_x = max(p[0] for p in raw_points) + pad
+    min_y = min(p[1] for p in raw_points) - pad
+    max_y = max(p[1] for p in raw_points) + pad
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    if span_x > WIDTH - 60 or span_y > HEIGHT - 60:
+        return None
+    ox = rng.randint(int(26 - min_x), int(WIDTH - 26 - max_x))
+    oy = rng.randint(int(26 - min_y), int(HEIGHT - 26 - max_y))
+
+    def place(point) -> list[int]:
+        x, y = xform(point)
+        return [int(round(x + ox)), int(round(y + oy))]
+
+    stem = place((layout["stem"][0], layout["stem"][1])) + place(
+        (layout["stem"][2], layout["stem"][3])
+    )
+    arms = []
+    for index, arm in enumerate(layout["arms"]):
+        segs = [
+            place((s[0], s[1])) + place((s[2], s[3]))
+            for s in arm
+        ]
+        arms.append({"segs": segs})
+    vanes = []
+    for vane, poly in zip(layout["vanes"], polys_local):
+        vanes.append({"arm": vane["arm"], "poly": [place(p) for p in poly]})
+    port = place(layout["port_local"])
+    pads = [place(p) for p in layout["pad_local"]]
+    cluster = (
+        int(min(p[0] for p in raw_points) + ox),
+        int(min(p[1] for p in raw_points) + oy),
+        int(max(p[0] for p in raw_points) + ox),
+        int(max(p[1] for p in raw_points) + oy),
+    )
+    return {"stem": stem, "arms": arms, "vanes": vanes, "port": port, "pads": pads,
+            "cluster": cluster}
+
+
+def _clearances(scene: dict) -> dict:
+    """Every visible quantity that bounds the decision, in pixels."""
+    branch_clouds = []
+    parts = []
+    for arm in scene["arms"]:
+        cloud: list[tuple[float, float]] = []
+        for seg in arm["segs"]:
+            cloud.extend(_seg_points(seg))
+        branch_clouds.append(cloud)
+        parts.append([_seg_points(seg) for seg in arm["segs"]])
+    stem_cloud = _seg_points(scene["stem"])
+    pad_clouds = []
+    for arm in scene["arms"]:
+        px, py = arm["pad_at"]
+        pad_clouds.append(
+            [(px + dx, py + dy) for dx in (-PAD_HALF, 0, PAD_HALF) for dy in (-PAD_HALF, 0, PAD_HALF)]
+        )
+
+    # background pitch between parts that are not joined end to end
+    pitch = 1e9
+    for i, j in ((0, 1), (1, 0)):
+        for far in (parts[i][1], parts[i][2], pad_clouds[i]):
+            pitch = min(pitch, _cloud_gap(far, stem_cloud) - 2 * STROKE_HALF)
+            for other in parts[j]:
+                pitch = min(pitch, _cloud_gap(far, other) - 2 * STROKE_HALF)
+        pitch = min(pitch, _cloud_gap(parts[i][0], parts[j][1]) - 2 * STROKE_HALF)
+        pitch = min(pitch, _cloud_gap(parts[i][0], parts[j][2]) - 2 * STROKE_HALF)
+
+    bind_gap = 1e9
+    vane_clear = 1e9
+    apex_reach = 1e9
+    for vane in scene["vanes"]:
+        cloud = _poly_points(vane["poly"])
+        own = _cloud_gap(cloud, branch_clouds[vane["arm"]])
+        other = min(
+            _cloud_gap(cloud, branch_clouds[1 - vane["arm"]]),
+            _cloud_gap(cloud, stem_cloud),
+        )
+        bind_gap = min(bind_gap, other - own)
+        vane_clear = min(vane_clear, own - STROKE_HALF)
+        cx, cy = _centroid(vane["poly"])
+        ax, ay = _apex(vane["poly"])
+        base = scene["arms"][vane["arm"]]["segs"][0]
+        ux, uy = base[2] - base[0], base[3] - base[1]
+        norm = math.hypot(ux, uy)
+        apex_reach = min(apex_reach, abs((ax - cx) * ux + (ay - cy) * uy) / norm)
+    return {
+        "fold_pitch": pitch,
+        "vane_bind_gap": bind_gap,
+        "vane_clearance": vane_clear,
+        "apex_reach": apex_reach,
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    tight = rng.random() < 0.11
+    for _ in range(400):
+        layout = _draw_layout(rng, tight)
+        if layout is None:
+            continue
+        placed = _place(layout, rng)
+        if placed is None:
+            continue
+        pad_names = ["blue", "orange"]
+        rng.shuffle(pad_names)
+        scene = {
+            "stem": placed["stem"],
+            "port": placed["port"],
+            "arms": [
+                {"pad": pad_names[i], "pad_at": placed["pads"][i], "segs": placed["arms"][i]["segs"]}
+                for i in range(2)
+            ],
+            "vanes": placed["vanes"],
+            "decoys": [],
+        }
+        clear = _clearances(scene)
+        floor = 6.0 if tight else MIN_MARGIN + 1.0
+        if clear["fold_pitch"] < 10.0 or clear["vane_clearance"] < 4.0:
+            continue
+        if clear["apex_reach"] < 7.0:
+            continue
+        if clear["vane_bind_gap"] < floor:
+            continue
+        if tight and clear["vane_bind_gap"] > MIN_MARGIN - 0.5:
+            continue
+        scene["decoys"] = _decoys(rng, placed["cluster"])
+        return scene
+    raise RuntimeError("sampler failed to find a legal layout")
+
+
+def _decoys(rng: random.Random, cluster: tuple[int, int, int, int]) -> list[dict]:
+    cx0, cy0, cx1, cy1 = cluster
+    forbidden = (cx0 - 20, cy0 - 20, cx1 + 20, cy1 + 20)
+    placed: list[tuple[int, int, int, int]] = []
+    decoys: list[dict] = []
+    for _ in range(rng.randint(7, 12)):
+        for _try in range(40):
+            kind = rng.choice(["bar", "square", "wedge"])
+            if kind == "bar":
+                w, h = rng.randint(18, 46), rng.randint(4, 6)
+                if rng.random() < 0.5:
+                    w, h = h, w
+            elif kind == "square":
+                w = h = rng.randint(9, 13)
+            else:
+                w = h = VANE_HEIGHT
+            x = rng.randint(14, WIDTH - 14 - w)
+            y = rng.randint(14, HEIGHT - 14 - h)
+            box = (x, y, x + w, y + h)
+            if box[0] < forbidden[2] and forbidden[0] < box[2] and box[1] < forbidden[3] and forbidden[1] < box[3]:
+                continue
+            if any(
+                box[0] < p[2] + 10 and p[0] < box[2] + 10 and box[1] < p[3] + 10 and p[1] < box[3] + 10
+                for p in placed
+            ):
+                continue
+            placed.append(box)
+            if kind == "wedge":
+                spin = rng.randint(0, 3)
+                pts = [(0.0, -VANE_HEIGHT * 2 / 3), (VANE_HALF_BASE, VANE_HEIGHT / 3), (-VANE_HALF_BASE, VANE_HEIGHT / 3)]
+                poly = []
+                for point in pts:
+                    rx, ry = _rot(point, spin, False)
+                    poly.append([int(round(x + w / 2 + rx)), int(round(y + h / 2 + ry))])
+                decoys.append({"kind": "wedge", "poly": poly})
+            else:
+                decoys.append({"kind": kind, "box": list(box)})
+            break
+    return decoys
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    for decoy in sorted(scene["decoys"], key=lambda d: (d["kind"], str(d.get("box") or d.get("poly")))):
+        if decoy["kind"] == "wedge":
+            draw.polygon([tuple(p) for p in decoy["poly"]], fill=DECOY)
+        else:
+            x0, y0, x1, y1 = decoy["box"]
+            draw.rectangle((x0, y0, x1, y1), fill=DECOY)
+
+    segments = [tuple(scene["stem"])]
+    for arm in sorted(scene["arms"], key=lambda a: a["segs"]):
+        segments.extend(tuple(s) for s in arm["segs"])
+    for x0, y0, x1, y1 in sorted(segments):
+        draw.rectangle(
+            (
+                min(x0, x1) - STROKE_HALF,
+                min(y0, y1) - STROKE_HALF,
+                max(x0, x1) + STROKE_HALF,
+                max(y0, y1) + STROKE_HALF,
+            ),
+            fill=INK,
+        )
+
+    for arm in sorted(scene["arms"], key=lambda a: a["pad"]):
+        px, py = arm["pad_at"]
+        draw.rectangle((px - PAD_HALF, py - PAD_HALF, px + PAD_HALF, py + PAD_HALF), fill=PADS[arm["pad"]])
+
+    px, py = scene["port"]
+    draw.rectangle((px - PORT_HALF, py - PORT_HALF, px + PORT_HALF, py + PORT_HALF), fill=PORT)
+
+    for vane in sorted(scene["vanes"], key=lambda v: v["poly"]):
+        draw.polygon([tuple(p) for p in vane["poly"]], fill=INK)
+    return image
+
+
+# --------------------------------------------------------------------------
+# analytic gold, margin, quarantine, symmetries
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    arms = scene["arms"]
+    vanes = scene["vanes"]
+    open_arms = []
+    for vane in vanes:
+        base = arms[vane["arm"]]["segs"][0]
+        ux, uy = base[2] - base[0], base[3] - base[1]
+        cx, cy = _centroid(vane["poly"])
+        ax, ay = _apex(vane["poly"])
+        if (ax - cx) * ux + (ay - cy) * uy > 0:
+            open_arms.append(vane["arm"])
+    if len(open_arms) != 1:
+        raise ValueError("scene must have exactly one outward vane")
+    return arms[open_arms[0]]["pad"]
+
+
+def margin(scene: dict) -> float:
+    clear = _clearances(scene)
+    return round(
+        min(clear["vane_bind_gap"], clear["fold_pitch"], clear["apex_reach"], clear["vane_clearance"] + 6.0),
+        4,
+    )
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < MIN_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    import copy
+
+    swapped = copy.deepcopy(scene)
+    swapped["arms"] = list(reversed(swapped["arms"]))
+    for vane in swapped["vanes"]:
+        vane["arm"] = 1 - vane["arm"]
+
+    reversed_vanes = copy.deepcopy(scene)
+    reversed_vanes["vanes"] = list(reversed(reversed_vanes["vanes"]))
+
+    rolled = copy.deepcopy(scene)
+    if len(rolled["decoys"]) > 1:
+        rolled["decoys"] = rolled["decoys"][1:] + rolled["decoys"][:1]
+
+    return [
+        ("swap_arm_records", swapped),
+        ("reverse_vane_records", reversed_vanes),
+        ("rotate_decoy_records", rolled),
+    ]

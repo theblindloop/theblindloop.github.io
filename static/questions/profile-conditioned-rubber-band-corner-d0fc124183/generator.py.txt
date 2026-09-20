@@ -1,0 +1,269 @@
+"""Rubber-band corner world: which coloured dot is a vertex of the dot cloud's
+convex outline?
+
+A scene is one flat list of equal-sized, non-touching dots. Fourteen are grey and
+four are coloured. Exactly one coloured dot is a corner of the tightened rubber
+band (the convex hull) around *all* the dots; the other three lie strictly inside
+it. Nothing local marks the answer: every dot has the same radius, the same
+shape, and the same ink, and the answer can only be found by organising the whole
+cloud into its global outline.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+CLASS_NAMES = ("red", "green", "blue", "orange")
+ABSTAIN = "abstain"
+
+WIDTH = 640
+HEIGHT = 520
+DOT_RADIUS = 9
+DOT_COUNT = 18
+MIN_SEPARATION = 34.0
+PAGE_MARGIN = 46
+
+BG_COLOR = (247, 246, 242)
+GREY_COLOR = (108, 110, 116)
+PALETTE = {
+    "red": (198, 46, 42),
+    "green": (30, 138, 62),
+    "blue": (36, 66, 190),
+    "orange": (226, 132, 18),
+}
+
+QUARANTINE_PX = 9.0
+SAMPLING_FLOOR_PX = 14.0
+DECOY_GAP_PX = 20.0
+GOLD_EPS_PX = 1.0
+
+
+# --------------------------------------------------------------------------
+# plane geometry
+# --------------------------------------------------------------------------
+def _hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Counter-clockwise convex hull (monotone chain) in image coordinates."""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return list(pts)
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: list[tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _dist_point_segment(p, a, b) -> float:
+    px, py = p
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    length = dx * dx + dy * dy
+    if length <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _dist_to_polygon(p, poly: list[tuple[float, float]]) -> float:
+    if len(poly) < 2:
+        return math.hypot(p[0] - poly[0][0], p[1] - poly[0][1]) if poly else 0.0
+    return min(
+        _dist_point_segment(p, poly[i], poly[(i + 1) % len(poly)]) for i in range(len(poly))
+    )
+
+
+def _inside_hull(p, poly: list[tuple[float, float]]) -> bool:
+    """True when p lies inside or on a counter-clockwise convex polygon."""
+    if len(poly) < 3:
+        return False
+    for i in range(len(poly)):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % len(poly)]
+        if (bx - ax) * (p[1] - ay) - (by - ay) * (p[0] - ax) < -1e-9:
+            return False
+    return True
+
+
+def _stick_out(index: int, points: list[tuple[float, float]]) -> float:
+    """How far points[index] lies outside the convex hull of every other point.
+
+    Zero exactly when the dot is not a corner of the cloud's outline.
+    """
+    others = [q for j, q in enumerate(points) if j != index]
+    poly = _hull(others)
+    p = points[index]
+    if _inside_hull(p, poly):
+        return 0.0
+    return _dist_to_polygon(p, poly)
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _sample_cloud(rng: random.Random) -> list[tuple[float, float]]:
+    pts: list[tuple[float, float]] = []
+    guard = 0
+    while len(pts) < DOT_COUNT and guard < 20000:
+        guard += 1
+        x = rng.uniform(PAGE_MARGIN, WIDTH - PAGE_MARGIN)
+        y = rng.uniform(PAGE_MARGIN, HEIGHT - PAGE_MARGIN)
+        if all(math.hypot(x - a, y - b) >= MIN_SEPARATION for a, b in pts):
+            pts.append((round(x, 3), round(y, 3)))
+    return pts
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic scene with exactly one coloured corner dot."""
+    rng = random.Random(seed * 7919 + 13)
+    target_colour = CLASS_NAMES[seed % 4]
+    decoy_mode = (seed // 4) % 2
+
+    for _ in range(400):
+        pts = _sample_cloud(rng)
+        if len(pts) < DOT_COUNT:
+            continue
+        poly = _hull(pts)
+        corners = [i for i, p in enumerate(pts) if p in poly]
+        interior = [i for i in range(len(pts)) if i not in corners]
+        if len(corners) < 3 or len(interior) < 4:
+            continue
+
+        centre = (WIDTH / 2.0, HEIGHT / 2.0)
+        radial = {i: math.hypot(pts[i][0] - centre[0], pts[i][1] - centre[1]) for i in range(len(pts))}
+        stick = {i: _stick_out(i, pts) for i in corners}
+        depth = {i: _dist_to_polygon(pts[i], poly) for i in interior}
+        deep = [i for i in interior if depth[i] >= SAMPLING_FLOOR_PX]
+        if len(deep) < 3:
+            continue
+
+        good_corners = [i for i in corners if stick[i] >= SAMPLING_FLOOR_PX]
+        rng.shuffle(good_corners)
+        chosen = None
+        for winner in good_corners:
+            if decoy_mode == 1:
+                pool = [i for i in deep if radial[i] > radial[winner] + DECOY_GAP_PX]
+                if not pool:
+                    continue
+                decoy = rng.choice(pool)
+                rest = [i for i in deep if i != decoy]
+                if len(rest) < 2:
+                    continue
+                inside = [decoy] + rng.sample(rest, 2)
+            else:
+                inside = rng.sample(deep, 3)
+            chosen = (winner, inside)
+            break
+        if chosen is None:
+            continue
+
+        winner, inside = chosen
+        others = [c for c in CLASS_NAMES if c != target_colour]
+        rng.shuffle(others)
+        colour_of = {winner: target_colour}
+        for idx, colour in zip(inside, others):
+            colour_of[idx] = colour
+
+        dots = [
+            {"x": pts[i][0], "y": pts[i][1], "color": colour_of.get(i, "grey")}
+            for i in range(len(pts))
+        ]
+        rng.shuffle(dots)
+        return {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "bg_color": list(BG_COLOR),
+            "dot_radius": DOT_RADIUS,
+            "grey_color": list(GREY_COLOR),
+            "palette": {name: list(rgb) for name, rgb in PALETTE.items()},
+            "dots": dots,
+        }
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# analytic consequences of a scene
+# --------------------------------------------------------------------------
+def _coloured(scene: dict) -> list[tuple[str, int]]:
+    return [(d["color"], i) for i, d in enumerate(scene["dots"]) if d["color"] != "grey"]
+
+
+def _points(scene: dict) -> list[tuple[float, float]]:
+    return [(float(d["x"]), float(d["y"])) for d in scene["dots"]]
+
+
+def analytic_gold(scene: dict) -> str:
+    """The single coloured dot that is a corner of the whole cloud's outline."""
+    pts = _points(scene)
+    scores = sorted(
+        ((_stick_out(i, pts), name) for name, i in _coloured(scene)), reverse=True
+    )
+    if len(scores) < 2 or scores[0][0] < GOLD_EPS_PX or scores[1][0] >= GOLD_EPS_PX:
+        return ABSTAIN
+    return scores[0][1]
+
+
+def margin(scene: dict) -> float:
+    """Smallest displacement that would change which coloured dot is a corner."""
+    pts = _points(scene)
+    poly = _hull(pts)
+    out: list[float] = []
+    depths: list[float] = []
+    for _, i in _coloured(scene):
+        stick = _stick_out(i, pts)
+        if stick > 0.0:
+            out.append(stick)
+        else:
+            depths.append(_dist_to_polygon(pts[i], poly))
+    if not out or not depths:
+        return 0.0
+    return round(min(min(out), min(depths)), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabellings: the dot list is an unordered set."""
+    dots = scene["dots"]
+    aliases = [
+        ("dot_list_cycle", dots[1:] + dots[:1]),
+        ("dot_list_reverse", list(reversed(dots))),
+    ]
+    out: list[tuple[str, dict]] = []
+    for name, ordering in aliases:
+        alias = dict(scene)
+        alias["dots"] = [dict(dot) for dot in ordering]
+        out.append((name, alias))
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), tuple(scene["bg_color"]))
+    draw = ImageDraw.Draw(image)
+    radius = float(scene["dot_radius"])
+    for dot in scene["dots"]:
+        if dot["color"] == "grey":
+            fill = tuple(scene["grey_color"])
+        else:
+            fill = tuple(scene["palette"][dot["color"]])
+        x, y = float(dot["x"]), float(dot["y"])
+        draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=fill)
+    return image

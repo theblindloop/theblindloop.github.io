@@ -1,0 +1,333 @@
+"""Deterministic renderer and analytic arm for an ordered double-hinge task.
+
+Each panel contains one asymmetric token and two visible hinge controls.  The
+first control turns the token by a quarter-turn, and the second control turns
+the already-turned token by another quarter-turn.  Targets are constructed
+from either that composed transform or a close, deliberately wrong transform.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+WIDTH = 1020
+HEIGHT = 740
+PANEL_W = 480
+PANEL_H = 340
+MARGIN_X = 20
+MARGIN_Y = 20
+GAP_X = 20
+GAP_Y = 20
+PANEL_LABELS = ("A", "B", "C", "D")
+
+BACKGROUND = (247, 249, 250)
+PANEL_FILL = (255, 255, 255)
+FRAME = (78, 98, 111)
+LABEL = (50, 65, 78)
+SOURCE = (28, 65, 104)
+TARGET_FILL = (255, 243, 211)
+TARGET_EDGE = (205, 87, 50)
+HINGE1_ARC = (20, 157, 190)
+HINGE1_CORE = (5, 76, 116)
+HINGE2_ARC = (224, 151, 38)
+HINGE2_CORE = (126, 79, 10)
+
+QUARANTINE_MARGIN = 16.0
+
+# A deliberately asymmetric, slightly concave token.  Its unequal prongs make
+# a full rotation sequence visible even when the overall orientation is similar.
+BASE_SHAPE = (
+    (-46, -25),
+    (-13, -27),
+    (-2, -45),
+    (15, -29),
+    (43, -35),
+    (29, -5),
+    (49, 18),
+    (16, 16),
+    (2, 46),
+    (-16, 25),
+    (-43, 32),
+    (-31, 3),
+    (-52, -6),
+)
+
+
+def panel_origin(slot: int) -> tuple[int, int]:
+    return (
+        MARGIN_X + (int(slot) % 2) * (PANEL_W + GAP_X),
+        MARGIN_Y + (int(slot) // 2) * (PANEL_H + GAP_Y),
+    )
+
+
+def _rotate_free(point: tuple[float, float], center: tuple[float, float], angle: float) -> tuple[float, float]:
+    radians = math.radians(angle)
+    c, s = math.cos(radians), math.sin(radians)
+    dx, dy = point[0] - center[0], point[1] - center[1]
+    return (center[0] + c * dx - s * dy, center[1] + s * dx + c * dy)
+
+
+def _rounded(points: Iterable[tuple[float, float]]) -> list[list[int]]:
+    return [[int(round(x)), int(round(y))] for x, y in points]
+
+
+def _centroid(points: Iterable[Iterable[float]]) -> tuple[float, float]:
+    values = [(float(point[0]), float(point[1])) for point in points]
+    return (
+        sum(point[0] for point in values) / len(values),
+        sum(point[1] for point in values) / len(values),
+    )
+
+
+def _source_polygon(center: tuple[float, float], angle: float) -> list[list[int]]:
+    return _rounded(
+        _rotate_free((center[0] + dx, center[1] + dy), center, angle)
+        for dx, dy in BASE_SHAPE
+    )
+
+
+def _quarter(point: Iterable[float], pivot: Iterable[float], direction: str) -> tuple[int, int]:
+    x, y = int(round(float(point[0]))), int(round(float(point[1])))
+    px, py = int(round(float(pivot[0]))), int(round(float(pivot[1])))
+    dx, dy = x - px, y - py
+    if direction == "cw":
+        # Positive screen-angle travel: right becomes down.
+        return (px - dy, py + dx)
+    if direction == "ccw":
+        return (px + dy, py - dx)
+    raise ValueError(direction)
+
+
+def _opposite(direction: str) -> str:
+    return "ccw" if direction == "cw" else "cw"
+
+
+def _transformed_polygon(*, panel: dict, reverse: bool = False, wrong_first: bool = False, wrong_second: bool = False) -> list[list[int]]:
+    if reverse:
+        operations = [
+            (panel["hinge2"], panel["turn2"]),
+            (panel["hinge1"], panel["turn1"]),
+        ]
+    else:
+        operations = [
+            (panel["hinge1"], _opposite(panel["turn1"]) if wrong_first else panel["turn1"]),
+            (panel["hinge2"], _opposite(panel["turn2"]) if wrong_second else panel["turn2"]),
+        ]
+    result: list[list[int]] = []
+    for point in panel["source"]:
+        current = (int(point[0]), int(point[1]))
+        for pivot, direction in operations:
+            current = _quarter(current, pivot, direction)
+        result.append([current[0], current[1]])
+    return result
+
+
+def _mean_vertex_error(left: list[list[int]], right: list[list[int]]) -> float:
+    return sum(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(left, right)) / len(left)
+
+
+def _inside(points: Iterable[Iterable[int]]) -> bool:
+    return all(42 <= int(point[0]) <= 438 and 122 <= int(point[1]) <= 318 for point in points)
+
+
+def _distance(a: Iterable[float], b: Iterable[float]) -> float:
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    return math.hypot(ax - bx, ay - by)
+
+
+def _polygon_clearance(pivot: Iterable[float], polygon: Iterable[Iterable[int]]) -> float:
+    return min(_distance(pivot, point) for point in polygon)
+
+
+def _scores(scene: dict) -> list[float]:
+    values = []
+    for panel in sorted(scene["panels"], key=lambda item: int(item["slot"])):
+        values.append(_mean_vertex_error(_transformed_polygon(panel=panel), panel["target"]))
+    return values
+
+
+def _wrong_target(rng: random.Random, panel: dict) -> list[list[int]] | None:
+    # Keep one decoy as a reversed-order composition whenever geometry permits.
+    # The other alternatives change one turn's direction, so a broad
+    # orientation cue is insufficient.  If that alternative leaves the work
+    # area, try the other causal mistakes before using a small translated
+    # near-miss that remains fully visible.
+    candidates = [
+        _transformed_polygon(panel=panel, reverse=True),
+        _transformed_polygon(panel=panel, wrong_first=True),
+        _transformed_polygon(panel=panel, wrong_second=True),
+    ]
+    rng.shuffle(candidates)
+    expected = _transformed_polygon(panel=panel)
+    for target in candidates:
+        if _inside(target) and _mean_vertex_error(expected, target) >= 22.0:
+            return target
+    for dx, dy in ((28, 0), (-28, 0), (0, 28), (0, -28), (22, 18), (-22, 18), (22, -18), (-22, -18)):
+        target = [[int(point[0]) + dx, int(point[1]) + dy] for point in expected]
+        if _inside(target) and _mean_vertex_error(expected, target) >= 22.0:
+            return target
+    return None
+
+
+def _make_panel(rng: random.Random, slot: int, is_winner: bool) -> dict:
+    """Rejection-sample a panel with separated controls and a clear residual."""
+
+    for _ in range(5000):
+        center = (rng.randint(125, 335), rng.randint(165, 265))
+        source = _source_polygon(center, rng.uniform(-28.0, 28.0))
+        hinge1 = [rng.randint(86, 394), rng.randint(136, 258)]
+        hinge2 = [rng.randint(86, 394), rng.randint(136, 258)]
+        if _distance(hinge1, hinge2) < 65.0:
+            continue
+        turn1 = rng.choice(("cw", "ccw"))
+        turn2 = rng.choice(("cw", "ccw"))
+        provisional = {
+            "slot": int(slot),
+            "source": source,
+            "hinge1": hinge1,
+            "hinge2": hinge2,
+            "turn1": turn1,
+            "turn2": turn2,
+        }
+        expected = _transformed_polygon(panel=provisional)
+        if not _inside(source) or not _inside(expected):
+            continue
+        source_center = _centroid(source)
+        expected_center = _centroid(expected)
+        if _distance(source_center, expected_center) < 72.0:
+            continue
+        # Keep the guide controls outside both token silhouettes.  The margin
+        # leaves room for a 27-pixel curved arrow around each pivot.
+        if min(
+            _distance(hinge1, source_center),
+            _distance(hinge2, source_center),
+            _distance(hinge1, expected_center),
+            _distance(hinge2, expected_center),
+        ) < 92.0:
+            continue
+        if min(
+            _polygon_clearance(hinge1, source),
+            _polygon_clearance(hinge2, source),
+            _polygon_clearance(hinge1, expected),
+            _polygon_clearance(hinge2, expected),
+        ) < 55.0:
+            continue
+        target = expected if is_winner else _wrong_target(rng, provisional)
+        if target is None or not _inside(target):
+            continue
+        if min(
+            _polygon_clearance(hinge1, target),
+            _polygon_clearance(hinge2, target),
+        ) < 55.0:
+            continue
+        if _distance(_centroid(source), _centroid(target)) < 60.0:
+            continue
+        if not is_winner and _mean_vertex_error(expected, target) < 22.0:
+            continue
+        provisional["target"] = target
+        return provisional
+    raise RuntimeError(f"could not sample hinge panel {slot}")
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    winner = int(seed) % 4
+    for _ in range(300):
+        panels = [_make_panel(rng, slot, slot == winner) for slot in range(4)]
+        scene = {"panels": panels}
+        scores = _scores(scene)
+        if scores[winner] == 0.0 and min(scores[index] for index in range(4) if index != winner) >= 22.0:
+            return scene
+    raise RuntimeError("could not sample a clear double-hinge scene")
+
+
+def _global(origin: tuple[int, int], point: Iterable[float]) -> tuple[float, float]:
+    return origin[0] + float(point[0]), origin[1] + float(point[1])
+
+
+def _arrowhead(draw: ImageDraw.ImageDraw, tip: tuple[float, float], tangent: tuple[float, float], color: tuple[int, int, int]) -> None:
+    dx, dy = tangent
+    norm = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / norm, dy / norm
+    px, py = -uy, ux
+    back = (tip[0] - 11.0 * ux, tip[1] - 11.0 * uy)
+    left = (back[0] + 7.0 * px, back[1] + 7.0 * py)
+    right = (back[0] - 7.0 * px, back[1] - 7.0 * py)
+    draw.polygon((tip, left, right), fill=color)
+
+
+def _draw_turn(draw: ImageDraw.ImageDraw, origin: tuple[int, int], pivot: Iterable[float], direction: str, color: tuple[int, int, int], core: tuple[int, int, int], number: str) -> None:
+    cx, cy = float(pivot[0]), float(pivot[1])
+    radius = 28.0
+    start = math.radians(180.0)
+    signed_span = math.radians(90.0 if direction == "cw" else -90.0)
+    points = []
+    for index in range(25):
+        t = start + signed_span * index / 24.0
+        points.append(_global(origin, (cx + radius * math.cos(t), cy + radius * math.sin(t))))
+    draw.line(points, fill=color, width=5, joint="curve")
+    end_angle = start + signed_span
+    tip_local = (cx + radius * math.cos(end_angle), cy + radius * math.sin(end_angle))
+    tangent = (
+        -math.sin(end_angle) * (1.0 if direction == "cw" else -1.0),
+        math.cos(end_angle) * (1.0 if direction == "cw" else -1.0),
+    )
+    _arrowhead(draw, _global(origin, tip_local), tangent, color)
+    draw.ellipse((origin[0] + cx - 10, origin[1] + cy - 10, origin[0] + cx + 10, origin[1] + cy + 10), fill=color)
+    draw.ellipse((origin[0] + cx - 6, origin[1] + cy - 6, origin[0] + cx + 6, origin[1] + cy + 6), fill=core)
+    draw.text((origin[0] + cx + 14, origin[1] + cy - 8), number, fill=LABEL)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for panel in sorted(scene["panels"], key=lambda item: int(item["slot"])):
+        slot = int(panel["slot"])
+        origin = panel_origin(slot)
+        x0, y0 = origin
+        x1, y1 = x0 + PANEL_W, y0 + PANEL_H
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=12, fill=PANEL_FILL, outline=FRAME, width=3)
+        draw.text((x0 + 16, y0 + 12), f"tile-{PANEL_LABELS[slot]}", fill=LABEL)
+        _draw_turn(draw, origin, panel["hinge1"], panel["turn1"], HINGE1_ARC, HINGE1_CORE, "1")
+        _draw_turn(draw, origin, panel["hinge2"], panel["turn2"], HINGE2_ARC, HINGE2_CORE, "2")
+        target = [_global(origin, point) for point in panel["target"]]
+        source = [_global(origin, point) for point in panel["source"]]
+        draw.polygon(target, fill=TARGET_FILL, outline=TARGET_EDGE)
+        draw.line(target + [target[0]], fill=TARGET_EDGE, width=3, joint="curve")
+        draw.polygon(source, fill=SOURCE, outline=SOURCE)
+        draw.line(source + [source[0]], fill=SOURCE, width=2, joint="curve")
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    panels = sorted(scene["panels"], key=lambda item: int(item["slot"]))
+    scores = [_mean_vertex_error(_transformed_polygon(panel=panel), panel["target"]) for panel in panels]
+    winner = min(range(len(scores)), key=lambda index: scores[index])
+    return f"tile-{PANEL_LABELS[winner]}"
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_scores(scene))
+    return float(scores[1] - scores[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    scores = _scores(scene)
+    best = min(scores)
+    return (
+        len({round(value, 9) for value in scores if value <= best + 1e-9}) != 1
+        or margin(scene) < QUARANTINE_MARGIN
+        or any(not _inside(panel["source"]) or not _inside(panel["target"]) for panel in scene["panels"])
+    )
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["panels"] = list(reversed(twin["panels"]))
+    return [("panel_record_order", twin)]

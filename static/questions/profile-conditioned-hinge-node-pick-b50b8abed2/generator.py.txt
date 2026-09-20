@@ -1,0 +1,343 @@
+"""Hinge-node world: which marked junction is the articulation point of the harness?
+
+A connected wiring harness is drawn on a jittered lattice. Three of its
+junctions carry round coloured patches (red, green, blue) that the grey wires
+are painted over, so the grey ink stays continuous through every patch. Rubbing
+out one whole patch deletes that junction together with the wire inside it.
+Exactly one of the three patches is a hinge: its removal breaks the remaining
+grey wiring into two or more pieces.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "hinge_node_pick-renderer-0.1.0"
+
+CANVAS = (704, 576)
+SUPERSAMPLE = 3
+BACKGROUND = (255, 255, 255)
+WIRE_COLOR = (70, 74, 82)
+STROKE_WIDTH = 9
+NODE_RADIUS = 5
+MARKER_RADIUS = 26
+ERASE_PAD = 6.0
+
+COLS = 5
+ROWS = 4
+SPACING = 128
+ORIGIN = 96
+JITTER = 22.0
+
+COLOURS = {
+    "red": (214, 54, 54),
+    "green": (32, 150, 60),
+    "blue": (48, 90, 220),
+}
+DECISIONS = ("red", "green", "blue")
+
+MIN_CLEARANCE = 24.0
+QUARANTINE_PX = 24.0
+
+
+# --------------------------------------------------------------------------- graph
+
+
+def _grid_edges() -> list[tuple[int, int]]:
+    edges: list[tuple[int, int]] = []
+    for row in range(ROWS):
+        for col in range(COLS):
+            index = row * COLS + col
+            if col + 1 < COLS:
+                edges.append((index, index + 1))
+            if row + 1 < ROWS:
+                edges.append((index, index + COLS))
+    return edges
+
+
+def _components(node_count: int, edges: Iterable[tuple[int, int]], drop: int = -1) -> int:
+    parent = list(range(node_count))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for a, b in edges:
+        if a == drop or b == drop:
+            continue
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    roots = {find(n) for n in range(node_count) if n != drop}
+    return len(roots)
+
+
+def _degrees(node_count: int, edges: Iterable[tuple[int, int]]) -> list[int]:
+    degrees = [0] * node_count
+    for a, b in edges:
+        degrees[a] += 1
+        degrees[b] += 1
+    return degrees
+
+
+# ------------------------------------------------------------------------ geometry
+
+
+def _segment_distance(p: tuple[float, float], q: tuple[float, float],
+                      r: tuple[float, float], s: tuple[float, float]) -> float:
+    def point_segment(pt, a, b) -> float:
+        ax, ay = a
+        bx, by = b
+        dx, dy = bx - ax, by - ay
+        length = dx * dx + dy * dy
+        if length <= 1e-12:
+            return math.hypot(pt[0] - ax, pt[1] - ay)
+        t = max(0.0, min(1.0, ((pt[0] - ax) * dx + (pt[1] - ay) * dy) / length))
+        return math.hypot(pt[0] - (ax + t * dx), pt[1] - (ay + t * dy))
+
+    return min(
+        point_segment(p, r, s),
+        point_segment(q, r, s),
+        point_segment(r, p, q),
+        point_segment(s, p, q),
+    )
+
+
+def _point_segment(pt, a, b) -> float:
+    return _segment_distance(pt, pt, a, b)
+
+
+def _clearances(scene: dict) -> list[float]:
+    nodes = [tuple(point) for point in scene["nodes"]]
+    edges = [tuple(edge) for edge in scene["edges"]]
+    stroke = float(scene["stroke_width"])
+    radius = float(scene["marker_radius"])
+    values: list[float] = []
+    for i, (a, b) in enumerate(edges):
+        for c, d in edges[i + 1:]:
+            if len({a, b, c, d}) < 4:
+                continue
+            gap = _segment_distance(nodes[a], nodes[b], nodes[c], nodes[d]) - stroke
+            values.append(gap)
+    for marker in scene["markers"]:
+        centre = nodes[marker["node"]]
+        for a, b in edges:
+            if marker["node"] in (a, b):
+                continue
+            gap = _point_segment(centre, nodes[a], nodes[b]) - (
+                radius + ERASE_PAD + stroke / 2.0
+            )
+            values.append(gap)
+        for other in scene["markers"]:
+            if other is marker:
+                continue
+            gap = math.dist(centre, nodes[other["node"]]) - 2.0 * (radius + ERASE_PAD)
+            values.append(gap)
+    return values
+
+
+def _hinge_separation(scene: dict, node: int) -> float:
+    """Smallest visible white gap between the wire stubs left by rubbing out a patch."""
+    nodes = [tuple(point) for point in scene["nodes"]]
+    stroke = float(scene["stroke_width"])
+    reach = float(scene["marker_radius"]) + ERASE_PAD
+    ends: list[tuple[float, float]] = []
+    for a, b in scene["edges"]:
+        if a == node:
+            other = b
+        elif b == node:
+            other = a
+        else:
+            continue
+        cx, cy = nodes[node]
+        ox, oy = nodes[other]
+        length = math.hypot(ox - cx, oy - cy)
+        ends.append((cx + reach * (ox - cx) / length, cy + reach * (oy - cy) / length))
+    best = float("inf")
+    for i, first in enumerate(ends):
+        for second in ends[i + 1:]:
+            best = min(best, math.dist(first, second) - stroke)
+    return best
+
+
+# -------------------------------------------------------------------------- sampling
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed) ^ 0x5157A11)
+    grid = _grid_edges()
+    node_count = COLS * ROWS
+    for _attempt in range(4000):
+        nodes = []
+        for row in range(ROWS):
+            for col in range(COLS):
+                nodes.append(
+                    [
+                        round(ORIGIN + col * SPACING + rng.uniform(-JITTER, JITTER), 3),
+                        round(ORIGIN + row * SPACING + rng.uniform(-JITTER, JITTER), 3),
+                    ]
+                )
+        order = list(grid)
+        rng.shuffle(order)
+        parent = list(range(node_count))
+
+        def find(a: int) -> int:
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        tree: list[tuple[int, int]] = []
+        rest: list[tuple[int, int]] = []
+        for a, b in order:
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                rest.append((a, b))
+            else:
+                parent[ra] = rb
+                tree.append((a, b))
+        extra_count = rng.randint(3, 6)
+        rng.shuffle(rest)
+        edges = tree + rest[:extra_count]
+        rng.shuffle(edges)
+
+        degrees = _degrees(node_count, edges)
+        hinges = {n for n in range(node_count) if _components(node_count, edges, drop=n) > 1}
+
+        picked = None
+        for degree in (3, 2):
+            cut = [n for n in range(node_count) if degrees[n] == degree and n in hinges]
+            safe = [n for n in range(node_count) if degrees[n] == degree and n not in hinges]
+            if cut and len(safe) >= 2:
+                picked = [rng.choice(cut)] + rng.sample(safe, 2)
+                break
+        if picked is None:
+            continue
+
+        # Counterbalance: the hinge colour cycles with the seed, so consecutive
+        # scenes of a dataset carry each answer equally often, and the two safe
+        # patches take the remaining colours in random order.
+        hinge_colour = DECISIONS[int(seed) % len(DECISIONS)]
+        safe_colours = [colour for colour in DECISIONS if colour != hinge_colour]
+        rng.shuffle(safe_colours)
+        markers = [
+            {"colour": colour, "node": node}
+            for colour, node in zip([hinge_colour] + safe_colours, picked)
+        ]
+        markers.sort(key=lambda entry: entry["colour"])
+
+        scene = {
+            "canvas": list(CANVAS),
+            "supersample": SUPERSAMPLE,
+            "background": list(BACKGROUND),
+            "wire_color": list(WIRE_COLOR),
+            "stroke_width": STROKE_WIDTH,
+            "node_radius": NODE_RADIUS,
+            "marker_radius": MARKER_RADIUS,
+            "nodes": nodes,
+            "edges": [list(edge) for edge in edges],
+            "markers": markers,
+        }
+        if min(_clearances(scene)) < MIN_CLEARANCE:
+            continue
+        if _hinge_separation(scene, picked[0]) < MIN_CLEARANCE:
+            continue
+        return scene
+    raise RuntimeError(f"no admissible harness for seed {seed}")
+
+
+# ------------------------------------------------------------------------- rendering
+
+
+def render(scene: dict) -> Image.Image:
+    scale = int(scene["supersample"])
+    width, height = (int(value) for value in scene["canvas"])
+    image = Image.new("RGB", (width * scale, height * scale), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    nodes = [(point[0] * scale, point[1] * scale) for point in scene["nodes"]]
+    wire = tuple(scene["wire_color"])
+    stroke = int(round(scene["stroke_width"] * scale))
+    marker_radius = scene["marker_radius"] * scale
+    node_radius = scene["node_radius"] * scale
+
+    for marker in scene["markers"]:
+        cx, cy = nodes[marker["node"]]
+        draw.ellipse(
+            [cx - marker_radius, cy - marker_radius, cx + marker_radius, cy + marker_radius],
+            fill=COLOURS[marker["colour"]],
+        )
+    for a, b in scene["edges"]:
+        draw.line([nodes[a], nodes[b]], fill=wire, width=stroke)
+    for cx, cy in nodes:
+        draw.ellipse(
+            [cx - node_radius, cy - node_radius, cx + node_radius, cy + node_radius],
+            fill=wire,
+        )
+    return image.resize((width, height), Image.LANCZOS)
+
+
+# ------------------------------------------------------------------------------ gold
+
+
+def analytic_gold(scene: dict) -> str:
+    node_count = len(scene["nodes"])
+    edges = [tuple(edge) for edge in scene["edges"]]
+    cut = [
+        marker["colour"]
+        for marker in scene["markers"]
+        if _components(node_count, edges, drop=marker["node"]) > 1
+    ]
+    if len(cut) != 1:
+        raise RuntimeError("scene does not carry exactly one hinge patch")
+    return cut[0]
+
+
+def margin(scene: dict) -> float:
+    node_count = len(scene["nodes"])
+    edges = [tuple(edge) for edge in scene["edges"]]
+    hinge = next(
+        marker["node"]
+        for marker in scene["markers"]
+        if _components(node_count, edges, drop=marker["node"]) > 1
+    )
+    return round(min(min(_clearances(scene)), _hinge_separation(scene, hinge)), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabelings of bookkeeping-only latent fields."""
+    twins: list[tuple[str, dict]] = []
+
+    reversed_edges = dict(scene)
+    reversed_edges["edges"] = [list(edge) for edge in reversed(scene["edges"])]
+    twins.append(("edge_draw_order_reversed", reversed_edges))
+
+    swapped_ends = dict(scene)
+    swapped_ends["edges"] = [[edge[1], edge[0]] for edge in scene["edges"]]
+    twins.append(("edge_endpoint_order_swapped", swapped_ends))
+
+    marker_order = dict(scene)
+    marker_order["markers"] = [dict(marker) for marker in reversed(scene["markers"])]
+    twins.append(("marker_slot_order_reversed", marker_order))
+
+    node_count = len(scene["nodes"])
+    permutation = list(range(node_count - 1, -1, -1))
+    relabelled = dict(scene)
+    relabelled["nodes"] = [scene["nodes"][permutation[i]] for i in range(node_count)]
+    inverse = {permutation[i]: i for i in range(node_count)}
+    relabelled["edges"] = [[inverse[a], inverse[b]] for a, b in scene["edges"]]
+    relabelled["markers"] = [
+        {"colour": marker["colour"], "node": inverse[marker["node"]]}
+        for marker in scene["markers"]
+    ]
+    twins.append(("node_index_relabelled", relabelled))
+    return twins

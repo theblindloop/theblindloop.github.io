@@ -1,0 +1,163 @@
+"""Pixel-only inverse arm for the mirror-axis symmetry search world.
+
+The oracle receives a rasterized image and nothing else.  It recovers the row of
+framed panels from the dark frame ink, fits each panel's drawn dashed axis from
+the mid-tone grey ink by principal-axis regression, recovers each panel's dot
+centres from the saturated colour ink by connected-component labelling, and
+reports the single panel whose reflected dot centres land back on its own dot
+centres.  It abstains when the layout, the dot count, the axis, or the winner is
+not uniquely recovered.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+AMBIGUOUS = "ambiguous"
+
+N_PANELS = 5
+GREY_SATURATION = 24
+FRAME_MAX = 110
+AXIS_LO = 130
+AXIS_HI = 215
+DOT_SATURATION = 45
+MIN_DOT_PIXELS = 60
+MIN_AXIS_PIXELS = 60
+MIN_PANEL_COLUMNS = 60
+DOTS_PER_PANEL = 6
+SYMMETRY_TOL = 4.0
+QUARANTINE_MARGIN = 8.0
+
+
+def _runs(flags: np.ndarray, minimum: int) -> list:
+    spans = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            if index - start >= minimum:
+                spans.append((start, index - 1))
+            start = None
+    if start is not None and len(flags) - start >= minimum:
+        spans.append((start, len(flags) - 1))
+    return spans
+
+
+def _components(mask: np.ndarray) -> list:
+    height, width = mask.shape
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    flat_mask = mask.reshape(-1)
+    flat_labels = labels.reshape(-1)
+    blobs = []
+    for start in np.flatnonzero(flat_mask):
+        if flat_labels[start]:
+            continue
+        current = len(blobs) + 1
+        flat_labels[start] = current
+        queue = deque([int(start)])
+        members = []
+        while queue:
+            index = queue.popleft()
+            members.append(index)
+            row, col = divmod(index, width)
+            neighbours = []
+            if col > 0:
+                neighbours.append(index - 1)
+            if col + 1 < width:
+                neighbours.append(index + 1)
+            if row > 0:
+                neighbours.append(index - width)
+            if row + 1 < height:
+                neighbours.append(index + width)
+            for nxt in neighbours:
+                if flat_mask[nxt] and not flat_labels[nxt]:
+                    flat_labels[nxt] = current
+                    queue.append(nxt)
+        blobs.append(members)
+    return blobs
+
+
+def _centroids(mask: np.ndarray, x_offset: int) -> list:
+    width = mask.shape[1]
+    centres = []
+    for members in _components(mask):
+        if len(members) < MIN_DOT_PIXELS:
+            continue
+        rows = np.array([index // width for index in members], dtype=np.float64)
+        cols = np.array([index % width for index in members], dtype=np.float64)
+        centres.append((float(cols.mean()) + x_offset, float(rows.mean())))
+    return centres
+
+
+def _fit_axis(mask: np.ndarray, x_offset: int):
+    rows, cols = np.nonzero(mask)
+    if rows.size < MIN_AXIS_PIXELS:
+        return None
+    points = np.stack([cols.astype(np.float64) + x_offset, rows.astype(np.float64)], axis=1)
+    centre = points.mean(axis=0)
+    centred = points - centre
+    covariance = centred.T @ centred / float(points.shape[0])
+    values, vectors = np.linalg.eigh(covariance)
+    if values[1] <= 1e-9 or values[1] <= 4.0 * values[0]:
+        return None
+    direction = vectors[:, int(np.argmax(values))]
+    norm = float(np.hypot(direction[0], direction[1]))
+    if norm < 1e-9:
+        return None
+    return (float(centre[0]), float(centre[1])), (
+        float(direction[0]) / norm,
+        float(direction[1]) / norm,
+    )
+
+
+def _asymmetry(centres: list, axis) -> float:
+    centre, direction = axis
+    normal = (direction[1], -direction[0])
+    worst = 0.0
+    for point in centres:
+        offset = (point[0] - centre[0]) * normal[0] + (point[1] - centre[1]) * normal[1]
+        mirror = (point[0] - 2.0 * offset * normal[0], point[1] - 2.0 * offset * normal[1])
+        nearest = min(
+            float(np.hypot(mirror[0] - other[0], mirror[1] - other[1]))
+            for other in centres
+        )
+        worst = max(worst, nearest)
+    return worst
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB")).astype(np.int16)
+    highest = array.max(axis=2)
+    lowest = array.min(axis=2)
+    saturation = highest - lowest
+    grey = saturation <= GREY_SATURATION
+    frame = grey & (highest < FRAME_MAX)
+    axis_ink = grey & (highest >= AXIS_LO) & (highest <= AXIS_HI)
+    dot_ink = saturation >= DOT_SATURATION
+
+    spans = _runs(frame.any(axis=0), MIN_PANEL_COLUMNS)
+    if len(spans) != N_PANELS:
+        return AMBIGUOUS
+
+    values = []
+    for left, right in spans:
+        inner = slice(left + 3, right - 2)
+        centres = _centroids(dot_ink[:, inner], inner.start)
+        if len(centres) != DOTS_PER_PANEL:
+            return AMBIGUOUS
+        axis = _fit_axis(axis_ink[:, inner], inner.start)
+        if axis is None:
+            return AMBIGUOUS
+        values.append(_asymmetry(centres, axis))
+
+    order = sorted(range(N_PANELS), key=lambda index: values[index])
+    best, runner_up = order[0], order[1]
+    if values[best] > SYMMETRY_TOL:
+        return AMBIGUOUS
+    if values[runner_up] - values[best] < QUARANTINE_MARGIN:
+        return AMBIGUOUS
+    return f"panel-{best + 1}"

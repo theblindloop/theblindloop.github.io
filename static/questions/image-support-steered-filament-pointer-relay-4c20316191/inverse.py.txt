@@ -1,0 +1,173 @@
+"""Image-only oracle for the filament_pointer_relay world.
+
+Receives a rendered RGB image and nothing else. It segments the filament, the
+red hub with its blue pointer bar, and the orange/teal operator tabs; it orders
+the tabs by geodesic distance along the filament measured from the hub end; and
+it replays the pointer. It abstains whenever the initial pointer, the filament,
+or the walking order of a detected tab cannot be recovered from pixels.
+
+This module imports no renderer, prompt, generator, verifier or gold code and
+never receives latent scene data.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "filament_pointer_relay-oracle-0.1.0"
+
+_WIRE = (38, 42, 58)
+_HUB = (206, 54, 66)
+_BAR = (24, 108, 190)
+_TURN = (236, 146, 26)
+_MIRROR = (28, 148, 122)
+
+_TOL = 26
+_HUB_SEARCH = 44
+_TAB_SEARCH = 20
+_MIN_BLOB = 24
+_MIN_BAR_OFFSET = 2.0
+_HEADING_RATIO = 2.0
+
+HEADINGS = ("north", "east", "south", "west")
+ABSTAIN = "abstain"
+
+
+def _mask(arr: np.ndarray, colour: tuple[int, int, int]) -> np.ndarray:
+    diff = np.abs(arr.astype(np.int16) - np.array(colour, dtype=np.int16))
+    return diff.max(axis=2) <= _TOL
+
+
+def _centroid(mask: np.ndarray) -> tuple[float, float] | None:
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return None
+    return float(xs.mean()), float(ys.mean())
+
+
+def _blobs(mask: np.ndarray) -> list[tuple[float, float, int]]:
+    """Connected components of a small mask: list of (cx, cy, size)."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out: list[tuple[float, float, int]] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys, xs):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        if len(pixels) >= _MIN_BLOB:
+            cy = sum(p[0] for p in pixels) / len(pixels)
+            cx = sum(p[1] for p in pixels) / len(pixels)
+            out.append((cx, cy, len(pixels)))
+    return out
+
+
+def _geodesic(wire: np.ndarray, source: tuple[int, int]) -> np.ndarray:
+    """8-connected BFS distances (in pixel steps) over the filament mask."""
+    dist = np.full(wire.shape, -1, dtype=np.int32)
+    sy, sx = source
+    dist[sy, sx] = 0
+    queue = deque([(sy, sx)])
+    height, width = wire.shape
+    while queue:
+        y, x = queue.popleft()
+        base = dist[y, x] + 1
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and wire[ny, nx] and dist[ny, nx] < 0:
+                    dist[ny, nx] = base
+                    queue.append((ny, nx))
+    return dist
+
+
+def _nearest_wire(
+    wire: np.ndarray, cx: float, cy: float, radius: int
+) -> tuple[int, int] | None:
+    height, width = wire.shape
+    y0, y1 = max(0, int(cy) - radius), min(height, int(cy) + radius + 1)
+    x0, x1 = max(0, int(cx) - radius), min(width, int(cx) + radius + 1)
+    window = wire[y0:y1, x0:x1]
+    ys, xs = np.nonzero(window)
+    if ys.size == 0:
+        return None
+    dy = (ys + y0) - cy
+    dx = (xs + x0) - cx
+    order = int(np.argmin(dy * dy + dx * dx))
+    return int(ys[order] + y0), int(xs[order] + x0)
+
+
+def _apply(heading: int, kind: str) -> int:
+    if kind == "turn":
+        return (heading + 1) % 4
+    return heading if heading % 2 == 0 else (heading + 2) % 4
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+
+    hub_mask = _mask(arr, _HUB)
+    bar_mask = _mask(arr, _BAR)
+    wire = _mask(arr, _WIRE)
+    if hub_mask.sum() < 60 or bar_mask.sum() < 20 or wire.sum() < 400:
+        return ABSTAIN
+
+    hub_centre = _centroid(hub_mask | bar_mask)
+    bar_centre = _centroid(bar_mask)
+    if hub_centre is None or bar_centre is None:
+        return ABSTAIN
+
+    dx = bar_centre[0] - hub_centre[0]
+    dy = bar_centre[1] - hub_centre[1]
+    if max(abs(dx), abs(dy)) < _MIN_BAR_OFFSET:
+        return ABSTAIN
+    if abs(dx) >= abs(dy):
+        if abs(dx) < _HEADING_RATIO * abs(dy):
+            return ABSTAIN
+        heading = 1 if dx > 0 else 3
+    else:
+        if abs(dy) < _HEADING_RATIO * abs(dx):
+            return ABSTAIN
+        heading = 2 if dy > 0 else 0
+
+    source = _nearest_wire(wire, hub_centre[0], hub_centre[1], _HUB_SEARCH)
+    if source is None:
+        return ABSTAIN
+    dist = _geodesic(wire, source)
+
+    events: list[tuple[int, str]] = []
+    for kind, colour in (("turn", _TURN), ("mirror", _MIRROR)):
+        for cx, cy, _size in _blobs(_mask(arr, colour)):
+            anchor = _nearest_wire(wire, cx, cy, _TAB_SEARCH)
+            if anchor is None:
+                return ABSTAIN
+            order = int(dist[anchor[0], anchor[1]])
+            if order < 0:
+                return ABSTAIN
+            events.append((order, kind))
+
+    if not events:
+        return ABSTAIN
+    keys = sorted(order for order, _ in events)
+    if len(keys) > 1 and min(b - a for a, b in zip(keys, keys[1:])) < 12:
+        return ABSTAIN
+
+    for _order, kind in sorted(events, key=lambda item: item[0]):
+        heading = _apply(heading, kind)
+    return HEADINGS[heading]

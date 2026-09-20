@@ -1,0 +1,145 @@
+"""Independent image-only graph inverse for Red Corridor Bypass."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        seen[y0, x0] = True
+        points = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < h and 0 <= xx < w and mask[yy, xx] and not seen[yy, xx]:
+                    seen[yy, xx] = True
+                    stack.append((yy, xx))
+        if len(points) >= 45:
+            output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _centers(mask: np.ndarray, expected: int, name: str) -> list[tuple[float, float]]:
+    comps = _components(mask)
+    if len(comps) != expected:
+        raise OracleAbstention(f"expected {expected} {name} component(s), found {len(comps)}")
+    return [(float(comp[:, 1].mean()), float(comp[:, 0].mean())) for comp in comps]
+
+
+def _axis_clusters(values: list[float]) -> list[float]:
+    ordered = sorted(values)
+    groups: list[list[float]] = [[ordered[0]]]
+    for value in ordered[1:]:
+        if value - groups[-1][-1] > 35.0:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    if len(groups) != 5 or any(len(group) != 5 for group in groups):
+        raise OracleAbstention("junction studs do not form five image-derived rows and columns")
+    return [float(np.mean(group)) for group in groups]
+
+
+def _nearest(value: float, centers: list[float]) -> int:
+    distances = [abs(value - center) for center in centers]
+    index = int(np.argmin(distances))
+    if distances[index] > 8.0:
+        raise OracleAbstention("stud center is off the inferred lattice")
+    return index
+
+
+def _edge_strip(
+    mask: np.ndarray,
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> np.ndarray:
+    ax, ay = a
+    bx, by = b
+    if abs(ay - by) < 12.0:
+        x0, x1 = sorted((ax, bx))
+        return mask[max(0, int(round((ay + by) / 2)) - 8): int(round((ay + by) / 2)) + 9,
+                    int(round(x0)) + 31: int(round(x1)) - 30]
+    if abs(ax - bx) < 12.0:
+        y0, y1 = sorted((ay, by))
+        return mask[int(round(y0)) + 31: int(round(y1)) - 30,
+                    int(round((ax + bx) / 2)) - 8: int(round((ax + bx) / 2)) + 9]
+    raise OracleAbstention("candidate lattice neighbors are not axis aligned")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Segment studs/strokes, reconstruct adjacency, delete red, then run BFS."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    red = (r > 145) & (r > g + 65) & (r > b + 55) & (g < 125)
+    green = (g > 120) & (g > r + 65) & (g > b + 20) & (r < 100)
+    gold = (r > 185) & (g > 115) & (g < 205) & (b < 110) & (r > g + 35)
+    neutral = (r > 145) & (r < 225) & (g > r + 13) & (b > r + 13)
+    dark = (r < 125) & (g < 125) & (b < 140)
+
+    neutral_centers = _centers(neutral, 23, "neutral stud")
+    start_center = _centers(green, 1, "green port")[0]
+    goal_center = _centers(gold, 1, "gold port")[0]
+    all_centers = neutral_centers + [start_center, goal_center]
+    xs = _axis_clusters([point[0] for point in all_centers])
+    ys = _axis_clusters([point[1] for point in all_centers])
+    node_points: dict[tuple[int, int], tuple[float, float]] = {}
+    for point in all_centers:
+        node = (_nearest(point[1], ys), _nearest(point[0], xs))
+        if node in node_points:
+            raise OracleAbstention("two studs map to one inferred junction")
+        node_points[node] = point
+    if len(node_points) != 25:
+        raise OracleAbstention("inferred junction lattice is incomplete")
+
+    start = (_nearest(start_center[1], ys), _nearest(start_center[0], xs))
+    goal = (_nearest(goal_center[1], ys), _nearest(goal_center[0], xs))
+    graph: dict[tuple[int, int], set[tuple[int, int]]] = {node: set() for node in node_points}
+    red_edges: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    ink = dark | red
+    for row in range(5):
+        for col in range(5):
+            a = (row, col)
+            for bnode in ((row + 1, col), (row, col + 1)):
+                if bnode not in node_points:
+                    continue
+                strip = _edge_strip(ink, node_points[a], node_points[bnode])
+                if strip.size and float(strip.mean()) > 0.82:
+                    graph[a].add(bnode)
+                    graph[bnode].add(a)
+                    red_strip = _edge_strip(red, node_points[a], node_points[bnode])
+                    if red_strip.size and float(red_strip.mean()) > 0.45:
+                        red_edges.append((a, bnode))
+    if len(red_edges) != 1:
+        raise OracleAbstention(f"expected one red corridor, found {len(red_edges)}")
+    if sum(len(values) for values in graph.values()) // 2 != 33:
+        raise OracleAbstention("corridor reconstruction is incomplete or contains extra ink")
+
+    ra, rb = red_edges[0]
+    graph[ra].discard(rb)
+    graph[rb].discard(ra)
+    queue = deque([start])
+    seen = {start}
+    while queue:
+        node = queue.popleft()
+        if node == goal:
+            return "yes"
+        for nxt in graph[node]:
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return "no"

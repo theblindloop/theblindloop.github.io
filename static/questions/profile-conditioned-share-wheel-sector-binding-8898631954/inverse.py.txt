@@ -1,0 +1,253 @@
+"""Image-only decision arm.
+
+This module receives a rasterized scene and nothing else. It segments the four
+bar colors, measures their pixel heights, recovers the wheel center and the spoke
+angles from the gray sector plate, measures each sector's angular span, locates
+and classifies the black glyph tags by their position around the wheel, and then
+picks the sector whose share of the full turn matches the red bar's share of the
+total bar height.
+
+It imports no renderer, prompt, generator, verifier, or analytic-gold code and it
+never sees latent scene data.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "share_wheel_sector_binding-oracle-0.1.0"
+
+_BAR_COLORS = {
+    "red": (214, 45, 40),
+    "blue": (40, 80, 200),
+    "green": (30, 150, 70),
+    "orange": (235, 140, 25),
+}
+_WHEEL_FILL = (205, 205, 205)
+_SPOKE = (70, 70, 70)
+_INK = (0, 0, 0)
+_TARGET = "red"
+_ABSTAIN = "abstain"
+
+
+def _mask(array: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    return np.all(array == np.array(color, dtype=np.int16), axis=2)
+
+
+def _bar_heights(array: np.ndarray) -> dict[str, int] | None:
+    heights: dict[str, int] = {}
+    for name, color in _BAR_COLORS.items():
+        rows = np.where(_mask(array, color).any(axis=1))[0]
+        if rows.size < 4:
+            return None
+        heights[name] = int(rows[-1] - rows[0] + 1)
+    return heights
+
+
+def _wheel(array: np.ndarray) -> tuple[float, float, float] | None:
+    plate = _mask(array, _WHEEL_FILL) | _mask(array, _SPOKE)
+    rows = np.where(plate.any(axis=1))[0]
+    cols = np.where(plate.any(axis=0))[0]
+    if rows.size < 40 or cols.size < 40:
+        return None
+    cx = (float(cols[0]) + float(cols[-1])) / 2.0
+    cy = (float(rows[0]) + float(rows[-1])) / 2.0
+    radius = (float(cols[-1]) - float(cols[0]) + 1.0) / 2.0
+    tall = (float(rows[-1]) - float(rows[0]) + 1.0) / 2.0
+    if abs(radius - tall) > 3.0:
+        return None
+    return cx, cy, radius
+
+
+def _angle_of(cx: float, cy: float, x: float, y: float) -> float:
+    return math.degrees(math.atan2(cy - y, x - cx)) % 360.0
+
+
+def _spoke_angles(
+    array: np.ndarray, cx: float, cy: float, radius: float
+) -> list[float] | None:
+    """Circular means of the four dark spoke runs, averaged over sample radii."""
+    spoke = _mask(array, _SPOKE)
+    height, width = spoke.shape
+    estimates: list[list[float]] = []
+    samples = 7200
+    for factor in (0.50, 0.62, 0.74, 0.86):
+        ring = radius * factor
+        theta = np.radians(np.arange(samples) * (360.0 / samples))
+        xs = np.rint(cx + ring * np.cos(theta)).astype(int)
+        ys = np.rint(cy - ring * np.sin(theta)).astype(int)
+        inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        hits = np.zeros(samples, dtype=bool)
+        hits[inside] = spoke[ys[inside], xs[inside]]
+        runs = _circular_runs(hits.tolist())
+        if len(runs) != 4:
+            continue
+        angles = []
+        for start, length in runs:
+            middle = (start + (length - 1) / 2.0) % samples
+            angles.append(middle * 360.0 / samples)
+        estimates.append(sorted(angles))
+    if not estimates:
+        return None
+    merged = []
+    for slot in range(4):
+        values = [estimate[slot] for estimate in estimates]
+        merged.append(_circular_mean(values))
+    return sorted(angle % 360.0 for angle in merged)
+
+
+def _circular_runs(flags: list[bool]) -> list[tuple[int, int]]:
+    total = len(flags)
+    if all(flags) or not any(flags):
+        return []
+    offset = 0
+    while flags[offset]:
+        offset += 1
+    runs: list[tuple[int, int]] = []
+    index = 0
+    while index < total:
+        position = (offset + index) % total
+        if flags[position]:
+            length = 0
+            while flags[(offset + index + length) % total] and index + length < total:
+                length += 1
+            runs.append((offset + index, length))
+            index += length
+        else:
+            index += 1
+    return runs
+
+
+def _circular_mean(values: list[float]) -> float:
+    xs = sum(math.cos(math.radians(v)) for v in values)
+    ys = sum(math.sin(math.radians(v)) for v in values)
+    return math.degrees(math.atan2(ys, xs)) % 360.0
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    height, width = mask.shape
+    out: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width:
+                        if mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+        out.append(np.array(pixels, dtype=np.int32))
+    return out
+
+
+def _classify(pixels: np.ndarray) -> str | None:
+    ys = pixels[:, 0]
+    xs = pixels[:, 1]
+    top, bottom = int(ys.min()), int(ys.max())
+    left, right = int(xs.min()), int(xs.max())
+    box_h = bottom - top + 1
+    box_w = right - left + 1
+    if box_h < 8 or box_w < 8:
+        return None
+    fill = pixels.shape[0] / float(box_h * box_w)
+    if fill > 0.90:
+        return "square"
+    if fill > 0.68:
+        return "circle"
+    bottom_row = xs[ys == bottom]
+    bottom_width = int(bottom_row.max() - bottom_row.min() + 1)
+    if bottom_width > 0.55 * box_w:
+        return "triangle"
+    return "diamond"
+
+
+def _glyph_angles(
+    array: np.ndarray, cx: float, cy: float, radius: float
+) -> list[tuple[float, str]] | None:
+    ink = _mask(array, _INK)
+    ys, xs = np.mgrid[0 : array.shape[0], 0 : array.shape[1]]
+    distance = np.hypot(xs - cx, ys - cy)
+    band = ink & (distance > radius * 1.02) & (distance < radius * 1.48)
+    found: list[tuple[float, str]] = []
+    for pixels in _components(band):
+        if pixels.shape[0] < 40:
+            continue
+        glyph = _classify(pixels)
+        if glyph is None:
+            return None
+        y = float(pixels[:, 0].mean())
+        x = float(pixels[:, 1].mean())
+        found.append((_angle_of(cx, cy, x, y), glyph))
+    if len(found) != 4:
+        return None
+    if len({glyph for _, glyph in found}) != 4:
+        return None
+    return found
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the glyph tagging the sector matching the red bar, or abstain."""
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+
+    heights = _bar_heights(array)
+    if heights is None:
+        return _ABSTAIN
+    wheel = _wheel(array)
+    if wheel is None:
+        return _ABSTAIN
+    cx, cy, radius = wheel
+
+    spokes = _spoke_angles(array, cx, cy, radius)
+    if spokes is None:
+        return _ABSTAIN
+    sectors = []
+    for index in range(4):
+        start = spokes[index]
+        end = spokes[(index + 1) % 4]
+        span = (end - start) % 360.0
+        middle = (start + span / 2.0) % 360.0
+        if span < 20.0:
+            return _ABSTAIN
+        sectors.append((middle, span))
+
+    tags = _glyph_angles(array, cx, cy, radius)
+    if tags is None:
+        return _ABSTAIN
+
+    labelled: list[tuple[float, str]] = []
+    used: set[int] = set()
+    for middle, span in sectors:
+        best_index = None
+        best_gap = 1e9
+        for index, (angle, glyph) in enumerate(tags):
+            gap = abs((angle - middle + 180.0) % 360.0 - 180.0)
+            if gap < best_gap:
+                best_gap = gap
+                best_index = index
+        if best_index is None or best_index in used or best_gap > span / 2.0:
+            return _ABSTAIN
+        used.add(best_index)
+        labelled.append((span, tags[best_index][1]))
+    if len(used) != 4:
+        return _ABSTAIN
+
+    total = float(sum(heights.values()))
+    wanted = 360.0 * float(heights[_TARGET]) / total
+    scored = sorted(
+        (abs(wanted - span), index) for index, (span, _) in enumerate(labelled)
+    )
+    if scored[1][0] - scored[0][0] < 0.75:
+        return _ABSTAIN
+    return labelled[scored[0][1]][1]

@@ -1,0 +1,158 @@
+"""Independent image-only inverse arm for Grid-Shift Token Replay."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+from PIL import Image
+
+_START_BG = (237, 241, 247)
+_MINI_BG = (221, 227, 236)
+_LABELS = tuple("ABCDEFGHI")
+
+
+def _near(arr: np.ndarray, color: tuple[int, int, int], tolerance: int = 3) -> np.ndarray:
+    target = np.asarray(color, dtype=np.int16)
+    return np.max(np.abs(arr.astype(np.int16) - target), axis=2) <= tolerance
+
+
+def _saturated(arr: np.ndarray) -> np.ndarray:
+    work = arr.astype(np.int16)
+    spread = work.max(axis=2) - work.min(axis=2)
+    return (spread >= 70) & (work.max(axis=2) >= 120) & (work.min(axis=2) <= 185)
+
+
+def _merge_coordinates(values: np.ndarray, bridge: int) -> list[tuple[int, int]]:
+    if values.size == 0:
+        return []
+    ordered = np.unique(values.astype(int))
+    groups: list[tuple[int, int]] = []
+    start = previous = int(ordered[0])
+    for raw in ordered[1:]:
+        value = int(raw)
+        if value - previous > bridge:
+            groups.append((start, previous))
+            start = value
+        previous = value
+    groups.append((start, previous))
+    return groups
+
+
+def _initial_cell(arr: np.ndarray, saturated: np.ndarray) -> tuple[int, float]:
+    background = _near(arr, _START_BG)
+    dense_y = np.flatnonzero(background.sum(axis=1) > 100)
+    dense_x = np.flatnonzero(background.sum(axis=0) > 100)
+    if len(dense_x) < 180 or len(dense_y) < 180:
+        raise ValueError("large starting grid is missing or damaged")
+    x0, x1 = int(dense_x.min()), int(dense_x.max())
+    y0, y1 = int(dense_y.min()), int(dense_y.max())
+    if not (210 <= x1 - x0 <= 235 and 210 <= y1 - y0 <= 235):
+        raise ValueError("starting grid extent is malformed")
+    local = saturated & (np.indices(saturated.shape)[1] >= x0) & (np.indices(saturated.shape)[1] <= x1)
+    local &= (np.indices(saturated.shape)[0] >= y0) & (np.indices(saturated.shape)[0] <= y1)
+    ry, rx = np.nonzero(local)
+    if not 500 <= len(rx) <= 1800:
+        raise ValueError("marked-token ring is missing or ambiguous")
+    cx, cy = float(rx.mean()), float(ry.mean())
+    nx = (cx - x0) / max(1.0, x1 - x0)
+    ny = (cy - y0) / max(1.0, y1 - y0)
+    col = min(2, max(0, int(nx * 3)))
+    row = min(2, max(0, int(ny * 3)))
+    expected_x, expected_y = (col + 0.5) / 3, (row + 0.5) / 3
+    residual = max(abs(nx - expected_x), abs(ny - expected_y))
+    if residual > 0.09:
+        raise ValueError("marked-token ring does not resolve to one cell")
+    boundary_margin = min(abs(nx - col / 3), abs(nx - (col + 1) / 3), abs(ny - row / 3), abs(ny - (row + 1) / 3))
+    return row * 3 + col, boundary_margin
+
+
+def _card_boxes(arr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    gray = _near(arr, _MINI_BG)
+    row_sums = gray.sum(axis=1)
+    row_groups = _merge_coordinates(
+        np.flatnonzero((row_sums > 100) & (row_sums < 800)),
+        bridge=6,
+    )
+    row_groups = [group for group in row_groups if 70 <= group[1] - group[0] <= 90]
+    if len(row_groups) != 1:
+        raise ValueError("operation mini-grids are missing or damaged")
+    y0, y1 = row_groups[0]
+    local = gray[y0 : y1 + 1]
+    xs = np.nonzero(local)[1]
+    xgroups = _merge_coordinates(xs, bridge=34)
+    boxes: list[tuple[int, int, int, int]] = []
+    for lo, hi in xgroups:
+        area = int(local[:, lo : hi + 1].sum())
+        if area < 1000:
+            continue
+        if 70 <= hi - lo <= 90:
+            boxes.append((lo, y0, hi, y1))
+    boxes.sort(key=lambda box: box[0])
+    if len(boxes) != 6:
+        raise ValueError(f"expected six ordered operation grids, recovered {len(boxes)}")
+    gaps = [boxes[i + 1][0] - boxes[i][2] for i in range(5)]
+    if min(gaps) < 45:
+        raise ValueError("operation-card order is not visually separated")
+    return boxes
+
+
+def _operation(
+    saturated: np.ndarray,
+    box: tuple[int, int, int, int],
+) -> tuple[dict[str, Any], float]:
+    x0, y0, x1, y1 = box
+    crop = saturated[y0 : y1 + 1, x0 : x1 + 1]
+    ys, xs = np.nonzero(crop)
+    if len(xs) < 900:
+        raise ValueError("an operation band is missing")
+    bx0, bx1, by0, by1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+    width, height = bx1 - bx0 + 1, by1 - by0 + 1
+    if width >= 2.4 * height:
+        axis = "row"
+        normalized = float(ys.mean()) / max(1.0, y1 - y0)
+    elif height >= 2.4 * width:
+        axis = "col"
+        normalized = float(xs.mean()) / max(1.0, x1 - x0)
+    else:
+        raise ValueError("operation band orientation is ambiguous")
+    index = min(2, max(0, int(normalized * 3)))
+    expected = (index + 0.5) / 3
+    residual = abs(normalized - expected)
+    if residual > 0.09:
+        raise ValueError("operation band index is ambiguous")
+    return {"axis": axis, "index": index}, (1 / 6 - residual)
+
+
+def _parse(image: Image.Image) -> tuple[int, list[dict[str, Any]], float]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[0] < 600 or arr.shape[1] < 900:
+        raise ValueError("raster is too small")
+    saturated = _saturated(arr)
+    initial, start_margin = _initial_cell(arr, saturated)
+    operations: list[dict[str, Any]] = []
+    margins: list[float] = [start_margin]
+    for box in _card_boxes(arr):
+        operation, op_margin = _operation(saturated, box)
+        operations.append(operation)
+        margins.append(op_margin)
+    codes = sorted((operation["axis"], int(operation["index"])) for operation in operations)
+    expected = sorted([*(('row', index) for index in range(3)), *(('col', index) for index in range(3))])
+    if codes != expected:
+        raise ValueError("operation-card multiset is incomplete or duplicated")
+    return initial, operations, min(margins)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Parse panel order and visible events, replay them, and return A-I."""
+    cell, operations, runner_up_margin = _parse(image)
+    if runner_up_margin < 0.06:
+        raise ValueError("pixel runner-up margin is too small")
+    for operation in operations:
+        row, col = divmod(cell, 3)
+        if operation["axis"] == "row" and row == int(operation["index"]):
+            col = (col + 1) % 3
+        elif operation["axis"] == "col" and col == int(operation["index"]):
+            row = (row + 1) % 3
+        cell = row * 3 + col
+    return _LABELS[cell]

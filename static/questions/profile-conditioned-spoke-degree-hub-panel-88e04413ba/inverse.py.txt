@@ -1,0 +1,150 @@
+"""Pixel-only decision arm for the spoke-degree hub search world.
+
+The arm receives a rendered PNG and nothing else. It segments the saturated hub
+discs, groups them into the key box and the five panels from their own image
+positions, counts the spokes of every hub by walking a sampling ring around it,
+and reports the panel holding the unique hub whose spoke count equals the key's.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+AMBIGUOUS = "abstain"
+
+DECISIONS = ("panel-1", "panel-2", "panel-3", "panel-4", "panel-5")
+
+SATURATION_MIN = 60  # channel spread of a hub disc
+DARK_MAX = 120  # spokes are near-black; frames and labels are light grey
+RING_RADIUS = 20.0
+RING_SAMPLES = 1440
+MIN_RESOLVABLE_GAP_DEG = 30.0
+EXPECTED_HUBS = 16
+PANELS = 5
+HUBS_PER_PANEL = 3
+MAX_PANEL_SPREAD_PX = 60.0
+MIN_PANEL_SEPARATION_PX = 100.0
+MIN_DISC_AREA_PX = 60
+
+
+def _components(mask: np.ndarray, min_area: int):
+    """Four-connected components of a boolean mask, as centroid/area records."""
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    out = []
+    for y0 in range(height):
+        row = mask[y0]
+        for x0 in range(width):
+            if not row[x0] or seen[y0, x0]:
+                continue
+            stack = [(y0, x0)]
+            seen[y0, x0] = True
+            pixels = []
+            while stack:
+                y, x = stack.pop()
+                pixels.append((y, x))
+                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                    if 0 <= ny < height and 0 <= nx < width:
+                        if mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+            if len(pixels) >= min_area:
+                ys = [p[0] for p in pixels]
+                xs = [p[1] for p in pixels]
+                out.append(
+                    {
+                        "cx": sum(xs) / len(xs),
+                        "cy": sum(ys) / len(ys),
+                        "area": len(pixels),
+                    }
+                )
+    return out
+
+
+def _ring_profile(dark: np.ndarray, cx: float, cy: float):
+    """Spoke count and tightest angular gap measured on a ring around a hub."""
+    height, width = dark.shape
+    hits = []
+    for index in range(RING_SAMPLES):
+        theta = 2.0 * math.pi * index / RING_SAMPLES
+        x = int(round(cx + RING_RADIUS * math.cos(theta)))
+        y = int(round(cy + RING_RADIUS * math.sin(theta)))
+        if 0 <= x < width and 0 <= y < height:
+            hits.append(bool(dark[y, x]))
+        else:
+            hits.append(False)
+    if all(hits) or not any(hits):
+        return 0, 0.0
+
+    # rotate so the profile starts on a gap, then read off the runs
+    start = hits.index(False)
+    rolled = hits[start:] + hits[:start]
+    runs = []
+    index = 0
+    while index < RING_SAMPLES:
+        if rolled[index]:
+            begin = index
+            while index < RING_SAMPLES and rolled[index]:
+                index += 1
+            runs.append((begin + index - 1) / 2.0)
+        else:
+            index += 1
+    if not runs:
+        return 0, 0.0
+    centers = sorted((start + r) * 360.0 / RING_SAMPLES % 360.0 for r in runs)
+    if len(centers) == 1:
+        gap = 360.0
+    else:
+        gap = min(
+            (centers[(i + 1) % len(centers)] - centers[i]) % 360.0
+            for i in range(len(centers))
+        )
+    return len(runs), gap
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB")).astype(np.int16)
+    high = rgb.max(axis=2)
+    low = rgb.min(axis=2)
+    saturated = (high - low) > SATURATION_MIN
+    dark = (high < DARK_MAX) & ~saturated
+
+    hubs = _components(saturated, MIN_DISC_AREA_PX)
+    if len(hubs) != EXPECTED_HUBS:
+        return AMBIGUOUS
+
+    hubs.sort(key=lambda hub: hub["cy"])
+    key_hub = hubs[0]
+    rest = hubs[1:]
+    if not rest or key_hub["cy"] > min(h["cy"] for h in rest) - 40.0:
+        return AMBIGUOUS
+
+    rest.sort(key=lambda hub: hub["cx"])
+    groups = [rest[i * HUBS_PER_PANEL : (i + 1) * HUBS_PER_PANEL] for i in range(PANELS)]
+    for group in groups:
+        if len(group) != HUBS_PER_PANEL:
+            return AMBIGUOUS
+        if group[-1]["cx"] - group[0]["cx"] > MAX_PANEL_SPREAD_PX:
+            return AMBIGUOUS
+    for left, right in zip(groups, groups[1:]):
+        if right[0]["cx"] - left[-1]["cx"] < MIN_PANEL_SEPARATION_PX:
+            return AMBIGUOUS
+
+    key_degree, key_gap = _ring_profile(dark, key_hub["cx"], key_hub["cy"])
+    if key_degree < 1 or key_gap < MIN_RESOLVABLE_GAP_DEG:
+        return AMBIGUOUS
+
+    matches = []
+    for index, group in enumerate(groups):
+        for hub in group:
+            degree, gap = _ring_profile(dark, hub["cx"], hub["cy"])
+            if degree < 1 or gap < MIN_RESOLVABLE_GAP_DEG:
+                return AMBIGUOUS
+            if degree == key_degree:
+                matches.append(index)
+    if len(matches) != 1:
+        return AMBIGUOUS
+    return DECISIONS[matches[0]]

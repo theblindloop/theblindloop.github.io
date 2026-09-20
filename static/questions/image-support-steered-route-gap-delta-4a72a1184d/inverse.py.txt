@@ -1,0 +1,153 @@
+"""Independent pixel-only inverse for the connected route-gap world."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+N_GAPS = 32
+CREST = tuple(int(bit) for bit in "00111100011001101100001111111111")
+VAULT = tuple(int(bit) for bit in "11111111110000110110011000111100")
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            result.append(np.asarray(pixels, dtype=np.float64))
+    return result
+
+
+def _center(points: np.ndarray) -> tuple[float, float]:
+    mean = points.mean(axis=0)
+    return float(mean[1]), float(mean[0])
+
+
+def _masks(array: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    navy = (blue - red > 22) & (blue - green > 8) & (red < 135) & (green < 160)
+    red_cap = (red > 140) & (red - green > 34) & (red - blue > 26) & (green < 175)
+    green_cap = (green > 88) & (green - red > 22) & (green - blue > 3) & (red < 160)
+    # Amber rings have high red and green but a distinctly low blue channel.
+    amber = (red > 125) & (green > 70) & (red - green > 30) & (green - blue > 28) & (blue < 125)
+    # The renderer leaves the route visible through each hollow ring, but
+    # finite-size resampling can split a few navy center pixels at a ring's
+    # outline.  Treating the visible fiducial as part of the same connected
+    # carrier makes the component test faithful to the drawn object.
+    route = navy | amber
+    return route, red_cap, green_cap, amber
+
+
+def _gap_bits(spacings: np.ndarray) -> tuple[int, ...]:
+    if len(spacings) != N_GAPS:
+        raise ValueError("expected 32 station gaps")
+    low = float(np.percentile(spacings, 25.0))
+    high = float(np.percentile(spacings, 75.0))
+    if high - low < 2.5:
+        raise ValueError("station gaps do not separate into short and long clusters")
+    for _ in range(16):
+        threshold = (low + high) / 2.0
+        left = spacings[spacings < threshold]
+        right = spacings[spacings >= threshold]
+        if len(left) < 5 or len(right) < 5:
+            raise ValueError("station gap clusters are underpopulated")
+        new_low = float(left.mean())
+        new_high = float(right.mean())
+        if abs(new_low - low) + abs(new_high - high) < 1e-4:
+            break
+        low, high = new_low, new_high
+    return tuple(int(value) for value in (spacings >= (low + high) / 2.0))
+
+
+def _difference(bits: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(bits[index] if index == 0 else bits[index] ^ bits[index - 1] for index in range(N_GAPS))
+
+
+def _hamming(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+    return sum(first != second for first, second in zip(left, right))
+
+
+def _near_route(route: np.ndarray, x: float, y: float, radius: int = 14) -> bool:
+    column = int(round(x))
+    row = int(round(y))
+    y0 = max(0, row - radius)
+    y1 = min(route.shape[0], row + radius + 1)
+    x0 = max(0, column - radius)
+    x1 = min(route.shape[1], column + radius + 1)
+    return bool(route[y0:y1, x0:x1].any())
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the connected route, ordered station gaps, and difference bitmap."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    route, red_mask, green_mask, amber_mask = _masks(array)
+    red_components = _components(red_mask, 24)
+    green_components = _components(green_mask, 24)
+    if len(red_components) != 1 or len(green_components) != 1:
+        raise ValueError("expected one red start cap and one green end cap")
+    red_x, red_y = _center(red_components[0])
+    green_x, green_y = _center(green_components[0])
+
+    route_components = _components(route, 180)
+    if len(route_components) != 1:
+        raise ValueError("the navy route is absent or not one connected component")
+    route_component = route_components[0]
+    if len(route_component) < 850:
+        raise ValueError("connected route evidence is incomplete")
+
+    amber_components = _components(amber_mask, 8)
+    if len(amber_components) != 31:
+        raise ValueError("expected 31 separate station rings")
+    station_centers = [_center(component) for component in amber_components]
+    for x, y in station_centers:
+        if not _near_route(route, x, y):
+            raise ValueError("station ring is not attached to the connected route")
+    if not _near_route(route, red_x, red_y) or not _near_route(route, green_x, green_y):
+        raise ValueError("direction cap is detached from the route")
+
+    # The route is drawn x-monotone.  Sorting by its unwrapped horizontal
+    # coordinate is the raster equivalent of walking the visible component;
+    # the caps choose the traversal direction.
+    all_centers = [(red_x, red_y), *station_centers, (green_x, green_y)]
+    all_centers.sort(key=lambda point: point[0])
+    if red_x > green_x:
+        all_centers.reverse()
+    if len(all_centers) != 33:
+        raise AssertionError("station ordering changed")
+    xs = np.asarray([point[0] for point in all_centers], dtype=np.float64)
+    spacings = np.abs(np.diff(xs))
+    if float(spacings.min()) < 5.0 or float(spacings.max()) > 26.0:
+        raise ValueError("station spacing is outside the visible route scale")
+
+    bits = _gap_bits(spacings)
+    output = _difference(bits)
+    distance_a = _hamming(output, CREST)
+    distance_b = _hamming(output, VAULT)
+    return "A" if distance_a <= distance_b else "B"

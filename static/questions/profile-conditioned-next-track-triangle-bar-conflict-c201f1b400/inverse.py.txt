@@ -1,0 +1,118 @@
+"""Independent pixel-only inverse arm for triangle-to-bar alignment."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose two sufficiently separated measurable cues."""
+
+
+@dataclass(frozen=True)
+class PixelMeasurement:
+    decision: str
+    runner_up_margin: float
+    triangle_area: int
+    bar_area: int
+    separation_px: float
+    taper_margin: float
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 8-connected component coordinates as (N,2) y/x arrays."""
+    seen = np.zeros(mask.shape, dtype=bool)
+    components: list[np.ndarray] = []
+    height, width = mask.shape
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(int(y), int(x))])
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            yy, xx = queue.popleft()
+            points.append((yy, xx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = yy + dy, xx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+        components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _end_areas(coords: np.ndarray, horizontal: bool) -> tuple[int, int, int, int]:
+    values = coords[:, 1] if horizontal else coords[:, 0]
+    low = int(values.min())
+    high = int(values.max())
+    span = high - low + 1
+    band = max(4, int(round(span * 0.13)))
+    low_area = int(np.count_nonzero(values < low + band))
+    high_area = int(np.count_nonzero(values > high - band))
+    return low_area, high_area, low, high
+
+
+def measure_from_image(image: Image.Image) -> PixelMeasurement:
+    """Measure the two cues and a runner-up margin from final RGB pixels only."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    channel_span = arr.max(axis=2) - arr.min(axis=2)
+    channel_max = arr.max(axis=2)
+    vivid = (channel_span > 58) & (channel_max > 118)
+    components = [c for c in _components(vivid) if len(c) >= 500]
+    components.sort(key=len, reverse=True)
+    if len(components) != 2:
+        raise OracleAbstention(f"expected two large vivid components, found {len(components)}")
+    triangle, bar = components
+    if len(triangle) < 1.55 * len(bar):
+        raise OracleAbstention("triangle and bar areas are not distinguishable")
+
+    by0, bx0 = bar.min(axis=0)
+    by1, bx1 = bar.max(axis=0)
+    bar_width = int(bx1 - bx0 + 1)
+    bar_height = int(by1 - by0 + 1)
+    if bar_height > 2.2 * bar_width:
+        horizontal = True
+    elif bar_width > 2.2 * bar_height:
+        horizontal = False
+    else:
+        raise OracleAbstention("bar axis is ambiguous")
+
+    low_area, high_area, tri_low, tri_high = _end_areas(triangle, horizontal)
+    taper_margin = abs(high_area - low_area) / max(1.0, float(min(high_area, low_area)))
+    if taper_margin < 1.0:
+        raise OracleAbstention("triangle apex taper is ambiguous")
+    point_sign = -1 if low_area < high_area else 1
+
+    tri_axis = float(triangle[:, 1].mean() if horizontal else triangle[:, 0].mean())
+    bar_axis = float(bar[:, 1].mean() if horizontal else bar[:, 0].mean())
+    delta = bar_axis - tri_axis
+    bar_sign = 1 if delta > 0 else -1
+    if horizontal:
+        separation = float(bx0 - tri_high if delta > 0 else tri_low - bx1)
+    else:
+        separation = float(by0 - tri_high if delta > 0 else tri_low - by1)
+    if separation < 12.0:
+        raise OracleAbstention(f"triangle/bar clearance too small: {separation:.1f}px")
+
+    decision = "toward" if point_sign == bar_sign else "away"
+    runner_up_margin = float(min(separation, 12.0 * taper_margin))
+    return PixelMeasurement(
+        decision=decision,
+        runner_up_margin=runner_up_margin,
+        triangle_area=int(len(triangle)),
+        bar_area=int(len(bar)),
+        separation_px=separation,
+        taper_margin=float(taper_margin),
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure_from_image(image).decision

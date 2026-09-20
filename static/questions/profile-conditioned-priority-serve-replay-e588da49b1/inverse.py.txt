@@ -1,0 +1,136 @@
+"""Scene-free pixel inverse arm for priority_serve_replay.
+
+Receives only a rendered RGB image.  From the raster alone it finds every
+coloured bar and every black triangle, orders them left to right by centroid,
+measures each bar's drawn height in pixels, then replays the declared rule --
+each triangle takes away the tallest bar still waiting -- and returns the colour
+taken by the last triangle.
+
+This module imports no renderer, prompt, generator, verifier or gold code and
+never sees latent scene data.  Its knowledge of the world is limited to what the
+public question text states: one row of cards read left to right, a coloured bar
+is an item whose drawn height is its priority, a black triangle is a serve.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "priority_serve_replay-oracle-0.1.0"
+
+_PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (206, 48, 42),
+    "orange": (238, 150, 26),
+    "blue": (46, 86, 196),
+    "green": (36, 142, 72),
+    "purple": (128, 60, 168),
+    "teal": (18, 132, 142),
+}
+_COLOUR_TOL = 60
+_INK_MAX = 90          # a black stroke: every channel this dark
+_MIN_BLOB = 300
+
+
+def _components(pixels: set[tuple[int, int]]) -> list[set[tuple[int, int]]]:
+    """Four-connected components of a pixel set."""
+    seen: set[tuple[int, int]] = set()
+    out: list[set[tuple[int, int]]] = []
+    for start in pixels:
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        blob = {start}
+        while stack:
+            x, y = stack.pop()
+            for nb in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if nb in pixels and nb not in seen:
+                    seen.add(nb)
+                    blob.add(nb)
+                    stack.append(nb)
+        out.append(blob)
+    return out
+
+
+def _classify(rgb: tuple[int, int, int]) -> str | None:
+    r, g, b = rgb
+    if r <= _INK_MAX and g <= _INK_MAX and b <= _INK_MAX:
+        return "ink"
+    best, best_d = None, None
+    for name, ref in _PALETTE.items():
+        d = abs(r - ref[0]) + abs(g - ref[1]) + abs(b - ref[2])
+        if best_d is None or d < best_d:
+            best, best_d = name, d
+    if best_d is not None and best_d <= _COLOUR_TOL:
+        return best
+    return None
+
+
+def _masks(image: Image.Image) -> dict[str, set[tuple[int, int]]]:
+    """Pixel sets per glyph class, using the same rule as ``_classify``."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    buckets: dict[str, set[tuple[int, int]]] = {}
+    ink = (arr <= _INK_MAX).all(axis=2)
+    dists = {
+        name: np.abs(arr - np.array(ref, dtype=np.int16)).sum(axis=2)
+        for name, ref in _PALETTE.items()
+    }
+    stack = np.stack([dists[n] for n in _PALETTE], axis=0)
+    nearest = stack.argmin(axis=0)
+    best = stack.min(axis=0)
+    for idx, name in enumerate(_PALETTE):
+        mask = (~ink) & (nearest == idx) & (best <= _COLOUR_TOL)
+        ys, xs = np.nonzero(mask)
+        if len(xs):
+            buckets[name] = set(zip(xs.tolist(), ys.tolist()))
+    ys, xs = np.nonzero(ink)
+    if len(xs):
+        buckets["ink"] = set(zip(xs.tolist(), ys.tolist()))
+    return buckets
+
+
+def _events(image: Image.Image) -> list[dict]:
+    """Every drawn card glyph, ordered left to right by its own centroid."""
+    buckets = _masks(image)
+
+    events: list[dict] = []
+    for kind, pixels in buckets.items():
+        for blob in _components(pixels):
+            if len(blob) < _MIN_BLOB:
+                continue
+            xs = [p[0] for p in blob]
+            ys = [p[1] for p in blob]
+            cx = sum(xs) / len(xs)
+            if kind == "ink":
+                events.append({"kind": "serve", "cx": cx})
+            else:
+                events.append(
+                    {
+                        "kind": "add",
+                        "cx": cx,
+                        "colour": kind,
+                        "height": max(ys) - min(ys) + 1,
+                    }
+                )
+    events.sort(key=lambda e: e["cx"])
+    return events
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Colour taken away by the last serve glyph in the drawn row."""
+    events = _events(image)
+    waiting: list[dict] = []
+    taken_last: dict | None = None
+    for ev in events:
+        if ev["kind"] == "add":
+            waiting.append(ev)
+            continue
+        if not waiting:
+            return "abstain"
+        taken = max(waiting, key=lambda w: w["height"])
+        waiting.remove(taken)
+        taken_last = taken
+    if taken_last is None:
+        return "abstain"
+    return str(taken_last["colour"])

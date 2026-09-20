@@ -1,0 +1,211 @@
+"""Pixel-only inverse arm for the rank-fixed-point duet world.
+
+Receives one RGB image and nothing else. It segments the cord ink and the
+markers, unions each cord with the markers lying on it, splits the ink into two
+connected cords, runs an 8-connected Dijkstra geodesic from each cord's black
+start square, ranks that cord's three coloured disks by their along-cord
+distance from the start square, and finally names the single colour whose
+position number agrees on both cords.
+
+It imports no renderer, prompt, generator, verifier, or gold code and never sees
+latent scene data.
+"""
+
+from __future__ import annotations
+
+import heapq
+import math
+
+import numpy as np
+from PIL import Image
+
+ABSTAIN = "abstain"
+
+_CORD = (34, 46, 74)
+_START = (0, 0, 0)
+_DISK = {
+    "red": (214, 40, 40),
+    "green": (26, 148, 62),
+    "blue": (60, 110, 226),
+}
+_TOL = 26
+_MIN_BLOB = 24
+_MIN_CORD = 400
+_ROOT2 = math.sqrt(2.0)
+_MIN_RANK_GAP = 0.03  # normalized along-cord separation required to order disks
+
+
+def _mask(arr: np.ndarray, rgb) -> np.ndarray:
+    diff = np.abs(arr.astype(np.int16) - np.array(rgb, dtype=np.int16))
+    return diff.max(axis=2) <= _TOL
+
+
+def _components(mask: np.ndarray, min_size: int):
+    """Label 8-connected components; return list of (size, [(y, x), ...])."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), dtype=bool)
+    out = []
+    ys, xs = np.nonzero(mask)
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        if seen[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        seen[y0, x0] = True
+        pix = []
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pix) >= min_size:
+            out.append((len(pix), pix))
+    out.sort(key=lambda item: -item[0])
+    return out
+
+
+def _center(pix) -> tuple[float, float]:
+    ys = [p[0] for p in pix]
+    xs = [p[1] for p in pix]
+    return (0.5 * (min(ys) + max(ys)), 0.5 * (min(xs) + max(xs)))
+
+
+def _geodesic(members: set, start: tuple[int, int]) -> dict:
+    """8-connected Dijkstra over a pixel set with unit / sqrt(2) step costs."""
+    dist = {start: 0.0}
+    heap = [(0.0, start)]
+    while heap:
+        d, node = heapq.heappop(heap)
+        if d > dist.get(node, math.inf) + 1e-9:
+            continue
+        y, x = node
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                nxt = (y + dy, x + dx)
+                if nxt not in members:
+                    continue
+                step = 1.0 if dy == 0 or dx == 0 else _ROOT2
+                nd = d + step
+                if nd + 1e-9 < dist.get(nxt, math.inf):
+                    dist[nxt] = nd
+                    heapq.heappush(heap, (nd, nxt))
+    return dist
+
+
+def _nearest(members: set, point: tuple[float, float]):
+    py, px = point
+    best = None
+    best_d = math.inf
+    for (y, x) in members:
+        d = (y - py) ** 2 + (x - px) ** 2
+        if d < best_d:
+            best_d = d
+            best = (y, x)
+    return best, math.sqrt(best_d)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"))
+
+    cord = _mask(arr, _CORD)
+    squares = _components(_mask(arr, _START), _MIN_BLOB)
+    if len(squares) != 2:
+        return ABSTAIN
+
+    disks = {}
+    for name, rgb in _DISK.items():
+        blobs = _components(_mask(arr, rgb), _MIN_BLOB)
+        if len(blobs) != 2:
+            return ABSTAIN
+        disks[name] = [pix for _size, pix in blobs]
+
+    ink = cord.copy()
+    for _size, pix in squares:
+        for y, x in pix:
+            ink[y, x] = True
+    for pix_list in disks.values():
+        for pix in pix_list:
+            for y, x in pix:
+                ink[y, x] = True
+
+    cords = _components(ink, _MIN_CORD)
+    if len(cords) != 2:
+        return ABSTAIN
+    cord_sets = [set(pix) for _size, pix in cords]
+
+    def owner(pix):
+        hits = [i for i, s in enumerate(cord_sets) if any(p in s for p in pix)]
+        if len(hits) != 1:
+            return None
+        return hits[0]
+
+    starts = {}
+    for _size, pix in squares:
+        idx = owner(pix)
+        if idx is None or idx in starts:
+            return ABSTAIN
+        starts[idx] = _center(pix)
+    if len(starts) != 2:
+        return ABSTAIN
+
+    fields = {}
+    for idx in (0, 1):
+        seed_pix, gap = _nearest(cord_sets[idx], starts[idx])
+        if gap > 3.0:
+            return ABSTAIN
+        dist = _geodesic(cord_sets[idx], seed_pix)
+        if len(dist) < 0.9 * len(cord_sets[idx]):
+            return ABSTAIN
+        total = max(dist.values())
+        if total <= 1.0:
+            return ABSTAIN
+        fields[idx] = (dist, total)
+
+    def depth(idx, pix):
+        dist, total = fields[idx]
+        cy, cx = _center(pix)
+        best = None
+        best_d = math.inf
+        for p in pix:
+            if p in dist:
+                d = (p[0] - cy) ** 2 + (p[1] - cx) ** 2
+                if d < best_d:
+                    best_d = d
+                    best = p
+        if best is None:
+            return None
+        return dist[best] / total
+
+    # Each colour must contribute exactly one disk to each of the two cords.
+    per_cord = {0: {}, 1: {}}
+    for name, pix_list in disks.items():
+        for pix in pix_list:
+            idx = owner(pix)
+            if idx is None or name in per_cord[idx]:
+                return ABSTAIN
+            d = depth(idx, pix)
+            if d is None:
+                return ABSTAIN
+            per_cord[idx][name] = d
+    if len(per_cord[0]) != 3 or len(per_cord[1]) != 3:
+        return ABSTAIN
+
+    ranks = {}
+    for idx in (0, 1):
+        vals = sorted(per_cord[idx].values())
+        if min(vals[i + 1] - vals[i] for i in range(len(vals) - 1)) < _MIN_RANK_GAP:
+            return ABSTAIN
+        order = sorted(per_cord[idx].items(), key=lambda kv: kv[1])
+        ranks[idx] = {name: i for i, (name, _d) in enumerate(order)}
+
+    fixed = sorted(n for n in ranks[0] if ranks[0][n] == ranks[1][n])
+    if len(fixed) != 1:
+        return ABSTAIN
+    return fixed[0]

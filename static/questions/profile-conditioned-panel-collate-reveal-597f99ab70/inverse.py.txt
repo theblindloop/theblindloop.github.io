@@ -1,0 +1,183 @@
+"""Independent pixel-only inverse arm for panel_collate_reveal.
+
+Receives ONLY the final PNG. It segments the nine blue panel frames and the nine
+blue rank dots, reads the left-to-right rank of each dot, reassembles the tiles
+into the declared 3x3 grid, and classifies the reconstructed letter against the
+two block candidates A and B declared by the public question contract. No scene
+data and no analytic gold.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "panel_collate_reveal-oracle-0.1.0"
+
+W = 420
+H = 420
+G_ROWS = 12
+G_COLS = 12
+TILES_PER_AXIS = 3
+CELLS_PER_TILE = 4
+PANEL = 84
+BORDER = 2
+
+TEMPLATE_A = [
+    list("............"),
+    list("....##......"),
+    list("...####....."),
+    list("..##..##...."),
+    list("..##..##...."),
+    list(".##....##..."),
+    list(".##....##..."),
+    list("##########.."),
+    list("##......##.."),
+    list("##......##.."),
+    list("............"),
+    list("............"),
+]
+TEMPLATE_B = [
+    list("............"),
+    list(".#########.."),
+    list(".##.....##.."),
+    list(".##.....##.."),
+    list(".##.....##.."),
+    list(".#########.."),
+    list(".##.....##.."),
+    list(".##.....##.."),
+    list(".##.....##.."),
+    list(".#########.."),
+    list("............"),
+    list("............"),
+]
+TEMPLATES = {"A": TEMPLATE_A, "B": TEMPLATE_B}
+
+
+def _template_mask(glyph: str) -> np.ndarray:
+    return np.array([[c == "#" for c in row] for row in TEMPLATES[glyph]], dtype=bool)
+
+
+def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    ys, xs = np.nonzero(mask)
+    coords = set(zip(xs.tolist(), ys.tolist()))
+    components = []
+    height, width = mask.shape
+    while coords:
+        start = coords.pop()
+        stack = [start]
+        pixels = [start]
+        while stack:
+            x, y = stack.pop()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < width and 0 <= ny < height and (nx, ny) in coords:
+                    coords.remove((nx, ny))
+                    stack.append((nx, ny))
+                    pixels.append((nx, ny))
+        components.append(np.array(pixels, dtype=float))
+    return components
+
+
+def _panel_blocks(blue_mask: np.ndarray) -> tuple[list[tuple[int, int, int, int]], list[tuple[float, float]]]:
+    components = _connected_components(blue_mask)
+    rings: list[tuple[int, int, int, int]] = []
+    dots: list[tuple[float, float]] = []
+    for comp in components:
+        xs = comp[:, 0]
+        ys = comp[:, 1]
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        w = x1 - x0 + 1
+        h = y1 - y0 + 1
+        if w > 40 and h > 40:
+            rings.append((x0, y0, x1, y1))
+        else:
+            dots.append((float(xs.mean()), float(ys.mean())))
+    return rings, dots
+
+
+def _cell_ink(arr: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
+    grid = np.zeros((CELLS_PER_TILE, CELLS_PER_TILE), dtype=bool)
+    cw = (x1 - x0) / CELLS_PER_TILE
+    ch = (y1 - y0) / CELLS_PER_TILE
+    for a in range(CELLS_PER_TILE):
+        for b in range(CELLS_PER_TILE):
+            sx = int(round(x0 + b * cw))
+            ex = int(round(x0 + (b + 1) * cw))
+            sy = int(round(y0 + a * ch))
+            ey = int(round(y0 + (a + 1) * ch))
+            block = arr[sy:ey, sx:ex]
+            if block.size == 0:
+                continue
+            grid[a, b] = bool((block < 128).mean() > 0.5)
+    return grid
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=int)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    blue = (b > r + 40) & (b > g + 60) & (b > 120)
+    lum = np.asarray(image.convert("L"), dtype=float)
+    rings, dots = _panel_blocks(blue)
+    recon = np.zeros((G_ROWS, G_COLS), dtype=bool)
+    placed = 0
+    for (x0, y0, x1, y1) in rings:
+        rect = (x0, y0, x1, y1)
+        slot = None
+        best_dist = 1e9
+        for (dx, dy) in dots:
+            if x0 - 2 <= dx <= x1 + 2 and y0 - 2 <= dy <= y1 + 2:
+                d = (dx - (x0 + x1) / 2.0) ** 2 + (dy - (y0 + y1) / 2.0) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    inner_w = (panel_width(rect) - 2 * BORDER)
+                    frac = (dx - (x0 + BORDER)) / inner_w if inner_w > 0 else 0.0
+                    slot = int(round(frac * 9.0 - 0.5))
+        if slot is None or not (0 <= slot < 9):
+            continue
+        ink = _cell_ink(lum, x0 + BORDER, y0 + BORDER, x1 - BORDER + 1, y1 - BORDER + 1)
+        rb = (slot // TILES_PER_AXIS) * CELLS_PER_TILE
+        cb = (slot % TILES_PER_AXIS) * CELLS_PER_TILE
+        recon[rb:rb + CELLS_PER_TILE, cb:cb + CELLS_PER_TILE] = ink
+        placed += 1
+    if placed == 0:
+        return "A"
+    scores = {}
+    for glyph, tmpl in TEMPLATES.items():
+        t = _template_mask(glyph)
+        scores[glyph] = float((recon & t).sum()) / float(t.sum())
+    return "A" if scores["A"] >= scores["B"] else "B"
+
+
+def panel_width(rect: tuple[int, int, int, int]) -> int:
+    return rect[2] - rect[0] + 1
+
+
+def reveal_margin(image: Image.Image) -> float:
+    arr = np.asarray(image.convert("RGB"), dtype=int)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    blue = (b > r + 40) & (b > g + 60) & (b > 120)
+    lum = np.asarray(image.convert("L"), dtype=float)
+    rings, dots = _panel_blocks(blue)
+    recon = np.zeros((G_ROWS, G_COLS), dtype=bool)
+    for (x0, y0, x1, y1) in rings:
+        slot = None
+        best_dist = 1e9
+        for (dx, dy) in dots:
+            if x0 - 2 <= dx <= x1 + 2 and y0 - 2 <= dy <= y1 + 2:
+                d = (dx - (x0 + x1) / 2.0) ** 2 + (dy - (y0 + y1) / 2.0) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    inner_w = (panel_width((x0, y0, x1, y1)) - 2 * BORDER)
+                    frac = (dx - (x0 + BORDER)) / inner_w if inner_w > 0 else 0.0
+                    slot = int(round(frac * 9.0 - 0.5))
+        if slot is None or not (0 <= slot < 9):
+            continue
+        ink = _cell_ink(lum, x0 + BORDER, y0 + BORDER, x1 - BORDER + 1, y1 - BORDER + 1)
+        rb = (slot // TILES_PER_AXIS) * CELLS_PER_TILE
+        cb = (slot % TILES_PER_AXIS) * CELLS_PER_TILE
+        recon[rb:rb + CELLS_PER_TILE, cb:cb + CELLS_PER_TILE] = ink
+    sA = float((recon & _template_mask("A")).sum()) / float(_template_mask("A").sum())
+    sB = float((recon & _template_mask("B")).sum()) / float(_template_mask("B").sum())
+    return abs(sA - sB)

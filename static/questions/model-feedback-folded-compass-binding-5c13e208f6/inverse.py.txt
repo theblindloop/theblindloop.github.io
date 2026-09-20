@@ -1,0 +1,160 @@
+"""Independent PNG-only decoder for transported compass directions."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 1000
+HEIGHT = 1030
+GRID_N = 9
+CELL = 38
+PANEL_X = (35, 515)
+PANEL_Y = (85, 555)
+GRID_OFFSET_X = 54
+GRID_OFFSET_Y = 72
+
+BLUE = np.array((37, 99, 235), dtype=np.uint8)
+AMBER = np.array((245, 158, 11), dtype=np.uint8)
+RED = np.array((220, 38, 38), dtype=np.uint8)
+GREEN = np.array((22, 163, 74), dtype=np.uint8)
+WHITE = np.array((255, 255, 255), dtype=np.uint8)
+INK = np.array((31, 41, 55), dtype=np.uint8)
+DIR_VECTORS = np.array(((0, -1), (1, 0), (0, 1), (-1, 0)), dtype=np.float64)
+
+
+class OracleAbstention(ValueError):
+    """The required visible marks cannot be decoded confidently."""
+
+
+def _origin(index: int) -> tuple[int, int]:
+    return PANEL_X[index % 2], PANEL_Y[index // 2]
+
+
+def _center(index: int, x: int, y: int) -> np.ndarray:
+    panel_x, panel_y = _origin(index)
+    return np.array((panel_x + GRID_OFFSET_X + (x + 0.5) * CELL,
+                     panel_y + GRID_OFFSET_Y + (y + 0.5) * CELL), dtype=np.float64)
+
+
+def _exact_mask(crop: np.ndarray, color: np.ndarray) -> np.ndarray:
+    return np.all(crop == color, axis=2)
+
+
+def _arrow_direction(arr: np.ndarray, center: np.ndarray, arrow_color: np.ndarray) -> int:
+    cx, cy = int(round(center[0])), int(round(center[1]))
+    radius = 14
+    patch = arr[cy - radius:cy + radius + 1, cx - radius:cx + radius + 1]
+    ys, xs = np.nonzero(_exact_mask(patch, arrow_color))
+    if not 45 <= len(xs) <= 170:
+        raise OracleAbstention(f"arrow marker has {len(xs)} pixels")
+    offsets = np.column_stack((xs - radius, ys - radius)).astype(np.float64)
+    extents = [float(np.max(offsets @ vector)) for vector in DIR_VECTORS]
+    order = np.argsort(extents)[::-1]
+    if extents[int(order[0])] < 10.0 or extents[int(order[0])] - extents[int(order[1])] < 3.0:
+        raise OracleAbstention(f"arrow direction is unclear: {extents}")
+    return int(order[0])
+
+
+def _tokens(arr: np.ndarray, panel_index: int, color: np.ndarray,
+            arrow_color: np.ndarray) -> list[tuple[np.ndarray, int]]:
+    found: list[tuple[np.ndarray, int]] = []
+    for y in range(GRID_N):
+        for x in range(GRID_N):
+            center = _center(panel_index, x, y)
+            cx, cy = int(round(center[0])), int(round(center[1]))
+            patch = arr[cy - 14:cy + 15, cx - 14:cx + 15]
+            if int(_exact_mask(patch, color).sum()) >= 600:
+                found.append((center, _arrow_direction(arr, center, arrow_color)))
+    if len(found) != 4:
+        raise OracleAbstention(
+            f"panel {panel_index + 1}: expected four directed tokens, found {len(found)}"
+        )
+    return found
+
+
+def _fit_axis(arr: np.ndarray, panel_index: int) -> tuple[np.ndarray, np.ndarray]:
+    panel_x, panel_y = _origin(panel_index)
+    gx, gy = panel_x + GRID_OFFSET_X, panel_y + GRID_OFFSET_Y
+    size = GRID_N * CELL
+    crop = arr[gy - 4:gy + size + 5, gx - 4:gx + size + 5]
+    ys, xs = np.nonzero(_exact_mask(crop, RED))
+    if not 450 <= len(xs) <= 2100:
+        raise OracleAbstention(f"panel {panel_index + 1}: fold line has {len(xs)} red pixels")
+    points = np.column_stack((xs + gx - 4, ys + gy - 4)).astype(np.float64)
+    center = points.mean(axis=0)
+    _, _, vt = np.linalg.svd(points - center, full_matrices=False)
+    direction = vt[0]
+    normal = np.array((-direction[1], direction[0]))
+    if float(np.quantile(np.abs((points - center) @ normal), 0.95)) > 4.5:
+        raise OracleAbstention(f"panel {panel_index + 1}: malformed fold line")
+    if float(np.ptp((points - center) @ direction)) < 210.0:
+        raise OracleAbstention(f"panel {panel_index + 1}: short fold line")
+    return center, direction
+
+
+def _fit_pin(arr: np.ndarray, panel_index: int) -> np.ndarray:
+    panel_x, panel_y = _origin(panel_index)
+    gx, gy = panel_x + GRID_OFFSET_X, panel_y + GRID_OFFSET_Y
+    size = GRID_N * CELL
+    crop = arr[gy - 18:gy + size + 19, gx - 18:gx + size + 19]
+    ys, xs = np.nonzero(_exact_mask(crop, GREEN))
+    if not 300 <= len(xs) <= 390:
+        raise OracleAbstention(f"panel {panel_index + 1}: pin has {len(xs)} green pixels")
+    points = np.column_stack((xs + gx - 18, ys + gy - 18)).astype(np.float64)
+    center = points.mean(axis=0)
+    radius = np.linalg.norm(points - center, axis=1)
+    if float(radius.max()) > 11.2 or float(np.quantile(radius, 0.9)) < 8.0:
+        raise OracleAbstention(f"panel {panel_index + 1}: malformed pin")
+    return center
+
+
+def _panel_score(arr: np.ndarray, index: int) -> int:
+    source = _tokens(arr, index, BLUE, WHITE)
+    target = _tokens(arr, index, AMBER, INK)
+    panel_x, panel_y = _origin(index)
+    gx, gy = panel_x + GRID_OFFSET_X, panel_y + GRID_OFFSET_Y
+    crop = arr[gy:gy + GRID_N * CELL + 1, gx:gx + GRID_N * CELL + 1]
+    blue_area = int(_exact_mask(crop, BLUE).sum())
+    amber_area = int(_exact_mask(crop, AMBER).sum())
+    if not (3300 <= blue_area <= 4100 and 3300 <= amber_area <= 4100):
+        raise OracleAbstention(f"panel {index + 1}: token areas are {blue_area}/{amber_area}")
+
+    axis_center, axis_direction = _fit_axis(arr, index)
+    pivot = _fit_pin(arr, index)
+    expected: list[tuple[np.ndarray, int]] = []
+    for point, direction in source:
+        delta = point - axis_center
+        reflected_point = axis_center + 2.0 * axis_direction * float(delta @ axis_direction) - delta
+        vector = DIR_VECTORS[direction]
+        reflected_vector = 2.0 * axis_direction * float(vector @ axis_direction) - vector
+        dx, dy = reflected_point - pivot
+        moved = pivot + np.array((-dy, dx))
+        turned = np.array((-reflected_vector[1], reflected_vector[0]))
+        expected.append((moved, int(np.argmax(DIR_VECTORS @ turned))))
+
+    used: set[int] = set()
+    score = 0
+    for point, direction in expected:
+        distances = [float(np.linalg.norm(point - observed)) if i not in used else math.inf
+                     for i, (observed, _) in enumerate(target)]
+        match = int(np.argmin(distances))
+        if distances[match] > 6.0:
+            raise OracleAbstention(f"panel {index + 1}: landing position mismatch")
+        used.add(match)
+        score += int(target[match][1] == direction)
+    return score
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = image.convert("RGB")
+    if rgb.size != (WIDTH, HEIGHT):
+        raise OracleAbstention(f"unexpected raster size {rgb.size}")
+    arr = np.asarray(rgb, dtype=np.uint8)
+    scores = [_panel_score(arr, index) for index in range(4)]
+    winners = [index for index, score in enumerate(scores) if score == 4]
+    if len(winners) != 1 or max((score for score in scores if score < 4), default=0) > 2:
+        raise OracleAbstention(f"directed landing is not unique: {scores}")
+    return f"panel-{winners[0] + 1}"

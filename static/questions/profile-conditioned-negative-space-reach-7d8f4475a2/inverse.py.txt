@@ -1,0 +1,117 @@
+"""Image-only inverse arm.
+
+Input: the final PNG and the public question contract (light background, thick
+dark walls, one red dot plus green/blue/orange/purple candidate dots, travel
+through background only).  No scene, no renderer, no gold.
+
+Method: rebuild the foreground complement (the negative space), flood it from
+the red dot, and report which candidate centroid the flood reaches.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_REFERENCE = {
+    "red": (214, 42, 42),
+    "green": (31, 150, 56),
+    "blue": (38, 86, 200),
+    "orange": (238, 140, 20),
+    "purple": (140, 60, 180),
+}
+_CANDIDATES = ("green", "blue", "orange", "purple")
+
+_INK_MAX = 110      # a wall pixel is dark in every channel
+_DOT_SAT = 55       # a dot pixel is strongly chromatic
+_DOT_VALUE = 110
+_SCALE = 2          # flood at half resolution, walls dilated by min-pooling
+_BLOB_RADIUS = 12   # dots are 9 px in radius; strays outside this are rim noise
+
+
+def _dot_blobs(rgb: np.ndarray) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Pixel coordinates of every dot, keyed by the nearest declared colour."""
+    high = rgb.max(axis=2).astype(np.int16)
+    low = rgb.min(axis=2).astype(np.int16)
+    chromatic = (high - low >= _DOT_SAT) & (high >= _DOT_VALUE)
+    ys, xs = np.nonzero(chromatic)
+    if ys.size == 0:
+        return {}
+    samples = rgb[ys, xs].astype(np.int32)
+    names = list(_REFERENCE)
+    refs = np.array([_REFERENCE[n] for n in names], dtype=np.int32)
+    dist = ((samples[:, None, :] - refs[None, :, :]) ** 2).sum(axis=2)
+    label = dist.argmin(axis=1)
+    blobs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for index, name in enumerate(names):
+        pick = label == index
+        if pick.sum() < 40:
+            continue
+        bx, by = xs[pick], ys[pick]
+        # Anti-aliased rims of one dot can drift towards a neighbouring
+        # reference colour, so keep only the compact body around the median.
+        mx, my = np.median(bx), np.median(by)
+        near = (np.abs(bx - mx) <= _BLOB_RADIUS) & (np.abs(by - my) <= _BLOB_RADIUS)
+        if near.sum() < 40:
+            continue
+        blobs[name] = (bx[near], by[near])
+    return blobs
+
+
+def _free_mask(rgb: np.ndarray) -> np.ndarray:
+    """Negative space = every pixel that is not wall ink.  Dots sit inside the
+    empty space and count as empty."""
+    wall = (rgb.max(axis=2) < _INK_MAX)
+    free = ~wall
+    h, w = free.shape
+    h2, w2 = h // _SCALE, w // _SCALE
+    blocks = free[: h2 * _SCALE, : w2 * _SCALE].reshape(h2, _SCALE, w2, _SCALE)
+    return blocks.all(axis=(1, 3))  # min-pool: conservative, walls never leak
+
+
+def _flood(free: np.ndarray, seed: np.ndarray) -> np.ndarray:
+    """Grow the seed through the negative space until it stops changing."""
+    reach = seed & free
+    for _ in range(4000):
+        grown = reach.copy()
+        grown[1:, :] |= reach[:-1, :]
+        grown[:-1, :] |= reach[1:, :]
+        grown[:, 1:] |= reach[:, :-1]
+        grown[:, :-1] |= reach[:, 1:]
+        grown &= free
+        if not (grown != reach).any():
+            break
+        reach = grown
+    return reach
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Colour of the candidate dot reachable from the red dot, or 'abstain'."""
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    blobs = _dot_blobs(rgb)
+    if "red" not in blobs:
+        return "abstain"
+    free = _free_mask(rgb)
+    red_xs, red_ys = blobs["red"]
+    seed = np.zeros_like(free)
+    seed[
+        np.clip((red_ys // _SCALE).astype(np.int64), 0, free.shape[0] - 1),
+        np.clip((red_xs // _SCALE).astype(np.int64), 0, free.shape[1] - 1),
+    ] = True
+    if not (seed & free).any():
+        return "abstain"
+    reach = _flood(free, seed)
+    hits = []
+    for name in _CANDIDATES:
+        if name not in blobs:
+            continue
+        # A dot lies wholly inside one empty region, but a dot painted close to
+        # a wall can have its centroid clipped, so the whole blob is tested.
+        xs, ys = blobs[name]
+        rows = np.clip((ys // _SCALE).astype(np.int64), 0, reach.shape[0] - 1)
+        cols = np.clip((xs // _SCALE).astype(np.int64), 0, reach.shape[1] - 1)
+        if bool(reach[rows, cols].any()):
+            hits.append(name)
+    if len(hits) != 1:
+        return "abstain"
+    return hits[0]

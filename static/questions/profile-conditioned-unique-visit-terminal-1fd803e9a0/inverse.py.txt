@@ -1,0 +1,155 @@
+"""Pixel-only inverse arm for the checkpoint-coverage network.
+
+The implementation segments role-colored node interiors, infers their centers,
+tests visible black strokes between aligned neighboring nodes, and searches the
+recovered graph. It receives no latent scene or analytic information.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+
+import numpy as np
+from PIL import Image
+
+_ROLE_RGB = {
+    "ordinary": (199, 208, 218),
+    "green": (38, 158, 73),
+    "purple": (143, 68, 173),
+    "red": (220, 55, 55),
+    "blue": (45, 105, 210),
+    "orange": (235, 139, 35),
+}
+_BLACK = np.array((24, 27, 31), dtype=np.int32)
+_TERMINAL_COLORS = ("red", "blue", "orange")
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 4-connected foreground components as arrays of (y, x)."""
+    work = mask.copy()
+    height, width = work.shape
+    components: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(work):
+        y0, x0 = int(y0), int(x0)
+        if not work[y0, x0]:
+            continue
+        work[y0, x0] = False
+        queue = deque([(y0, x0)])
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and work[yy, xx]:
+                    work[yy, xx] = False
+                    queue.append((yy, xx))
+        if len(points) >= 120:
+            components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _recover_nodes(arr: np.ndarray) -> list[dict]:
+    nodes: list[dict] = []
+    data = arr.astype(np.int32)
+    for role, rgb in _ROLE_RGB.items():
+        distance = np.sqrt(((data - np.asarray(rgb, dtype=np.int32)) ** 2).sum(axis=2))
+        for component in _components(distance <= 38.0):
+            y, x = component.mean(axis=0)
+            nodes.append({"x": float(x), "y": float(y), "role": role})
+    if len(nodes) != 16:
+        raise ValueError(f"expected 16 visible node interiors, recovered {len(nodes)}")
+    if sum(node["role"] == "green" for node in nodes) != 1:
+        raise ValueError("the raster must contain exactly one green start")
+    if sum(node["role"] == "purple" for node in nodes) != 3:
+        raise ValueError("the raster must contain exactly three purple checkpoints")
+    for color in _TERMINAL_COLORS:
+        if sum(node["role"] == color for node in nodes) != 1:
+            raise ValueError(f"the raster must contain exactly one {color} terminal")
+    return nodes
+
+
+def _is_neighbor_pair(nodes: list[dict], a: int, b: int) -> bool:
+    ax, ay = nodes[a]["x"], nodes[a]["y"]
+    bx, by = nodes[b]["x"], nodes[b]["y"]
+    vertical = abs(ax - bx) <= 3.0
+    horizontal = abs(ay - by) <= 3.0
+    if not (vertical or horizontal):
+        return False
+    for index, other in enumerate(nodes):
+        if index in (a, b):
+            continue
+        ox, oy = other["x"], other["y"]
+        if vertical and abs(ox - (ax + bx) / 2.0) <= 4.0:
+            if min(ay, by) < oy < max(ay, by):
+                return False
+        if horizontal and abs(oy - (ay + by) / 2.0) <= 4.0:
+            if min(ax, bx) < ox < max(ax, bx):
+                return False
+    return True
+
+
+def _has_link(black: np.ndarray, first: dict, second: dict) -> bool:
+    x1, y1 = first["x"], first["y"]
+    x2, y2 = second["x"], second["y"]
+    length = float(np.hypot(x2 - x1, y2 - y1))
+    if length < 45.0:
+        return False
+    trim = min(0.32, 20.0 / length)
+    votes = []
+    height, width = black.shape
+    for t in np.linspace(trim, 1.0 - trim, 41):
+        x = int(round(x1 + t * (x2 - x1)))
+        y = int(round(y1 + t * (y2 - y1)))
+        xlo, xhi = max(0, x - 2), min(width, x + 3)
+        ylo, yhi = max(0, y - 2), min(height, y + 3)
+        votes.append(int(black[ylo:yhi, xlo:xhi].sum()) >= 3)
+    return float(np.mean(votes)) >= 0.82
+
+
+def _recover_graph(arr: np.ndarray, nodes: list[dict]) -> dict[int, list[int]]:
+    delta = arr.astype(np.int32) - _BLACK
+    black = np.sqrt((delta * delta).sum(axis=2)) <= 70.0
+    adjacency: dict[int, list[int]] = defaultdict(list)
+    for a in range(len(nodes)):
+        for b in range(a + 1, len(nodes)):
+            if _is_neighbor_pair(nodes, a, b) and _has_link(black, nodes[a], nodes[b]):
+                adjacency[a].append(b)
+                adjacency[b].append(a)
+    return adjacency
+
+
+def _route_counts(nodes: list[dict], adjacency: dict[int, list[int]]) -> dict[str, int]:
+    start = next(index for index, node in enumerate(nodes) if node["role"] == "green")
+    checkpoints = {
+        index for index, node in enumerate(nodes) if node["role"] == "purple"
+    }
+    terminal_colors = {
+        index: node["role"]
+        for index, node in enumerate(nodes)
+        if node["role"] in _TERMINAL_COLORS
+    }
+    counts = {color: 0 for color in _TERMINAL_COLORS}
+
+    def visit(node: int, seen: set[int]) -> None:
+        if node in terminal_colors:
+            if checkpoints <= seen:
+                counts[terminal_colors[node]] += 1
+            return
+        for neighbor in adjacency[node]:
+            if neighbor not in seen:
+                visit(neighbor, seen | {neighbor})
+
+    visit(start, {start})
+    return counts
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the unique feasible terminal color from final RGB pixels alone."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    nodes = _recover_nodes(arr)
+    adjacency = _recover_graph(arr, nodes)
+    counts = _route_counts(nodes, adjacency)
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    if ranked[0][1] <= 0 or ranked[1][1] != 0:
+        raise ValueError(f"no unique checkpoint-covering terminal in raster: {counts}")
+    return ranked[0][0]

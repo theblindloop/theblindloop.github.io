@@ -1,0 +1,163 @@
+"""Pixel-only inverse arm for the rotated-quilt mark-transposition world.
+
+Receives one rasterized PNG and the public question contract only. It never sees
+the latent scene, the analytic gold, or any renderer code. Pipeline:
+
+1. segment the quilt from the page background and locate its 6 x 6 tile lattice;
+2. read every tile's fill colour and its white mark mask independently;
+3. solve the declared cross-block correspondence (180-degree block rotation) and
+   score every right-block tile against its rotated partner's mark;
+4. abstain unless exactly two tiles carry a decisive mismatch;
+5. only then read the fill colour of the reading-order-first of those two.
+
+Abstention is by exception: destroyed lattice structure, unreadable tiles, or an
+inconsistent number of mismatches are refusals, not guesses.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ROWS = 6
+BLOCK_COLS = 3
+COLS = BLOCK_COLS * 2
+INTERIOR_INSET = 0.14
+MARK_LEVEL = 190
+INK_LEVEL = 100
+MIN_FILL_FRACTION = 0.30
+MAX_PALETTE_DISTANCE = 70.0
+MISMATCH_FLOOR = 0.04
+MATCH_CEILING = 0.02
+
+# The question contract names four fill colours; these are their rendered values.
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (176, 42, 42),
+    "blue": (36, 78, 168),
+    "green": (26, 112, 66),
+    "purple": (104, 52, 148),
+}
+
+
+def _rule_centres(profile: np.ndarray, expected: int) -> list[float]:
+    """Centres of the dark lattice rules found in one darkness projection."""
+    peak = float(profile.max())
+    if peak <= 0.0:
+        raise ValueError("no lattice rules are visible")
+    active = profile > 0.5 * peak
+    centres: list[float] = []
+    start: int | None = None
+    for index, flag in enumerate(active):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            centres.append((start + index - 1) / 2.0)
+            start = None
+    if start is not None:
+        centres.append((start + len(active) - 1) / 2.0)
+    if len(centres) != expected:
+        raise ValueError(f"found {len(centres)} lattice rules, expected {expected}")
+    return centres
+
+
+def _fit_axis(centres: list[float], cells: int) -> tuple[float, float]:
+    """Uniform (origin, pitch) fit from the interior rules of one axis.
+
+    The two outermost rules are drawn against the page margin and their measured
+    centres are biased inward, so the pitch is fitted from the interior rules and
+    the outer rules are only used as a consistency check.
+    """
+    interior = centres[1:-1]
+    pitch = (interior[-1] - interior[0]) / (len(interior) - 1)
+    origin = interior[0] - pitch
+    if pitch < 40.0:
+        raise ValueError("lattice cells are too small to read")
+    for index, centre in enumerate(interior, start=1):
+        if abs(centre - (origin + index * pitch)) > 2.0:
+            raise ValueError("lattice spacing is not uniform")
+    for index, centre in ((0, centres[0]), (cells, centres[-1])):
+        if abs(centre - (origin + index * pitch)) > 5.0:
+            raise ValueError("lattice border is displaced")
+    return origin, pitch
+
+
+def _lattice(array: np.ndarray) -> tuple[float, float, float, float]:
+    ink = array.astype(np.float32).max(axis=2) < INK_LEVEL
+    xs = _rule_centres(ink.sum(axis=0).astype(np.float64), COLS + 1)
+    ys = _rule_centres(ink.sum(axis=1).astype(np.float64), ROWS + 1)
+    x0, x_pitch = _fit_axis(xs, COLS)
+    y0, y_pitch = _fit_axis(ys, ROWS)
+    if abs(x_pitch - y_pitch) > 2.0:
+        raise ValueError("lattice cells are not square")
+    return x0, x_pitch, y0, y_pitch
+
+
+def _tile_interior(array: np.ndarray, lattice, row: int, col: int, side: int) -> np.ndarray:
+    x0, x_pitch, y0, y_pitch = lattice
+    left = int(round(x0 + (col + INTERIOR_INSET) * x_pitch))
+    top = int(round(y0 + (row + INTERIOR_INSET) * y_pitch))
+    return array[top : top + side, left : left + side]
+
+
+def _read_tile(patch: np.ndarray) -> tuple[str, np.ndarray]:
+    if patch.size == 0:
+        raise ValueError("tile patch is empty")
+    values = patch.astype(np.float32)
+    mark = values.min(axis=2) > MARK_LEVEL
+    ink = values.max(axis=2) < INK_LEVEL
+    fill = ~(mark | ink)
+    if float(fill.mean()) < MIN_FILL_FRACTION:
+        raise ValueError("tile fill is missing or destroyed")
+    median = np.median(values[fill], axis=0)
+    best, distance = None, None
+    for name, rgb in PALETTE.items():
+        candidate = float(np.linalg.norm(median - np.asarray(rgb, dtype=np.float32)))
+        if distance is None or candidate < distance:
+            best, distance = name, candidate
+    if distance is None or distance > MAX_PALETTE_DISTANCE:
+        raise ValueError("tile fill colour is not a contract palette colour")
+    return str(best), mark
+
+
+def _dissimilarity(a: np.ndarray, b: np.ndarray) -> float:
+    union = int(np.count_nonzero(a | b))
+    if union == 0:
+        return 1.0
+    return float(np.count_nonzero(a ^ b)) / union
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    lattice = _lattice(array)
+    side = int(round(lattice[1] * (1.0 - 2.0 * INTERIOR_INSET)))
+    if side < 16:
+        raise ValueError("tiles are too small to read")
+
+    colors: dict[tuple[int, int], str] = {}
+    marks: dict[tuple[int, int], np.ndarray] = {}
+    for row in range(ROWS):
+        for col in range(COLS):
+            patch = _tile_interior(array, lattice, row, col, side)
+            if patch.shape[:2] != (side, side):
+                raise ValueError("tile lattice does not fit the visible quilt")
+            name, mask = _read_tile(patch)
+            colors[(row, col)] = name
+            marks[(row, col)] = mask
+
+    scores: list[tuple[float, tuple[int, int]]] = []
+    for row in range(ROWS):
+        for col in range(BLOCK_COLS):
+            partner = (ROWS - 1 - row, BLOCK_COLS - 1 - col)
+            scores.append(
+                (
+                    _dissimilarity(marks[(row, BLOCK_COLS + col)], marks[partner]),
+                    (row, col),
+                )
+            )
+    scores.sort(key=lambda item: (-item[0], item[1]))
+    if scores[1][0] < MISMATCH_FLOOR or scores[2][0] > MATCH_CEILING:
+        raise ValueError(
+            "the image does not show exactly two decisive mark transpositions"
+        )
+    first = min(scores[0][1], scores[1][1])
+    return colors[(first[0], BLOCK_COLS + first[1])]

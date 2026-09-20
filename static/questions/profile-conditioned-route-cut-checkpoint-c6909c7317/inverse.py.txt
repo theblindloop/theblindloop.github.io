@@ -1,0 +1,139 @@
+"""Independent PNG-only inverse arm for route_cut_checkpoint.
+
+The oracle segments circular fills, reconstructs black links from sampled ink
+between recovered centroids, and performs a vertex-removal connectivity test.
+It receives no scene data and intentionally shares no code with the renderer.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import math
+
+import numpy as np
+from PIL import Image
+
+
+REFERENCE = {
+    "generic": np.array((211, 217, 224), dtype=np.int32),
+    "green": np.array((38, 174, 91), dtype=np.int32),
+    "purple": np.array((132, 79, 188), dtype=np.int32),
+    "red": np.array((221, 61, 61), dtype=np.int32),
+    "blue": np.array((48, 107, 215), dtype=np.int32),
+    "orange": np.array((239, 143, 33), dtype=np.int32),
+}
+CANDIDATES = ("red", "blue", "orange")
+
+
+def _components(mask: np.ndarray) -> list[tuple[float, float, int]]:
+    work = mask.copy()
+    components = []
+    ys, xs = np.nonzero(work)
+    height, width = work.shape
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if not work[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        work[start_y, start_x] = False
+        sum_x = sum_y = area = 0
+        while stack:
+            y, x = stack.pop()
+            sum_x += x
+            sum_y += y
+            area += 1
+            if y and work[y - 1, x]:
+                work[y - 1, x] = False
+                stack.append((y - 1, x))
+            if y + 1 < height and work[y + 1, x]:
+                work[y + 1, x] = False
+                stack.append((y + 1, x))
+            if x and work[y, x - 1]:
+                work[y, x - 1] = False
+                stack.append((y, x - 1))
+            if x + 1 < width and work[y, x + 1]:
+                work[y, x + 1] = False
+                stack.append((y, x + 1))
+        if area >= 120:
+            components.append((sum_x / area, sum_y / area, area))
+    return components
+
+
+def _recover_nodes(pixels: np.ndarray) -> list[dict]:
+    rgb = pixels.astype(np.int32)
+    nodes = []
+    for label, reference in REFERENCE.items():
+        distance2 = np.sum((rgb - reference) ** 2, axis=2)
+        for x, y, area in _components(distance2 < 42 * 42):
+            nodes.append({"label": label, "x": x, "y": y, "area": area})
+    counts = {label: sum(node["label"] == label for node in nodes) for label in REFERENCE}
+    if counts["green"] != 1 or counts["purple"] != 1:
+        raise ValueError(f"expected one START and FINISH marker, found {counts}")
+    if any(counts[color] != 1 for color in CANDIDATES):
+        raise ValueError(f"expected one checkpoint of each answer color, found {counts}")
+    if counts["generic"] < 10:
+        raise ValueError(f"too few generic graph nodes: {counts['generic']}")
+    if len(nodes) != 20:
+        raise ValueError(f"expected 20 visible graph nodes, found {len(nodes)}")
+    return nodes
+
+
+def _has_link(dark: np.ndarray, left: dict, right: dict) -> bool:
+    dx = right["x"] - left["x"]
+    dy = right["y"] - left["y"]
+    distance = math.hypot(dx, dy)
+    if distance > 118 or distance < 35:
+        return False
+    ux, uy = dx / distance, dy / distance
+    start = 19.0
+    stop = distance - 19.0
+    if stop <= start:
+        return False
+    samples = max(9, int(stop - start) + 1)
+    evidence = []
+    height, width = dark.shape
+    for offset in np.linspace(start, stop, samples):
+        x = int(round(left["x"] + ux * offset))
+        y = int(round(left["y"] + uy * offset))
+        y0, y1 = max(0, y - 2), min(height, y + 3)
+        x0, x1 = max(0, x - 2), min(width, x + 3)
+        evidence.append(bool(np.mean(dark[y0:y1, x0:x1]) >= 0.28))
+    return float(np.mean(evidence)) >= 0.82
+
+
+def _path_exists(adjacency: list[set[int]], start: int, finish: int, removed: int) -> bool:
+    queue = deque([start])
+    seen = {start, removed}
+    while queue:
+        current = queue.popleft()
+        if current == finish:
+            return True
+        for neighbor in adjacency[current] - seen:
+            seen.add(neighbor)
+            queue.append(neighbor)
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    pixels = np.asarray(image.convert("RGB"))
+    if pixels.shape[1] < 700 or pixels.shape[0] < 300:
+        raise ValueError("raster is too small for the declared graph world")
+    nodes = _recover_nodes(pixels)
+    intensity = pixels.astype(np.int16)
+    dark = np.max(intensity, axis=2) < 105
+    adjacency = [set() for _ in nodes]
+    for left in range(len(nodes)):
+        for right in range(left + 1, len(nodes)):
+            if _has_link(dark, nodes[left], nodes[right]):
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+    start = next(index for index, node in enumerate(nodes) if node["label"] == "green")
+    finish = next(index for index, node in enumerate(nodes) if node["label"] == "purple")
+    checkpoints = [index for index, node in enumerate(nodes) if node["label"] in CANDIDATES]
+    winners = [
+        nodes[index]["label"]
+        for index in checkpoints
+        if not _path_exists(adjacency, start, finish, index)
+    ]
+    if len(winners) != 1:
+        raise ValueError(f"ambiguous pixel graph: cut-checkpoint candidates={winners}")
+    return winners[0]

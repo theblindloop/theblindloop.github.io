@@ -1,0 +1,203 @@
+"""Segment-ratio correspondence world.
+
+Three horizontal three-section bars are drawn on a white canvas. Every bar is
+divided by two vertical boundaries into, from left to right, an indigo section,
+a turquoise middle section, and an amber section, each of a different width. The
+reference bar (at the top) fixes a derived quantitative relation: the RATIO of
+the middle section's width to the left section's width (middle divided by left).
+Two candidate bars (``A`` and ``B``) are drawn at different total widths and
+positions. Exactly one candidate reproduces the reference's middle-to-left ratio;
+the other uses a clearly different ratio (its middle and left widths differ from
+the reference in a way that changes the ratio). The decision is which candidate -
+A or B - reproduces the reference's segment ratio.
+
+The intended computation is a *compositional* quantitative relation: measure the
+widths of two interior sections (left and middle) within each bar, divide middle
+by left to obtain a derived ratio, and select the candidate whose derived ratio
+matches the reference's. It is not a single-boundary self-normalized fraction, an
+absolute section width, or the total bar length: the correct candidate is a
+uniformly scaled version of the reference (both side-by-side sections scaled by a
+common factor) so that neither absolute width matches the reference while the
+derived ratio is preserved.
+
+The renderer owns scene sampling + rasterization + the analytic gold. The
+independent pixel-only inverse arm (``oracle.py``) recovers the same decision from
+the final PNG alone by measuring the indigo (left) and turquoise (middle) section
+widths in each panel, forming the middle/left ratio, and selecting the candidate
+whose measured ratio matches the reference's.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 640
+HEIGHT = 560
+BACKGROUND = (255, 255, 255)
+INDIGO = (63, 72, 204)
+TURQUOISE = (0, 188, 168)
+AMBER = (255, 176, 32)
+LABEL = (35, 35, 35)
+
+BAR_HEIGHT = 38
+# Panel top rows: reference / candidate A / candidate B.
+PANEL_TOPS = {"reference": 150, "A": 320, "B": 460}
+
+REF_W_LO, REF_W_HI = 220, 300
+CAND_W_LO, CAND_W_HI = 170, 300
+
+F_LO, F_HI = 0.20, 0.50
+SUM_MAX = 0.86
+K_LO, K_HI = 0.70, 1.30
+RATIO_LO, RATIO_HI = 0.50, 2.00
+DELTA_RATIO_LO, DELTA_RATIO_HI = 0.32, 0.60
+QUAR_MIN_MARGIN = 0.30
+
+_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``."""
+    rng = np.random.default_rng(seed)
+
+    ref_w = float(rng.integers(REF_W_LO, REF_W_HI + 1))
+    a_w = float(rng.integers(CAND_W_LO, CAND_W_HI + 1))
+    b_w = float(rng.integers(CAND_W_LO, CAND_W_HI + 1))
+    ref_cx = float(rng.uniform(0.35, 0.65) * WIDTH)
+    a_cx = float(rng.uniform(0.30, 0.70) * WIDTH)
+    b_cx = float(rng.uniform(0.30, 0.70) * WIDTH)
+
+    # Reference: left (indigo) and middle (turquoise) section widths as fractions
+    # of the reference bar's own length.
+    while True:
+        f_l = float(rng.uniform(F_LO, F_HI))
+        f_m = float(rng.uniform(F_LO, F_HI))
+        ratio_ref = f_m / f_l
+        if (f_l + f_m <= SUM_MAX and RATIO_LO <= ratio_ref <= RATIO_HI):
+            break
+
+    # Correct candidate: a common factor k scales BOTH left and middle widths so
+    # both absolute widths differ from the reference but the ratio is preserved.
+    fl_c = fm_c = 0.0
+    for _ in range(500):
+        k = float(rng.uniform(K_LO, K_HI))
+        fl_c = k * f_l
+        fm_c = k * f_m
+        if (0.20 <= fl_c <= 0.62 and 0.20 <= fm_c <= 0.62 and fl_c + fm_c <= SUM_MAX):
+            break
+
+    # Wrong candidate: a pair whose middle/left ratio differs clearly.
+    fl_w = fm_w = 0.0
+    for _ in range(1000):
+        fl_w = float(rng.uniform(F_LO, 0.50))
+        fm_w = float(rng.uniform(F_LO, 0.50))
+        ratio_w = fm_w / fl_w
+        if (fl_w + fm_w <= SUM_MAX and abs(ratio_w - ratio_ref) >= DELTA_RATIO_LO):
+            break
+
+    correct_index = int(rng.integers(0, 2))
+    if correct_index == 0:
+        a_l, a_m, b_l, b_m = fl_c, fm_c, fl_w, fm_w
+    else:
+        a_l, a_m, b_l, b_m = fl_w, fm_w, fl_c, fm_c
+
+    return {
+        "reference_left_frac": float(round(f_l, 4)),
+        "reference_mid_frac": float(round(f_m, 4)),
+        "a_left_frac": float(round(a_l, 4)),
+        "a_mid_frac": float(round(a_m, 4)),
+        "b_left_frac": float(round(b_l, 4)),
+        "b_mid_frac": float(round(b_m, 4)),
+        "ref_width": float(ref_w),
+        "ref_cx": float(ref_cx),
+        "a_width": float(a_w),
+        "a_cx": float(a_cx),
+        "b_width": float(b_w),
+        "b_cx": float(b_cx),
+        "correct_index": correct_index,
+    }
+
+
+def _bar_box(center_x: float, width: float, top: int, height: int) -> tuple[float, float, int, int]:
+    x0 = center_x - width / 2.0
+    x1 = center_x + width / 2.0
+    return x0, x1, top, top + height
+
+
+def _draw_bar(draw: ImageDraw.ImageDraw, cx: float, width: float, top: int, lf: float, mf: float) -> None:
+    x0, x1, top, bottom = _bar_box(cx, width, top, BAR_HEIGHT)
+    l_end = int(round(x0 + lf * width))
+    m_end = int(round(x0 + (lf + mf) * width))
+    x1i = int(round(x0 + width))
+    draw.rectangle([x0, top, l_end, bottom], fill=INDIGO)
+    draw.rectangle([l_end + 1, top, m_end, bottom], fill=TURQUOISE)
+    draw.rectangle([m_end + 1, top, x1i, bottom], fill=AMBER)
+
+
+def ratio_of(left_frac: float, mid_frac: float) -> float:
+    """Derived compositional ratio: middle section width over left section width."""
+    return float(mid_frac / left_frac)
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the latent scene (a deterministic PNG)."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype(_FONT_PATH, 26)
+    except OSError:
+        font = ImageFont.load_default()
+
+    draw.text((12, 116), "REFERENCE", font=font, fill=LABEL)
+    _draw_bar(
+        draw, scene["ref_cx"], scene["ref_width"], PANEL_TOPS["reference"],
+        scene["reference_left_frac"], scene["reference_mid_frac"],
+    )
+    draw.text((12, PANEL_TOPS["A"] + 6), "A", font=font, fill=LABEL)
+    _draw_bar(
+        draw, scene["a_cx"], scene["a_width"], PANEL_TOPS["A"],
+        scene["a_left_frac"], scene["a_mid_frac"],
+    )
+    draw.text((12, PANEL_TOPS["B"] + 6), "B", font=font, fill=LABEL)
+    _draw_bar(
+        draw, scene["b_cx"], scene["b_width"], PANEL_TOPS["B"],
+        scene["b_left_frac"], scene["b_mid_frac"],
+    )
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Structural gold: which candidate reproduces the reference's segment ratio.
+
+    The gold reads exactly the six section-width fields and compares each
+    candidate's derived middle/left ratio against the reference's.
+    """
+    ratio_ref = ratio_of(scene["reference_left_frac"], scene["reference_mid_frac"])
+    ratio_a = ratio_of(scene["a_left_frac"], scene["a_mid_frac"])
+    ratio_b = ratio_of(scene["b_left_frac"], scene["b_mid_frac"])
+    da = abs(ratio_a - ratio_ref)
+    db = abs(ratio_b - ratio_ref)
+    return "A" if da <= db else "B"
+
+
+def margin(scene: dict) -> float:
+    """Commitment magnitude: absolute gap between the two candidate ratios."""
+    ratio_a = ratio_of(scene["a_left_frac"], scene["a_mid_frac"])
+    ratio_b = ratio_of(scene["b_left_frac"], scene["b_mid_frac"])
+    return float(abs(ratio_a - ratio_b))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine scenes where the ratio would be illegible or ambiguous."""
+    ratio_ref = ratio_of(scene["reference_left_frac"], scene["reference_mid_frac"])
+    if not (RATIO_LO <= ratio_ref <= RATIO_HI):
+        return True
+    if margin(scene) < QUAR_MIN_MARGIN:
+        return True
+    return False
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """The scene is injectively rendered; no latent aliases are declared."""
+    return []

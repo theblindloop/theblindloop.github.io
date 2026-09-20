@@ -1,0 +1,343 @@
+"""Renderer and analytic arm for paired rigid-silhouette correspondence."""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+RENDERER_VERSION = "paired-silhouette-rotation-correspondence-0.1.0"
+WIDTH, HEIGHT = 512, 512
+SCALE = 3
+GRID = 10
+CELL = 10
+TARGET_CELLS = 10
+PANEL_X = (196, 64, 328)
+PANEL_Y = (100, 300, 300)
+CARD_WIDTH, CARD_HEIGHT = 120, 190
+CONTENT_OFFSET = (10, 44)
+QUARANTINE_MARGIN = 0.03
+
+BACKGROUND = (247, 246, 241)
+CARD = (235, 237, 232)
+CARD_EDGE = (126, 137, 139)
+INK = (42, 53, 63)
+TEXT = (52, 64, 70)
+PAPER = (250, 248, 239)
+NEUTRAL_BADGE = (135, 150, 151)
+AMBER = (231, 157, 43)
+VIOLET = (155, 94, 194)
+
+# Five-cell connected polyominoes. Every rendered island has the same area;
+# only the full two-island field carries the correspondence information.
+_SHAPES: tuple[tuple[tuple[int, int], ...], ...] = (
+    ((0, 0), (1, 0), (2, 0), (2, 1), (2, 2)),
+    ((0, 0), (0, 1), (1, 1), (2, 1), (2, 2)),
+    ((0, 1), (1, 0), (1, 1), (1, 2), (2, 1)),
+    ((0, 0), (0, 1), (0, 2), (1, 0), (2, 0)),
+    ((0, 0), (1, 0), (1, 1), (1, 2), (2, 2)),
+    ((0, 0), (0, 1), (1, 0), (2, 0), (2, 1)),
+    ((0, 0), (0, 1), (1, 1), (1, 2), (2, 2)),
+    ((0, 2), (1, 0), (1, 1), (1, 2), (2, 0)),
+)
+
+
+def _font(size: int):
+    for name in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ):
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size=size * SCALE)
+    return ImageFont.load_default()
+
+
+def _rotate_cw(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> list[list[int]]:
+    return [list(row) for row in zip(*pattern[::-1])]
+
+
+def _rotate_ccw(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> list[list[int]]:
+    return [list(row) for row in zip(*pattern)][::-1]
+
+
+def _mismatch(
+    left: list[list[int]] | tuple[tuple[int, ...], ...],
+    right: list[list[int]] | tuple[tuple[int, ...], ...],
+) -> int:
+    return sum(
+        int(a != b)
+        for row_left, row_right in zip(left, right, strict=True)
+        for a, b in zip(row_left, row_right, strict=True)
+    )
+
+
+def _components(pattern: list[list[int]]) -> list[set[tuple[int, int]]]:
+    remaining = {(y, x) for y in range(GRID) for x in range(GRID) if pattern[y][x]}
+    found: list[set[tuple[int, int]]] = []
+    while remaining:
+        seed = min(remaining)
+        stack = [seed]
+        component = {seed}
+        remaining.remove(seed)
+        while stack:
+            y, x = stack.pop()
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    component.add(neighbor)
+                    stack.append(neighbor)
+        found.append(component)
+    return found
+
+
+def _pattern_from_parts(
+    first: tuple[tuple[int, int], ...],
+    second: tuple[tuple[int, int], ...],
+    first_anchor: tuple[int, int],
+    second_anchor: tuple[int, int],
+) -> list[list[int]]:
+    pattern = [[0 for _ in range(GRID)] for _ in range(GRID)]
+    for shape, (ay, ax) in ((first, first_anchor), (second, second_anchor)):
+        for dy, dx in shape:
+            y, x = ay + dy, ax + dx
+            if not (0 <= y < GRID and 0 <= x < GRID) or pattern[y][x]:
+                raise ValueError("pattern parts overlap or leave the field")
+            pattern[y][x] = 1
+    comps = _components(pattern)
+    if len(comps) != 2 or sorted(len(item) for item in comps) != [5, 5]:
+        raise ValueError("pattern parts are not two separated five-cell islands")
+    return pattern
+
+
+def _make_pattern_pool() -> tuple[tuple[tuple[int, ...], ...], ...]:
+    rng = random.Random(719_311)
+    pool: list[tuple[tuple[int, ...], ...]] = []
+    seen: set[tuple[tuple[int, ...], ...]] = set()
+    first_anchors = [(1, 1), (1, 2), (2, 1), (2, 2)]
+    second_anchors = [(6, 6), (6, 5), (5, 6), (6, 7), (7, 6)]
+    for _ in range(5000):
+        first = rng.choice(_SHAPES)
+        second = rng.choice(_SHAPES)
+        pattern = _pattern_from_parts(
+            first,
+            second,
+            rng.choice(first_anchors),
+            rng.choice(second_anchors),
+        )
+        key = tuple(tuple(row) for row in pattern)
+        if key in seen:
+            continue
+        seen.add(key)
+        pool.append(key)
+        if len(pool) >= 64:
+            break
+    if len(pool) < 32:
+        raise RuntimeError("pattern pool is too small")
+    return tuple(pool)
+
+
+_PATTERN_POOL = _make_pattern_pool()
+
+
+def _pattern_tuple(pattern: list[list[int]] | tuple[tuple[int, ...], ...]) -> tuple[tuple[int, ...], ...]:
+    if len(pattern) != GRID or any(len(row) != GRID for row in pattern):
+        raise ValueError("silhouette must be a 10x10 binary field")
+    values = tuple(tuple(int(value) for value in row) for row in pattern)
+    if any(value not in (0, 1) for row in values for value in row):
+        raise ValueError("silhouette cells must be binary")
+    if sum(sum(row) for row in values) != TARGET_CELLS:
+        raise ValueError("silhouette must contain ten occupied cells")
+    comps = _components([list(row) for row in values])
+    if sorted(len(item) for item in comps) != [5, 5]:
+        raise ValueError("silhouette must contain two five-cell components")
+    return values
+
+
+def _panel_map(scene: dict) -> dict[str, dict]:
+    panels: dict[str, dict] = {}
+    for record in scene["candidate_panels"]:
+        slot = str(record["slot"])
+        if slot in panels or slot not in {"A", "B"}:
+            raise ValueError("candidate slots must be unique A and B")
+        panels[slot] = record
+    if set(panels) != {"A", "B"}:
+        raise ValueError("candidate slots must be A and B")
+    return panels
+
+
+def _validate_scene(scene: dict) -> tuple[tuple[tuple[int, ...], ...], dict[str, dict]]:
+    reference = _pattern_tuple(scene["reference_pattern"])
+    panels = _panel_map(scene)
+    for record in panels.values():
+        _pattern_tuple(record["pattern"])
+        if record["badge"] not in {"amber", "violet"}:
+            raise ValueError("candidate badge must be amber or violet")
+    return reference, panels
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample balanced exact and near-boundary two-island correspondences."""
+
+    rng = random.Random(int(seed))
+    reference = [list(row) for row in rng.choice(_PATTERN_POOL)]
+    matched_pre = _rotate_ccw(reference)
+    candidates: list[tuple[int, tuple[tuple[int, ...], ...]]] = []
+    for pattern in _PATTERN_POOL:
+        error = _mismatch(_rotate_cw(pattern), reference)
+        if 4 <= error:
+            candidates.append((error, pattern))
+    if not candidates:
+        raise RuntimeError("no separated wrong silhouette")
+    if int(seed) % 5 == 0:
+        near = [item for item in candidates if item[0] <= 8]
+        source = near if near else candidates
+    else:
+        far = [item for item in candidates if item[0] >= 12]
+        source = far if far else candidates
+    wrong = [list(row) for row in rng.choice(source)[1]]
+
+    matching_slot = "A" if rng.randrange(2) == 0 else "B"
+    matching_badge = "amber" if rng.randrange(2) == 0 else "violet"
+    wrong_badge = "violet" if matching_badge == "amber" else "amber"
+    records = [
+        {
+            "slot": "A",
+            "pattern": matched_pre if matching_slot == "A" else wrong,
+            "badge": matching_badge if matching_slot == "A" else wrong_badge,
+        },
+        {
+            "slot": "B",
+            "pattern": matched_pre if matching_slot == "B" else wrong,
+            "badge": matching_badge if matching_slot == "B" else wrong_badge,
+        },
+    ]
+    rng.shuffle(records)
+    return {
+        "reference_pattern": reference,
+        "candidate_panels": records,
+    }
+
+
+def _errors(reference: tuple[tuple[int, ...], ...], panels: dict[str, dict]) -> dict[str, int]:
+    return {
+        slot: _mismatch(_rotate_cw(_pattern_tuple(panels[slot]["pattern"])), reference)
+        for slot in ("A", "B")
+    }
+
+
+def analytic_gold(scene: dict) -> str:
+    """Select the badge attached to the uniquely matching candidate slot."""
+
+    reference, panels = _validate_scene(scene)
+    errors = _errors(reference, panels)
+    if errors["A"] == errors["B"]:
+        raise ValueError("transformed silhouette errors are tied")
+    best = "A" if errors["A"] < errors["B"] else "B"
+    return str(panels[best]["badge"])
+
+
+def margin(scene: dict) -> float:
+    """Return the transformed binary-field mismatch gap normalized by 100 cells."""
+
+    reference, panels = _validate_scene(scene)
+    errors = sorted(_errors(reference, panels).values())
+    return float(errors[1] - errors[0]) / float(GRID * GRID)
+
+
+def is_quarantined(scene: dict) -> bool:
+    try:
+        reference, panels = _validate_scene(scene)
+        errors = _errors(reference, panels)
+        return errors["A"] == errors["B"] or margin(scene) < QUARANTINE_MARGIN
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _box(box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SCALE)) for value in box)  # type: ignore[return-value]
+
+
+def _draw_text(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, font, fill=TEXT) -> None:
+    draw.text((int(round(xy[0] * SCALE)), int(round(xy[1] * SCALE))), text, font=font, fill=fill)
+
+
+def _draw_pattern(
+    draw: ImageDraw.ImageDraw,
+    origin_x: float,
+    origin_y: float,
+    pattern: list[list[int]] | tuple[tuple[int, ...], ...],
+) -> None:
+    for row, values in enumerate(pattern):
+        for col, value in enumerate(values):
+            if int(value):
+                left = origin_x + col * CELL
+                top = origin_y + row * CELL
+                draw.rectangle(_box((left, top, left + CELL - 1, top + CELL - 1)), fill=INK)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render three separated, antialiased cards in one regional band."""
+
+    reference, panels = _validate_scene(scene)
+    image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    title_font = _font(17)
+    note_font = _font(10)
+    label_font = _font(13)
+
+    _draw_text(draw, (62, 38), "PAIRED SILHOUETTE CORRESPONDENCE", title_font)
+    _draw_text(
+        draw,
+        (62, 67),
+        "Rotate A and B clockwise; compare both islands and their complete placement.",
+        note_font,
+    )
+
+    labels = ("REFERENCE  R", "CANDIDATE  A", "CANDIDATE  B")
+    for index, slot in enumerate(("R", "A", "B")):
+        x = float(PANEL_X[index])
+        y = float(PANEL_Y[index])
+        draw.rounded_rectangle(
+            _box((x, y, x + CARD_WIDTH, y + CARD_HEIGHT)),
+            radius=12 * SCALE,
+            fill=CARD,
+            outline=CARD_EDGE,
+            width=2 * SCALE,
+        )
+        _draw_text(draw, (x + 11, y + 12), labels[index], label_font)
+        if slot == "R":
+            badge_fill = NEUTRAL_BADGE
+            pattern = reference
+        else:
+            record = panels[slot]
+            badge_fill = AMBER if record["badge"] == "amber" else VIOLET
+            pattern = record["pattern"]
+        draw.rounded_rectangle(
+            _box((x + 87, y + 17, x + 113, y + 43)),
+            radius=6 * SCALE,
+            fill=badge_fill,
+            outline=TEXT,
+            width=1 * SCALE,
+        )
+        _draw_pattern(draw, x + CONTENT_OFFSET[0], y + CONTENT_OFFSET[1], pattern)
+        _draw_text(draw, (x + 13, y + 159), "two equal islands", note_font, fill=TEXT)
+
+    _draw_text(
+        draw,
+        (62, 498),
+        "R = reference     A/B = candidates     CW 90°",
+        note_font,
+        fill=(91, 103, 106),
+    )
+    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Exercise the harmless permutation of slot-addressed candidate records."""
+
+    twin = copy.deepcopy(scene)
+    twin["candidate_panels"] = list(reversed(twin["candidate_panels"]))
+    return [("candidate_record_order", twin)]

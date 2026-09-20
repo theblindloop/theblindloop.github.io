@@ -1,0 +1,117 @@
+"""Independent image-only inverse arm for signed dot-change search.
+
+This module deliberately duplicates the public palette rather than importing
+the renderer.  It segments colored dots, finds their connected components,
+infers the left/right split from the raster's component-centroid gap, and
+enumerates every candidate color before requiring a unique runner-up-separated
+winner.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (217, 45, 32),
+    "blue": (37, 99, 235),
+    "green": (22, 128, 60),
+    "purple": (126, 34, 206),
+}
+REFERENCE_RGB = (75, 85, 99)
+COLOR_DISTANCE = 22.0
+MIN_COMPONENT_AREA = 120
+MAX_COMPONENT_AREA = 280
+
+
+class OracleAbstention(ValueError):
+    """Raised when destructive or ambiguous pixels do not support a decision."""
+
+
+@dataclass(frozen=True)
+class Component:
+    area: int
+    cx: float
+    cy: float
+
+
+def _mask_for(array: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    delta = array.astype(np.int16) - np.asarray(rgb, dtype=np.int16)
+    return np.sqrt(np.sum(delta.astype(np.float32) ** 2, axis=2)) <= COLOR_DISTANCE
+
+
+def _components(mask: np.ndarray) -> list[Component]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found: list[Component] = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(sy, sx)])
+        seen[sy, sx] = True
+        pixels: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        area = len(pixels)
+        if MIN_COMPONENT_AREA <= area <= MAX_COMPONENT_AREA:
+            coords = np.asarray(pixels, dtype=np.float64)
+            found.append(Component(area, float(coords[:, 1].mean()), float(coords[:, 0].mean())))
+    return found
+
+
+def _infer_split(all_components: list[Component], image_width: int) -> float:
+    xs = sorted(component.cx for component in all_components)
+    if len(xs) < 8:
+        raise OracleAbstention("too few visible dots to infer two endpoint bands")
+    gaps = [(xs[index + 1] - xs[index], index) for index in range(len(xs) - 1)]
+    gap, index = max(gaps)
+    if gap < 120.0:
+        raise OracleAbstention("left and right evidence bands are not visibly separated")
+    split = (xs[index] + xs[index + 1]) / 2.0
+    if not (0.25 * image_width < split < 0.75 * image_width):
+        raise OracleAbstention("inferred endpoint split is implausibly eccentric")
+    return split
+
+
+def _pair_counts(components: list[Component], split: float) -> tuple[int, int]:
+    left = sum(component.cx < split for component in components)
+    right = sum(component.cx > split for component in components)
+    if left < 1 or right < 1 or left > 6 or right > 6:
+        raise OracleAbstention(f"invalid endpoint counts ({left}, {right})")
+    return int(left), int(right)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the unique candidate color matching the gray signed count delta."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    measured: dict[str, list[Component]] = {
+        name: _components(_mask_for(array, rgb)) for name, rgb in PALETTE.items()
+    }
+    reference = _components(_mask_for(array, REFERENCE_RGB))
+    all_components = [*reference, *(item for values in measured.values() for item in values)]
+    split = _infer_split(all_components, array.shape[1])
+    ref_left, ref_right = _pair_counts(reference, split)
+    reference_delta = ref_right - ref_left
+    if abs(reference_delta) < 2:
+        raise OracleAbstention("reference signed change lacks the public decision margin")
+
+    errors: dict[str, int] = {}
+    for color in ("red", "blue", "green", "purple"):
+        left, right = _pair_counts(measured[color], split)
+        errors[color] = abs((right - left) - reference_delta)
+    ranked = sorted(errors.items(), key=lambda item: (item[1], item[0]))
+    if ranked[0][1] != 0:
+        raise OracleAbstention("no candidate exactly matches the reference signed change")
+    if ranked[1][1] - ranked[0][1] < 1:
+        raise OracleAbstention("candidate winner is tied or lacks a one-dot runner-up gap")
+    return ranked[0][0]

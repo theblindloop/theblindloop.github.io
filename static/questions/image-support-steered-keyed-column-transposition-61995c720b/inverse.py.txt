@@ -1,0 +1,191 @@
+"""Independent pixel-only inverse for keyed column transposition."""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import Iterable
+
+import numpy as np
+from PIL import Image
+
+TAG_COLORS: tuple[tuple[int, int, int], ...] = (
+    (210, 58, 63),
+    (232, 128, 40),
+    (221, 184, 45),
+    (54, 153, 91),
+    (43, 158, 177),
+    (54, 104, 196),
+    (143, 82, 177),
+)
+DARK = (30, 38, 52)
+LIGHT = (220, 225, 219)
+
+_TEMPLATE_ROWS = {
+    "arch": (
+        "0111110",
+        "1000001",
+        "1000001",
+        "1000001",
+        "1000001",
+        "1000001",
+        "1000001",
+    ),
+    "fork": (
+        "1001001",
+        "1001001",
+        "1001001",
+        "1111111",
+        "0001000",
+        "0000000",
+        "0000000",
+    ),
+    "zigzag": (
+        "1111110",
+        "0000010",
+        "0000100",
+        "0001000",
+        "0010000",
+        "0100000",
+        "0111111",
+    ),
+}
+TEMPLATES = {
+    name: tuple(tuple(int(value) for value in row) for row in rows)
+    for name, rows in _TEMPLATE_ROWS.items()
+}
+
+
+class PixelEvidenceError(ValueError):
+    pass
+
+
+def _components(array: np.ndarray, color: tuple[int, int, int]) -> list[dict]:
+    mask = np.all(array == np.asarray(color, dtype=np.uint8), axis=2)
+    seen = np.zeros(mask.shape, dtype=bool)
+    components: list[dict] = []
+    height, width = mask.shape
+    for start_y, start_x in np.argwhere(mask):
+        sy, sx = int(start_y), int(start_x)
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        ys = [point[0] for point in points]
+        xs = [point[1] for point in points]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        components.append(
+            {
+                "area": len(points),
+                "bbox": (x0, y0, x1, y1),
+                "width": x1 - x0 + 1,
+                "height": y1 - y0 + 1,
+                "cx": (x0 + x1) / 2.0,
+                "cy": (y0 + y1) / 2.0,
+            }
+        )
+    return components
+
+
+def _filled_rectangle(component: dict) -> bool:
+    return int(component["area"]) == int(component["width"]) * int(component["height"])
+
+
+def _hamming(left: Iterable[Iterable[int]], right: Iterable[Iterable[int]]) -> int:
+    return sum(a != b for row_a, row_b in zip(left, right) for a, b in zip(row_a, row_b))
+
+
+def _decode(image: Image.Image) -> tuple[tuple[int, ...], ...]:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    key_components: dict[int, dict] = {}
+    header_components: dict[int, dict] = {}
+    for tag, color in enumerate(TAG_COLORS):
+        components = _components(array, color)
+        if len(components) != 2 or any(not _filled_rectangle(item) for item in components):
+            raise PixelEvidenceError(f"tag {tag} does not have two complete rectangular fiducials")
+        large, small = sorted(components, key=lambda item: int(item["area"]), reverse=True)
+        if not (large["width"] >= 3 * large["height"] and large["height"] >= 12):
+            raise PixelEvidenceError(f"tag {tag} key chip is malformed")
+        if small["width"] != small["height"] or small["width"] not in (11, 12):
+            raise PixelEvidenceError(f"tag {tag} header chip is malformed")
+        if large["cx"] >= small["cx"]:
+            raise PixelEvidenceError("detached key must remain left of the payload headers")
+        key_components[tag] = large
+        header_components[tag] = small
+
+    key_order = sorted(range(7), key=lambda tag: float(key_components[tag]["cy"]))
+    key_xs = [float(key_components[tag]["cx"]) for tag in key_order]
+    if max(key_xs) - min(key_xs) > 1.0:
+        raise PixelEvidenceError("key chips are not vertically aligned")
+    key_steps = [
+        float(key_components[key_order[index + 1]]["cy"] - key_components[key_order[index]]["cy"])
+        for index in range(6)
+    ]
+    if min(key_steps) <= 0 or max(key_steps) - min(key_steps) > 1.0:
+        raise PixelEvidenceError("key chip spacing is incomplete or irregular")
+
+    payload_order = sorted(range(7), key=lambda tag: float(header_components[tag]["cx"]))
+    header_ys = [float(header_components[tag]["cy"]) for tag in payload_order]
+    if max(header_ys) - min(header_ys) > 1.0:
+        raise PixelEvidenceError("payload headers are not horizontally aligned")
+    side = int(header_components[payload_order[0]]["width"])
+    if any(int(header_components[tag]["width"]) != side for tag in payload_order):
+        raise PixelEvidenceError("payload header sizes disagree")
+
+    cells: list[tuple[dict, int]] = []
+    for color, bit in ((DARK, 1), (LIGHT, 0)):
+        for component in _components(array, color):
+            if not _filled_rectangle(component) or component["width"] != side or component["height"] != side:
+                raise PixelEvidenceError("a payload cell is missing, clipped, or malformed")
+            cells.append((component, bit))
+    if len(cells) != 49:
+        raise PixelEvidenceError(f"expected 49 complete payload cells, found {len(cells)}")
+
+    x_levels = sorted({float(component["cx"]) for component, _ in cells})
+    y_levels = sorted({float(component["cy"]) for component, _ in cells})
+    if len(x_levels) != 7 or len(y_levels) != 7:
+        raise PixelEvidenceError("payload cells do not form a complete 7 by 7 lattice")
+    header_xs = [float(header_components[tag]["cx"]) for tag in payload_order]
+    if any(abs(a - b) > 0.01 for a, b in zip(x_levels, header_xs)):
+        raise PixelEvidenceError("header chips do not bind one-to-one with payload columns")
+
+    x_index = {value: index for index, value in enumerate(x_levels)}
+    y_index = {value: index for index, value in enumerate(y_levels)}
+    payload_columns = [[0 for _ in range(7)] for _ in range(7)]
+    occupied: set[tuple[int, int]] = set()
+    for component, bit in cells:
+        position = (y_index[float(component["cy"])], x_index[float(component["cx"])])
+        if position in occupied:
+            raise PixelEvidenceError("duplicate payload cell position")
+        occupied.add(position)
+        payload_columns[position[1]][position[0]] = bit
+    by_tag = {tag: payload_columns[index] for index, tag in enumerate(payload_order)}
+    ordered_columns = [by_tag[tag] for tag in key_order]
+    return tuple(tuple(ordered_columns[x][y] for x in range(7)) for y in range(7))
+
+
+def classify_from_image(image: Image.Image) -> dict:
+    grid = _decode(image)
+    ranked = sorted((_hamming(grid, template), name) for name, template in TEMPLATES.items())
+    best_distance, decision = ranked[0]
+    runner_distance = ranked[1][0]
+    if runner_distance == best_distance:
+        raise PixelEvidenceError("reordered grid has a tied template distance")
+    return {
+        "decision": decision,
+        "best_distance": int(best_distance),
+        "runner_up_distance": int(runner_distance),
+        "margin": float(runner_distance - best_distance),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(classify_from_image(image)["decision"])

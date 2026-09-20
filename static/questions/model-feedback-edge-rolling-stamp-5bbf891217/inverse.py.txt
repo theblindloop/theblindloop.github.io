@@ -1,0 +1,137 @@
+"""Independent image-only inverse using raster geometry only."""
+
+from __future__ import annotations
+
+import math
+
+from PIL import Image
+
+
+WIDTH = 1120
+HEIGHT = 760
+TRACK_RIGHT = 810
+LABELS = ("red", "green", "violet")
+PIP_COLORS = {
+    "red": (220, 55, 68),
+    "green": (30, 158, 104),
+    "violet": (132, 72, 184),
+}
+STEP_FILLS = (
+    (224, 240, 250), (211, 232, 248), (199, 225, 246), (186, 217, 243),
+    (174, 209, 239), (163, 201, 234), (151, 192, 228), (139, 183, 221),
+)
+GOLD = (242, 177, 45)
+
+
+def _collect_points(image: Image.Image) -> dict[tuple[int, int, int], list[tuple[int, int]]]:
+    pixels = image.load()
+    targets = set(STEP_FILLS) | set(PIP_COLORS.values()) | {GOLD}
+    found = {rgb: [] for rgb in targets}
+    for y in range(100, HEIGHT):
+        for x in range(0, TRACK_RIGHT):
+            rgb = pixels[x, y]
+            if rgb in found:
+                found[rgb].append((x, y))
+    return found
+
+
+def _triangle_geometry(points: list[tuple[int, int]]) -> tuple[tuple[float, float], bool]:
+    if len(points) < 350:
+        raise ValueError("missing numbered triangle fill")
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
+    min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+    height = max_y - min_y
+    if height < 55 or max_x - min_x < 65:
+        raise ValueError("triangle is too small")
+    upper = sum(1 for x, y in points if min_y + 0.10 * height <= y <= min_y + 0.28 * height)
+    lower = sum(1 for x, y in points if min_y + 0.72 * height <= y <= min_y + 0.90 * height)
+    if upper == lower:
+        raise ValueError("ambiguous triangle orientation")
+    cx = (min_x + max_x) / 2.0
+    # Two vertices lie on the wide side, so the geometric centroid is one
+    # third of the altitude inward from that side.
+    wide_side_on_top = upper > lower
+    cy = min_y + (height / 3.0 if wide_side_on_top else 2.0 * height / 3.0)
+    return (cx, cy), wide_side_on_top
+
+
+def _color_center(points: list[tuple[int, int]], rgb: tuple[int, int, int]) -> tuple[float, float]:
+    if len(points) < 120:
+        raise ValueError(f"missing marker color {rgb}")
+    return sum(x for x, _ in points) / len(points), sum(y for _, y in points) / len(points)
+
+
+def _reflect(point: tuple[float, float], first: tuple[float, float], second: tuple[float, float]) -> tuple[float, float]:
+    # Adjacent congruent triangles have centroid-to-centroid normal n; their
+    # shared edge is the perpendicular bisector of those centroids.
+    nx, ny = second[0] - first[0], second[1] - first[1]
+    norm = math.hypot(nx, ny)
+    if norm < 25:
+        raise ValueError("consecutive triangle centers are not separated")
+    nx, ny = nx / norm, ny / norm
+    mx, my = (first[0] + second[0]) / 2.0, (first[1] + second[1]) / 2.0
+    signed = (mx - point[0]) * nx + (my - point[1]) * ny
+    return point[0] + 2.0 * signed * nx, point[1] + 2.0 * signed * ny
+
+
+def _vertices(center: tuple[float, float], wide_side_on_top: bool, side: float) -> list[tuple[float, float]]:
+    cx, cy = center
+    altitude = side * math.sqrt(3.0) / 2.0
+    if wide_side_on_top:
+        return [
+            (cx - side / 2.0, cy - altitude / 3.0),
+            (cx + side / 2.0, cy - altitude / 3.0),
+            (cx, cy + 2.0 * altitude / 3.0),
+        ]
+    return [
+        (cx, cy - 2.0 * altitude / 3.0),
+        (cx + side / 2.0, cy + altitude / 3.0),
+        (cx - side / 2.0, cy + altitude / 3.0),
+    ]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    image = image.convert("RGB")
+    if image.size != (WIDTH, HEIGHT):
+        raise ValueError(f"unexpected image size {image.size}")
+    points = _collect_points(image)
+    geometries = [_triangle_geometry(points[fill]) for fill in STEP_FILLS]
+    centers = [item[0] for item in geometries]
+    # Confirm the encoded sequence is a chain of adjacent equal-size faces.
+    distances = [math.dist(a, b) for a, b in zip(centers, centers[1:])]
+    if min(distances) < 35 or max(distances) > 90 or max(distances) - min(distances) > 20:
+        raise ValueError("numbered cells do not form a stable adjacent chain")
+    # For congruent equilateral faces, adjacent-centroid distance is side/sqrt(3).
+    # The median suppresses the small bbox perturbations caused by pips and star.
+    side = sorted(distances)[len(distances) // 2] * math.sqrt(3.0)
+    if not 85 <= side <= 140:
+        raise ValueError("recovered face scale is invalid")
+    cell_vertices = [_vertices(center, orientation, side) for center, orientation in geometries]
+
+    pip_positions = {label: _color_center(points[rgb], rgb) for label, rgb in PIP_COLORS.items()}
+    state = {}
+    for label, point in pip_positions.items():
+        ranked = sorted((math.dist(point, vertex), index) for index, vertex in enumerate(cell_vertices[0]))
+        if ranked[0][0] > 22 or ranked[1][0] - ranked[0][0] < 35:
+            raise ValueError("material pip is not at a unique start vertex")
+        state[ranked[0][1]] = label
+    if len(state) != 3:
+        raise ValueError("material pips do not bijectively label the start face")
+
+    for current, nxt in zip(cell_vertices, cell_vertices[1:]):
+        matches = []
+        for old_index, old_vertex in enumerate(current):
+            for new_index, new_vertex in enumerate(nxt):
+                if math.dist(old_vertex, new_vertex) < 22:
+                    matches.append((old_index, new_index))
+        if len(matches) != 2 or len({a for a, _ in matches}) != 2 or len({b for _, b in matches}) != 2:
+            raise ValueError("could not recover one unique shared edge")
+        old_tip = next(index for index in range(3) if index not in {a for a, _ in matches})
+        new_tip = next(index for index in range(3) if index not in {b for _, b in matches})
+        state = {new_index: state[old_index] for old_index, new_index in matches} | {new_tip: state[old_tip]}
+    star = _color_center(points[GOLD], GOLD)
+    ranked = sorted((math.dist(vertex, star), index) for index, vertex in enumerate(cell_vertices[-1]))
+    if ranked[0][0] > 22 or ranked[1][0] - ranked[0][0] < 35:
+        raise ValueError("star does not uniquely mark a final vertex")
+    return state[ranked[0][1]]

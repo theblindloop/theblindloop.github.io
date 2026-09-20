@@ -1,0 +1,360 @@
+"""Renderer for the window-unit area tally world.
+
+One solid slate patch of medium span sits on a pale sheet.  Exactly one square
+window is cut out of the patch interior, and that window's own area is the unit
+of area for the question: the decision is how many whole window-areas of slate
+ink remain.  All decisive evidence therefore lives inside one connected,
+area-like body: the whole patch contributes its area, and the enclosed window
+supplies the unit.
+"""
+
+from __future__ import annotations
+
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "window_area_unit_tally-0.1.0"
+
+WIDTH = 520
+HEIGHT = 380
+
+SHEET = (247, 245, 240)
+SLATE = (58, 66, 84)
+DISTRACTOR_COLORS = (
+    (196, 118, 62),
+    (86, 150, 118),
+    (152, 108, 172),
+    (206, 172, 74),
+    (92, 132, 186),
+)
+
+PART_SLOTS = 3
+MIN_COUNT = 5
+MAX_COUNT = 10
+
+WIN_MIN = 30
+WIN_MAX = 86
+WIN_PAD = 3
+
+AREA_MIN = 10000
+AREA_MAX = 44000
+AREA_BANDS = ((10000, 17000), (17000, 26000), (26000, 35000), (35000, 44000))
+
+ACCEPT_FRACTION_MARGIN = 0.09
+QUARANTINE_FRACTION_MARGIN = 0.14
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _patch_parts(rng: random.Random, cx: int, cy: int, span: int) -> dict:
+    """Three overlapping opaque parts whose union is one connected patch."""
+    base = rng.randint(int(span * 0.62), int(span * 0.80))
+    fields = {
+        "p0_cx": cx,
+        "p0_cy": cy,
+        "p0_rx": base,
+        "p0_ry": rng.randint(int(base * 0.72), int(base * 0.98)),
+        "p0_rect": 0,
+    }
+    off = max(6, base // 3)
+    for slot in range(1, PART_SLOTS):
+        fields[f"p{slot}_cx"] = cx + rng.randint(-off, off)
+        fields[f"p{slot}_cy"] = cy + rng.randint(-off, off)
+        fields[f"p{slot}_rx"] = rng.randint(int(base * 0.55), int(base * 0.95))
+        fields[f"p{slot}_ry"] = rng.randint(int(base * 0.55), int(base * 0.95))
+        fields[f"p{slot}_rect"] = rng.randint(0, 1)
+    return fields
+
+
+def _part_box(scene: dict, slot: int) -> tuple[int, int, int, int]:
+    cx = (scene["p0_cx"], scene["p1_cx"], scene["p2_cx"])[slot]
+    cy = (scene["p0_cy"], scene["p1_cy"], scene["p2_cy"])[slot]
+    rx = (scene["p0_rx"], scene["p1_rx"], scene["p2_rx"])[slot]
+    ry = (scene["p0_ry"], scene["p1_ry"], scene["p2_ry"])[slot]
+    return (cx - rx, cy - ry, cx + rx, cy + ry)
+
+
+def _part_is_rect(scene: dict, slot: int) -> bool:
+    return bool((scene["p0_rect"], scene["p1_rect"], scene["p2_rect"])[slot])
+
+
+def _draw_parts(draw: ImageDraw.ImageDraw, scene: dict, fill) -> None:
+    for slot in range(PART_SLOTS):
+        box = _part_box(scene, slot)
+        if box[2] < box[0] or box[3] < box[1]:
+            continue
+        if _part_is_rect(scene, slot):
+            draw.rectangle(box, fill=fill)
+        else:
+            draw.ellipse(box, fill=fill)
+
+
+def _patch_mask(scene: dict) -> np.ndarray:
+    """Boolean mask of the patch before the window is cut."""
+    mask = Image.new("L", (scene["width"], scene["height"]), 0)
+    _draw_parts(ImageDraw.Draw(mask), scene, 255)
+    return np.asarray(mask, dtype=np.uint8) > 0
+
+
+def _boxes_overlap(a, b, pad: int = 0) -> bool:
+    return not (
+        a[2] + pad < b[0] or b[2] + pad < a[0] or a[3] + pad < b[1] or b[3] + pad < a[1]
+    )
+
+
+def _distractors(rng: random.Random, forbidden: tuple[int, int, int, int]) -> list[dict]:
+    placed: list[dict] = []
+    boxes: list[tuple[int, int, int, int]] = []
+    wanted = rng.randint(3, 5)
+    for _ in range(200):
+        if len(placed) >= wanted:
+            break
+        w = rng.randint(16, 40)
+        h = rng.randint(14, 36)
+        x0 = rng.randint(8, WIDTH - 8 - w)
+        y0 = rng.randint(8, HEIGHT - 8 - h)
+        box = (x0, y0, x0 + w, y0 + h)
+        if _boxes_overlap(box, forbidden, pad=14):
+            continue
+        if any(_boxes_overlap(box, other, pad=6) for other in boxes):
+            continue
+        boxes.append(box)
+        placed.append(
+            {
+                "kind": rng.choice(("disk", "block", "hollow", "ticks")),
+                "box": list(box),
+                "color": rng.randrange(len(DISTRACTOR_COLORS)),
+            }
+        )
+    return placed
+
+
+def _single_component_without_holes(mask: np.ndarray) -> bool:
+    """The patch must be one connected body whose only later hole is the window."""
+    if not mask.any():
+        return False
+    ys, xs = np.nonzero(mask)
+    seen = np.zeros_like(mask)
+    stack = [(int(ys[0]), int(xs[0]))]
+    seen[ys[0], xs[0]] = True
+    total = 1
+    height, width = mask.shape
+    while stack:
+        y, x = stack.pop()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                seen[ny, nx] = True
+                total += 1
+                stack.append((ny, nx))
+    if total != int(mask.sum()):
+        return False
+    return not bool((~mask & ~_reachable_from_border(~mask)).any())
+
+
+def _reachable_from_border(free: np.ndarray) -> np.ndarray:
+    """Span flood fill of ``free`` seeded from every border pixel."""
+    height, width = free.shape
+    seen = np.zeros_like(free)
+    stack: list[tuple[int, int]] = []
+    for x in range(width):
+        if free[0, x]:
+            stack.append((0, x))
+        if free[height - 1, x]:
+            stack.append((height - 1, x))
+    for y in range(height):
+        if free[y, 0]:
+            stack.append((y, 0))
+        if free[y, width - 1]:
+            stack.append((y, width - 1))
+    while stack:
+        y, x = stack.pop()
+        row = free[y] & ~seen[y]
+        if not row[x]:
+            continue
+        blocked = np.nonzero(~row)[0]
+        left = blocked[blocked < x]
+        right = blocked[blocked > x]
+        x0 = int(left[-1]) + 1 if left.size else 0
+        x1 = int(right[0]) - 1 if right.size else width - 1
+        seen[y, x0 : x1 + 1] = True
+        for ny in (y - 1, y + 1):
+            if not 0 <= ny < height:
+                continue
+            nrow = free[ny, x0 : x1 + 1] & ~seen[ny, x0 : x1 + 1]
+            idx = np.nonzero(nrow)[0]
+            if idx.size == 0:
+                continue
+            breaks = np.nonzero(np.diff(idx) > 1)[0]
+            starts = np.concatenate(([idx[0]], idx[breaks + 1]))
+            for start in starts:
+                stack.append((ny, x0 + int(start)))
+    return seen
+
+
+def _window_slots(mask: np.ndarray, side: int) -> np.ndarray:
+    """Top-left corners where a padded ``side`` square lies wholly in the patch."""
+    block = side + 2 * WIN_PAD
+    integral = np.pad(mask.astype(np.int64).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    sums = (
+        integral[block:, block:]
+        - integral[:-block, block:]
+        - integral[block:, :-block]
+        + integral[:-block, :-block]
+    )
+    return np.argwhere(sums == block * block)
+
+
+def _raw_scene(rng: random.Random, target: int) -> dict | None:
+    band = AREA_BANDS[rng.randrange(len(AREA_BANDS))]
+    span = rng.randint(62, 142)
+    cx = rng.randint(span + 26, WIDTH - span - 26)
+    cy = rng.randint(span + 22, HEIGHT - span - 22)
+    scene = {"width": WIDTH, "height": HEIGHT}
+    scene.update(_patch_parts(rng, cx, cy, span))
+
+    boxes = [_part_box(scene, slot) for slot in range(PART_SLOTS)]
+    x0 = min(b[0] for b in boxes)
+    y0 = min(b[1] for b in boxes)
+    x1 = max(b[2] for b in boxes)
+    y1 = max(b[3] for b in boxes)
+    if x0 < 18 or y0 < 18 or x1 > WIDTH - 18 or y1 > HEIGHT - 18:
+        return None
+    if not 0.28 <= (x1 - x0) / WIDTH <= 0.64:
+        return None
+    if not 0.30 <= (y1 - y0) / HEIGHT <= 0.66:
+        return None
+
+    mask = _patch_mask(scene)
+    area = int(mask.sum())
+    if not AREA_MIN <= area <= AREA_MAX:
+        return None
+    if not band[0] <= area <= band[1]:
+        return None
+    if not _single_component_without_holes(mask):
+        return None
+
+    sides = [
+        side
+        for side in range(WIN_MIN, WIN_MAX + 1)
+        if int(area // (side * side)) - 1 == target
+        and ACCEPT_FRACTION_MARGIN
+        <= _fraction_from(area, side)
+        <= 0.5
+    ]
+    if not sides:
+        return None
+    rng.shuffle(sides)
+    for side in sides:
+        slots = _window_slots(mask, side)
+        if slots.size == 0:
+            continue
+        pick = slots[rng.randrange(len(slots))]
+        scene["win_s"] = int(side)
+        scene["win_y"] = int(pick[0]) + WIN_PAD
+        scene["win_x"] = int(pick[1]) + WIN_PAD
+        scene["distractors"] = _distractors(rng, (x0, y0, x1, y1))
+        return scene
+    return None
+
+
+def _fraction_from(area: int, side: int) -> float:
+    unit = side * side
+    ink = area - unit
+    count = ink // unit
+    return float(min(ink - count * unit, (count + 1) * unit - ink)) / float(unit)
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one answerable, legible scene."""
+    rng = random.Random(seed * 6421 + 29)
+    target = MIN_COUNT + (seed // 3) % (MAX_COUNT - MIN_COUNT + 1)
+    for _ in range(4000):
+        scene = _raw_scene(rng, target)
+        if scene is None:
+            continue
+        if analytic_gold(scene) != str(target):
+            continue
+        if fraction_margin(scene) < ACCEPT_FRACTION_MARGIN:
+            continue
+        return scene
+    raise RuntimeError(f"no answerable scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# gold
+# --------------------------------------------------------------------------
+def measurements(scene: dict) -> tuple[int, int]:
+    """Slate ink area and window-unit area, both in pixels, from the geometry."""
+    mask = _patch_mask(scene)
+    side = int(scene["win_s"])
+    unit = side * side
+    return int(mask.sum()) - unit, unit
+
+
+def analytic_gold(scene: dict) -> str:
+    ink, unit = measurements(scene)
+    return str(int(ink // unit))
+
+
+def fraction_margin(scene: dict) -> float:
+    ink, unit = measurements(scene)
+    count = ink // unit
+    return float(min(ink - count * unit, (count + 1) * unit - ink)) / float(unit)
+
+
+def margin(scene: dict) -> float:
+    """Pixels of slate area separating the scene from the nearest whole-unit flip."""
+    _, unit = measurements(scene)
+    return float(round(fraction_margin(scene) * unit, 6))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(fraction_margin(scene) < QUARANTINE_FRACTION_MARGIN)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabellings of the latent scene."""
+    out: list[tuple[str, dict]] = []
+    relabelled = dict(scene)
+    for key in ("cx", "cy", "rx", "ry", "rect"):
+        for slot in range(PART_SLOTS):
+            relabelled[f"p{slot}_{key}"] = scene[f"p{PART_SLOTS - 1 - slot}_{key}"]
+    out.append(("patch_part_slot_reversal", relabelled))
+    if len(scene["distractors"]) > 1:
+        flipped = dict(scene)
+        flipped["distractors"] = list(reversed(scene["distractors"]))
+        out.append(("distractor_order_reversal", flipped))
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (scene["width"], scene["height"]), SHEET)
+    draw = ImageDraw.Draw(image)
+
+    for item in scene["distractors"]:
+        x0, y0, x1, y1 = item["box"]
+        color = DISTRACTOR_COLORS[item["color"]]
+        kind = item["kind"]
+        if kind == "disk":
+            draw.ellipse((x0, y0, x1, y1), fill=color)
+        elif kind == "block":
+            draw.rectangle((x0, y0, x1, y1), fill=color)
+        elif kind == "hollow":
+            draw.rectangle((x0, y0, x1, y1), outline=color, width=2)
+        else:
+            step = max(5, (x1 - x0) // 4)
+            for x in range(x0, x1 - 1, step):
+                draw.line((x, y0, x, y1), fill=color, width=2)
+
+    _draw_parts(draw, scene, SLATE)
+
+    wx, wy, side = scene["win_x"], scene["win_y"], scene["win_s"]
+    draw.rectangle((wx, wy, wx + side - 1, wy + side - 1), fill=SHEET)
+    return image

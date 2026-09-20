@@ -1,0 +1,176 @@
+"""Pixel-only inverse arm: recover the band's period from the raster alone.
+
+Input is a single RGB image and the public question contract.  No scene data,
+no renderer, no prompt, generator, verifier or analytic-gold code is imported.
+
+Procedure: segment the dark grey/black ink, split it by row bands into the
+repeated mark band and the isolated reference tick, locate the coloured ticks by
+nearest match to the four named colours, then score every tick offset by how
+well the mark band maps onto a copy of itself shifted by that offset.  The tick
+with the best self-match names the period; ambiguous or weak fields abstain.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ABSTAIN = "abstain"
+
+_TICK_COLOURS = {
+    "red": (206, 42, 40),
+    "green": (28, 142, 66),
+    "blue": (40, 84, 206),
+    "orange": (228, 146, 18),
+}
+
+DARK_MAX = 120
+GREY_TOL = 40
+SAT_MIN = 55
+MIN_TICK_PIXELS = 40
+MIN_BAND_PIXELS = 400
+COLOUR_TOL = 90
+MIN_MATCH = 0.55
+MIN_GAP = 0.08
+
+
+def _row_runs(flags: np.ndarray, min_gap: int = 4) -> list[tuple[int, int]]:
+    """Contiguous row intervals of True, merging gaps shorter than `min_gap`."""
+    runs: list[tuple[int, int]] = []
+    start = None
+    for index, value in enumerate(flags):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, len(flags)))
+    merged: list[tuple[int, int]] = []
+    for run in runs:
+        if merged and run[0] - merged[-1][1] < min_gap:
+            merged[-1] = (merged[-1][0], run[1])
+        else:
+            merged.append(run)
+    return merged
+
+
+def _segment(dark: np.ndarray, saturated: np.ndarray):
+    """Split the dark ink into the repeated band and the reference tick.
+
+    The coloured bars fix the row range of the bar row; the black reference tick
+    is the dark ink inside those rows, and the repeated band is the dark ink
+    outside them.  Returns the band mask cropped to its ink columns together
+    with the reference tick's centre column, or None when the picture does not
+    show that layout.
+    """
+    bar_rows = np.nonzero(saturated.any(axis=1))[0]
+    if bar_rows.size == 0:
+        return None
+    top, bottom = int(bar_rows.min()), int(bar_rows.max()) + 1
+    reference = dark[top:bottom, :]
+    ref_xs = np.nonzero(reference.any(axis=0))[0]
+    if ref_xs.size == 0 or ref_xs.size > 24:
+        return None
+    anchor_x = float(np.nonzero(reference)[1].mean())
+    band = dark.copy()
+    band[top:bottom, :] = False
+    band_rows = np.nonzero(band.any(axis=1))[0]
+    band_cols = np.nonzero(band.any(axis=0))[0]
+    if band_rows.size < 8 or band_cols.size < 40:
+        return None
+    mask = band[
+        int(band_rows.min()) : int(band_rows.max()) + 1,
+        int(band_cols.min()) : int(band_cols.max()) + 1,
+    ]
+    if int(np.count_nonzero(mask)) < MIN_BAND_PIXELS:
+        return None
+    return mask, anchor_x
+
+
+def _self_match(mask: np.ndarray, shift: int) -> float:
+    width = mask.shape[1]
+    if shift <= 0 or shift >= width:
+        return 0.0
+    left = mask[:, : width - shift]
+    right = mask[:, shift:]
+    union = int(np.count_nonzero(left | right))
+    if union == 0:
+        return 0.0
+    return float(np.count_nonzero(left & right)) / float(union)
+
+
+def _colour_name(rgb: tuple[float, float, float]) -> str | None:
+    best_name = None
+    best_dist = float("inf")
+    for name, reference in _TICK_COLOURS.items():
+        dist = sum((rgb[i] - reference[i]) ** 2 for i in range(3)) ** 0.5
+        if dist < best_dist:
+            best_dist, best_name = dist, name
+    return best_name if best_dist <= COLOUR_TOL else None
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int32)
+    high = arr.max(axis=2)
+    low = arr.min(axis=2)
+    dark = (high < DARK_MAX) & ((high - low) < GREY_TOL)
+    if int(np.count_nonzero(dark)) < MIN_BAND_PIXELS:
+        return ABSTAIN
+
+    saturated = ((high - low) > SAT_MIN) & (high > 80)
+    segments = _segment(dark, saturated)
+    if segments is None:
+        return ABSTAIN
+    mask, anchor_x = segments
+    scores: list[tuple[float, str]] = []
+    labels: dict[str, list[int]] = {}
+    ys, xs = np.nonzero(saturated)
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        name = _colour_name(tuple(float(v) for v in arr[y, x]))
+        if name is not None:
+            labels.setdefault(name, []).append(x)
+    for name, columns in labels.items():
+        if len(columns) < MIN_TICK_PIXELS:
+            continue
+        shift = int(round(float(np.mean(columns)) - anchor_x))
+        if shift <= 0:
+            continue
+        scores.append((_self_match(mask, shift), name))
+    if len(scores) < 2:
+        return ABSTAIN
+
+    scores.sort(reverse=True)
+    if scores[0][0] < MIN_MATCH or scores[0][0] - scores[1][0] < MIN_GAP:
+        return ABSTAIN
+    return scores[0][1]
+
+
+def pixel_decision_gap(image: Image.Image) -> float:
+    """Diagnostic only: self-match gap between the best and the runner-up tick.
+
+    Reported for stress reports; the graded decision uses decision_from_image.
+    """
+    arr = np.asarray(image.convert("RGB")).astype(np.int32)
+    high = arr.max(axis=2)
+    low = arr.min(axis=2)
+    dark = (high < DARK_MAX) & ((high - low) < GREY_TOL)
+    saturated = ((high - low) > SAT_MIN) & (high > 80)
+    segments = _segment(dark, saturated)
+    if segments is None:
+        return 0.0
+    mask, anchor_x = segments
+    labels: dict[str, list[int]] = {}
+    ys, xs = np.nonzero(saturated)
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        name = _colour_name(tuple(float(v) for v in arr[y, x]))
+        if name is not None:
+            labels.setdefault(name, []).append(x)
+    found = sorted(
+        _self_match(mask, int(round(float(np.mean(cols)) - anchor_x)))
+        for cols in labels.values()
+        if len(cols) >= MIN_TICK_PIXELS
+    )
+    if len(found) < 2:
+        return 0.0
+    return float(found[-1] - found[-2])

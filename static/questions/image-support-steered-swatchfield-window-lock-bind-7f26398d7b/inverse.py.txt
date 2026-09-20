@@ -1,0 +1,160 @@
+"""Pixel-only inverse arm for swatchfield_window_lock_bind.
+
+Input: the final PNG and the public question contract.  No scene, no renderer,
+no gold, no metadata.  The arm segments the slate board, splits its contents
+into the large swatch field and the smaller detached key patch by their column
+gaps, recovers both colour lattices, solves the cross-patch correspondence by
+exhaustive window comparison, requires that exactly one window matches, and only
+then reads the mark that sits on that window's centre swatch.
+
+Anything that makes the reconstruction unsafe - non-palette pixels on the board,
+a lattice that is not 7-by-7 plus 3-by-3, a key swatch that carries a mark, a
+non-unique window, or a matched centre without a mark - returns the abstention
+token instead of a colour.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "swatchfield_window_lock_bind-oracle-0.1.0"
+ABSTAIN = "indeterminate"
+
+_SLATE = (44, 52, 66)
+_SWATCHES = {
+    (226, 188, 96): "sand",
+    (46, 150, 150): "teal",
+    (208, 96, 128): "rose",
+    (120, 158, 66): "olive",
+    (92, 102, 190): "indigo",
+}
+_MARKS = {
+    (200, 32, 32): "red",
+    (246, 176, 30): "amber",
+    (52, 200, 212): "cyan",
+    (150, 54, 196): "violet",
+}
+
+_FIELD_N = 7
+_WIN_N = 3
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    start = None
+    for i, on in enumerate(flags):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            out.append((start, i - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def _swatch_at(rgb: np.ndarray, x: int, y: int) -> str | None:
+    h, w, _ = rgb.shape
+    if not (0 <= x < w and 0 <= y < h):
+        return None
+    return _SWATCHES.get(tuple(int(v) for v in rgb[y, x]))
+
+
+def _mark_at(rgb: np.ndarray, x: int, y: int) -> str | None:
+    return _MARKS.get(tuple(int(v) for v in rgb[y, x]))
+
+
+def _read_lattice(
+    rgb: np.ndarray, cols: list[tuple[int, int]], rows: list[tuple[int, int]], probe: float
+) -> tuple[list[list[str]], list[list[str | None]]] | None:
+    """Read one flat-colour lattice; return (base colours, centre marks)."""
+    base: list[list[str]] = []
+    centres: list[list[str | None]] = []
+    for y0, y1 in rows:
+        base_row: list[str] = []
+        mark_row: list[str | None] = []
+        for x0, x1 in cols:
+            cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+            off = max(3, int(round(min(x1 - x0, y1 - y0) * probe)))
+            corners = [
+                _swatch_at(rgb, cx - off, cy - off),
+                _swatch_at(rgb, cx + off, cy - off),
+                _swatch_at(rgb, cx - off, cy + off),
+                _swatch_at(rgb, cx + off, cy + off),
+            ]
+            if corners[0] is None or any(c != corners[0] for c in corners):
+                return None
+            base_row.append(corners[0])
+            middle = tuple(int(v) for v in rgb[cy, cx])
+            if middle in _SWATCHES:
+                mark_row.append(None if _SWATCHES[middle] == corners[0] else "?")
+            elif middle in _MARKS:
+                mark_row.append(_MARKS[middle])
+            else:
+                return None
+        base.append(base_row)
+        centres.append(mark_row)
+    return base, centres
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+    slate = np.all(rgb == np.array(_SLATE, dtype=np.uint8), axis=-1)
+    if not slate.any():
+        return ABSTAIN
+    ys, xs = np.nonzero(slate)
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    if min(y1 - y0, x1 - x0) < 60:
+        return ABSTAIN
+
+    board = rgb[y0 : y1 + 1, x0 : x1 + 1]
+    board_slate = slate[y0 : y1 + 1, x0 : x1 + 1]
+    if board_slate.mean() < 0.15:
+        return ABSTAIN
+
+    inner = ~board_slate
+    col_runs = _runs(inner.any(axis=0))
+    if len(col_runs) != _FIELD_N + _WIN_N:
+        return ABSTAIN
+    gaps = [col_runs[i + 1][0] - col_runs[i][1] for i in range(len(col_runs) - 1)]
+    split = int(np.argmax(gaps))
+    if split != _FIELD_N - 1 or gaps[split] <= max(gaps[:split] + gaps[split + 1 :]):
+        return ABSTAIN
+    field_cols, key_cols = col_runs[: split + 1], col_runs[split + 1 :]
+
+    def rows_for(cols: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        strip = inner[:, cols[0][0] : cols[-1][1] + 1]
+        return _runs(strip.any(axis=1))
+
+    field_rows, key_rows = rows_for(field_cols), rows_for(key_cols)
+    if len(field_rows) != _FIELD_N or len(key_rows) != _WIN_N:
+        return ABSTAIN
+    if len(key_cols) != _WIN_N:
+        return ABSTAIN
+
+    field = _read_lattice(board, field_cols, field_rows, 0.36)
+    key = _read_lattice(board, key_cols, key_rows, 0.30)
+    if field is None or key is None:
+        return ABSTAIN
+    field_base, field_marks = field
+    key_base, key_marks = key
+    if any(m is not None for row in key_marks for m in row):
+        return ABSTAIN  # the key must never carry a mark
+
+    flat_key = [key_base[i][j] for i in range(_WIN_N) for j in range(_WIN_N)]
+    exact: list[tuple[int, int]] = []
+    for top in range(_FIELD_N - _WIN_N + 1):
+        for left in range(_FIELD_N - _WIN_N + 1):
+            window = [field_base[top + i][left + j] for i in range(_WIN_N) for j in range(_WIN_N)]
+            if window == flat_key:
+                exact.append((top, left))
+    if len(exact) != 1:
+        return ABSTAIN
+
+    top, left = exact[0]
+    answer = field_marks[top + 1][left + 1]
+    if answer is None or answer == "?":
+        return ABSTAIN
+    return answer

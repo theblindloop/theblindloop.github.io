@@ -1,0 +1,172 @@
+"""Independent pixel-only inverse for Adjacent-Change Mosaic Reveal.
+
+The inverse locates the visible frame, uses the two colored corner marks to
+rectify it, reads all 90 source cells, performs the declared overlapping
+horizontal inequality transform, and reports the best/runner-up template gap.
+It imports no renderer, prompt, generator, verifier, scene, or gold code.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+FRAME_RGB = np.array((72, 78, 90), dtype=np.int16)
+SOURCE_ROWS = 10
+SOURCE_COLS = 9
+OUTPUT_ROWS = 10
+OUTPUT_COLS = 8
+PAD = 14
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _literal_templates() -> dict[str, tuple[int, ...]]:
+    rows = {
+        "diamond": (
+            "...##...",
+            "..#..#..",
+            ".#....#.",
+            "..#..#..",
+            "...##...",
+        ),
+        "fork": (
+            "#..##..#",
+            "....#.#.",
+            ".#..#...",
+            "....#...",
+            "....#...",
+        ),
+        "stair": (
+            "##......",
+            ".##.....",
+            "...##...",
+            "...##...",
+            "....##..",
+        ),
+    }
+    output: dict[str, tuple[int, ...]] = {}
+    for name, logical_rows in rows.items():
+        bits: list[int] = []
+        for logical_row in logical_rows:
+            row_bits = [int(value == "#") for value in logical_row]
+            bits.extend(row_bits)
+            bits.extend(row_bits)
+        output[name] = tuple(bits)
+    return output
+
+
+TEMPLATES = _literal_templates()
+
+
+def _rectified_patch(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    signed = array.astype(np.int16)
+    frame = np.max(np.abs(signed - FRAME_RGB), axis=2) <= 1
+    ys, xs = np.nonzero(frame)
+    if len(xs) < 500:
+        raise OracleError("complete marked frame not found")
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    crop = array[y0 : y1 + 1, x0 : x1 + 1]
+    if not 188 <= crop.shape[1] <= 230 or not 188 <= crop.shape[0] <= 230:
+        raise OracleError("marked frame has unsupported extent")
+
+    candidates: list[np.ndarray] = []
+    for turns in range(4):
+        trial = np.rot90(crop, turns)
+        height, width = trial.shape[:2]
+        usable_height = height - 2 * PAD
+        usable_width = width - 2 * PAD
+        if usable_height <= 0 or usable_width <= 0:
+            continue
+        if usable_height % SOURCE_ROWS or usable_width % SOURCE_COLS:
+            continue
+        cell_y = usable_height // SOURCE_ROWS
+        cell_x = usable_width // SOURCE_COLS
+        if cell_x != cell_y or cell_x not in (18, 19, 20):
+            continue
+        cyan = (trial[:, :, 0] < 60) & (trial[:, :, 1] > 150) & (trial[:, :, 2] > 160)
+        gold = (trial[:, :, 0] > 190) & (trial[:, :, 1] > 120) & (trial[:, :, 2] < 80)
+        cy, cx = np.nonzero(cyan)
+        gy, gx = np.nonzero(gold)
+        if len(cx) < 20 or len(gx) < 20:
+            continue
+        if (
+            cx.mean() < width / 2
+            and cy.mean() < height / 2
+            and gx.mean() > width / 2
+            and gy.mean() < height / 2
+        ):
+            candidates.append(trial.copy())
+    if len(candidates) != 1:
+        raise OracleError("cyan-to-gold orientation fiducials are missing or ambiguous")
+    return candidates[0]
+
+
+def _read_source(patch: np.ndarray) -> np.ndarray:
+    height, width = patch.shape[:2]
+    cell_y = (height - 2 * PAD) // SOURCE_ROWS
+    cell_x = (width - 2 * PAD) // SOURCE_COLS
+    if cell_x != cell_y or cell_x not in (18, 19, 20):
+        raise OracleError("frame scale is incompatible with the declared 10 by 9 grid")
+    cell = cell_x
+    source = np.zeros((SOURCE_ROWS, SOURCE_COLS), dtype=np.uint8)
+    for row in range(SOURCE_ROWS):
+        for col in range(SOURCE_COLS):
+            cx = PAD + col * cell + cell // 2
+            cy = PAD + row * cell + cell // 2
+            sample = patch[cy - 2 : cy + 3, cx - 2 : cx + 3].astype(np.float32)
+            if sample.shape != (5, 5, 3):
+                raise OracleError("cell sampling escaped the visible frame")
+            channel_std = float(sample.reshape(-1, 3).std(axis=0).max())
+            mean = sample.mean(axis=(0, 1))
+            luminance = float(0.2126 * mean[0] + 0.7152 * mean[1] + 0.0722 * mean[2])
+            if channel_std > 3.0 or luminance > 235.0 or 120.0 < luminance < 185.0:
+                raise OracleError("a required source cell is erased or corrupted")
+            source[row, col] = int(luminance < 120.0)
+    if int(source.sum()) != 45:
+        raise OracleError("source mosaic violates the declared equal-ink carrier family")
+    return source
+
+
+def _differentiate(source: np.ndarray) -> tuple[int, ...]:
+    if source.shape != (SOURCE_ROWS, SOURCE_COLS):
+        raise OracleError("source array has the wrong shape")
+    derivative = (source[:, 1:] != source[:, :-1]).astype(np.uint8)
+    for pair in range(5):
+        if not np.array_equal(derivative[2 * pair], derivative[2 * pair + 1]):
+            raise OracleError("the transformed carrier lacks the visible doubled-row invariant")
+    values = tuple(int(value) for value in derivative.ravel())
+    if sum(values) != 20:
+        raise OracleError("adjacent-change result violates the equal-ink output family")
+    return values
+
+
+def _classify(bits: tuple[int, ...]) -> tuple[str, float, dict[str, int]]:
+    distances = {
+        name: sum(left != right for left, right in zip(bits, template, strict=True))
+        for name, template in TEMPLATES.items()
+    }
+    ordered = sorted((distance, name) for name, distance in distances.items())
+    gap = float(ordered[1][0] - ordered[0][0])
+    return ("ambiguous" if gap == 0 else ordered[0][1]), gap, distances
+
+
+def measure(image: Image.Image) -> dict:
+    patch = _rectified_patch(image)
+    source = _read_source(patch)
+    bits = _differentiate(source)
+    decision, gap, distances = _classify(bits)
+    return {
+        "decision": decision,
+        "margin": gap,
+        "derivative_bits": list(bits),
+        "distances": distances,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure(image)["decision"])

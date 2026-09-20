@@ -1,0 +1,261 @@
+"""Breach-relevel world: how deep is the water once one wall is taken away?
+
+A landscape of thirteen columns of unit blocks stands on the ground. The rain
+water trapped in that landscape *as drawn* is painted in pale blue, so the
+factual equilibrium is given away for free. Exactly one column is red.
+
+The question asks for the water depth above a third, remote column (marked by
+a black arrow) in the counterfactual landscape in which the red column has
+been taken away down to the ground. Scenes are sampled so that the red column
+is exactly the peak that confines the arrow column's pool, so that the new
+confining peak lies strictly beyond the removed column, and so that the drawn
+blue depth over the arrow column is never the answer and misses it by at least
+two whole blocks.
+
+The renderer owns scene sampling, rasterization and the structural analytic
+gold. The independent pixel-only inverse arm (``oracle.py``) recovers the same
+decision from the final PNG alone.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 860
+HEIGHT = 640
+BACKGROUND = (255, 255, 255)
+
+N_COLS = 13
+MAX_H = 8
+BLOCK = 56
+X0 = 66
+BASE_Y = 540
+INSET = 3
+
+GROUND_TOP = BASE_Y
+GROUND_BOTTOM = BASE_Y + 12
+GROUND_X0 = 40
+GROUND_X1 = 820
+
+ROCK_COLOR = (70, 74, 82)
+CUT_COLOR = (198, 44, 44)
+WATER_COLOR = (150, 196, 236)
+MARKER_COLOR = (0, 0, 0)
+
+ARROW_TIP_Y = BASE_Y + 26
+ARROW_BASE_Y = BASE_Y + 66
+ARROW_HALF = 20
+
+MAX_ANSWER = 5
+QUARANTINE_MIN_MARGIN = 2.0 * BLOCK
+
+
+def _cell_box(col: int, level: int) -> tuple[int, int, int, int]:
+    """Pixel box of the block at ``col`` sitting ``level`` blocks above ground."""
+    x1 = X0 + col * BLOCK + INSET
+    x2 = X0 + (col + 1) * BLOCK - INSET - 1
+    y2 = BASE_Y - level * BLOCK - INSET - 1
+    y1 = BASE_Y - (level + 1) * BLOCK + INSET
+    return x1, y1, x2, y2
+
+
+def _col_center_x(col: int) -> int:
+    return X0 + col * BLOCK + BLOCK // 2
+
+
+def _water(heights) -> list[int]:
+    """Classic trapped-rain profile: depth of standing water over each column."""
+    h = [int(v) for v in heights]
+    n = len(h)
+    pref = [0] * n
+    suf = [0] * n
+    run = 0
+    for i in range(n):
+        run = max(run, h[i])
+        pref[i] = run
+    run = 0
+    for i in range(n - 1, -1, -1):
+        run = max(run, h[i])
+        suf[i] = run
+    return [max(0, min(pref[i], suf[i]) - h[i]) for i in range(n)]
+
+
+def _removed_profile(heights, removed: int) -> list[int]:
+    h = [int(v) for v in heights]
+    h[int(removed)] = 0
+    return h
+
+
+def _depth_at(heights, col: int) -> int:
+    return _water(heights)[int(col)]
+
+
+def _side_max(h, lo: int, hi: int) -> int:
+    """Max height over the inclusive column range, or -1 when the range is empty."""
+    if lo > hi:
+        return -1
+    return max(int(h[i]) for i in range(lo, hi + 1))
+
+
+def _pair_is_valid(h, query: int, removed: int, mode: str) -> bool:
+    """Is ``removed`` the peak that confines ``query``'s pool?
+
+    Both modes require the removed column to be the tallest column on its side
+    of the query and that side to be the side whose maximum sets the water
+    level over the query, so deleting it genuinely re-levels the pool. They
+    differ in what is left behind. In ``relevel`` the next tallest column on
+    that side lies strictly *beyond* the removed one, so the new confining peak
+    can only be found by scanning past the breach. In ``drain`` nothing on that
+    whole side outreaches the query's own top, so the pool empties out of that
+    open end instead of settling lower.
+    """
+    n = len(h)
+    if abs(query - removed) < 2 or int(h[removed]) < 1:
+        return False
+    if removed > query:
+        near_lo, near_hi = query + 1, removed - 1
+        far_lo, far_hi = removed + 1, n - 1
+        other = _side_max(h, 0, query)
+    else:
+        near_lo, near_hi = removed + 1, query - 1
+        far_lo, far_hi = 0, removed - 1
+        other = _side_max(h, query, n - 1)
+    near = max(_side_max(h, near_lo, near_hi), int(h[query]))
+    far = _side_max(h, far_lo, far_hi)
+    if int(h[removed]) <= max(near, far) or int(h[removed]) > other:
+        return False
+    if mode == "relevel":
+        return far > near
+    if mode == "drain":
+        return max(near, far) <= int(h[query])
+    raise ValueError(f"unknown mode {mode!r}")
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent scene deterministically from ``seed``.
+
+    Rejection sampling keeps the counterfactual essential and its answer far
+    from every anchor the picture offers: the drawn blue depth over the arrow
+    column is wrong by at least two blocks off quarantine, the removed column
+    is never adjacent to the arrow column, and the new confining peak always
+    sits beyond the breach. A minority of seeds deliberately target a one-block
+    gap; those scenes are quarantined and only ever used as boundary evidence.
+    """
+    rng = np.random.default_rng(int(seed) * 2 + 11)
+    tight = bool(rng.random() < 0.18)
+    mode = "drain" if rng.random() < 0.3 else "relevel"
+    gaps = (1,) if tight else (3, 2)
+    target = int(rng.integers(1, MAX_ANSWER + 1))
+    tiers = [{"gaps": gaps, "target": target}, {"gaps": gaps, "target": None}]
+    if not tight:
+        tiers.append({"gaps": (2,), "target": None})
+
+    for tier in tiers:
+        for _ in range(4000):
+            h = [int(rng.integers(0, MAX_H + 1)) for _ in range(N_COLS)]
+            w = _water(h)
+            options = []
+            for q in range(N_COLS):
+                if w[q] < 1:
+                    continue
+                for r in range(N_COLS):
+                    if not _pair_is_valid(h, q, r, mode):
+                        continue
+                    d_f = w[q]
+                    d_c = _depth_at(_removed_profile(h, r), q)
+                    if d_c > MAX_ANSWER or d_f > MAX_H:
+                        continue
+                    if (d_f - d_c) not in tier["gaps"]:
+                        continue
+                    if mode == "relevel" and tier["target"] is not None and d_c != tier["target"]:
+                        continue
+                    options.append((q, r))
+            if not options:
+                continue
+            q, r = options[int(rng.integers(0, len(options)))]
+            paint_order = list(range(N_COLS))
+            rng.shuffle(paint_order)
+            return {
+                "n_cols": N_COLS,
+                "heights": [int(v) for v in h],
+                "query": int(q),
+                "removed": int(r),
+                "paint_order": [int(v) for v in paint_order],
+            }
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize the latent scene (deterministic, anti-aliasing free)."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    d = ImageDraw.Draw(img)
+
+    heights = [int(v) for v in scene["heights"]]
+    query = int(scene["query"])
+    removed = int(scene["removed"])
+    water = _water(heights)
+
+    d.rectangle([GROUND_X0, GROUND_TOP, GROUND_X1, GROUND_BOTTOM], fill=ROCK_COLOR)
+
+    # Columns are disjoint, so the declared paint order is invisible.
+    for col in scene["paint_order"]:
+        col = int(col)
+        rock = CUT_COLOR if col == removed else ROCK_COLOR
+        for level in range(heights[col]):
+            d.rectangle(_cell_box(col, level), fill=rock)
+        for level in range(heights[col], heights[col] + water[col]):
+            d.rectangle(_cell_box(col, level), fill=WATER_COLOR)
+
+    cx = _col_center_x(query)
+    d.polygon(
+        [
+            (cx, ARROW_TIP_Y),
+            (cx - ARROW_HALF, ARROW_BASE_Y),
+            (cx + ARROW_HALF, ARROW_BASE_Y),
+        ],
+        fill=MARKER_COLOR,
+    )
+    return img
+
+
+def analytic_gold(scene: dict) -> str:
+    """Structural gold: water depth over the arrow column once the red one goes."""
+    edited = _removed_profile(scene["heights"], scene["removed"])
+    return f"depth-{_depth_at(edited, scene['query'])}"
+
+
+def margin(scene: dict) -> float:
+    """Commitment magnitude: pixel distance between the drawn and true answers.
+
+    The picture paints the factual pool over the arrow column. The margin is
+    how many pixels of water height separate that painted anchor from the
+    counterfactual depth the question asks for.
+    """
+    d_f = _depth_at(scene["heights"], scene["query"])
+    d_c = _depth_at(_removed_profile(scene["heights"], scene["removed"]), scene["query"])
+    return float(BLOCK * abs(d_f - d_c))
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine scenes whose answer sits within one block of the drawn anchor."""
+    return margin(scene) < QUARANTINE_MIN_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Column paint order is photometrically invisible.
+
+    Every block is inset three pixels inside its lattice cell, so no two
+    columns share a pixel and permuting ``paint_order`` yields a byte-identical
+    raster, while the analytic gold reads only heights, query and removed.
+    """
+    order = list(scene["paint_order"])
+    twins = []
+    for name, twin_order in (
+        ("rotated_paint_order", [order[-1]] + order[:-1]),
+        ("reversed_paint_order", list(reversed(order))),
+    ):
+        twin = dict(scene)
+        twin["paint_order"] = twin_order
+        twins.append((name, twin))
+    return twins

@@ -1,0 +1,174 @@
+"""Image-only inverse arm: find the dot that has no mirror partner.
+
+This module never sees the latent scene. From the PNG and the public question
+contract alone it
+
+1. separates ink from background by channel distance to the corner background;
+2. segments the ink into connected components (row-run union-find) and keeps
+   each component's centroid and mean colour;
+3. names each component grey / red / orange / green / blue from saturation and
+   hue only, and refuses images that do not show the declared four colours;
+4. rebuilds the global reflection structure: every perpendicular bisector of a
+   pair of recovered centres is a candidate mirror line, and for each coloured
+   centre it measures the best residual achievable when that centre is the
+   nominated exception;
+5. returns the colour whose residual is smallest, refusing when the runner-up
+   is not separated from it.
+
+Nothing local decides the answer: dot count, dot size, total ink and the four
+colours are identical across answers, and each colour is worn by exactly one
+dot, so only the whole point set under reflection carries the decision.
+"""
+
+from __future__ import annotations
+
+import colorsys
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "unpaired_mirror_dot-oracle-0.1.0"
+
+INK_MIN_DELTA = 45  # channel distance from the background => dot ink
+MIN_DOT_PIXELS = 90
+MIN_DOTS = 9
+GREY_MAX_CHROMA = 45  # max-minus-min channel below this => an uncoloured dot
+DECIDE_TOLERANCE_PX = 6.0  # the true exception scores far below this
+SEPARATION_PX = 4.0  # required gap to the runner-up colour
+
+HUE_BINS = (
+    ("red", 330.0, 375.0),
+    ("orange", 15.0, 75.0),
+    ("green", 75.0, 185.0),
+    ("blue", 185.0, 300.0),
+)
+
+
+class OracleError(ValueError):
+    """The image does not contain the structure the question declares."""
+
+
+def _components(mask: np.ndarray) -> list[list[tuple[int, int, int]]]:
+    """Connected components (4-connectivity) via row runs and union-find."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    runs: list[tuple[int, int, int, int]] = []
+    previous: list[tuple[int, int, int, int]] = []
+    for row in range(height):
+        line = mask[row]
+        if not line.any():
+            previous = []
+            continue
+        padded = np.concatenate(([False], line, [False]))
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        current: list[tuple[int, int, int, int]] = []
+        for start, end in zip(edges[0::2], edges[1::2]):
+            index = len(parent)
+            parent.append(index)
+            entry = (row, int(start), int(end), index)
+            current.append(entry)
+            runs.append(entry)
+            for _, p_start, p_end, p_index in previous:
+                if p_start < end and start < p_end:
+                    union(index, p_index)
+        previous = current
+
+    groups: dict[int, list[tuple[int, int, int]]] = {}
+    for row, start, end, index in runs:
+        groups.setdefault(find(index), []).append((row, start, end))
+    return list(groups.values())
+
+
+def _colour_name(mean_rgb: np.ndarray) -> str:
+    red, green, blue = (float(channel) for channel in mean_rgb)
+    if max(red, green, blue) - min(red, green, blue) < GREY_MAX_CHROMA:
+        return "grey"
+    hue = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)[0] * 360.0
+    for name, low, high in HUE_BINS:
+        if low <= hue < high or low <= hue + 360.0 < high:
+            return name
+    raise OracleError(f"unreadable dot hue {hue:.1f}")
+
+
+def measure(image: Image.Image) -> tuple[np.ndarray, dict[str, int]]:
+    """Return (dot centres, colour name -> centre index) from pixels alone."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    corners = np.array([arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]], dtype=np.int16)
+    background = np.median(corners, axis=0)
+    ink = np.abs(arr - background).max(axis=-1) >= INK_MIN_DELTA
+
+    centres: list[tuple[float, float]] = []
+    coloured: dict[str, int] = {}
+    for pixel_runs in _components(ink):
+        columns: list[int] = []
+        rows: list[int] = []
+        for row, start, end in pixel_runs:
+            columns.extend(range(start, end))
+            rows.extend([row] * (end - start))
+        if len(columns) < MIN_DOT_PIXELS:
+            continue
+        index = len(centres)
+        centres.append((float(np.mean(columns)) + 0.5, float(np.mean(rows)) + 0.5))
+        name = _colour_name(arr[np.asarray(rows), np.asarray(columns)].mean(axis=0))
+        if name != "grey":
+            if name in coloured:
+                raise OracleError(f"two dots share the colour {name}")
+            coloured[name] = index
+
+    if len(centres) < MIN_DOTS:
+        raise OracleError(f"only {len(centres)} dot components found")
+    if sorted(coloured) != ["blue", "green", "orange", "red"]:
+        raise OracleError(f"expected four declared colours, found {sorted(coloured)}")
+    return np.asarray(centres, dtype=np.float64), coloured
+
+
+def _exception_residuals(points: np.ndarray, indices: list[int]) -> np.ndarray:
+    """Best mirror residual for each nominated exception dot, in px."""
+    count = points.shape[0]
+    left, right = np.triu_indices(count, 1)
+    delta = points[right] - points[left]
+    span = np.hypot(delta[:, 0], delta[:, 1])
+    good = span > 1e-9
+    delta, span = delta[good], span[good]
+    origin = (points[left[good]] + points[right[good]]) / 2.0
+    heading = np.stack([-delta[:, 1], delta[:, 0]], axis=1) / span[:, None]
+
+    relative = points[None, :, :] - origin[:, None, :]
+    along = (relative * heading[:, None, :]).sum(axis=-1)[:, :, None] * heading[:, None, :]
+    flipped = origin[:, None, :] + 2.0 * along - relative
+    gaps = np.linalg.norm(flipped[:, :, None, :] - points[None, None, :, :], axis=-1)
+
+    out = np.empty(len(indices), dtype=np.float64)
+    for slot, index in enumerate(indices):
+        trimmed = gaps.copy()
+        trimmed[:, :, index] = np.inf
+        nearest = trimmed.min(axis=-1)
+        nearest[:, index] = -np.inf
+        out[slot] = nearest.max(axis=-1).min()
+    return out
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Colour of the unpaired dot, recovered from the image alone."""
+    points, coloured = measure(image)
+    names = sorted(coloured)
+    residuals = _exception_residuals(points, [coloured[name] for name in names])
+    order = np.argsort(residuals)
+    best = int(order[0])
+    if residuals[best] > DECIDE_TOLERANCE_PX:
+        raise OracleError("no colour leaves the rest of the dots mirror-symmetric")
+    if residuals[int(order[1])] - residuals[best] < SEPARATION_PX:
+        raise OracleError("two colours explain the mirror structure equally well")
+    return names[best]

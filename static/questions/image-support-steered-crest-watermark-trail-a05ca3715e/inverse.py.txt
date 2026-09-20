@@ -1,0 +1,220 @@
+"""Pixel-only inverse arm for crest_watermark_trail.
+
+Receives one rendered RGB image and nothing else.  It recovers the trail, its
+two terminals, the coloured triangles that sit on it, orders those triangles by
+geodesic distance from the round bead, classifies each as a rise or a fall from
+its own outline, replays the running count and reports the colour of the
+triangle at which that count reaches its single highest value.  Every structural
+doubt raises, which is the abstention channel.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "crest_watermark_trail-oracle-0.1.0"
+
+_TRACK = (98, 100, 106)
+_TERMINAL = (26, 26, 30)
+_PALETTE = {
+    "red": (198, 52, 44),
+    "green": (30, 128, 62),
+    "blue": (44, 86, 196),
+    "purple": (132, 52, 170),
+}
+_BLOCK = 4
+_MIN_MARK_AREA = 48
+_MIN_TERMINAL_AREA = 150
+_MIN_BLOCK_GAP = 3
+
+
+class OracleAbstention(RuntimeError):
+    """Raised when the image does not support one unambiguous replay."""
+
+
+def _near(array: np.ndarray, rgb, tol: int) -> np.ndarray:
+    reference = np.asarray(rgb, dtype=np.int16)
+    return np.abs(array - reference).sum(axis=2) <= tol
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Eight-connected components of a small boolean mask, as index arrays."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    out: list[np.ndarray] = []
+    for sy, sx in np.argwhere(mask):
+        if seen[sy, sx]:
+            continue
+        stack = [(int(sy), int(sx))]
+        seen[sy, sx] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < height and 0 <= nx < width:
+                        if mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+        out.append(np.asarray(pixels, dtype=np.int32))
+    return out
+
+
+def _bbox(pixels: np.ndarray) -> tuple[int, int, int, int]:
+    return (
+        int(pixels[:, 0].min()),
+        int(pixels[:, 1].min()),
+        int(pixels[:, 0].max()),
+        int(pixels[:, 1].max()),
+    )
+
+
+def _terminals(mask: np.ndarray) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return the (bead, cap) centroids, told apart by bounding-box fill."""
+    beads, caps = [], []
+    for pixels in _components(mask):
+        if len(pixels) < _MIN_TERMINAL_AREA:
+            raise OracleAbstention("dark blob too small to identify")
+        y0, x0, y1, x1 = _bbox(pixels)
+        fill = len(pixels) / float((y1 - y0 + 1) * (x1 - x0 + 1))
+        centroid = (float(pixels[:, 0].mean()), float(pixels[:, 1].mean()))
+        if fill <= 0.85:
+            beads.append(centroid)
+        elif fill >= 0.92:
+            caps.append(centroid)
+        else:
+            raise OracleAbstention("dark blob is neither round nor square")
+    if len(beads) != 1 or len(caps) != 1:
+        raise OracleAbstention("expected exactly one bead and one square block")
+    return beads[0], caps[0]
+
+
+def _orientation(pixels: np.ndarray) -> str:
+    """Rise or fall, from the width profile of the triangle outline."""
+    y0, x0, y1, x1 = _bbox(pixels)
+    height = y1 - y0 + 1
+    if height < 8:
+        raise OracleAbstention("triangle is too short to orient")
+    band = max(2, height // 4)
+    top = pixels[pixels[:, 0] < y0 + band]
+    bottom = pixels[pixels[:, 0] > y1 - band]
+    if not len(top) or not len(bottom):
+        raise OracleAbstention("triangle has no measurable profile")
+    top_width = float(top[:, 1].max() - top[:, 1].min() + 1)
+    bottom_width = float(bottom[:, 1].max() - bottom[:, 1].min() + 1)
+    if bottom_width >= 1.8 * top_width:
+        return "up"
+    if top_width >= 1.8 * bottom_width:
+        return "down"
+    raise OracleAbstention("triangle orientation is not resolvable")
+
+
+def _distance_field(passable: np.ndarray, source: tuple[float, float]) -> np.ndarray:
+    height, width = passable.shape
+    blocks_y, blocks_x = height // _BLOCK, width // _BLOCK
+    trimmed = passable[: blocks_y * _BLOCK, : blocks_x * _BLOCK]
+    grid = trimmed.reshape(blocks_y, _BLOCK, blocks_x, _BLOCK).any(axis=(1, 3))
+    start = (
+        min(blocks_y - 1, int(source[0]) // _BLOCK),
+        min(blocks_x - 1, int(source[1]) // _BLOCK),
+    )
+    if not grid[start]:
+        found = None
+        for radius in range(1, 4):
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    ny, nx = start[0] + dy, start[1] + dx
+                    if 0 <= ny < blocks_y and 0 <= nx < blocks_x and grid[ny, nx]:
+                        found = (ny, nx)
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if found is None:
+            raise OracleAbstention("bead is not attached to the trail")
+        start = found
+    distance = np.full(grid.shape, -1, dtype=np.int32)
+    distance[start] = 0
+    queue = deque([start])
+    while queue:
+        y, x = queue.popleft()
+        step = distance[y, x] + 1
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < blocks_y and 0 <= nx < blocks_x:
+                    if grid[ny, nx] and distance[ny, nx] < 0:
+                        distance[ny, nx] = step
+                        queue.append((ny, nx))
+    return distance
+
+
+def _reach(distance: np.ndarray, point: tuple[float, float]) -> int:
+    blocks_y, blocks_x = distance.shape
+    by = min(blocks_y - 1, int(point[0]) // _BLOCK)
+    bx = min(blocks_x - 1, int(point[1]) // _BLOCK)
+    best = -1
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            ny, nx = by + dy, bx + dx
+            if 0 <= ny < blocks_y and 0 <= nx < blocks_x and distance[ny, nx] >= 0:
+                if best < 0 or distance[ny, nx] < best:
+                    best = int(distance[ny, nx])
+    if best < 0:
+        raise OracleAbstention("a painted feature is not on the trail")
+    return best
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    track = _near(array, _TRACK, 60)
+    dark = _near(array, _TERMINAL, 90)
+    marks: list[dict] = []
+    coloured = np.zeros(track.shape, dtype=bool)
+    for name, rgb in _PALETTE.items():
+        mask = _near(array, rgb, 90)
+        coloured |= mask
+        for pixels in _components(mask):
+            if len(pixels) < _MIN_MARK_AREA:
+                raise OracleAbstention("a coloured mark is damaged")
+            marks.append(
+                {
+                    "colour": name,
+                    "kind": _orientation(pixels),
+                    "centre": (float(pixels[:, 0].mean()), float(pixels[:, 1].mean())),
+                }
+            )
+    if not 5 <= len(marks) <= 14:
+        raise OracleAbstention(f"unexpected mark count {len(marks)}")
+
+    bead, cap = _terminals(dark)
+    passable = track | dark | coloured
+    distance = _distance_field(passable, bead)
+    _reach(distance, cap)
+
+    for mark in marks:
+        mark["along"] = _reach(distance, mark["centre"])
+    marks.sort(key=lambda mark: mark["along"])
+    positions = [mark["along"] for mark in marks]
+    if any(
+        positions[index + 1] - positions[index] < _MIN_BLOCK_GAP
+        for index in range(len(positions) - 1)
+    ):
+        raise OracleAbstention("two marks are too close along the trail to order")
+
+    level = 0
+    levels = []
+    for mark in marks:
+        level += 1 if mark["kind"] == "up" else -1
+        levels.append(level)
+    peak = max(levels)
+    crest = [index for index, value in enumerate(levels) if value == peak]
+    if len(crest) != 1:
+        raise OracleAbstention("the highest count is reached more than once")
+    return marks[crest[0]]["colour"]

@@ -1,0 +1,131 @@
+"""Independent PNG-only inverse arm for the reference-attribute search.
+
+The code deliberately repeats the page geometry and infers both attributes from
+ink components. It never receives a scene or imports the renderer.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+WIDTH = 900
+HEIGHT = 720
+PANEL_LABELS = ("A", "B", "C", "D")
+PANEL_X0 = (35, 475, 35, 475)
+PANEL_Y0 = (220, 220, 470, 470)
+SLOT_OFFSETS = ((105, 85), (285, 85), (105, 175), (285, 175))
+REFERENCE_CENTER = (140, 100)
+STRIPE_TOLERANCE_DEGREES = 14.0
+# Keep each measurement window clear of the neighboring vertical slot and of
+# the panel frame; the largest outline plus antialiasing reaches about 44 px.
+CROP_RADIUS = 50
+
+
+def _ink_mask(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.shape[:2] != (HEIGHT, WIDTH):
+        raise ValueError(f"unexpected image size {arr.shape[:2][::-1]}")
+    # The public raster uses a dark blue ink and a pale background. A threshold
+    # rather than a palette lookup keeps this an actual measurement of pixels.
+    return (arr[:, :, 0] < 120) & (arr[:, :, 1] < 140) & (arr[:, :, 2] < 165)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 8-connected components as (y, x) integer coordinates."""
+
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x] or visited[y, x]:
+                continue
+            stack = [(y, x)]
+            visited[y, x] = True
+            points: list[tuple[int, int]] = []
+            while stack:
+                cy, cx = stack.pop()
+                points.append((cy, cx))
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if not dx and not dy:
+                            continue
+                        ny, nx = cy + dy, cx + dx
+                        if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+            components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _crop(mask: np.ndarray, center: tuple[float, float]) -> np.ndarray:
+    cx, cy = (int(round(value)) for value in center)
+    x0, x1 = cx - CROP_RADIUS, cx + CROP_RADIUS + 1
+    y0, y1 = cy - CROP_RADIUS, cy + CROP_RADIUS + 1
+    if x0 < 0 or y0 < 0 or x1 > WIDTH or y1 > HEIGHT:
+        raise ValueError("measurement crop is outside the image")
+    return mask[y0:y1, x0:x1]
+
+
+def _classify_shape(component: np.ndarray) -> str:
+    ys, xs = component[:, 0], component[:, 1]
+    min_x, max_x = float(xs.min()), float(xs.max())
+    min_y, max_y = float(ys.min()), float(ys.max())
+    width = max_x - min_x + 1.0
+    height = max_y - min_y + 1.0
+    # The upright triangle is wider than it is high; circle and square are not.
+    if width / height > 1.075:
+        return "triangle"
+    corner = (
+        ((xs <= min_x + 9) | (xs >= max_x - 9))
+        & ((ys <= min_y + 9) | (ys >= max_y - 9))
+    )
+    corner_fraction = float(corner.mean())
+    return "square" if corner_fraction > 0.035 else "circle"
+
+
+def _line_angle(component: np.ndarray) -> float:
+    if len(component) < 12:
+        raise ValueError("stripe component is too small")
+    points = component[:, ::-1]  # (x, y)
+    centered = points - points.mean(axis=0)
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    direction = vt[0]
+    return math.degrees(math.atan2(float(direction[1]), float(direction[0]))) % 180.0
+
+
+def _measure_one(mask: np.ndarray, center: tuple[float, float]) -> tuple[str, float]:
+    components = sorted(_components(_crop(mask, center)), key=len, reverse=True)
+    if len(components) < 2 or len(components[0]) < 300:
+        raise ValueError("candidate crop does not contain a closed outline and stripe")
+    # The closed outline is the largest component; the detached stripe is next.
+    return _classify_shape(components[0]), _line_angle(components[1])
+
+
+def _angle_delta(first: float, second: float) -> float:
+    return abs((float(first) - float(second) + 90.0) % 180.0 - 90.0)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Infer the unique panel winner from the raster alone."""
+
+    mask = _ink_mask(image)
+    reference_shape, reference_angle = _measure_one(mask, REFERENCE_CENTER)
+    measured: list[tuple[int, int, int]] = []
+    for panel, (x0, y0) in enumerate(zip(PANEL_X0, PANEL_Y0)):
+        for slot, (dx, dy) in enumerate(SLOT_OFFSETS):
+            shape, angle = _measure_one(mask, (x0 + dx, y0 + dy))
+            score = int(shape == reference_shape) + int(
+                _angle_delta(angle, reference_angle) <= STRIPE_TOLERANCE_DEGREES
+            )
+            measured.append((score, panel, slot))
+
+    ordered = sorted(measured, reverse=True)
+    if ordered[0][0] != 2 or ordered[0][0] == ordered[1][0]:
+        raise ValueError("pixel evidence has no unique two-attribute winner")
+    if ordered[0][0] - ordered[1][0] < 1:
+        raise ValueError("pixel winner has no runner-up margin")
+    return PANEL_LABELS[ordered[0][1]]

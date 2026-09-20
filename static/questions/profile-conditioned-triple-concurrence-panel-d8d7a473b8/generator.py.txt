@@ -1,0 +1,379 @@
+"""Triple-concurrence panel world.
+
+Every panel carries three straight lines, one red, one green and one blue, each
+drawn all the way across the panel. Two lines with different bearings meet in
+exactly one point, so a panel yields three pairwise crossing points. Those three
+points either form a visible open triangle or collapse onto a single common
+point. The panel whose three lines are concurrent is the answer; the margin is
+the widest spread of the crossing triple in the closest competing panel.
+
+The latent scene is stored columnar: every latent field is a top-level key of
+the scene dictionary, indexed by panel and, for the line fields, by line.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "triple_concurrence_panel-0.2.0"
+
+WIDTH = 800
+HEIGHT = 200
+PANEL_COUNT = 4
+LINES_PER_PANEL = 3
+PANEL_W = WIDTH // PANEL_COUNT
+PANELS = ("panel_1", "panel_2", "panel_3", "panel_4")
+
+SUPERSAMPLE = 3
+LINE_WIDTH = 3
+DIVIDER_WIDTH = 2
+INSET = 5.0             # panel interior margin used for clipping the strokes
+CROSSING_INSET = 20.0   # every crossing point stays this far inside the panel
+MIN_ANGLE_SEP_DEG = 28.0
+MIN_COMPETING_SPREAD = 22.0
+QUARANTINE_MARGIN = 24.0
+
+BACKGROUND = (255, 255, 255)
+DIVIDER = (168, 168, 168)
+# Fixed in every panel of every scene, so hue carries no information at all.
+LINE_COLORS = ((198, 44, 44), (26, 124, 58), (40, 72, 196))
+
+
+# --------------------------------------------------------------------------
+# canonical line representatives
+# --------------------------------------------------------------------------
+def _canon(angle: float, offset: float) -> tuple[float, float]:
+    """Fold a line onto its canonical representative.
+
+    A bearing and its half turn describe the same line once the perpendicular
+    offset changes sign, so bearings are folded into [0, 180) and rounded. The
+    rounding removes the last-bit differences the fold would otherwise leave,
+    which is what makes the half-turn alias render byte-identically.
+    """
+    angle = angle % 360.0
+    if angle >= 180.0:
+        angle -= 180.0
+        offset = -offset
+    return round(angle, 9), round(offset, 9)
+
+
+def _geometry(scene: dict, panel: int) -> list[tuple[float, float]]:
+    """Canonical (bearing, offset) pairs of one panel, in canonical order."""
+    pairs = [
+        _canon(angle, offset)
+        for angle, offset in zip(scene["angle"][panel], scene["offset"][panel])
+    ]
+    return sorted(pairs)
+
+
+def _direction(angle_deg: float) -> tuple[float, float]:
+    rad = math.radians(angle_deg)
+    return math.cos(rad), math.sin(rad)
+
+
+def _line_point(ax: float, ay: float, angle: float, offset: float) -> tuple[float, float]:
+    """A point on the line: the panel anchor pushed along the line normal."""
+    dx, dy = _direction(angle)
+    return ax - dy * offset, ay + dx * offset
+
+
+def _intersect(ax, ay, first, second) -> tuple[float, float] | None:
+    p1x, p1y = _line_point(ax, ay, first[0], first[1])
+    p2x, p2y = _line_point(ax, ay, second[0], second[1])
+    d1x, d1y = _direction(first[0])
+    d2x, d2y = _direction(second[0])
+    den = d1x * d2y - d1y * d2x
+    if abs(den) < 1e-9:
+        return None
+    t = ((p2x - p1x) * d2y - (p2y - p1y) * d2x) / den
+    return p1x + t * d1x, p1y + t * d1y
+
+
+def crossings(scene: dict, panel: int) -> list[tuple[float, float]]:
+    ax = scene["ax"][panel]
+    ay = scene["ay"][panel]
+    lines = _geometry(scene, panel)
+    points = []
+    for i in range(len(lines)):
+        for j in range(i + 1, len(lines)):
+            point = _intersect(ax, ay, lines[i], lines[j])
+            if point is not None:
+                points.append(point)
+    return points
+
+
+def spread(scene: dict, panel: int) -> float:
+    """Widest distance between two crossing points of the panel, in pixels."""
+    points = crossings(scene, panel)
+    if len(points) < LINES_PER_PANEL:
+        return float("inf")
+    worst = 0.0
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            worst = max(worst, math.dist(points[i], points[j]))
+    return worst
+
+
+# --------------------------------------------------------------------------
+# panel geometry
+# --------------------------------------------------------------------------
+def _panel_index(ax: float) -> int:
+    return min(PANEL_COUNT - 1, max(0, int(ax // PANEL_W)))
+
+
+def _panel_rect(index: int) -> tuple[float, float, float, float]:
+    x0 = index * PANEL_W + INSET
+    x1 = (index + 1) * PANEL_W - INSET
+    return x0, INSET, x1, HEIGHT - INSET
+
+
+def _clip(rect, point, angle) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Clip the infinite line to the rectangle (Liang-Barsky), canonical order."""
+    x0, y0, x1, y1 = rect
+    px, py = point
+    dx, dy = _direction(angle)
+    lo, hi = -1e9, 1e9
+    for num, den in ((x0 - px, dx), (px - x1, -dx), (y0 - py, dy), (py - y1, -dy)):
+        if abs(den) < 1e-12:
+            if num > 0:
+                return None
+            continue
+        t = num / den
+        if den > 0:
+            lo = max(lo, t)
+        else:
+            hi = min(hi, t)
+    if lo >= hi:
+        return None
+    a = (px + lo * dx, py + lo * dy)
+    b = (px + hi * dx, py + hi * dy)
+    return (a, b) if a <= b else (b, a)
+
+
+def _strokes(scene: dict, panel: int):
+    """Clipped stroke endpoints of one panel, in canonical drawing order."""
+    ax = scene["ax"][panel]
+    ay = scene["ay"][panel]
+    rect = _panel_rect(_panel_index(ax))
+    for angle, offset in _geometry(scene, panel):
+        clipped = _clip(rect, _line_point(ax, ay, angle, offset), angle)
+        if clipped is not None:
+            yield angle, offset, clipped
+
+
+def panel_ink(scene: dict, panel: int) -> float:
+    """Total stroked length of the panel, used only to counterbalance ink."""
+    return sum(math.dist(a, b) for _, _, (a, b) in _strokes(scene, panel))
+
+
+def crossings_inside(scene: dict, panel: int) -> bool:
+    index = _panel_index(scene["ax"][panel])
+    x0 = index * PANEL_W + CROSSING_INSET
+    x1 = (index + 1) * PANEL_W - CROSSING_INSET
+    for cx, cy in crossings(scene, panel):
+        if not (x0 <= cx <= x1 and CROSSING_INSET <= cy <= HEIGHT - CROSSING_INSET):
+            return False
+    return True
+
+
+def angles_ok(angles) -> bool:
+    ordered = sorted(angle % 180.0 for angle in angles)
+    for i in range(len(ordered)):
+        gap = (ordered[(i + 1) % len(ordered)] - ordered[i]) % 180.0
+        if gap < MIN_ANGLE_SEP_DEG or gap > 180.0 - MIN_ANGLE_SEP_DEG:
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _probe_scene(ax, ay, angles, offsets) -> dict:
+    return {
+        "ax": [ax],
+        "ay": [ay],
+        "angle": [list(angles)],
+        "offset": [list(offsets)],
+        "color": [list(range(LINES_PER_PANEL))],
+    }
+
+
+def _sample_panel(rng: random.Random, index: int, target: float) -> tuple:
+    """One panel whose crossing triple has exactly the requested spread."""
+    for _ in range(400):
+        base = rng.uniform(0.0, 180.0)
+        angles = sorted(
+            (base + 60.0 * k + rng.uniform(-15.0, 15.0)) % 180.0
+            for k in range(LINES_PER_PANEL)
+        )
+        if not angles_ok(angles):
+            continue
+        ax = index * PANEL_W + PANEL_W / 2 + rng.uniform(-34.0, 34.0)
+        ay = HEIGHT / 2 + rng.uniform(-30.0, 30.0)
+        if target <= 0.0:
+            offsets = [0.0] * LINES_PER_PANEL
+        else:
+            unit = [rng.uniform(-1.0, 1.0) for _ in range(LINES_PER_PANEL)]
+            if max(abs(value) for value in unit) < 0.25:
+                continue
+            # Crossing points are affine in the offsets and coincide when the
+            # offsets vanish, so the spread is exactly linear in a global scale.
+            unit_spread = spread(_probe_scene(ax, ay, angles, unit), 0)
+            if not math.isfinite(unit_spread) or unit_spread < 1e-6:
+                continue
+            scale = target / unit_spread
+            offsets = [value * scale for value in unit]
+        order = list(range(LINES_PER_PANEL))
+        rng.shuffle(order)  # the stored line order must not name the answer
+        panel = (
+            ax,
+            ay,
+            [angles[k] for k in order],
+            [offsets[k] for k in order],
+            [k for k in order],
+        )
+        probe = _probe_scene(ax, ay, panel[2], panel[3])
+        if not crossings_inside(probe, 0):
+            continue
+        if target > 0.0 and abs(spread(probe, 0) - target) > 1e-6:
+            continue
+        return panel
+    raise RuntimeError("panel sampling failed")
+
+
+def _assemble(panels: list) -> dict:
+    return {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "line_width": LINE_WIDTH,
+        "ax": [panel[0] for panel in panels],
+        "ay": [panel[1] for panel in panels],
+        "angle": [list(panel[2]) for panel in panels],
+        "offset": [list(panel[3]) for panel in panels],
+        "color": [list(panel[4]) for panel in panels],
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    answer_index = seed % PANEL_COUNT
+    if rng.random() < 0.18:
+        min_spread = rng.uniform(MIN_COMPETING_SPREAD, 23.6)
+    else:
+        min_spread = rng.uniform(25.0, 62.0)
+    runner_index = rng.choice([i for i in range(PANEL_COUNT) if i != answer_index])
+    # Concurrent lines run closer to the panel centre than offset ones and are
+    # therefore longer, so stroked ink would otherwise leak the answer. The
+    # answer panel's ink rank is forced onto a cycling target instead.
+    ink_rank_target = (seed + seed // PANEL_COUNT) % PANEL_COUNT
+    for _ in range(200):
+        panels = []
+        for index in range(PANEL_COUNT):
+            if index == answer_index:
+                target = 0.0
+            elif index == runner_index:
+                target = min_spread
+            else:
+                target = min_spread + rng.uniform(8.0, 46.0)
+            panels.append(_sample_panel(rng, index, target))
+        scene = _assemble(panels)
+        inks = [panel_ink(scene, p) for p in range(PANEL_COUNT)]
+        rank = sorted(range(PANEL_COUNT), key=lambda k: -inks[k]).index(answer_index)
+        if rank == ink_rank_target:
+            break
+    else:
+        raise RuntimeError("ink counterbalancing failed")
+    order = list(range(PANEL_COUNT))
+    rng.shuffle(order)  # the stored panel order must not name the answer
+    return _assemble([panels[k] for k in order])
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _canonical_colors(scene: dict, panel: int) -> list:
+    """Colour indices reordered onto the canonical line order of the panel."""
+    records = [
+        (_canon(angle, offset), colour)
+        for angle, offset, colour in zip(
+            scene["angle"][panel], scene["offset"][panel], scene["color"][panel]
+        )
+    ]
+    records.sort(key=lambda record: record[0])
+    return [colour for _, colour in records]
+
+
+def render(scene: dict) -> Image.Image:
+    scale = SUPERSAMPLE
+    big = Image.new("RGB", (scene["width"] * scale, scene["height"] * scale), BACKGROUND)
+    draw = ImageDraw.Draw(big)
+    for index in range(1, PANEL_COUNT):
+        x = index * PANEL_W * scale
+        draw.line(
+            [(x, 0), (x, scene["height"] * scale)],
+            fill=DIVIDER,
+            width=DIVIDER_WIDTH * scale,
+        )
+    for panel in sorted(range(len(scene["ax"])), key=lambda p: scene["ax"][p]):
+        colors = _canonical_colors(scene, panel)
+        for slot, (_, _, ((x0, y0), (x1, y1))) in enumerate(_strokes(scene, panel)):
+            draw.line(
+                [(x0 * scale, y0 * scale), (x1 * scale, y1 * scale)],
+                fill=LINE_COLORS[colors[slot] % len(LINE_COLORS)],
+                width=int(scene["line_width"]) * scale,
+            )
+    return big.resize((scene["width"], scene["height"]), Image.LANCZOS)
+
+
+# --------------------------------------------------------------------------
+# analytic arm
+# --------------------------------------------------------------------------
+def ordered_panels(scene: dict) -> list:
+    """Panel records named by rendered position, not by stored list order."""
+    return sorted(range(len(scene["ax"])), key=lambda panel: scene["ax"][panel])
+
+
+def analytic_gold(scene: dict) -> str:
+    spreads = [spread(scene, panel) for panel in ordered_panels(scene)]
+    return PANELS[min(range(len(spreads)), key=lambda k: spreads[k])]
+
+
+def margin(scene: dict) -> float:
+    spreads = sorted(spread(scene, panel) for panel in ordered_panels(scene))
+    return float(spreads[1] - spreads[0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    """Label-preserving storage aliases; each must render byte-identically."""
+    panel_fields = ("ax", "ay", "angle", "offset", "color")
+    line_fields = ("angle", "offset", "color")
+
+    def permute(order):
+        alias = dict(scene)
+        for field in panel_fields:
+            alias[field] = [scene[field][k] for k in order]
+        return alias
+
+    count = len(scene["ax"])
+    out = [
+        ("panel_record_reversal", permute(list(reversed(range(count))))),
+        ("panel_record_rotation", permute(list(range(1, count)) + [0])),
+    ]
+
+    reversed_lines = dict(scene)
+    for field in line_fields:
+        reversed_lines[field] = [list(reversed(values)) for values in scene[field]]
+    out.append(("line_record_reversal", reversed_lines))
+
+    half_turn = dict(scene)
+    half_turn["angle"] = [[angle + 180.0 for angle in values] for values in scene["angle"]]
+    half_turn["offset"] = [[-offset for offset in values] for values in scene["offset"]]
+    out.append(("line_half_turn_representative", half_turn))
+    return out

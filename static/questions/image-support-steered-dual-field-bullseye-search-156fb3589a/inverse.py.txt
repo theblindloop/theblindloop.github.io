@@ -1,0 +1,175 @@
+"""Independent final-PNG inverse arm for dual-field bullseye search.
+
+Only the public colors and question rule are encoded here. The oracle segments
+the raster, fits every colored bar axis with PCA, fits the single gold disk,
+forms one hit-color set per distant field, and returns their unique intersection.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+COLORS = ("red", "blue", "green", "purple")
+PALETTE = np.asarray(
+    (
+        [210, 48, 64],
+        [40, 92, 205],
+        [20, 142, 84],
+        [128, 55, 176],
+        [224, 169, 28],
+        [249, 247, 242],
+    ),
+    dtype=np.float32,
+)
+MIN_BAR_AREA = 2100
+MAX_BAR_AREA = 3300
+MIN_BAR_ELONGATION = 12.0
+MIN_GOLD_AREA = 9000
+MAX_GOLD_AREA = 15000
+MIN_TANGENCY_CLEARANCE_PX = 12.0
+
+
+@dataclass(frozen=True)
+class BarFit:
+    color: str
+    cx: float
+    cy: float
+    ux: float
+    uy: float
+    area: int
+
+
+@dataclass(frozen=True)
+class DiskFit:
+    cx: float
+    cy: float
+    radius: float
+    area: int
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        seen[y0, x0] = True
+        points = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.float64))
+    return output
+
+
+def _fit_bar(points_yx: np.ndarray, color: str, shape: tuple[int, int]) -> BarFit:
+    area = len(points_yx)
+    if not MIN_BAR_AREA <= area <= MAX_BAR_AREA:
+        raise ValueError(f"{color} bar has implausible area {area}")
+    xy = points_yx[:, ::-1]
+    center = xy.mean(axis=0)
+    covariance = np.cov(xy - center, rowvar=False, bias=True)
+    values, vectors = np.linalg.eigh(covariance)
+    if values[0] <= 0 or values[1] / values[0] < MIN_BAR_ELONGATION:
+        raise ValueError(f"{color} component is not a straight elongated bar")
+    direction = vectors[:, 1]
+    projections = (xy - center) @ direction
+    normal = np.asarray([-direction[1], direction[0]])
+    cross = (xy - center) @ normal
+    length = float(projections.max() - projections.min() + 1.0)
+    width = float(cross.max() - cross.min() + 1.0)
+    if not 102.0 <= length <= 126.0 or not 20.0 <= width <= 30.0:
+        raise ValueError(f"{color} component has implausible fitted dimensions")
+    height, raster_width = shape
+    if center[0] <= 0 or center[1] <= 0 or center[0] >= raster_width or center[1] >= height:
+        raise ValueError(f"{color} bar center is outside the raster")
+    return BarFit(color, float(center[0]), float(center[1]), float(direction[0]), float(direction[1]), area)
+
+
+def _fit_disk(points_yx: np.ndarray) -> DiskFit:
+    area = len(points_yx)
+    if not MIN_GOLD_AREA <= area <= MAX_GOLD_AREA:
+        raise ValueError(f"gold target has implausible area {area}")
+    ys = points_yx[:, 0]
+    xs = points_yx[:, 1]
+    box_w = float(xs.max() - xs.min() + 1.0)
+    box_h = float(ys.max() - ys.min() + 1.0)
+    fill = area / (box_w * box_h)
+    if not 0.94 <= box_w / box_h <= 1.06 or not 0.72 <= fill <= 0.84:
+        raise ValueError("gold target is not a filled circular disk")
+    return DiskFit(float(xs.mean()), float(ys.mean()), math.sqrt(area / math.pi), area)
+
+
+def _measure(image: Image.Image) -> tuple[dict[str, list[BarFit]], DiskFit, tuple[int, int]]:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 64:
+        raise ValueError("unsupported raster")
+    distances = ((array[:, :, None, :] - PALETTE[None, None, :, :]) ** 2).sum(axis=3)
+    labels = distances.argmin(axis=2)
+    bars: dict[str, list[BarFit]] = {}
+    for index, color in enumerate(COLORS):
+        # Fit every bar-like component that remains. This deliberately permits a
+        # destructive intervention to erase an irrelevant distractor without
+        # turning that absent distractor into spurious decisive support. On every
+        # clean generated raster all eight components are present and fitted.
+        fitted = []
+        for component in _components(labels == index, 300):
+            try:
+                fitted.append(_fit_bar(component, color, labels.shape))
+            except ValueError:
+                continue
+        if len(fitted) > 2:
+            raise ValueError(f"{color} has too many bar-like components")
+        bars[color] = fitted
+    gold_components = _components(labels == 4, MIN_GOLD_AREA)
+    if len(gold_components) != 1:
+        raise ValueError("raster must contain exactly one gold disk")
+    target = _fit_disk(gold_components[0])
+    return bars, target, labels.shape
+
+
+def _line_clearance(bar: BarFit, target: DiskFit) -> float:
+    dx = target.cx - bar.cx
+    dy = target.cy - bar.cy
+    perpendicular_distance = abs(dx * bar.uy - dy * bar.ux)
+    return target.radius - perpendicular_distance
+
+
+def decision_from_image(image: Image.Image) -> str:
+    bars, target, shape = _measure(image)
+    height, width = shape
+    if not 0.38 * width < target.cx < 0.62 * width:
+        raise ValueError("gold disk must visibly separate the two fields")
+    hits = {"left": set(), "right": set()}
+    for color, pair in bars.items():
+        left = [bar for bar in pair if bar.cx < 0.38 * width]
+        right = [bar for bar in pair if bar.cx > 0.62 * width]
+        if len(left) > 1 or len(right) > 1 or len(left) + len(right) != len(pair):
+            raise ValueError(f"{color} has an ambiguous field assignment")
+        for side, bar in (("left", left[0] if left else None), ("right", right[0] if right else None)):
+            if bar is None:
+                continue
+            clearance = _line_clearance(bar, target)
+            if abs(clearance) < MIN_TANGENCY_CLEARANCE_PX:
+                raise ValueError(f"{color} {side} bar is too close to tangency")
+            if clearance > 0.0:
+                hits[side].add(color)
+    scores = sorted(
+        ((int(color in hits["left"]) + int(color in hits["right"]), color) for color in COLORS),
+        key=lambda item: (-item[0], item[1]),
+    )
+    if scores[0][0] != 2 or scores[0][0] - scores[1][0] < 1:
+        raise ValueError("no unique double-hit color with a runner-up gap")
+    return scores[0][1]

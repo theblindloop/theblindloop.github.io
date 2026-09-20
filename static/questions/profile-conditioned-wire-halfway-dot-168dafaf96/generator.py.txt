@@ -1,0 +1,270 @@
+"""Scene sampler, renderer and analytic gold for wire_halfway_dot.
+
+One folded wire is drawn as a self-avoiding rectilinear walk on a lattice whose
+non-consecutive cells never touch, so the stroke is a single simple curve with
+two free ends and no crossing or self-contact anywhere.  Three equal dots sit on
+the wire.  The decision is which dot is nearest the point exactly halfway along
+the wire, where distance is measured along the wire itself.
+
+The straight-line cue -- which dot sits nearest the middle of the picture -- is
+balanced by construction to agree with the answer on exactly one third of the
+sampled seeds, i.e. at chance for a three-way choice, so it carries no signal.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "wire_halfway_dot-renderer-0.1.0"
+
+CANVAS = 640
+STEP = 42
+ORIGIN = 29
+GRID = 14
+WIRE_PX = 5
+DOT_RADIUS = 12
+
+BG = (255, 255, 255)
+WIRE = (95, 95, 95)
+PALETTE = {
+    "red": (206, 34, 34),
+    "green": (22, 138, 62),
+    "blue": (32, 74, 204),
+}
+COLORS = ("red", "green", "blue")
+
+QUARANTINE_PX = 100.0
+MIN_PATH_CELLS = 30
+MAX_PATH_CELLS = 40
+MIN_DOT_GAP_CELLS = 3
+MIN_DOT_PIXEL_GAP = 120.0
+EDGE_KEEPOUT = 0.09
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _walk(rng: random.Random, target: int) -> list[list[int]] | None:
+    """Self-avoiding lattice walk whose non-consecutive cells are never
+    4-adjacent, so parallel runs of the drawn wire always keep one empty lattice
+    lane between them."""
+    start = [rng.randrange(1, GRID - 1), rng.randrange(1, GRID - 1)]
+    path = [start]
+    used = {tuple(start)}
+    for _ in range(target * 40):
+        if len(path) >= target:
+            break
+        cx, cy = path[-1]
+        moves = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        rng.shuffle(moves)
+        stepped = False
+        for dx, dy in moves:
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < GRID and 0 <= ny < GRID):
+                continue
+            if (nx, ny) in used:
+                continue
+            bad = False
+            for ax, ay in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nb = (nx + ax, ny + ay)
+                if nb in used and nb != (cx, cy):
+                    bad = True
+                    break
+            if bad:
+                continue
+            path.append([nx, ny])
+            used.add((nx, ny))
+            stepped = True
+            break
+        if not stepped:
+            if len(path) < 4:
+                return None
+            drop = path.pop()
+            used.discard(tuple(drop))
+    return path if len(path) >= MIN_PATH_CELLS else None
+
+
+def _px(cell: list[int]) -> tuple[float, float]:
+    return (ORIGIN + cell[0] * STEP, ORIGIN + cell[1] * STEP)
+
+
+def _arclengths(cells: list[list[int]]) -> list[float]:
+    out = [0.0]
+    for a, b in zip(cells, cells[1:]):
+        (ax, ay), (bx, by) = _px(a), _px(b)
+        out.append(out[-1] + math.hypot(bx - ax, by - ay))
+    return out
+
+
+def _centre_cue(scene: dict) -> str:
+    """Colour of the dot nearest the middle of the drawn wire in straight-line
+    picture distance -- the cheap cue this world balances to chance."""
+    cells = scene["cells"]
+    xs = [_px(c)[0] for c in cells]
+    ys = [_px(c)[1] for c in cells]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    best, best_d = None, None
+    for dot in scene["dots"]:
+        x, y = _px(cells[dot["index"]])
+        d = math.hypot(x - mx, y - my)
+        if best_d is None or d < best_d:
+            best, best_d = dot["color"], d
+    return best
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    want_cue_agrees = (seed % 3) == 0
+    want_colour = COLORS[(seed // 3) % 3]
+    near_boundary = (seed % 8) == 3
+
+    for attempt in range(6000):
+        if attempt == 3000:
+            near_boundary = False  # coverage target, never a correctness condition
+        target = rng.randint(MIN_PATH_CELLS, MAX_PATH_CELLS)
+        cells = _walk(rng, target)
+        if cells is None:
+            continue
+        arcs = _arclengths(cells)
+        total = arcs[-1]
+        half = total / 2.0
+        lo, hi = EDGE_KEEPOUT * total, (1 - EDGE_KEEPOUT) * total
+
+        if near_boundary:
+            gap = rng.uniform(14.0, 0.85 * QUARANTINE_PX)
+        else:
+            gap = rng.uniform(1.35 * QUARANTINE_PX, 4.0 * STEP)
+        off = rng.uniform(0.0, 0.55 * STEP)
+
+        idx = list(range(len(cells)))
+        winners = [i for i in idx if lo <= arcs[i] <= hi and abs(arcs[i] - half) <= off]
+        rng.shuffle(winners)
+        chosen = None
+        for w in winners:
+            dw = abs(arcs[w] - half)
+            ceiling = dw + 0.95 * QUARANTINE_PX if near_boundary else float("inf")
+            others = [
+                i
+                for i in idx
+                if lo <= arcs[i] <= hi
+                and abs(i - w) >= MIN_DOT_GAP_CELLS
+                and abs(arcs[i] - half) >= dw + gap
+            ]
+            runners = [i for i in others if abs(arcs[i] - half) <= ceiling]
+            rng.shuffle(runners)
+            rng.shuffle(others)
+            for a in runners:
+                for b in others:
+                    if abs(a - b) < MIN_DOT_GAP_CELLS:
+                        continue
+                    if abs(arcs[b] - half) < abs(arcs[a] - half):
+                        continue
+                    trio = [w, a, b]
+                    pts = [_px(cells[i]) for i in trio]
+                    if min(
+                        math.hypot(p[0] - q[0], p[1] - q[1])
+                        for p in pts
+                        for q in pts
+                        if p is not q
+                    ) < MIN_DOT_PIXEL_GAP:
+                        continue
+                    da, db = abs(arcs[a] - half), abs(arcs[b] - half)
+                    if abs(da - db) < 1e-9:
+                        continue
+                    chosen = (w, a, b, min(da, db) - dw)
+                    break
+                if chosen:
+                    break
+            if chosen:
+                break
+        if chosen is None:
+            continue
+        if near_boundary and chosen[3] >= 0.95 * QUARANTINE_PX:
+            continue
+
+        w, a, b, margin = chosen
+        rest = [c for c in COLORS if c != want_colour]
+        rng.shuffle(rest)
+        dots = [
+            {"color": want_colour, "index": w},
+            {"color": rest[0], "index": a},
+            {"color": rest[1], "index": b},
+        ]
+        rng.shuffle(dots)
+        scene = {
+            "canvas": CANVAS,
+            "step": STEP,
+            "origin": ORIGIN,
+            "grid": GRID,
+            "wire_px": WIRE_PX,
+            "dot_radius": DOT_RADIUS,
+            "cells": cells,
+            "dots": dots,
+            "palette": {k: list(v) for k, v in sorted(PALETTE.items())},
+            "wire_rgb": list(WIRE),
+            "background_rgb": list(BG),
+        }
+        if (_centre_cue(scene) == want_colour) != want_cue_agrees:
+            continue
+        return scene
+    raise RuntimeError(f"no admissible scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    size = int(scene["canvas"])
+    img = Image.new("RGB", (size, size), tuple(scene["background_rgb"]))
+    drw = ImageDraw.Draw(img)
+    pts = [_px(c) for c in scene["cells"]]
+    drw.line(pts, fill=tuple(scene["wire_rgb"]), width=int(scene["wire_px"]), joint="curve")
+    r = int(scene["dot_radius"])
+    for dot in sorted(scene["dots"], key=lambda d: d["color"]):
+        x, y = _px(scene["cells"][dot["index"]])
+        drw.ellipse([x - r, y - r, x + r, y + r], fill=tuple(scene["palette"][dot["color"]]))
+    return img
+
+
+# --------------------------------------------------------------------------
+# analytic gold
+# --------------------------------------------------------------------------
+def _offsets(scene: dict) -> list[tuple[float, str]]:
+    arcs = _arclengths(scene["cells"])
+    half = arcs[-1] / 2.0
+    return sorted((abs(arcs[d["index"]] - half), d["color"]) for d in scene["dots"])
+
+
+def analytic_gold(scene: dict) -> str:
+    return _offsets(scene)[0][1]
+
+
+def margin(scene: dict) -> float:
+    off = _offsets(scene)
+    return float(off[1][0] - off[0][0])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical, gold-preserving latent rewrites."""
+    n = len(scene["cells"])
+
+    reversed_wire = dict(scene)
+    reversed_wire["cells"] = list(reversed(scene["cells"]))
+    reversed_wire["dots"] = [
+        {"color": d["color"], "index": n - 1 - d["index"]} for d in scene["dots"]
+    ]
+
+    reordered_dots = dict(scene)
+    reordered_dots["dots"] = list(reversed(scene["dots"]))
+
+    return [
+        ("reverse_wire_direction", reversed_wire),
+        ("reverse_dot_record_order", reordered_dots),
+    ]

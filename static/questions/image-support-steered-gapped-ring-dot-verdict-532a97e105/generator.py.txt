@@ -1,0 +1,313 @@
+"""Scene sampling, rendering and analytic gold for the gapped-ring dot verdict world.
+
+One connected thin rectilinear trace is drawn on a lattice.  The trace always
+carries exactly one genuinely closed circuit and one decoy circuit that is
+interrupted by a single visible gap, joined by a long isthmus so that all of the
+decisive ink is a single thin connected component spanning the page.  Two dots of
+different colour sit far apart, one inside the closed circuit and one inside the
+gapped decoy.  The decision names the dot that the trace actually shuts in.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BACKGROUND = (255, 255, 255)
+TRACE_INK = (16, 16, 16)
+GREEN_INK = (0, 150, 0)
+RED_INK = (200, 0, 0)
+DECOR_INKS = ((40, 90, 200), (230, 140, 20), (150, 150, 150), (140, 60, 170))
+
+GRID_N = 12
+CELL_PX = 46
+MARGIN_PX = 44
+DOT_RADIUS_PX = 10
+STROKE_CYCLE = (7, 9, 11, 5)
+QUARANTINE_FLOOR = 6.0
+
+# ---------------------------------------------------------------------------
+# lattice helpers
+#
+# A vertical wall edge ("v", i, j) is the lattice segment from node (i, j) to
+# node (i, j + 1); it separates cell (i - 1, j) from cell (i, j).
+# A horizontal wall edge ("h", i, j) runs from node (i, j) to node (i + 1, j);
+# it separates cell (i, j - 1) from cell (i, j).
+# ---------------------------------------------------------------------------
+
+
+def _rect_cycle(x0: int, y0: int, x1: int, y1: int) -> list:
+    """Boundary edges of the cell block [x0, x1) x [y0, y1)."""
+    edges = []
+    for i in range(x0, x1):
+        edges.append(("h", i, y0))
+        edges.append(("h", i, y1))
+    for j in range(y0, y1):
+        edges.append(("v", x0, j))
+        edges.append(("v", x1, j))
+    return edges
+
+
+def _link_path(node_a, node_b) -> list:
+    """L-shaped chain of lattice edges from node_a to node_b (horizontal first)."""
+    (ax, ay), (bx, by) = node_a, node_b
+    edges = []
+    step = 1 if bx >= ax else -1
+    for x in range(ax, bx, step):
+        edges.append(("h", min(x, x + step), ay))
+    step = 1 if by >= ay else -1
+    for y in range(ay, by, step):
+        edges.append(("v", bx, min(y, y + step)))
+    return edges
+
+
+def _outside_reachable(grid_n: int, wall_edges) -> set:
+    """Cells reachable from the page exterior without crossing a wall edge."""
+    blocked = set(tuple(edge) for edge in wall_edges)
+    start = []
+    for i in range(grid_n):
+        for j in range(grid_n):
+            if i == 0 and ("v", 0, j) not in blocked:
+                start.append((i, j))
+            if i == grid_n - 1 and ("v", grid_n, j) not in blocked:
+                start.append((i, j))
+            if j == 0 and ("h", i, 0) not in blocked:
+                start.append((i, j))
+            if j == grid_n - 1 and ("h", i, grid_n) not in blocked:
+                start.append((i, j))
+    seen = set(start)
+    queue = deque(start)
+    while queue:
+        i, j = queue.popleft()
+        for di, dj, edge in (
+            (-1, 0, ("v", i, j)),
+            (1, 0, ("v", i + 1, j)),
+            (0, -1, ("h", i, j)),
+            (0, 1, ("h", i, j + 1)),
+        ):
+            if edge in blocked:
+                continue
+            ni, nj = i + di, j + dj
+            if 0 <= ni < grid_n and 0 <= nj < grid_n and (ni, nj) not in seen:
+                seen.add((ni, nj))
+                queue.append((ni, nj))
+    return seen
+
+
+def _edges_connected(wall_edges) -> bool:
+    """True when the wall edge set forms a single connected trace."""
+    edges = [tuple(edge) for edge in wall_edges]
+    if not edges:
+        return False
+    nodes = {}
+    for kind, i, j in edges:
+        a = (i, j)
+        b = (i, j + 1) if kind == "v" else (i + 1, j)
+        nodes.setdefault(a, []).append(b)
+        nodes.setdefault(b, []).append(a)
+    start = next(iter(nodes))
+    seen = {start}
+    queue = deque([start])
+    while queue:
+        node = queue.popleft()
+        for other in nodes[node]:
+            if other not in seen:
+                seen.add(other)
+                queue.append(other)
+    return len(seen) == len(nodes)
+
+
+# ---------------------------------------------------------------------------
+# sampling
+# ---------------------------------------------------------------------------
+
+
+def _candidate_scene(rng: random.Random, stroke: int, inside_color: str):
+    half = GRID_N // 2
+    quadrant = rng.randrange(4)
+    # true closed circuit in one quadrant, gapped decoy in the opposite one
+    boxes = []
+    for slot in (quadrant, (quadrant + 2) % 4):
+        bw = rng.randint(3, 4)
+        bh = rng.randint(3, 4)
+        left = 0 if slot in (0, 3) else half
+        top = 0 if slot in (0, 1) else half
+        x0 = left + rng.randint(0, half - bw)
+        y0 = top + rng.randint(0, half - bh)
+        boxes.append((x0, y0, x0 + bw, y0 + bh))
+    shut, open_box = boxes
+    shut_edges = _rect_cycle(*shut)
+    decoy_edges = _rect_cycle(*open_box)
+    gap = decoy_edges[rng.randrange(len(decoy_edges))]
+    decoy_edges = [edge for edge in decoy_edges if edge != gap]
+
+    link = _link_path((shut[0], shut[1]), (open_box[2], open_box[3]))
+    wall_edges = sorted(set(shut_edges) | set(decoy_edges) | set(link))
+
+    shut_cell = (rng.randint(shut[0], shut[2] - 1), rng.randint(shut[1], shut[3] - 1))
+    open_cell = (
+        rng.randint(open_box[0], open_box[2] - 1),
+        rng.randint(open_box[1], open_box[3] - 1),
+    )
+    reachable = _outside_reachable(GRID_N, wall_edges)
+    if shut_cell in reachable or open_cell not in reachable:
+        return None
+    if not _edges_connected(wall_edges):
+        return None
+
+    # the two dots must sit in widely separated parts of the page
+    span = abs(shut_cell[0] - open_cell[0]) + abs(shut_cell[1] - open_cell[1])
+    if span < GRID_N:
+        return None
+
+    if inside_color == "green":
+        green_cell, red_cell = shut_cell, open_cell
+    else:
+        green_cell, red_cell = open_cell, shut_cell
+
+    used = set()
+    for kind, i, j in wall_edges:
+        used.add((i, j))
+        used.add((i, j + 1) if kind == "v" else (i + 1, j))
+    decor = []
+    free = [
+        (i, j)
+        for i in range(GRID_N)
+        for j in range(GRID_N)
+        if (i, j) not in (green_cell, red_cell)
+        and not any(
+            edge in set(tuple(e) for e in wall_edges)
+            for edge in (("v", i, j), ("v", i + 1, j), ("h", i, j), ("h", i, j + 1))
+        )
+    ]
+    rng.shuffle(free)
+    for cell in free[: rng.randint(4, 6)]:
+        decor.append(
+            {
+                "cell": list(cell),
+                "ink": rng.randrange(len(DECOR_INKS)),
+                "ring": rng.random() < 0.5,
+            }
+        )
+
+    return {
+        "canvas_px": MARGIN_PX * 2 + GRID_N * CELL_PX,
+        "cell_px": CELL_PX,
+        "decor_marks": decor,
+        "dot_radius_px": DOT_RADIUS_PX,
+        "green_cell": list(green_cell),
+        "grid_n": GRID_N,
+        "margin_px": MARGIN_PX,
+        "red_cell": list(red_cell),
+        "wall_edges": [list(edge) for edge in wall_edges],
+        "wall_px": stroke,
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one scene."""
+    rng = random.Random(int(seed) * 7919 + 13)
+    index = int(seed) % 1000
+    stroke = STROKE_CYCLE[(index // 2) % len(STROKE_CYCLE)]
+    inside_color = "green" if index % 2 == 0 else "red"
+    for _ in range(4000):
+        scene = _candidate_scene(rng, stroke, inside_color)
+        if scene is not None:
+            return scene
+    raise RuntimeError("scene sampling failed")
+
+
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+
+
+def _fill(array, x0, y0, x1, y1, colour) -> None:
+    array[max(y0, 0) : y1 + 1, max(x0, 0) : x1 + 1] = colour
+
+
+def render(scene: dict) -> Image.Image:
+    grid_n = int(scene["grid_n"])
+    cell = int(scene["cell_px"])
+    margin = int(scene["margin_px"])
+    stroke = int(scene["wall_px"])
+    radius = int(scene["dot_radius_px"])
+    size = int(scene["canvas_px"])
+    array = np.zeros((size, size, 3), dtype=np.uint8)
+    array[:, :] = BACKGROUND
+
+    def node_px(i, j):
+        return margin + i * cell, margin + j * cell
+
+    for mark in scene["decor_marks"]:
+        i, j = mark["cell"]
+        colour = DECOR_INKS[int(mark["ink"]) % len(DECOR_INKS)]
+        cx, cy = node_px(i, j)
+        x0, y0 = cx + 12, cy + 12
+        x1, y1 = cx + cell - 12, cy + cell - 12
+        _fill(array, x0, y0, x1, y1, colour)
+        if mark["ring"]:
+            _fill(array, x0 + 5, y0 + 5, x1 - 5, y1 - 5, BACKGROUND)
+
+    half = stroke // 2
+    for kind, i, j in scene["wall_edges"]:
+        ax, ay = node_px(i, j)
+        if kind == "v":
+            bx, by = node_px(i, j + 1)
+        else:
+            bx, by = node_px(i + 1, j)
+        _fill(array, ax - half, ay - half, bx + half, by + half, TRACE_INK)
+
+    yy, xx = np.mgrid[0:size, 0:size]
+    for dot_cell, colour in ((scene["green_cell"], GREEN_INK), (scene["red_cell"], RED_INK)):
+        i, j = dot_cell
+        cx, cy = node_px(i, j)
+        cx += cell // 2
+        cy += cell // 2
+        disc = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
+        array[disc] = colour
+
+    # grid_n is the lattice extent that fixes the drawn frame of the trace
+    assert size == margin * 2 + grid_n * cell
+    return Image.fromarray(array, mode="RGB")
+
+
+# ---------------------------------------------------------------------------
+# analytic gold
+# ---------------------------------------------------------------------------
+
+
+def analytic_gold(scene: dict) -> str:
+    """Name the dot that the trace shuts away from the outside of the page."""
+    grid_n = int(scene["grid_n"])
+    wall_edges = [tuple(edge) for edge in scene["wall_edges"]]
+    green_cell = tuple(scene["green_cell"])
+    red_cell = tuple(scene["red_cell"])
+    reachable = _outside_reachable(grid_n, wall_edges)
+    green_shut = green_cell not in reachable
+    red_shut = red_cell not in reachable
+    if green_shut == red_shut:
+        raise ValueError("scene does not shut in exactly one dot")
+    return "green" if green_shut else "red"
+
+
+def margin(scene: dict) -> float:
+    """Weakest decisive width in pixels."""
+    stroke = int(scene["wall_px"])
+    cell = int(scene["cell_px"])
+    radius = int(scene["dot_radius_px"])
+    corridor = cell - stroke
+    clearance = corridor / 2.0 - radius
+    return float(min(float(stroke), float(corridor), clearance))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_FLOOR
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No latent aliases are declared: every gold input is drawn into the raster."""
+    return []

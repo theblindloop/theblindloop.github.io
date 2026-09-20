@@ -1,0 +1,386 @@
+"""Renderer, analytic gold and margin for the illusory-edge-cycle world.
+
+A medium-sized patch of the page carries exactly seven equal dark discs.  Every
+disc has one wedge cut out of it, and the apex of every wedge sits exactly at
+that disc's centre, so each wedge contributes two straight edges that leave the
+disc centre.  Some of the discs are mutually *continuation compatible*: for such
+a pair, one straight wedge edge of each disc runs exactly along the straight
+line joining the two disc centres, so the pair induces one illusory segment
+whose ends are pinned by two different discs.  The compatible pairs of a scene
+form a graph over the discs; in a clean scene that graph is a single simple
+cycle over three, four or five discs and every remaining disc is isolated.  The
+cycle is the closed illusory outline, and the decision is how many sides it has.
+
+Nothing along the illusory outline is ever painted: the only ink is the seven
+discs, and the sides exist purely as the alignment of two distant wedge edges.
+The renderer paints discs in one flat colour and clutter in a second flat
+colour, so the raster is an order-independent union of same-coloured paint.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "illusory_edge_cycle-0.1.0"
+
+WIDTH = 640
+HEIGHT = 480
+SUPERSAMPLE = 3
+
+DISC_RADIUS = 24
+DISC_COUNT = 7
+MIN_CENTRE_GAP = 58.0
+# Discs that carry an illusory side stand far enough apart that their decisive
+# neighbourhoods are separate components of the image, not one blob.
+MIN_VERTEX_GAP = 146.0
+CLUTTER_CLEARANCE = 13.0
+
+# One flat pair of ink colours; nothing about the answer touches the palette.
+BACKGROUND = (246, 244, 237)
+DISC_COLOUR = (38, 40, 47)
+CLUTTER_COLOUR = (213, 211, 203)
+
+# Angular tolerance, in degrees, at which a pair of wedge edges counts as one
+# illusory side.  Gold and the pixel arm use the same public constant.
+ALIGN_TOLERANCE_DEG = 10.0
+# Margin below which the continuation structure is a finite-resolution boundary
+# case; sampling leaves the band (6, 30) empty.
+QUARANTINE_MARGIN_DEG = 14.0
+CLEAR_MARGIN_DEG = 30.0
+
+# Total removed wedge angle, in degrees, summed over all seven discs.  It is a
+# constant of the world, so total ink is identical in every scene and says
+# nothing about the number of illusory sides.
+TOTAL_WEDGE_DEG = 665.0
+
+SIDE_LABELS = {3: "three", 4: "four", 5: "five"}
+UNCLEAR = "unclear"
+
+
+# --------------------------------------------------------------------------
+# angle helpers
+# --------------------------------------------------------------------------
+def _wrap(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _angle_gap(a: float, b: float) -> float:
+    return abs(_wrap(a - b))
+
+
+def _edge_directions(bisector: float, wedge: float) -> tuple[float, float]:
+    return (_wrap(bisector - 0.5 * wedge), _wrap(bisector + 0.5 * wedge))
+
+
+# --------------------------------------------------------------------------
+# continuation graph shared by gold and (independently reimplemented) oracle
+# --------------------------------------------------------------------------
+def _pair_error_deg(discs: list, i: int, j: int) -> float:
+    xi, yi, bi, wi = discs[i][0], discs[i][1], discs[i][3], discs[i][4]
+    xj, yj, bj, wj = discs[j][0], discs[j][1], discs[j][3], discs[j][4]
+    towards_j = math.atan2(yj - yi, xj - xi)
+    towards_i = math.atan2(yi - yj, xi - xj)
+    dev_i = min(_angle_gap(towards_j, e) for e in _edge_directions(bi, wi))
+    dev_j = min(_angle_gap(towards_i, e) for e in _edge_directions(bj, wj))
+    return math.degrees(max(dev_i, dev_j))
+
+
+def _errors(discs: list) -> dict:
+    return {
+        (i, j): _pair_error_deg(discs, i, j)
+        for i in range(len(discs))
+        for j in range(i + 1, len(discs))
+    }
+
+
+def cycle_length(discs: list, tolerance: float = ALIGN_TOLERANCE_DEG) -> int | None:
+    """Return the length of the unique illusory cycle, or None if there is none."""
+    errors = _errors(discs)
+    count = len(discs)
+    adjacency: list[list[int]] = [[] for _ in range(count)]
+    for (i, j), error in errors.items():
+        if error <= tolerance:
+            adjacency[i].append(j)
+            adjacency[j].append(i)
+    if any(len(row) not in (0, 2) for row in adjacency):
+        return None
+    active = [i for i in range(count) if len(adjacency[i]) == 2]
+    if len(active) < 3:
+        return None
+    start = active[0]
+    previous = start
+    current = adjacency[start][0]
+    walked = [start]
+    while current != start:
+        walked.append(current)
+        following = [n for n in adjacency[current] if n != previous]
+        if len(following) != 1:
+            return None
+        previous, current = current, following[0]
+        if len(walked) > count:
+            return None
+    if len(walked) != len(active):
+        return None
+    return len(walked) if len(walked) in SIDE_LABELS else None
+
+
+def structure_and_margin(discs: list) -> tuple[int | None, float]:
+    """Illusory-cycle length plus the angular slack of that reading, in degrees."""
+    errors = _errors(discs)
+    inside = [e for e in errors.values() if e <= ALIGN_TOLERANCE_DEG]
+    outside = [e for e in errors.values() if e > ALIGN_TOLERANCE_DEG]
+    length = cycle_length(discs)
+    if length is None:
+        # An unreadable structure is exactly as far from a clean reading as its
+        # tightest alignment is from being absent.
+        return None, float(min(inside)) if inside else 0.0
+    slack = (min(outside) if outside else 180.0) - (max(inside) if inside else 0.0)
+    return length, float(max(0.0, slack))
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _polygon(rng: random.Random, centre: tuple[float, float], radius: float, sides: int):
+    base = rng.uniform(0.0, 2.0 * math.pi)
+    points = []
+    for index in range(sides):
+        angle = base + 2.0 * math.pi * index / sides + rng.uniform(-0.10, 0.10)
+        reach = radius * (1.0 + rng.uniform(-0.055, 0.055))
+        points.append((centre[0] + reach * math.cos(angle), centre[1] + reach * math.sin(angle)))
+    return points
+
+
+def _convex(points: list) -> bool:
+    count = len(points)
+    signs = []
+    for index in range(count):
+        ax, ay = points[index]
+        bx, by = points[(index + 1) % count]
+        cx, cy = points[(index + 2) % count]
+        signs.append((bx - ax) * (cy - by) - (by - ay) * (cx - bx))
+    return all(s > 0 for s in signs) or all(s < 0 for s in signs)
+
+
+def _interior_wedge(points: list, index: int) -> tuple[float, float]:
+    """Bisector and opening of the wedge that must be cut out at one vertex."""
+    count = len(points)
+    here = points[index]
+    previous = points[(index - 1) % count]
+    following = points[(index + 1) % count]
+    to_previous = math.atan2(previous[1] - here[1], previous[0] - here[0])
+    to_following = math.atan2(following[1] - here[1], following[0] - here[0])
+    opening = abs(_wrap(to_previous - to_following))
+    bisector = to_following + 0.5 * _wrap(to_previous - to_following)
+    return _wrap(bisector), opening
+
+
+def _far_enough(candidate, placed, gap: float) -> bool:
+    return all(math.hypot(candidate[0] - p[0], candidate[1] - p[1]) >= gap for p in placed)
+
+
+def _attempt(rng: random.Random, planted: bool) -> dict | None:
+    sides = rng.choice((3, 3, 4, 4, 5, 5))
+    span = {3: (94.0, 108.0), 4: (112.0, 124.0), 5: (128.0, 140.0)}[sides]
+    span = rng.uniform(*span)
+    centre = (rng.uniform(268.0, 372.0), rng.uniform(214.0, 266.0))
+    vertices = _polygon(rng, centre, span, sides)
+    if not _convex(vertices):
+        return None
+    for i in range(sides):
+        for j in range(i + 1, sides):
+            if math.hypot(vertices[i][0] - vertices[j][0], vertices[i][1] - vertices[j][1]) < MIN_VERTEX_GAP:
+                return None
+
+    wedges = [_interior_wedge(vertices, index) for index in range(sides)]
+    if any(not (math.radians(38.0) <= w <= math.radians(150.0)) for _b, w in wedges):
+        return None
+    used_deg = sum(math.degrees(w) for _b, w in wedges)
+    spare = DISC_COUNT - sides
+    weights = [rng.uniform(0.86, 1.14) for _ in range(spare)]
+    scale = (TOTAL_WEDGE_DEG - used_deg) / sum(weights)
+    spare_openings = [math.radians(scale * w) for w in weights]
+    if any(not (math.radians(40.0) <= w <= math.radians(150.0)) for w in spare_openings):
+        return None
+
+    discs = [
+        [round(vertices[i][0], 4), round(vertices[i][1], 4), DISC_RADIUS,
+         round(wedges[i][0], 6), round(wedges[i][1], 6)]
+        for i in range(sides)
+    ]
+    placed = [(d[0], d[1]) for d in discs]
+    for i in range(sides):
+        for j in range(i + 1, sides):
+            if abs(i - j) in (1, sides - 1):
+                continue
+            if _pair_error_deg(discs, i, j) < CLEAR_MARGIN_DEG:
+                return None
+
+    remaining = list(spare_openings)
+    if planted:
+        # Park one extra disc directly on an illusory side and aim one of its
+        # wedge edges back at that side's vertex, so the vertex acquires a third
+        # illusory partner and the outline can no longer be read.
+        opening = remaining.pop()
+        vertex = rng.randrange(sides)
+        following = (vertex + 1) % sides
+        ax, ay = vertices[vertex]
+        bx, by = vertices[following]
+        length = math.hypot(bx - ax, by - ay)
+        low, high = MIN_CENTRE_GAP + 3.0, length - MIN_CENTRE_GAP - 3.0
+        if high <= low:
+            return None
+        along = rng.uniform(low, high)
+        direction = math.atan2(by - ay, bx - ax)
+        spot = (ax + along * math.cos(direction), ay + along * math.sin(direction))
+        if not _far_enough(spot, placed, MIN_CENTRE_GAP):
+            return None
+        back = _wrap(direction + math.pi)
+        bisector = _wrap(back + (0.5 * opening if rng.random() < 0.5 else -0.5 * opening))
+        discs.append([round(spot[0], 4), round(spot[1], 4), DISC_RADIUS,
+                      round(bisector, 6), round(opening, 6)])
+        placed.append(spot)
+
+    for opening in remaining:
+        for _try in range(400):
+            angle = rng.uniform(0.0, 2.0 * math.pi)
+            reach = span * rng.uniform(0.52, 1.12)
+            spot = (centre[0] + reach * math.cos(angle), centre[1] + reach * math.sin(angle))
+            if not (46.0 <= spot[0] <= WIDTH - 46.0 and 46.0 <= spot[1] <= HEIGHT - 46.0):
+                continue
+            if not _far_enough(spot, placed, MIN_CENTRE_GAP):
+                continue
+            fresh = [round(spot[0], 4), round(spot[1], 4), DISC_RADIUS,
+                     round(_wrap(rng.uniform(0.0, 2.0 * math.pi)), 6), round(opening, 6)]
+            trial = discs + [fresh]
+            here = len(trial) - 1
+            if any(_pair_error_deg(trial, other, here) < CLEAR_MARGIN_DEG
+                   for other in range(here)):
+                continue
+            placed.append(spot)
+            discs.append(fresh)
+            break
+        else:
+            return None
+    if len(discs) != DISC_COUNT:
+        return None
+
+    order = list(range(DISC_COUNT))
+    rng.shuffle(order)
+    discs = [discs[index] for index in order]
+
+    length, slack = structure_and_margin(discs)
+    if planted:
+        if length is not None or slack > 6.0:
+            return None
+    else:
+        if length != sides or slack < CLEAR_MARGIN_DEG:
+            return None
+
+    clutter = []
+    for _mark in range(rng.randint(14, 22)):
+        for _try in range(80):
+            x = rng.uniform(16.0, WIDTH - 16.0)
+            y = rng.uniform(16.0, HEIGHT - 16.0)
+            size = rng.uniform(4.0, 11.0)
+            if _far_enough((x, y), placed, DISC_RADIUS + size + CLUTTER_CLEARANCE):
+                clutter.append([round(x, 3), round(y, 3), round(size, 3),
+                                "round" if rng.random() < 0.5 else "square"])
+                break
+    return {
+        "discs": discs,
+        "width": WIDTH,
+        "height": HEIGHT,
+        "bg": list(BACKGROUND),
+        "fg": list(DISC_COLOUR),
+        "clutter_color": list(CLUTTER_COLOUR),
+        "clutter": clutter,
+    }
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed) * 2_654_435_761 % (2 ** 61 - 1))
+    planted = rng.random() < 0.25
+    for _attempt_index in range(6000):
+        scene = _attempt(rng, planted)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict) -> Image.Image:
+    width = int(scene["width"])
+    height = int(scene["height"])
+    scale = SUPERSAMPLE
+    canvas = Image.new("RGB", (width * scale, height * scale), tuple(scene["bg"]))
+    draw = ImageDraw.Draw(canvas)
+
+    clutter_colour = tuple(scene["clutter_color"])
+    for x, y, size, kind in scene["clutter"]:
+        box = [(x - size) * scale, (y - size) * scale, (x + size) * scale, (y + size) * scale]
+        if kind == "round":
+            draw.ellipse(box, fill=clutter_colour)
+        else:
+            draw.rectangle(box, fill=clutter_colour)
+
+    ink = tuple(scene["fg"])
+    background = tuple(scene["bg"])
+    for cx, cy, radius, bisector, wedge in scene["discs"]:
+        box = [(cx - radius) * scale, (cy - radius) * scale,
+               (cx + radius) * scale, (cy + radius) * scale]
+        draw.ellipse(box, fill=ink)
+    for cx, cy, radius, bisector, wedge in scene["discs"]:
+        pad = 1.0
+        box = [(cx - radius - pad) * scale, (cy - radius - pad) * scale,
+               (cx + radius + pad) * scale, (cy + radius + pad) * scale]
+        start = math.degrees(bisector - 0.5 * wedge)
+        end = math.degrees(bisector + 0.5 * wedge)
+        draw.pieslice(box, start, end, fill=background)
+    return canvas.resize((width, height), Image.BOX)
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine, latent aliases
+# --------------------------------------------------------------------------
+def analytic_gold(scene: dict) -> str:
+    length, slack = structure_and_margin(scene["discs"])
+    if length is None or slack < QUARANTINE_MARGIN_DEG:
+        return UNCLEAR
+    return SIDE_LABELS[length]
+
+
+def margin(scene: dict) -> float:
+    return float(structure_and_margin(scene["discs"])[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(structure_and_margin(scene["discs"])[1] < QUARANTINE_MARGIN_DEG)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabellings of the latent scene.
+
+    Every disc carries the same flat colour and no two discs overlap, and all
+    clutter carries a second flat colour, so the raster is an order-independent
+    union of paint: rotating or reversing the disc list, or reversing the
+    clutter list, cannot change a single pixel.  Gold reads the disc set as a
+    set, so it must be preserved.
+    """
+    discs = scene["discs"]
+    rotated = dict(scene)
+    rotated["discs"] = discs[1:] + discs[:1]
+    reversed_discs = dict(scene)
+    reversed_discs["discs"] = list(reversed(discs))
+    reversed_clutter = dict(scene)
+    reversed_clutter["clutter"] = list(reversed(scene["clutter"]))
+    return [
+        ("disc_list_rotation", rotated),
+        ("disc_list_reversal", reversed_discs),
+        ("clutter_list_reversal", reversed_clutter),
+    ]

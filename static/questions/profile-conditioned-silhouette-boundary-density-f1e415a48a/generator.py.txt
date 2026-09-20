@@ -1,0 +1,227 @@
+"""Deterministic renderer and analytic gold for normalized silhouette density."""
+
+from __future__ import annotations
+
+import math
+import random
+from functools import lru_cache
+from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont
+
+
+RENDERER_VERSION = "silhouette_boundary_density-0.1.0"
+CANVAS_SIZE = (1000, 640)
+SUPERSAMPLE = 4
+PANEL_RECTS = {
+    "a": (60, 120, 480, 550),
+    "b": (520, 120, 940, 550),
+}
+TARGET_TEMPLATE_AREA = 3.0
+QUARANTINE_GAP = 0.42
+SHAPE_KINDS = ("round", "octagon", "square", "triangle", "star")
+PAIR_POOL = (
+    ("round", "triangle"),
+    ("square", "triangle"),
+    ("triangle", "star"),
+    ("round", "star"),
+    ("octagon", "triangle"),
+    ("octagon", "star"),
+)
+SHAPE_COLORS = (
+    (26, 111, 214),
+    (215, 65, 70),
+    (30, 151, 103),
+    (155, 74, 202),
+    (232, 132, 32),
+)
+BACKGROUND = (248, 250, 253)
+PANEL_FILL = (255, 255, 255)
+PANEL_OUTLINE = (180, 190, 204)
+TITLE_COLOR = (26, 36, 52)
+SUBTITLE_COLOR = (78, 91, 109)
+LABEL_COLOR = (43, 56, 75)
+
+
+def _regular_polygon(sides: int, phase: float) -> tuple[tuple[float, float], ...]:
+    return tuple(
+        (
+            math.cos(phase + 2.0 * math.pi * index / sides),
+            math.sin(phase + 2.0 * math.pi * index / sides),
+        )
+        for index in range(sides)
+    )
+
+
+def _raw_vertices(kind: str) -> tuple[tuple[float, float], ...]:
+    if kind == "round":
+        return _regular_polygon(16, -math.pi / 2.0)
+    if kind == "octagon":
+        return _regular_polygon(8, -math.pi / 2.0)
+    if kind == "square":
+        return _regular_polygon(4, -math.pi / 4.0)
+    if kind == "triangle":
+        return _regular_polygon(3, -math.pi / 2.0)
+    if kind == "star":
+        points = []
+        for index in range(10):
+            radius = 1.0 if index % 2 == 0 else 0.42
+            angle = -math.pi / 2.0 + index * math.pi / 5.0
+            points.append((radius * math.cos(angle), radius * math.sin(angle)))
+        return tuple(points)
+    raise KeyError(f"unknown shape kind {kind!r}")
+
+
+def _polygon_area(vertices: tuple[tuple[float, float], ...]) -> float:
+    return 0.5 * abs(
+        sum(
+            vertices[index][0] * vertices[(index + 1) % len(vertices)][1]
+            - vertices[(index + 1) % len(vertices)][0] * vertices[index][1]
+            for index in range(len(vertices))
+        )
+    )
+
+
+def _polygon_perimeter(vertices: tuple[tuple[float, float], ...]) -> float:
+    return sum(
+        math.dist(vertices[index], vertices[(index + 1) % len(vertices)])
+        for index in range(len(vertices))
+    )
+
+
+@lru_cache(maxsize=None)
+def _template_vertices(kind: str) -> tuple[tuple[float, float], ...]:
+    raw = _raw_vertices(kind)
+    factor = math.sqrt(TARGET_TEMPLATE_AREA / _polygon_area(raw))
+    return tuple((x * factor, y * factor) for x, y in raw)
+
+
+@lru_cache(maxsize=None)
+def _boundary_score(kind: str) -> float:
+    vertices = _template_vertices(kind)
+    return _polygon_perimeter(vertices) / math.sqrt(_polygon_area(vertices))
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Sample a balanced pair with independent visual nuisance fields."""
+
+    seed = int(seed)
+    pair_rng = random.Random(seed * 1009 + 17)
+    style_rng = random.Random(seed * 7919 + 53)
+    first, second = PAIR_POOL[(seed * 5 + 7) % len(PAIR_POOL)]
+    if pair_rng.randrange(2):
+        kind_a, kind_b = second, first
+    else:
+        kind_a, kind_b = first, second
+
+    def center(x_mid: float) -> list[float]:
+        return [
+            round(x_mid + style_rng.uniform(-22.0, 22.0), 4),
+            round(335.0 + style_rng.uniform(-18.0, 18.0), 4),
+        ]
+
+    def color() -> list[int]:
+        return list(SHAPE_COLORS[style_rng.randrange(len(SHAPE_COLORS))])
+
+    return {
+        "shape_type_a": kind_a,
+        "shape_type_b": kind_b,
+        "center_a": center(270.0),
+        "center_b": center(730.0),
+        "scale_a": round(style_rng.uniform(82.0, 102.0), 4),
+        "scale_b": round(style_rng.uniform(82.0, 102.0), 4),
+        "rotation_a": round(style_rng.uniform(-math.pi, math.pi), 6),
+        "rotation_b": round(style_rng.uniform(-math.pi, math.pi), 6),
+        "color_a": color(),
+        "color_b": color(),
+    }
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    """Select the silhouette with the larger continuous boundary-density score."""
+
+    score_a = _boundary_score(scene["shape_type_a"])
+    score_b = _boundary_score(scene["shape_type_b"])
+    if abs(score_a - score_b) < 1e-12:
+        raise ValueError("exactly tied shape families are not answerable")
+    return "A" if score_a > score_b else "B"
+
+
+def margin(scene: dict[str, Any]) -> float:
+    return abs(_boundary_score(scene["shape_type_a"]) - _boundary_score(scene["shape_type_b"]))
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    return margin(scene) < QUARANTINE_GAP
+
+
+def _shape_points(
+    scene: dict[str, Any], side: str, kind: str
+) -> list[tuple[float, float]]:
+    center = scene[f"center_{side}"]
+    scale = float(scene[f"scale_{side}"])
+    rotation = float(scene[f"rotation_{side}"])
+    cosine = math.cos(rotation)
+    sine = math.sin(rotation)
+    points = []
+    for x, y in _template_vertices(kind):
+        xr = cosine * x - sine * y
+        yr = sine * x + cosine * y
+        points.append((float(center[0]) + scale * xr, float(center[1]) + scale * yr))
+    return points
+
+
+def _scaled_box(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    return tuple(int(round(value * SUPERSAMPLE)) for value in box)
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    """Render only the public visual scene; no analytic answer is drawn."""
+
+    high = Image.new(
+        "RGB",
+        (CANVAS_SIZE[0] * SUPERSAMPLE, CANVAS_SIZE[1] * SUPERSAMPLE),
+        BACKGROUND,
+    )
+    draw = ImageDraw.Draw(high)
+    points_by_side = {
+        "a": _shape_points(scene, "a", scene["shape_type_a"]),
+        "b": _shape_points(scene, "b", scene["shape_type_b"]),
+    }
+    for side in ("a", "b"):
+        draw.rounded_rectangle(
+            _scaled_box(PANEL_RECTS[side]),
+            radius=14 * SUPERSAMPLE,
+            fill=PANEL_FILL,
+            outline=PANEL_OUTLINE,
+            width=2 * SUPERSAMPLE,
+        )
+        points = [
+            (round(x * SUPERSAMPLE), round(y * SUPERSAMPLE))
+            for x, y in points_by_side[side]
+        ]
+        color = tuple(int(value) for value in scene[f"color_{side}"])
+        draw.polygon(points, fill=color)
+        draw.line(points + [points[0]], fill=color, width=2 * SUPERSAMPLE, joint="curve")
+
+    image = high.resize(CANVAS_SIZE, Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    draw.text((48, 28), "Normalized silhouette boundary density", fill=TITLE_COLOR, font=font)
+    draw.text(
+        (48, 50),
+        "Compare perimeter divided by square root of filled area; larger means a busier boundary",
+        fill=SUBTITLE_COLOR,
+        font=font,
+    )
+    draw.text((78, 138), "A", fill=LABEL_COLOR, font=font)
+    draw.text((538, 138), "B", fill=LABEL_COLOR, font=font)
+    draw.text((70, 574), "filled closed silhouette", fill=SUBTITLE_COLOR, font=font)
+    draw.text((530, 574), "filled closed silhouette", fill=SUBTITLE_COLOR, font=font)
+    return image
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """No unexposed interchangeable latent field is claimed for this scene."""
+
+    return []

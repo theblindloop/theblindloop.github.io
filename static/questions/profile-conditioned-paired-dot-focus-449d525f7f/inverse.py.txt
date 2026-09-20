@@ -1,0 +1,153 @@
+"""Independent inverse arm for paired-dot focus images.
+
+This module receives only a raster.  It segments dark connected components,
+forms mutual-nearest-neighbor pairs, recovers each pair's undrawn line, locates
+the four colored rings, and scores their centers against the complete line
+field.  It intentionally shares no imports or code with the renderer.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+ANSWER_RGB = {
+    "red": (205, 55, 76),
+    "blue": (38, 113, 178),
+    "green": (35, 145, 99),
+    "orange": (224, 132, 35),
+}
+
+
+class OracleAbstention(ValueError):
+    """Raised when the required global evidence cannot be recovered safely."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Return 8-connected components as arrays of (y, x) pixel coordinates."""
+    if mask.ndim != 2:
+        raise OracleAbstention("segmentation mask is not two-dimensional")
+    visited = np.zeros(mask.shape, dtype=bool)
+    height, width = mask.shape
+    components: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if visited[y0, x0]:
+            continue
+        visited[y0, x0] = True
+        queue = deque([(y0, x0)])
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and mask[ny, nx]
+                        and not visited[ny, nx]
+                    ):
+                        visited[ny, nx] = True
+                        queue.append((ny, nx))
+        components.append(np.asarray(points, dtype=np.float64))
+    return components
+
+
+def _component_centers(mask: np.ndarray, minimum: int, maximum: int) -> list[tuple[float, float]]:
+    centers = []
+    for component in _components(mask):
+        if minimum <= len(component) <= maximum:
+            # Pixel centers, returned in ordinary (x, y) order.
+            centers.append((float(component[:, 1].mean() + 0.5), float(component[:, 0].mean() + 0.5)))
+    return centers
+
+
+def _pair_mutual_nearest(points: list[tuple[float, float]]) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    if len(points) < 6 or len(points) % 2:
+        raise OracleAbstention(f"expected an even set of dot components, found {len(points)}")
+    array = np.asarray(points, dtype=np.float64)
+    distances = np.linalg.norm(array[:, None, :] - array[None, :, :], axis=2)
+    np.fill_diagonal(distances, np.inf)
+    nearest = distances.argmin(axis=1)
+    pairs = []
+    used: set[int] = set()
+    for index, mate_value in enumerate(nearest):
+        mate = int(mate_value)
+        if int(nearest[mate]) == index and index not in used and mate not in used:
+            pair_distance = float(distances[index, mate])
+            alternatives = np.delete(distances[index], [index, mate])
+            if not 10.0 <= pair_distance <= 24.0:
+                raise OracleAbstention(f"implausible within-pair distance {pair_distance:.2f}")
+            if len(alternatives) and float(alternatives.min()) < pair_distance * 1.45:
+                raise OracleAbstention("nearest-neighbor pairing is not visually isolated")
+            used.update((index, mate))
+            pairs.append((points[index], points[mate]))
+    if len(used) != len(points):
+        raise OracleAbstention("dark dots do not form a complete mutual-nearest pairing")
+    return pairs
+
+
+def _distance_to_axis(point: tuple[float, float], pair: tuple[tuple[float, float], tuple[float, float]]) -> float:
+    px, py = point
+    (x1, y1), (x2, y2) = pair
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length < 1.0:
+        raise OracleAbstention("paired component centers coincide")
+    return abs(dx * (y1 - py) - (x1 - px) * dy) / length
+
+
+def measure(image: Image.Image) -> dict:
+    """Reconstruct the visible proximity graph and its global focus scores."""
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.shape[0] < 64 or array.shape[1] < 64:
+        raise OracleAbstention("raster is too small")
+
+    # Every permitted ink variant has all RGB channels below 90; none of the
+    # four public answer colors does.  This rule is independent of scene state.
+    dark_mask = array.max(axis=2) < 90
+    dark_centers = _component_centers(dark_mask, minimum=35, maximum=180)
+    pairs = _pair_mutual_nearest(dark_centers)
+    if not 10 <= len(pairs) <= 20:
+        raise OracleAbstention(f"unexpected pair count {len(pairs)}")
+
+    candidate_centers: dict[str, tuple[float, float]] = {}
+    float_array = array.astype(np.float64)
+    for name, rgb in ANSWER_RGB.items():
+        difference = float_array - np.asarray(rgb, dtype=np.float64)
+        mask = (difference * difference).sum(axis=2) < 28.0**2
+        components = [component for component in _components(mask) if len(component) >= 45]
+        if len(components) != 1:
+            raise OracleAbstention(f"expected one visible {name} ring, found {len(components)}")
+        component = components[0]
+        candidate_centers[name] = (
+            float(component[:, 1].mean() + 0.5),
+            float(component[:, 0].mean() + 0.5),
+        )
+
+    scores = []
+    for name, center in candidate_centers.items():
+        distances = [_distance_to_axis(center, pair) for pair in pairs]
+        scores.append((sum(distances) / len(distances), name))
+    scores.sort(key=lambda item: (item[0], item[1]))
+    return {
+        "decision": scores[0][1],
+        "margin": scores[1][0] - scores[0][0],
+        "scores": {name: score for score, name in scores},
+        "dot_count": len(dark_centers),
+        "pair_count": len(pairs),
+        "candidate_centers": candidate_centers,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return one answer label using final PNG pixels and public rules only."""
+    return str(measure(image)["decision"])

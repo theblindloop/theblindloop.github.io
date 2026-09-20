@@ -1,0 +1,162 @@
+"""Independent PNG-only inverse arm for the room common-neighbor question."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_CYAN = np.array([0, 151, 181], dtype=np.int16)
+_ORANGE = np.array([228, 105, 25], dtype=np.int16)
+_BLACK = np.array([28, 30, 34], dtype=np.int16)
+_TOL = 38.0
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[dict]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    parts = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sy, sx)])
+        seen[sy, sx] = True
+        points = []
+        border = False
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            border |= y == 0 or x == 0 or y == height - 1 or x == width - 1
+            for ny, nx in ((y-1, x), (y+1, x), (y, x-1), (y, x+1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            ys = [p[0] for p in points]
+            xs = [p[1] for p in points]
+            parts.append({"area": len(points), "cx": int(round(sum(xs)/len(xs))), "cy": int(round(sum(ys)/len(ys))), "border": border, "points": points})
+    return parts
+
+
+def _tokens(array: np.ndarray, color: np.ndarray, name: str) -> list[tuple[int, int]]:
+    mask = np.linalg.norm(array - color, axis=2) <= _TOL
+    parts = _components(mask, minimum=100)
+    if len(parts) != 2 or any(not 240 <= part["area"] <= 420 for part in parts):
+        raise ValueError(f"expected two intact {name} markers")
+    return [(part["cx"], part["cy"]) for part in parts]
+
+
+def _bridge_wall_bands(black: np.ndarray) -> np.ndarray:
+    """Repair local erasures using only long, visibly supported wall projections."""
+    repaired = black.copy()
+    rows = np.flatnonzero(black.sum(axis=1) >= 100)
+    cols = np.flatnonzero(black.sum(axis=0) >= 100)
+    all_y, all_x = np.nonzero(black)
+    if len(rows) < 40 or len(cols) < 40 or not len(all_x):
+        raise ValueError("wall lattice cannot be reconstructed")
+    # The repeated long bands jointly reveal the lattice envelope even when a
+    # local rectangular raster loss removes one end of an individual band.
+    x0, x1 = int(all_x.min()), int(all_x.max())
+    y0, y1 = int(all_y.min()), int(all_y.max())
+    for y in rows:
+        repaired[y, x0:x1 + 1] = True
+    for x in cols:
+        repaired[y0:y1 + 1, x] = True
+    return repaired
+
+
+def _room_labels(barrier: np.ndarray) -> tuple[np.ndarray, list[dict]]:
+    parts = _components(~barrier, minimum=500)
+    rooms = [part for part in parts if not part["border"] and part["area"] >= 1000]
+    if len(rooms) != 16:
+        raise ValueError("expected sixteen closed rooms")
+    labels = np.full(barrier.shape, -1, dtype=np.int16)
+    for index, part in enumerate(rooms):
+        for y, x in part["points"]:
+            labels[y, x] = index
+    return labels, rooms
+
+
+def _room_at(labels: np.ndarray, point: tuple[int, int]) -> int:
+    x, y = point
+    value = int(labels[y, x])
+    if value >= 0:
+        return value
+    # Color pixels are non-barrier but labels can be absent only under corruption.
+    for radius in range(1, 16):
+        y0, y1 = max(0, y-radius), min(labels.shape[0], y+radius+1)
+        x0, x1 = max(0, x-radius), min(labels.shape[1], x+radius+1)
+        values = labels[y0:y1, x0:x1]
+        found = values[values >= 0]
+        if found.size:
+            return int(np.bincount(found).argmax())
+    raise ValueError("marker is not inside a recovered room")
+
+
+def _adjacency(labels: np.ndarray, black: np.ndarray, room_count: int) -> list[set[int]]:
+    graph = [set() for _ in range(room_count)]
+    counts: dict[tuple[int, int], int] = {}
+    height, width = black.shape
+    # Scan across short black runs. A real shared wall yields dozens of parallel witnesses;
+    # a diagonal corner yields at most a few and is rejected by the threshold.
+    for y in range(height):
+        x = 0
+        while x < width:
+            if not black[y, x]:
+                x += 1
+                continue
+            start = x
+            while x < width and black[y, x]:
+                x += 1
+            if 3 <= x - start <= 18 and start > 0 and x < width:
+                a, b = int(labels[y, start-1]), int(labels[y, x])
+                if a >= 0 and b >= 0 and a != b:
+                    key = tuple(sorted((a, b)))
+                    counts[key] = counts.get(key, 0) + 1
+    for x in range(width):
+        y = 0
+        while y < height:
+            if not black[y, x]:
+                y += 1
+                continue
+            start = y
+            while y < height and black[y, x]:
+                y += 1
+            if 3 <= y - start <= 18 and start > 0 and y < height:
+                a, b = int(labels[start-1, x]), int(labels[y, x])
+                if a >= 0 and b >= 0 and a != b:
+                    key = tuple(sorted((a, b)))
+                    counts[key] = counts.get(key, 0) + 1
+    for (a, b), witnesses in counts.items():
+        if witnesses >= 20:
+            graph[a].add(b)
+            graph[b].add(a)
+    if sum(len(values) for values in graph) != 48:
+        raise ValueError("room adjacency graph is incomplete or malformed")
+    return graph
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.shape[:2] != (400, 400):
+        raise ValueError("expected a 400 by 400 raster")
+    cyan = _tokens(array, _CYAN, "cyan")
+    orange = _tokens(array, _ORANGE, "orange")
+    raw_black = np.linalg.norm(array - _BLACK, axis=2) <= _TOL
+    if int(raw_black.sum()) < 8000:
+        raise ValueError("substantial floor-plan walls are missing")
+    barrier = _bridge_wall_bands(raw_black)
+    labels, rooms = _room_labels(barrier)
+    graph = _adjacency(labels, barrier, len(rooms))
+    outcomes = {}
+    for name, points in (("cyan", cyan), ("orange", orange)):
+        a, b = (_room_at(labels, point) for point in points)
+        if a == b:
+            raise ValueError("same-color markers must occupy different rooms")
+        outcomes[name] = bool((graph[a] - {b}) & (graph[b] - {a}))
+    winners = [name for name, value in outcomes.items() if value]
+    if len(winners) != 1:
+        raise ValueError("image does not expose exactly one common-neighbor pair")
+    return winners[0]

@@ -1,0 +1,222 @@
+"""Renderer for the marked Morton/Z-order raster reveal world.
+
+The latent image is a broad glyph plus a high-frequency gray carrier.  The
+carrier raster is written into a single square in recursive NW, NE, SW, SE
+Morton order.  The public question tells the solver how to restore spatial
+adjacency before applying a 5x5 mean.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from functools import lru_cache
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "morton-raster-reveal-0.1.0"
+SYMBOLS = ("beacon", "cusp", "ladder", "wave")
+CANVAS_WIDTH = 720
+CANVAS_HEIGHT = 560
+BACKGROUND = (248, 248, 248)
+MARKER_BANK = (
+    (210, 62, 62),
+    (46, 126, 208),
+    (45, 164, 104),
+    (178, 88, 194),
+    (225, 137, 42),
+    (38, 168, 170),
+    (198, 74, 126),
+    (104, 94, 196),
+)
+TILE_SIZES = (128, 256)
+QUARANTINE_MARGIN = 0.08
+
+
+def _glyph_mask(size: int, symbol: str) -> np.ndarray:
+    """Draw one broad, centered, non-textual glyph into a binary mask."""
+
+    mask = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(mask)
+    w = max(5, int(round(size * 0.055)))
+    left = int(round(size * 0.23))
+    right = int(round(size * 0.77))
+    top = int(round(size * 0.22))
+    bottom = int(round(size * 0.78))
+    mid = int(round(size * 0.50))
+    if symbol == "beacon":
+        radius = int(round(size * 0.22))
+        draw.ellipse((mid - radius, mid - radius - 8, mid + radius, mid + radius - 8), outline=255, width=w)
+        draw.line((mid, int(round(size * 0.27)), mid, int(round(size * 0.75))), fill=255, width=w)
+        draw.line((int(round(size * 0.39)), int(round(size * 0.75)), int(round(size * 0.61)), int(round(size * 0.75))), fill=255, width=w)
+    elif symbol == "cusp":
+        draw.line((left, top + 5, mid, bottom, right, top + 5), fill=255, width=w, joint="curve")
+        draw.line((int(round(size * 0.35)), int(round(size * 0.57)), mid, int(round(size * 0.43))), fill=255, width=w)
+    elif symbol == "ladder":
+        draw.line((left, top, left, bottom), fill=255, width=w)
+        draw.line((right, top, right, bottom), fill=255, width=w)
+        for fraction in (0.31, 0.45, 0.59, 0.73):
+            y = int(round(size * fraction))
+            draw.line((left, y, right, y), fill=255, width=w)
+    elif symbol == "wave":
+        points = []
+        for i in range(61):
+            x = left + (right - left) * i / 60.0
+            y = mid + size * 0.15 * math.sin(2.0 * math.pi * (i / 60.0) * 1.55)
+            points.append((int(round(x)), int(round(y))))
+        draw.line(points, fill=255, width=w, joint="curve")
+        draw.line((left, int(round(size * 0.66)), right, int(round(size * 0.66))), fill=255, width=max(3, w // 2))
+    else:
+        raise ValueError(f"unknown symbol {symbol!r}")
+    return np.asarray(mask, dtype=np.float32) / 255.0
+
+
+@lru_cache(maxsize=None)
+def _morton_order(size: int) -> tuple[tuple[int, int], ...]:
+    """Return source (row, column) coordinates in recursive Z order."""
+
+    if size < 1 or size & (size - 1):
+        raise ValueError("Morton raster side must be a positive power of two")
+    order: list[tuple[int, int]] = []
+
+    def visit(row: int, col: int, side: int) -> None:
+        if side == 1:
+            order.append((row, col))
+            return
+        half = side // 2
+        visit(row, col, half)
+        visit(row, col + half, half)
+        visit(row + half, col, half)
+        visit(row + half, col + half, half)
+
+    visit(0, 0, size)
+    return tuple(order)
+
+
+def _box5(values: np.ndarray) -> np.ndarray:
+    padded = np.pad(values, 2, mode="edge")
+    result = np.zeros_like(values, dtype=np.float32)
+    for dy in range(5):
+        for dx in range(5):
+            result += padded[dy : dy + values.shape[0], dx : dx + values.shape[1]]
+    return result / 25.0
+
+
+def _restored_carrier(scene: dict) -> np.ndarray:
+    size = int(scene["tile_size"])
+    symbol = str(scene["symbol"])
+    mask = _glyph_mask(size, symbol)
+    yy, xx = np.indices((size, size))
+    phase = int(scene["carrier_phase"])
+    amplitude = float(scene["carrier_amplitude"])
+    checker = np.where(((xx + yy + phase) & 1) == 0, -1.0, 1.0)
+    # A second, weaker 4-pixel component prevents the scrambled carrier from
+    # looking like a simple checkerboard while remaining harmless to the mean.
+    stripe = np.sin((xx * 2.0 + yy + phase) * math.pi / 2.0)
+    values = 236.0 - 190.0 * mask + amplitude * checker + 0.28 * amplitude * stripe
+    return np.clip(values, 18.0, 250.0).astype(np.uint8)
+
+
+def _encoded_tile(scene: dict) -> np.ndarray:
+    restored = _restored_carrier(scene)
+    size = restored.shape[0]
+    encoded = np.empty(size * size, dtype=np.uint8)
+    flat = restored.reshape(-1)
+    for index, (row, col) in enumerate(_morton_order(size)):
+        encoded[index] = flat[row * size + col]
+    return encoded.reshape((size, size))
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample balanced label and nuisance variables from independent streams."""
+
+    symbol_rng = random.Random(int(seed) * 1009 + 17)
+    size_rng = random.Random(int(seed) * 1013 + 31)
+    place_rng = random.Random(int(seed) * 1019 + 47)
+    palette_rng = random.Random(int(seed) * 1021 + 61)
+    carrier_rng = random.Random(int(seed) * 1031 + 73)
+    symbol = SYMBOLS[symbol_rng.randrange(len(SYMBOLS))]
+    size = TILE_SIZES[size_rng.randrange(len(TILE_SIZES))]
+    tile_x = place_rng.randint(68, CANVAS_WIDTH - size - 68)
+    tile_y = place_rng.randint(68, CANVAS_HEIGHT - size - 68)
+    palette = palette_rng.sample(MARKER_BANK, 4)
+    return {
+        "symbol": symbol,
+        "tile_size": size,
+        "tile_x": tile_x,
+        "tile_y": tile_y,
+        "palette": [list(color) for color in palette],
+        "carrier_phase": carrier_rng.randrange(8),
+        "carrier_amplitude": carrier_rng.choice((16, 22, 28)),
+        "canvas_width": CANVAS_WIDTH,
+        "canvas_height": CANVAS_HEIGHT,
+        "marker_size": carrier_rng.choice((10, 12, 14)),
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    """Render one RGB PNG-compatible image from a JSON scene."""
+
+    width = int(scene["canvas_width"])
+    height = int(scene["canvas_height"])
+    size = int(scene["tile_size"])
+    x0 = int(scene["tile_x"])
+    y0 = int(scene["tile_y"])
+    marker = int(scene["marker_size"])
+    palette = [tuple(int(channel) for channel in color) for color in scene["palette"]]
+    if len(palette) != 4:
+        raise ValueError("exactly four fiducial colors are required")
+    if width != CANVAS_WIDTH or height != CANVAS_HEIGHT:
+        raise ValueError("scene canvas differs from the declared fixed canvas")
+    if size not in TILE_SIZES or x0 < marker or y0 < marker:
+        raise ValueError("invalid tile geometry")
+    if x0 + size + marker > width or y0 + size + marker > height:
+        raise ValueError("tile does not fit on canvas")
+    image = Image.new("RGB", (width, height), BACKGROUND)
+    tile = Image.fromarray(_encoded_tile(scene), mode="L").convert("RGB")
+    image.paste(tile, (x0, y0))
+    draw = ImageDraw.Draw(image)
+    # Each marker is outside, flush with one tile corner.  Their locations, not
+    # their colors, are the only registration signal available to the oracle.
+    draw.rectangle((x0 - marker, y0 - marker, x0 - 1, y0 - 1), fill=palette[0])
+    draw.rectangle((x0 + size, y0 - marker, x0 + size + marker - 1, y0 - 1), fill=palette[1])
+    draw.rectangle((x0 + size, y0 + size, x0 + size + marker - 1, y0 + size + marker - 1), fill=palette[2])
+    draw.rectangle((x0 - marker, y0 + size, x0 - 1, y0 + size + marker - 1), fill=palette[3])
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    """Analytic label: only the explicit abstract-symbol field is label-bearing."""
+
+    return str(scene["symbol"])
+
+
+def _template_scores(scene: dict) -> list[float]:
+    """Renderer-side margin calculation, independent of the pixel oracle."""
+
+    # The analytic margin intentionally uses the restored field before the
+    # Morton write, then applies exactly the declared smoothing operation.
+    restored = _restored_carrier(scene).astype(np.float32)
+    observed_dark = 236.0 - _box5(restored)
+    scores = []
+    for symbol in SYMBOLS:
+        target = _box5(190.0 * _glyph_mask(int(scene["tile_size"]), symbol))
+        error = float(np.mean(np.abs(observed_dark - target)))
+        scores.append(1.0 - error / 190.0)
+    return scores
+
+
+def margin(scene: dict) -> float:
+    scores = sorted(_template_scores(scene), reverse=True)
+    return float(scores[0] - scores[1])
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No unclaimed latent aliases: all sampled fields are explicit nuisances."""
+
+    return []

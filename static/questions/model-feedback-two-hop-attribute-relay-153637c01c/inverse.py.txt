@@ -1,0 +1,180 @@
+"""Scene-free pixel oracle for the two-hop attribute relay world.
+
+Receives a rendered PNG and nothing else. It re-derives the twelve tiles from
+their gray outlines, reads each tile's bar color, black glyph and dot count,
+locates the black ring, and relays the identity shape -> dot count -> color.
+
+It imports no renderer, prompt, generator, verifier or analytic-gold code and
+never accepts latent scene data.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+_GRAY = (150, 150, 150)
+_BLACK_MAX = 60
+_COLOR_RGB = {
+    "blue": (30, 90, 220),
+    "green": (25, 150, 60),
+    "orange": (240, 140, 20),
+    "purple": (150, 45, 190),
+}
+
+
+def _components(mask: np.ndarray) -> list[dict]:
+    """Run-based 8-connected labeling; returns bbox/area/edge-row widths."""
+    height, width = mask.shape
+    parent: list[int] = []
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    runs: list[tuple[int, int, int, int]] = []   # (y, x0, x1, label)
+    prev: list[tuple[int, int, int]] = []
+    for y in range(height):
+        row = mask[y]
+        if not row.any():
+            prev = []
+            continue
+        idx = np.flatnonzero(np.diff(np.concatenate(([0], row.view(np.int8), [0]))))
+        cur: list[tuple[int, int, int]] = []
+        for s, e in zip(idx[0::2], idx[1::2]):
+            x0, x1 = int(s), int(e) - 1
+            label = len(parent)
+            parent.append(label)
+            for py0, py1, plabel in prev:
+                if px_overlap(x0, x1, py0, py1):
+                    union(label, plabel)
+            cur.append((x0, x1, label))
+            runs.append((y, x0, x1, label))
+        prev = cur
+
+    groups: dict[int, list[tuple[int, int, int]]] = {}
+    for y, x0, x1, label in runs:
+        groups.setdefault(find(label), []).append((y, x0, x1))
+
+    out = []
+    for rows in groups.values():
+        ys = [r[0] for r in rows]
+        y0, y1 = min(ys), max(ys)
+        x0 = min(r[1] for r in rows)
+        x1 = max(r[2] for r in rows)
+        area = sum(r[2] - r[1] + 1 for r in rows)
+        top = [r for r in rows if r[0] == y0]
+        bot = [r for r in rows if r[0] == y1]
+        out.append(
+            {
+                "bbox": (x0, y0, x1, y1),
+                "w": x1 - x0 + 1,
+                "h": y1 - y0 + 1,
+                "area": area,
+                "top_w": max(r[2] for r in top) - min(r[1] for r in top) + 1,
+                "bot_w": max(r[2] for r in bot) - min(r[1] for r in bot) + 1,
+                "cx": (x0 + x1) / 2.0,
+                "cy": (y0 + y1) / 2.0,
+            }
+        )
+    return out
+
+
+def px_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
+    return a0 <= b1 + 1 and b0 <= a1 + 1
+
+
+def _inside(box: tuple[int, int, int, int], cx: float, cy: float) -> bool:
+    return box[0] <= cx <= box[2] and box[1] <= cy <= box[3]
+
+
+def _classify_glyph(comp: dict) -> str:
+    wide_top = comp["top_w"] > 0.7 * comp["w"]
+    wide_bot = comp["bot_w"] > 0.7 * comp["w"]
+    if wide_top and wide_bot:
+        return "square"
+    if wide_bot:
+        return "up_tri"
+    if wide_top:
+        return "down_tri"
+    return "plus"
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.int16)
+
+    gray_mask = np.all(np.abs(arr - np.array(_GRAY)) <= 8, axis=2)
+    tiles = [c for c in _components(gray_mask) if c["w"] > 120 and c["h"] > 120]
+    if len(tiles) != 12:
+        raise ValueError(f"expected 12 tile outlines, found {len(tiles)}")
+
+    black_mask = np.all(arr <= _BLACK_MAX, axis=2)
+    blacks = _components(black_mask)
+
+    rings, glyphs, pips = [], [], []
+    for comp in blacks:
+        fill = comp["area"] / float(comp["w"] * comp["h"])
+        if comp["w"] > 180 and comp["h"] > 180 and fill < 0.4:
+            rings.append(comp)
+        elif max(comp["w"], comp["h"]) >= 40:
+            glyphs.append(comp)
+        else:
+            pips.append(comp)
+    if len(rings) != 1:
+        raise ValueError(f"expected exactly one ring, found {len(rings)}")
+    if len(glyphs) != 8:
+        raise ValueError(f"expected 8 glyphs, found {len(glyphs)}")
+
+    swatches = []
+    for name, rgb in _COLOR_RGB.items():
+        m = np.all(np.abs(arr - np.array(rgb)) <= 8, axis=2)
+        for comp in _components(m):
+            if comp["area"] > 500:
+                swatches.append((name, comp))
+    if len(swatches) != 8:
+        raise ValueError(f"expected 8 color bars, found {len(swatches)}")
+
+    records = []
+    for tile in tiles:
+        box = tile["bbox"]
+        color = None
+        for name, comp in swatches:
+            if _inside(box, comp["cx"], comp["cy"]):
+                color = name
+        glyph = None
+        for comp in glyphs:
+            if _inside(box, comp["cx"], comp["cy"]):
+                glyph = _classify_glyph(comp)
+        dots = sum(1 for comp in pips if _inside(box, comp["cx"], comp["cy"]))
+        records.append(
+            {"box": box, "cx": tile["cx"], "cy": tile["cy"],
+             "color": color, "glyph": glyph, "dots": dots}
+        )
+
+    left = [r for r in records if r["color"] is not None and r["glyph"] is not None]
+    middle = [r for r in records if r["color"] is None and r["glyph"] is not None]
+    right = [r for r in records if r["color"] is not None and r["glyph"] is None]
+    if not (len(left) == len(middle) == len(right) == 4):
+        raise ValueError("column classification failed")
+
+    ring = rings[0]
+    marked = [r for r in left if _inside(ring["bbox"], r["cx"], r["cy"])]
+    if len(marked) != 1:
+        raise ValueError("ring does not select exactly one left tile")
+
+    shape = marked[0]["glyph"]
+    hit = [r for r in middle if r["glyph"] == shape]
+    if len(hit) != 1:
+        raise ValueError("shape does not match exactly one middle tile")
+    dots = hit[0]["dots"]
+    target = [r for r in right if r["dots"] == dots]
+    if len(target) != 1:
+        raise ValueError("dot count does not match exactly one right tile")
+    return target[0]["color"]

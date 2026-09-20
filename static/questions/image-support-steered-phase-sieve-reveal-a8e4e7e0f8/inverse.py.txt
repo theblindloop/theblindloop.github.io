@@ -1,0 +1,221 @@
+"""Pixel-only inverse arm for the phase-sieve reveal world.
+
+The arm receives a single rendered image and the public question contract only.
+It locates the pale panel and its ink frame, derives the 21x21 cell lattice from
+the frame's interior, reads each cell against the midpoint of the two cell tones
+that the panel itself shows, finds the two tapering pointer triangles in the
+margins, converts each pointer into a row or column remainder modulo three, keeps the cells
+of the selected interleaved sub-lattice and names the resulting 7x7 symbol.  It
+raises ``ValueError`` - it abstains - whenever any of those steps is ambiguous.
+
+No renderer, prompt, generator, verifier or analytic-gold code is imported and
+no latent scene data is accepted.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "phase_sieve_reveal-oracle-0.1.0"
+
+GRID = 21
+BLOCK = 3
+
+# The symbol alphabet is public: it is spelled out in every prompt family.
+SYMBOL_ART: dict[str, tuple[str, ...]] = {
+    "plus": ("...#...", "...#...", "...#...", "#######", "...#...", "...#...", "...#..."),
+    "ex": ("#.....#", ".#...#.", "..#.#..", "...#...", "..#.#..", ".#...#.", "#.....#"),
+    "ring": (".#####.", ".#...#.", ".#...#.", ".#...#.", ".#...#.", ".#...#.", ".#####."),
+    "tee": ("#######", "...#...", "...#...", "...#...", "...#...", "...#...", "...#..."),
+    "ell": ("#......", "#......", "#......", "#......", "#......", "#......", "#######"),
+    "zee": ("#######", ".....#.", "....#..", "...#...", "..#....", ".#.....", "#######"),
+    "arrow": ("...#...", "..###..", ".#.#.#.", "#..#..#", "...#...", "...#...", "...#..."),
+    "vee": ("#.....#", "#.....#", ".#...#.", ".#...#.", "..#.#..", "..#.#..", "...#..."),
+    "corners": ("##...##", "##...##", ".......", "..###..", ".......", "##...##", "##...##"),
+}
+TEMPLATES = {
+    name: np.array([[1 if ch == "#" else 0 for ch in row] for row in art], dtype=np.int8)
+    for name, art in SYMBOL_ART.items()
+}
+
+
+def _luma(image: Image.Image) -> np.ndarray:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float64)
+    return 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+
+
+def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    if rows.size == 0 or cols.size == 0:
+        raise ValueError("empty mask has no bounding box")
+    return int(cols[0]), int(rows[0]), int(cols[-1]), int(rows[-1])
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """Four-connected components of a sparse boolean mask, as coordinate arrays."""
+
+    seen = np.zeros(mask.shape, dtype=bool)
+    out: list[np.ndarray] = []
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        pixels = []
+        queue = deque([(int(y), int(x))])
+        seen[y, x] = True
+        while queue:
+            cy, cx = queue.popleft()
+            pixels.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if (
+                    0 <= ny < mask.shape[0]
+                    and 0 <= nx < mask.shape[1]
+                    and mask[ny, nx]
+                    and not seen[ny, nx]
+                ):
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        out.append(np.array(pixels, dtype=np.int64))
+    return out
+
+
+def _taper(profile: np.ndarray) -> str:
+    """'x'/'y' tapering is decided by strict monotonicity of an extent profile."""
+
+    if profile.size < 4:
+        return "none"
+    diffs = np.diff(profile)
+    if np.all(diffs < 0) or np.all(diffs > 0):
+        return "taper"
+    return "none"
+
+
+def decision_from_image(image: Image.Image) -> str:
+    luma = _luma(image)
+    background = float(np.median(luma))
+    lo = float(luma.min())
+    hi = float(luma.max())
+    if hi - background < 40.0 or background - lo < 40.0:
+        raise ValueError("the picture does not show three separated tones")
+    pale_mask = luma > (background + hi) / 2.0
+    dark_mask = luma < (background + lo) / 2.0
+
+    # The panel span is read from majority profiles rather than from extreme
+    # pixels, so a locally damaged panel edge still yields the same span.
+    row_counts = pale_mask.sum(axis=1)
+    col_counts = pale_mask.sum(axis=0)
+    if row_counts.max() < 60 or col_counts.max() < 60:
+        raise ValueError("no pale panel of usable size")
+    rows = np.flatnonzero(row_counts >= 0.5 * row_counts.max())
+    cols = np.flatnonzero(col_counts >= 0.5 * col_counts.max())
+    py0, py1 = int(rows[0]), int(rows[-1])
+    px0, px1 = int(cols[0]), int(cols[-1])
+    if min(px1 - px0, py1 - py0) < 60:
+        raise ValueError("no pale panel of usable size")
+
+    inner = dark_mask[py0 : py1 + 1, px0 : px1 + 1]
+    if not inner.any():
+        raise ValueError("the panel carries no ink")
+    # The ink frame's four edges are the median first and last ink positions
+    # along each axis, which a local blemish cannot move.
+    height, width_full = inner.shape
+    live_cols = inner.any(axis=0)
+    live_rows = inner.any(axis=1)
+    if live_cols.sum() < 8 or live_rows.sum() < 8:
+        raise ValueError("the panel ink does not outline a frame")
+    fy0 = int(np.median(inner.argmax(axis=0)[live_cols]))
+    fy1 = int(np.median((height - 1 - inner[::-1].argmax(axis=0))[live_cols]))
+    fx0 = int(np.median(inner.argmax(axis=1)[live_rows]))
+    fx1 = int(np.median((width_full - 1 - inner[:, ::-1].argmax(axis=1))[live_rows]))
+    if fx1 - fx0 < 40 or fy1 - fy0 < 40:
+        raise ValueError("the ink frame is too small to carry a cell lattice")
+    width = fx1 - fx0 + 1
+    height = fy1 - fy0 + 1
+    thicknesses = []
+    for candidate in range(1, 6):
+        span_w = width - 2 * candidate
+        span_h = height - 2 * candidate
+        if span_w <= 0 or span_h <= 0:
+            continue
+        if span_w % GRID or span_h % GRID or span_w != span_h:
+            continue
+        if span_w // GRID < 8:
+            continue
+        band = inner[fy0 : fy0 + candidate, fx0 : fx1 + 1]
+        if band.mean() < 0.6:
+            continue
+        thicknesses.append(candidate)
+    if len(thicknesses) != 1:
+        raise ValueError(f"panel frame thickness is ambiguous: {thicknesses}")
+    thick = thicknesses[0]
+    pitch = (width - 2 * thick) // GRID
+    cells_x0 = px0 + fx0 + thick
+    cells_y0 = py0 + fy0 + thick
+
+    inset = max(2, pitch // 4)
+    means = np.empty((GRID, GRID), dtype=np.float64)
+    for r in range(GRID):
+        for c in range(GRID):
+            y = cells_y0 + r * pitch
+            x = cells_x0 + c * pitch
+            patch = luma[y + inset : y + pitch - inset, x + inset : x + pitch - inset]
+            means[r, c] = float(patch.mean())
+    spread = float(means.max() - means.min())
+    if spread < 60.0:
+        raise ValueError("the panel does not show two separated cell tones")
+    cells = (means < (means.max() + means.min()) / 2.0).astype(np.int8)
+
+    outside = dark_mask.copy()
+    outside[max(0, py0 - 3) : py1 + 4, max(0, px0 - 3) : px1 + 4] = False
+    row_pointers: list[float] = []
+    col_pointers: list[float] = []
+    for pixels in _components(outside):
+        if not 25 <= pixels.shape[0] <= 220:
+            continue
+        ys, xs = pixels[:, 0], pixels[:, 1]
+        if ys.max() - ys.min() > 30 or xs.max() - xs.min() > 30:
+            continue
+        col_profile = np.array(
+            [int(np.count_nonzero(xs == value)) for value in range(xs.min(), xs.max() + 1)]
+        )
+        row_profile = np.array(
+            [int(np.count_nonzero(ys == value)) for value in range(ys.min(), ys.max() + 1)]
+        )
+        x_taper = _taper(col_profile) == "taper"
+        y_taper = _taper(row_profile) == "taper"
+        if x_taper == y_taper:
+            continue
+        centre_y = float(ys.mean())
+        centre_x = float(xs.mean())
+        if x_taper and py0 <= centre_y <= py1:
+            row_pointers.append(centre_y)
+        elif y_taper and px0 <= centre_x <= px1:
+            col_pointers.append(centre_x)
+    if len(row_pointers) != 1 or len(col_pointers) != 1:
+        raise ValueError(
+            f"expected one pointer per axis, found {len(row_pointers)} and {len(col_pointers)}"
+        )
+
+    def _phase(centre: float, origin: int) -> int:
+        raw = (centre - origin - pitch / 2.0) / pitch
+        index = int(round(raw))
+        if abs(raw - index) > 0.25 or not 0 <= index < GRID:
+            raise ValueError("a pointer does not name a line of the panel")
+        return index % BLOCK
+
+    row_phase = _phase(row_pointers[0], cells_y0)
+    col_phase = _phase(col_pointers[0], cells_x0)
+
+    pattern = cells[row_phase::BLOCK, col_phase::BLOCK]
+    if pattern.shape != (GRID // BLOCK, GRID // BLOCK):
+        raise ValueError("the selected sub-lattice is not square")
+    scored = sorted(
+        (int(np.count_nonzero(pattern != template)), name)
+        for name, template in TEMPLATES.items()
+    )
+    if scored[1][0] - scored[0][0] < 1:
+        raise ValueError("the revealed pattern is tied between two symbols")
+    return scored[0][1]

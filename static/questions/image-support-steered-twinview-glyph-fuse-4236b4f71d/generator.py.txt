@@ -1,0 +1,324 @@
+"""Twin-view glyph fusion world.
+
+A cream board carries six framed 5x5 tiles that never touch one another.
+
+Two of the tiles are VIEWS: both wear the same slate-grey frame and both show
+the same hidden 5x5 glyph, except that each view has an opaque grey shutter
+covering some of its cells. The two shutters never cover the same cell, so the
+two views together reveal every cell of the glyph while neither view on its own
+does.
+
+The other four tiles are CANDIDATES. Each wears a frame in a different colour
+and shows a complete, unshuttered 5x5 pattern. Exactly one candidate equals the
+fused glyph. The wrong candidates are produced from the glyph by swapping an
+equal number of filled and empty cells, so every tile in the picture carries
+exactly the same amount of dark ink; ink, cell counts and colour therefore say
+nothing about the answer.
+
+Each wrong candidate is chosen so that at least one of them survives view A
+alone and at least one survives view B alone. A solver that reads only one view
+cannot decide, so both widely separated views and the matching candidate tile
+are jointly necessary.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "twinview_glyph_fuse-0.1.0"
+
+CANVAS_W = 900
+CANVAS_H = 900
+
+GRID = 5
+CELL = 26
+STROKE = 6
+TILE_SIDE = GRID * CELL + 2 * STROKE  # 142
+
+BOARD = (247, 243, 233)
+CELL_BG = (252, 252, 250)
+GRIDLINE = (214, 209, 197)
+INK = (26, 28, 34)
+SHUTTER = (135, 138, 146)
+VIEW_FRAME = (58, 66, 84)
+
+COLOR_NAMES = ("red", "orange", "green", "teal", "blue", "purple")
+COLORS = {
+    "red": (206, 42, 42),
+    "orange": (232, 124, 28),
+    "green": (46, 150, 62),
+    "teal": (26, 158, 168),
+    "blue": (48, 86, 208),
+    "purple": (140, 58, 180),
+}
+
+DECOR_COLORS = ((198, 186, 160), (176, 190, 178))
+DECOR_SIDE = 12
+N_DECOR = 14
+
+N_CELLS = GRID * GRID
+N_CANDIDATES = 4
+
+# Slot centres: a 3x3 lattice of well separated tile positions.
+SLOT_XS = (160, 450, 740)
+SLOT_YS = (160, 450, 740)
+SLOTS = tuple((SLOT_XS[c], SLOT_YS[r]) for r in range(3) for c in range(3))
+CORNER_SLOTS = (0, 2, 6, 8)
+DIAGONALS = ((0, 8), (8, 0), (2, 6), (6, 2))
+
+QUARANTINE_MARGIN = 3.0  # fewer than 3 disagreeing cells is a near-boundary case
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+
+
+def _swap_pair(rng: random.Random, glyph: list[int], pool: list[int], k: int) -> list[int] | None:
+    """Flip k filled and k empty cells of ``glyph``, all taken from ``pool``."""
+    filled = [c for c in pool if glyph[c] == 1]
+    empty = [c for c in pool if glyph[c] == 0]
+    if len(filled) < k or len(empty) < k:
+        return None
+    out = list(glyph)
+    for cell in rng.sample(filled, k) + rng.sample(empty, k):
+        out[cell] = 1 - out[cell]
+    return out
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one fully specified scene; deterministic in ``seed``."""
+    rng = random.Random(seed * 7919 + 13)
+    index = seed % 1000
+
+    # tight (k == 1) scenes are the near-boundary class
+    tight = (index % 4) == 3
+
+    for _ in range(4000):
+        glyph = [1 if rng.random() < 0.44 else 0 for _ in range(N_CELLS)]
+        if not 8 <= sum(glyph) <= 17:
+            continue
+
+        cells = list(range(N_CELLS))
+        rng.shuffle(cells)
+        n_a = rng.randint(6, 8)
+        n_b = rng.randint(6, 8)
+        mask_a = sorted(cells[:n_a])
+        mask_b = sorted(cells[n_a : n_a + n_b])
+        # each shutter must hide at least one filled and one empty cell so that
+        # an equal-ink rival can hide entirely underneath it
+        ok = all(
+            any(glyph[c] == 1 for c in mask) and any(glyph[c] == 0 for c in mask)
+            for mask in (mask_a, mask_b)
+        )
+        if not ok:
+            continue
+
+        k = 1 if tight else 2
+        rival_a = _swap_pair(rng, glyph, mask_a, k)
+        rival_b = _swap_pair(rng, glyph, mask_b, k)
+        if rival_a is None or rival_b is None:
+            continue
+        rival_c = _swap_pair(rng, glyph, list(range(N_CELLS)), k + 1)
+        if rival_c is None:
+            continue
+        wrongs = [rival_a, rival_b, rival_c]
+        keys = {tuple(glyph)} | {tuple(w) for w in wrongs}
+        if len(keys) != 4:
+            continue
+
+        patterns = [list(glyph)] + wrongs
+        # counterbalanced answer colour and answer reading-order position
+        colours = list(COLOR_NAMES)
+        rng.shuffle(colours)
+        answer_colour = COLOR_NAMES[index % len(COLOR_NAMES)]
+        colours = [answer_colour] + [c for c in colours if c != answer_colour][: N_CANDIDATES - 1]
+
+        # geometry: the two views sit at opposite corners
+        d0, d1 = DIAGONALS[index % len(DIAGONALS)]
+        free = [s for s in range(len(SLOTS)) if s not in (d0, d1)]
+        rng.shuffle(free)
+        tile_slots = sorted(free[:N_CANDIDATES])
+        # the correct tile's rank in top-to-bottom reading order cycles
+        rank = index % N_CANDIDATES
+        order = list(range(N_CANDIDATES))
+        order[0], order[rank] = order[rank], order[0]
+        # order[i] == slot index position for pattern i
+        slot_for_pattern = [tile_slots[order.index(i)] for i in range(N_CANDIDATES)]
+
+        def place(slot: int) -> tuple[int, int]:
+            cx, cy = SLOTS[slot]
+            jx = rng.randint(-14, 14)
+            jy = rng.randint(-14, 14)
+            return cx + jx - TILE_SIDE // 2, cy + jy - TILE_SIDE // 2
+
+        tiles = []
+        for i in range(N_CANDIDATES):
+            x, y = place(slot_for_pattern[i])
+            tiles.append({"x": x, "y": y, "colour": colours[i], "cells": patterns[i]})
+        views = []
+        for slot, mask in ((d0, mask_a), (d1, mask_b)):
+            x, y = place(slot)
+            views.append({"x": x, "y": y, "hidden": mask})
+
+        boxes = [(t["x"], t["y"]) for t in tiles] + [(v["x"], v["y"]) for v in views]
+        decor = _sample_decor(rng, boxes)
+
+        return {
+            "glyph": glyph,
+            "views": views,
+            "tiles": tiles,
+            "decor": decor,
+            "swaps": k,
+        }
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+def _sample_decor(rng: random.Random, boxes: list[tuple[int, int]]) -> list[dict]:
+    placed: list[dict] = []
+    guard = 0
+    while len(placed) < N_DECOR and guard < 4000:
+        guard += 1
+        x = rng.randint(16, CANVAS_W - 16 - DECOR_SIDE)
+        y = rng.randint(16, CANVAS_H - 16 - DECOR_SIDE)
+        clash = False
+        for bx, by in boxes:
+            if bx - 24 <= x <= bx + TILE_SIDE + 12 and by - 24 <= y <= by + TILE_SIDE + 12:
+                clash = True
+                break
+        if clash:
+            continue
+        for other in placed:
+            if abs(other["x"] - x) < DECOR_SIDE + 10 and abs(other["y"] - y) < DECOR_SIDE + 10:
+                clash = True
+                break
+        if clash:
+            continue
+        placed.append({"x": x, "y": y, "tone": rng.randrange(len(DECOR_COLORS))})
+    return placed
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+
+def _draw_tile(draw: ImageDraw.ImageDraw, x: int, y: int, frame, cells, hidden) -> None:
+    draw.rectangle([x, y, x + TILE_SIDE - 1, y + TILE_SIDE - 1], fill=frame)
+    ix, iy = x + STROKE, y + STROKE
+    inner = GRID * CELL
+    draw.rectangle([ix, iy, ix + inner - 1, iy + inner - 1], fill=CELL_BG)
+    for i in range(1, GRID):
+        draw.line([ix + i * CELL, iy, ix + i * CELL, iy + inner - 1], fill=GRIDLINE)
+        draw.line([ix, iy + i * CELL, ix + inner - 1, iy + i * CELL], fill=GRIDLINE)
+    for idx in range(N_CELLS):
+        r, c = divmod(idx, GRID)
+        cx0 = ix + c * CELL
+        cy0 = iy + r * CELL
+        if idx in hidden:
+            draw.rectangle([cx0, cy0, cx0 + CELL - 1, cy0 + CELL - 1], fill=SHUTTER)
+        elif cells[idx] == 1:
+            draw.rectangle([cx0 + 3, cy0 + 3, cx0 + CELL - 4, cy0 + CELL - 4], fill=INK)
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (CANVAS_W, CANVAS_H), BOARD)
+    draw = ImageDraw.Draw(image)
+    for spot in sorted(scene["decor"], key=lambda d: (d["y"], d["x"])):
+        x, y = spot["x"], spot["y"]
+        draw.rectangle(
+            [x, y, x + DECOR_SIDE - 1, y + DECOR_SIDE - 1],
+            fill=DECOR_COLORS[spot["tone"]],
+        )
+    for view in sorted(scene["views"], key=lambda v: (v["y"], v["x"])):
+        _draw_tile(draw, view["x"], view["y"], VIEW_FRAME, scene["glyph"], set(view["hidden"]))
+    for tile in sorted(scene["tiles"], key=lambda t: (t["y"], t["x"])):
+        _draw_tile(draw, tile["x"], tile["y"], COLORS[tile["colour"]], tile["cells"], set())
+    return image
+
+
+# --------------------------------------------------------------------------
+# analytic gold
+# --------------------------------------------------------------------------
+
+
+def fused_pattern(scene: dict) -> list[int | None]:
+    """What the two shuttered views jointly reveal, cell by cell."""
+    fused: list[int | None] = [None] * N_CELLS
+    for view in scene["views"]:
+        hidden = set(view["hidden"])
+        for idx in range(N_CELLS):
+            if idx not in hidden:
+                fused[idx] = scene["glyph"][idx]
+    return fused
+
+
+def _consistent(pattern: list[int], fused: list[int | None]) -> bool:
+    return all(f is None or pattern[i] == f for i, f in enumerate(fused))
+
+
+def analytic_gold(scene: dict) -> str:
+    """Frame colour of the unique candidate agreeing with the fused evidence."""
+    fused = fused_pattern(scene)
+    winners = [t for t in scene["tiles"] if _consistent(t["cells"], fused)]
+    if len(winners) != 1:
+        raise ValueError("scene does not have a unique consistent candidate")
+    return winners[0]["colour"]
+
+
+def disagreement_counts(scene: dict) -> list[int]:
+    """Per losing tile, how many revealed cells contradict it."""
+    fused = fused_pattern(scene)
+    out = []
+    for tile in scene["tiles"]:
+        bad = sum(
+            1 for i, f in enumerate(fused) if f is not None and tile["cells"][i] != f
+        )
+        if bad:
+            out.append(bad)
+    return out
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin: revealed cells contradicting the best rival."""
+    counts = disagreement_counts(scene)
+    return float(min(counts)) if counts else 0.0
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def single_view_ambiguity(scene: dict) -> list[int]:
+    """How many candidates survive each view taken on its own."""
+    survivors = []
+    for view in scene["views"]:
+        hidden = set(view["hidden"])
+        partial: list[int | None] = [
+            None if i in hidden else scene["glyph"][i] for i in range(N_CELLS)
+        ]
+        survivors.append(sum(1 for t in scene["tiles"] if _consistent(t["cells"], partial)))
+    return survivors
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Tile list order is a pure alias.
+
+    Nothing in the picture overlaps and the gold is recovered by searching the
+    tiles for the one agreeing with the fused evidence, never by list position,
+    so permuting the stored lists re-draws a byte-identical picture with an
+    unchanged answer.
+    """
+    tiles = scene["tiles"]
+    rotated = {**scene, "tiles": tiles[1:] + tiles[:1]}
+    reversed_tiles = {**scene, "tiles": list(reversed(tiles))}
+    swapped_views = {**scene, "views": list(reversed(scene["views"]))}
+    decor_reversed = {**scene, "decor": list(reversed(scene["decor"]))}
+    return [
+        ("tile_list_rotation", rotated),
+        ("tile_list_reversal", reversed_tiles),
+        ("view_list_swap", swapped_views),
+        ("decor_list_reversal", decor_reversed),
+    ]

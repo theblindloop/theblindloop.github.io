@@ -1,0 +1,153 @@
+"""Independent pixel-only inverse arm for Split Seal Correspondence."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+INK = np.array((20, 25, 33), dtype=np.int16)
+FRAME = np.array((92, 101, 112), dtype=np.int16)
+TAG_RGB = {
+    "amber": np.array((230, 150, 35), dtype=np.int16),
+    "cyan": np.array((25, 160, 190), dtype=np.int16),
+    "violet": np.array((135, 80, 190), dtype=np.int16),
+}
+
+
+def _near(array: np.ndarray, color: np.ndarray, tolerance: int = 8) -> np.ndarray:
+    delta = array.astype(np.int16) - color
+    return np.max(np.abs(delta), axis=2) <= tolerance
+
+
+def _components(mask: np.ndarray):
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    output = []
+    for sy, sx in np.argwhere(mask):
+        sy, sx = int(sy), int(sx)
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        points = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _box(points: np.ndarray):
+    ys, xs = points[:, 0], points[:, 1]
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _normalize(cells):
+    min_x = min(x for x, _ in cells)
+    min_y = min(y for _, y in cells)
+    return tuple(sorted((x - min_x, y - min_y) for x, y in cells))
+
+
+def _rotate(cells):
+    return _normalize(tuple((-y, x) for x, y in cells))
+
+
+def _shape_signature(points: np.ndarray):
+    x0, y0, x1, y1 = _box(points)
+    area = len(points)
+    cell = int(round(math.sqrt(area / 4.0)))
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if cell < 8 or abs(area - 4 * cell * cell) > 4 or width % cell or height % cell:
+        raise ValueError("damaged or non-tetromino glyph")
+    local = np.zeros((height, width), dtype=bool)
+    local[points[:, 0] - y0, points[:, 1] - x0] = True
+    cells = []
+    for gy in range(height // cell):
+        for gx in range(width // cell):
+            count = int(local[gy * cell : (gy + 1) * cell, gx * cell : (gx + 1) * cell].sum())
+            if count >= int(0.95 * cell * cell):
+                cells.append((gx, gy))
+            elif count:
+                raise ValueError("partially erased glyph cell")
+    if len(cells) != 4:
+        raise ValueError("glyph does not contain four squares")
+    canonical = []
+    value = _normalize(tuple(cells))
+    for _ in range(4):
+        canonical.append(value)
+        value = _rotate(value)
+    return min(canonical)
+
+
+def _inside(points: np.ndarray, frame):
+    x0, y0, x1, y1 = frame
+    cy = float(points[:, 0].mean())
+    cx = float(points[:, 1].mean())
+    return x0 < cx < x1 and y0 < cy < y1
+
+
+def _read_set(components, frame, side=None):
+    x0, _, x1, _ = frame
+    middle = (x0 + x1) / 2.0
+    chosen = []
+    for points in components:
+        if not _inside(points, frame):
+            continue
+        cx = float(points[:, 1].mean())
+        if side == "left" and cx >= middle:
+            continue
+        if side == "right" and cx <= middle:
+            continue
+        chosen.append(_shape_signature(points))
+    if len(chosen) != 3 or len(set(chosen)) != 3:
+        raise ValueError("panel does not expose three distinct glyphs")
+    return set(chosen)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.shape[0] < 300 or array.shape[1] < 500:
+        raise ValueError("raster is too small")
+
+    gray_components = _components(_near(array, FRAME))
+    frames = []
+    for points in gray_components:
+        x0, y0, x1, y1 = _box(points)
+        if len(points) > 1000 and x1 - x0 > 220 and y1 - y0 > 140:
+            frames.append((x0, y0, x1, y1))
+    if len(frames) != 5:
+        raise ValueError("expected five intact panel frames")
+    frames.sort(key=lambda value: ((value[1] + value[3]) / 2.0, (value[0] + value[2]) / 2.0))
+    top = sorted(frames[:2], key=lambda value: value[0])
+    bottom = sorted(frames[2:], key=lambda value: value[0])
+    if top[1][1] - top[0][1] > 30 or bottom[-1][1] - bottom[0][1] > 30:
+        raise ValueError("panel rows are malformed")
+
+    black_components = [points for points in _components(_near(array, INK)) if len(points) > 100]
+    reference_left = _read_set(black_components, top[0])
+    reference_right = _read_set(black_components, top[1])
+
+    scored = []
+    for frame in bottom:
+        tags = []
+        x0, y0, x1, y1 = frame
+        for name, color in TAG_RGB.items():
+            count = int(_near(array[y0 : y1 + 1, x0 : x1 + 1], color).sum())
+            if count >= 1100:
+                tags.append(name)
+        if len(tags) != 1:
+            raise ValueError("candidate tag is missing or ambiguous")
+        left = _read_set(black_components, frame, "left")
+        right = _read_set(black_components, frame, "right")
+        distance = len(reference_left ^ left) + len(reference_right ^ right)
+        scored.append((distance, tags[0]))
+    scored.sort()
+    if len(scored) != 3 or scored[0][0] != 0 or scored[1][0] == 0:
+        raise ValueError("no unique exact two-sided correspondence")
+    return scored[0][1]

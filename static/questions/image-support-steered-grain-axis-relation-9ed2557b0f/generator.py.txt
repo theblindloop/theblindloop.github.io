@@ -1,0 +1,443 @@
+"""Renderer for the grain-axis-relation world.
+
+One solid pale patch of medium span carries a dense field of short dark
+strokes.  Each stroke points in its own direction, but the field as a whole
+has one average direction -- the grain.  The decision is the relation between
+that aggregate grain and the patch's own long axis.  No single stroke settles
+it: the per-stroke jitter is wide enough that a handful of strokes is not
+evidence, while the whole interior of the patch is.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image
+
+RENDERER_VERSION = "grain_axis_relation-0.1.0"
+
+CANVAS = 480
+SS = 3  # supersampling factor
+
+STROKE_LEN = 22.0
+STROKE_WIDTH = 3.2
+STROKE_JITTER_DEG = 34.0
+STROKE_CLEARANCE = 4.2
+INNER_INSET = 16.0
+
+ALONG_MAX_DEG = 35.0
+ACROSS_MIN_DEG = 55.0
+QUARANTINE_DEG = 6.0
+
+_TINTS = [
+    [176, 205, 232],
+    [186, 222, 196],
+    [236, 205, 178],
+    [214, 195, 231],
+    [196, 219, 224],
+    [235, 200, 202],
+]
+_INKS = [
+    [30, 34, 40],
+    [26, 42, 34],
+    [44, 30, 30],
+    [30, 30, 52],
+]
+_PAGE = [250, 250, 249]
+_CLUTTER = [
+    [208, 208, 208],
+    [216, 216, 215],
+    [199, 199, 200],
+]
+
+_PATCH_KINDS = ("ellipse", "stadium", "rounded_rect")
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _axial_mean_deg(angles_deg: list[float]) -> float:
+    """Mean direction of undirected orientations, in degrees mod 180."""
+    sin2 = sum(math.sin(2.0 * math.radians(a)) for a in angles_deg)
+    cos2 = sum(math.cos(2.0 * math.radians(a)) for a in angles_deg)
+    return math.degrees(math.atan2(sin2, cos2)) * 0.5 % 180.0
+
+
+def _axial_delta_deg(a: float, b: float) -> float:
+    """Acute angle between two undirected directions, in [0, 90]."""
+    d = abs(a - b) % 180.0
+    return d if d <= 90.0 else 180.0 - d
+
+
+def _patch_contains(patch: dict, x: float, y: float, inset: float) -> bool:
+    ang = math.radians(patch["angle_deg"])
+    dx, dy = x - patch["cx"], y - patch["cy"]
+    xr = dx * math.cos(ang) + dy * math.sin(ang)
+    yr = -dx * math.sin(ang) + dy * math.cos(ang)
+    a = patch["a"] - inset
+    b = patch["b"] - inset
+    if a <= 1.0 or b <= 1.0:
+        return False
+    kind = patch["kind"]
+    if kind == "ellipse":
+        return (xr / a) ** 2 + (yr / b) ** 2 <= 1.0
+    if kind == "stadium":
+        half = max(a - b, 0.0)
+        ex = min(max(xr, -half), half)
+        return (xr - ex) ** 2 + yr ** 2 <= b * b
+    r = min(b * 0.55, a * 0.35)
+    if abs(xr) > a or abs(yr) > b:
+        return False
+    ox = max(abs(xr) - (a - r), 0.0)
+    oy = max(abs(yr) - (b - r), 0.0)
+    return ox * ox + oy * oy <= r * r
+
+
+def _capsule_clear(sa: dict, sb: dict, gap: float) -> bool:
+    """True when two stroke capsules stay at least ``gap`` pixels apart."""
+    pa = _stroke_endpoints(sa)
+    pb = _stroke_endpoints(sb)
+    return _segment_distance(pa, pb) >= gap + STROKE_WIDTH
+
+
+def _stroke_endpoints(stroke: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    ang = math.radians(stroke["angle_deg"])
+    hx = math.cos(ang) * STROKE_LEN * 0.5
+    hy = math.sin(ang) * STROKE_LEN * 0.5
+    return (
+        (stroke["x"] - hx, stroke["y"] - hy),
+        (stroke["x"] + hx, stroke["y"] + hy),
+    )
+
+
+def _point_segment_distance(p, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    vx, vy = bx - ax, by - ay
+    denom = vx * vx + vy * vy
+    t = 0.0 if denom == 0.0 else ((px - ax) * vx + (py - ay) * vy) / denom
+    t = min(max(t, 0.0), 1.0)
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _segment_distance(seg_a, seg_b) -> float:
+    a0, a1 = seg_a
+    b0, b1 = seg_b
+    return min(
+        _point_segment_distance(a0, b0, b1),
+        _point_segment_distance(a1, b0, b1),
+        _point_segment_distance(b0, a0, a1),
+        _point_segment_distance(b1, a0, a1),
+    )
+
+
+def _lay_strokes(rng: random.Random, sites: list[tuple[float, float]], mean_deg: float) -> list[dict]:
+    """Place jittered strokes on the given sites, then re-centre the field so the
+    axial mean of the drawn angles equals ``mean_deg`` exactly."""
+    placed: list[dict] = []
+    for (x, y) in sites:
+        angle = mean_deg + rng.uniform(-STROKE_JITTER_DEG, STROKE_JITTER_DEG)
+        cand = {"x": round(x, 3), "y": round(y, 3), "angle_deg": round(angle % 180.0, 4)}
+        if all(_capsule_clear(cand, other, STROKE_CLEARANCE) for other in placed):
+            placed.append(cand)
+    if not placed:
+        return placed
+    residual = _axial_mean_deg([s["angle_deg"] for s in placed]) - mean_deg
+    for stroke in placed:
+        stroke["angle_deg"] = round((stroke["angle_deg"] - residual) % 180.0, 4)
+    return placed
+
+
+def _grid_sites(rng: random.Random, patch: dict, pitch: float, inset: float) -> list[tuple[float, float]]:
+    ang = math.radians(patch["angle_deg"])
+    ca, sa = math.cos(ang), math.sin(ang)
+    reach = int(patch["a"] / pitch) + 2
+    down = int(patch["b"] / pitch) + 2
+    sites = []
+    for row in range(-down, down + 1):
+        for col in range(-reach, reach + 1):
+            u = col * pitch + (pitch * 0.5 if row % 2 else 0.0) + rng.uniform(-3.0, 3.0)
+            v = row * pitch * 0.92 + rng.uniform(-3.0, 3.0)
+            x = patch["cx"] + u * ca - v * sa
+            y = patch["cy"] + u * sa + v * ca
+            if _patch_contains(patch, x, y, inset):
+                sites.append((x, y))
+    rng.shuffle(sites)
+    return sites
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    for _ in range(400):
+        scene = _try_scene(rng)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+def _try_scene(rng: random.Random) -> dict | None:
+    kind = rng.choice(_PATCH_KINDS)
+    a = rng.uniform(112.0, 146.0)
+    aspect = rng.uniform(1.65, 2.55)
+    b = a / aspect
+    if b < 46.0:
+        return None
+    axis_deg = rng.uniform(0.0, 180.0)
+    cx = CANVAS * 0.5 + rng.uniform(-26.0, 26.0)
+    cy = CANVAS * 0.5 + rng.uniform(-26.0, 26.0)
+    patch = {
+        "kind": kind,
+        "cx": round(cx, 3),
+        "cy": round(cy, 3),
+        "a": round(a, 3),
+        "b": round(b, 3),
+        "angle_deg": round(axis_deg, 4),
+    }
+    # keep the whole patch on the page with a wide margin: regional, not spanning
+    if not _patch_on_page(patch, margin=26.0):
+        return None
+
+    target_class = rng.choices(
+        ["along", "across", "unclear", "boundary"], weights=[5, 5, 2, 2]
+    )[0]
+    if target_class == "along":
+        delta = rng.uniform(2.0, ALONG_MAX_DEG - QUARANTINE_DEG - 1.5)
+    elif target_class == "across":
+        delta = rng.uniform(ACROSS_MIN_DEG + QUARANTINE_DEG + 1.5, 88.0)
+    elif target_class == "unclear":
+        delta = rng.uniform(
+            ALONG_MAX_DEG + QUARANTINE_DEG + 1.0, ACROSS_MIN_DEG - QUARANTINE_DEG - 1.0
+        )
+    else:
+        # a deliberate near-cut-off scene: inside the quarantine guard band
+        cut = rng.choice([ALONG_MAX_DEG, ACROSS_MIN_DEG])
+        delta = cut + rng.uniform(-QUARANTINE_DEG + 0.4, QUARANTINE_DEG - 0.4)
+    grain_deg = (axis_deg + delta * rng.choice([1.0, -1.0])) % 180.0
+
+    sites = _grid_sites(rng, patch, pitch=rng.uniform(21.0, 24.0), inset=INNER_INSET)
+    inside = _lay_strokes(rng, sites, grain_deg)
+    if len(inside) < 20:
+        return None
+
+    # decoy field outside the patch: same ink, same size, unrelated grain
+    outside_grain = (grain_deg + rng.uniform(48.0, 132.0)) % 180.0
+    outside = _sample_outside_strokes(rng, patch, outside_grain)
+
+    scene = {
+        "width": CANVAS,
+        "height": CANVAS,
+        "patch": patch,
+        "inside_strokes": inside,
+        "outside_strokes": outside,
+        "clutter": _sample_clutter(rng, patch),
+        "tint": list(_TINTS[rng.randrange(len(_TINTS))]),
+        "ink": list(_INKS[rng.randrange(len(_INKS))]),
+        "clutter_rgb": list(_CLUTTER[rng.randrange(len(_CLUTTER))]),
+        "page": list(_PAGE),
+    }
+    return scene
+
+
+def _patch_on_page(patch: dict, margin: float) -> bool:
+    ang = math.radians(patch["angle_deg"])
+    a, b = patch["a"], patch["b"]
+    ex = math.hypot(a * math.cos(ang), b * math.sin(ang))
+    ey = math.hypot(a * math.sin(ang), b * math.cos(ang))
+    return (
+        patch["cx"] - ex >= margin
+        and patch["cx"] + ex <= CANVAS - margin
+        and patch["cy"] - ey >= margin
+        and patch["cy"] + ey <= CANVAS - margin
+    )
+
+
+def _sample_outside_strokes(rng: random.Random, patch: dict, mean_deg: float) -> list[dict]:
+    placed: list[dict] = []
+    wanted = rng.randint(7, 12)
+    for _ in range(700):
+        if len(placed) >= wanted:
+            break
+        x = rng.uniform(20.0, CANVAS - 20.0)
+        y = rng.uniform(20.0, CANVAS - 20.0)
+        angle = (mean_deg + rng.uniform(-STROKE_JITTER_DEG, STROKE_JITTER_DEG)) % 180.0
+        cand = {"x": round(x, 3), "y": round(y, 3), "angle_deg": round(angle, 4)}
+        if _patch_contains(patch, x, y, -(STROKE_LEN * 0.5 + 13.0)):
+            continue
+        if any(not _capsule_clear(cand, other, STROKE_CLEARANCE) for other in placed):
+            continue
+        placed.append(cand)
+    return placed
+
+
+def _sample_clutter(rng: random.Random, patch: dict) -> list[dict]:
+    blobs: list[dict] = []
+    wanted = rng.randint(5, 9)
+    for _ in range(600):
+        if len(blobs) >= wanted:
+            break
+        rx = rng.uniform(9.0, 20.0)
+        ry = rng.uniform(9.0, 20.0)
+        x = rng.uniform(16.0, CANVAS - 16.0)
+        y = rng.uniform(16.0, CANVAS - 16.0)
+        if _patch_contains(patch, x, y, -(max(rx, ry) + 12.0)):
+            continue
+        blobs.append(
+            {
+                "x": round(x, 3),
+                "y": round(y, 3),
+                "rx": round(rx, 3),
+                "ry": round(ry, 3),
+                "angle_deg": round(rng.uniform(0.0, 180.0), 4),
+            }
+        )
+    return blobs
+
+
+# --------------------------------------------------------------------------
+# rasterisation
+# --------------------------------------------------------------------------
+def _bbox_grid(cx: float, cy: float, reach: float, w: int, h: int):
+    x0 = max(int(math.floor((cx - reach) * SS)), 0)
+    x1 = min(int(math.ceil((cx + reach) * SS)) + 1, w)
+    y0 = max(int(math.floor((cy - reach) * SS)), 0)
+    y1 = min(int(math.ceil((cy + reach) * SS)) + 1, h)
+    if x0 >= x1 or y0 >= y1:
+        return None
+    xs = (np.arange(x0, x1, dtype=np.float64) + 0.5) / SS
+    ys = (np.arange(y0, y1, dtype=np.float64) + 0.5) / SS
+    return x0, x1, y0, y1, xs[None, :], ys[:, None]
+
+
+def _paint(buf: np.ndarray, box, mask: np.ndarray, rgb) -> None:
+    x0, x1, y0, y1 = box
+    region = buf[y0:y1, x0:x1]
+    for channel in range(3):
+        region[..., channel][mask] = rgb[channel]
+
+
+def _patch_mask(patch: dict, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    ang = math.radians(patch["angle_deg"])
+    dx = xs - patch["cx"]
+    dy = ys - patch["cy"]
+    xr = dx * math.cos(ang) + dy * math.sin(ang)
+    yr = -dx * math.sin(ang) + dy * math.cos(ang)
+    a, b = patch["a"], patch["b"]
+    kind = patch["kind"]
+    if kind == "ellipse":
+        return (xr / a) ** 2 + (yr / b) ** 2 <= 1.0
+    if kind == "stadium":
+        half = max(a - b, 0.0)
+        ex = np.clip(xr, -half, half)
+        return (xr - ex) ** 2 + yr ** 2 <= b * b
+    r = min(b * 0.55, a * 0.35)
+    ox = np.maximum(np.abs(xr) - (a - r), 0.0)
+    oy = np.maximum(np.abs(yr) - (b - r), 0.0)
+    return (np.abs(xr) <= a) & (np.abs(yr) <= b) & (ox * ox + oy * oy <= r * r)
+
+
+def _stroke_mask(stroke: dict, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    ang = math.radians(stroke["angle_deg"])
+    dx = xs - stroke["x"]
+    dy = ys - stroke["y"]
+    along = dx * math.cos(ang) + dy * math.sin(ang)
+    perp = -dx * math.sin(ang) + dy * math.cos(ang)
+    half = STROKE_LEN * 0.5 - STROKE_WIDTH * 0.5
+    excess = np.maximum(np.abs(along) - half, 0.0)
+    return excess * excess + perp * perp <= (STROKE_WIDTH * 0.5) ** 2
+
+
+def render(scene: dict) -> Image.Image:
+    w, h = int(scene["width"]) * SS, int(scene["height"]) * SS
+    buf = np.empty((h, w, 3), dtype=np.uint8)
+    buf[..., 0] = scene["page"][0]
+    buf[..., 1] = scene["page"][1]
+    buf[..., 2] = scene["page"][2]
+
+    for blob in scene["clutter"]:
+        reach = max(blob["rx"], blob["ry"]) + 2.0
+        grid = _bbox_grid(blob["x"], blob["y"], reach, w, h)
+        if grid is None:
+            continue
+        x0, x1, y0, y1, xs, ys = grid
+        ang = math.radians(blob["angle_deg"])
+        dx, dy = xs - blob["x"], ys - blob["y"]
+        xr = dx * math.cos(ang) + dy * math.sin(ang)
+        yr = -dx * math.sin(ang) + dy * math.cos(ang)
+        mask = (xr / blob["rx"]) ** 2 + (yr / blob["ry"]) ** 2 <= 1.0
+        _paint(buf, (x0, x1, y0, y1), mask, scene["clutter_rgb"])
+
+    patch = scene["patch"]
+    reach = patch["a"] + 3.0
+    grid = _bbox_grid(patch["cx"], patch["cy"], reach, w, h)
+    if grid is not None:
+        x0, x1, y0, y1, xs, ys = grid
+        _paint(buf, (x0, x1, y0, y1), _patch_mask(patch, xs, ys), scene["tint"])
+
+    for stroke in list(scene["outside_strokes"]) + list(scene["inside_strokes"]):
+        grid = _bbox_grid(stroke["x"], stroke["y"], STROKE_LEN * 0.5 + 3.0, w, h)
+        if grid is None:
+            continue
+        x0, x1, y0, y1, xs, ys = grid
+        _paint(buf, (x0, x1, y0, y1), _stroke_mask(stroke, xs, ys), scene["ink"])
+
+    small = buf.reshape(h // SS, SS, w // SS, SS, 3).mean(axis=(1, 3))
+    return Image.fromarray(np.rint(small).astype(np.uint8), mode="RGB")
+
+
+# --------------------------------------------------------------------------
+# analytic gold
+# --------------------------------------------------------------------------
+def _delta(scene: dict) -> float:
+    grain = _axial_mean_deg([s["angle_deg"] for s in scene["inside_strokes"]])
+    return _axial_delta_deg(grain, float(scene["patch"]["angle_deg"]))
+
+
+def analytic_gold(scene: dict) -> str:
+    delta = _delta(scene)
+    if delta < ALONG_MAX_DEG:
+        return "along"
+    if delta > ACROSS_MIN_DEG:
+        return "across"
+    return "unclear"
+
+
+def margin(scene: dict) -> float:
+    """Degrees of slack to the nearest declared class boundary (35 or 55)."""
+    delta = _delta(scene)
+    return round(min(abs(delta - ALONG_MAX_DEG), abs(delta - ACROSS_MIN_DEG)), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_DEG)
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabellings of the latent scene.
+
+    Strokes never overlap one another and share one flat ink colour, so their
+    paint order is irrelevant to the raster; the same holds for the flat-colour
+    clutter blobs.  The gold reads only an order-free axial mean, so all three
+    transforms must leave the decision untouched.
+    """
+    out: list[tuple[str, dict]] = []
+
+    reversed_inside = dict(scene)
+    reversed_inside["inside_strokes"] = list(reversed(scene["inside_strokes"]))
+    out.append(("reverse_inside_stroke_order", reversed_inside))
+
+    rotated = dict(scene)
+    strokes = list(scene["inside_strokes"])
+    if len(strokes) > 2:
+        cut = len(strokes) // 3
+        rotated["inside_strokes"] = strokes[cut:] + strokes[:cut]
+        out.append(("rotate_inside_stroke_order", rotated))
+
+    shuffled_clutter = dict(scene)
+    shuffled_clutter["clutter"] = list(reversed(scene["clutter"]))
+    shuffled_clutter["outside_strokes"] = list(reversed(scene["outside_strokes"]))
+    out.append(("reverse_background_order", shuffled_clutter))
+
+    return out

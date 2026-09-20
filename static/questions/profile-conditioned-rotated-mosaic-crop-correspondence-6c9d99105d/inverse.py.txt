@@ -1,0 +1,175 @@
+"""Independent inverse arm using only pixels from the final PNG."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+FRAME = (69, 82, 104)
+PAPER = np.array((247, 244, 232), dtype=np.float32)
+INK = np.array((34, 38, 45), dtype=np.float32)
+MAGENTA = (210, 38, 142)
+RINGS = {
+    "red": (220, 54, 62),
+    "green": (34, 157, 91),
+    "blue": (44, 105, 205),
+}
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    work = mask.copy()
+    height, width = work.shape
+    components: list[tuple[int, int, int, int, int]] = []
+    while work.any():
+        flat = int(np.flatnonzero(work)[0])
+        y0, x0 = divmod(flat, width)
+        queue = deque([(y0, x0)])
+        work[y0, x0] = False
+        min_x = max_x = x0
+        min_y = max_y = y0
+        count = 0
+        while queue:
+            y, x = queue.popleft()
+            count += 1
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and work[ny, nx]:
+                    work[ny, nx] = False
+                    queue.append((ny, nx))
+        components.append((count, min_x, min_y, max_x, max_y))
+    return components
+
+
+def _runs(values: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(values)
+    if not len(indices):
+        return []
+    runs: list[tuple[int, int]] = []
+    start = previous = int(indices[0])
+    for value in indices[1:]:
+        current = int(value)
+        if current != previous + 1:
+            runs.append((start, previous))
+            start = current
+        previous = current
+    runs.append((start, previous))
+    return runs
+
+
+def _find_grids(arr: np.ndarray) -> list[dict]:
+    mask = np.all(arr == np.array(FRAME, dtype=np.uint8), axis=2)
+    boxes = [component for component in _components(mask) if component[0] > 5_000]
+    grids: list[dict] = []
+    for _, min_x, min_y, max_x, max_y in boxes:
+        local = mask[min_y : max_y + 1, min_x : max_x + 1]
+        vertical = _runs(local.sum(axis=0) >= local.shape[0] * 0.8)
+        horizontal = _runs(local.sum(axis=1) >= local.shape[1] * 0.8)
+        if len(vertical) != len(horizontal) or len(vertical) not in (5, 9):
+            continue
+        x_lines = [min_x + (start + end) // 2 for start, end in vertical]
+        y_lines = [min_y + (start + end) // 2 for start, end in horizontal]
+        grids.append({"n": len(vertical) - 1, "x": x_lines, "y": y_lines})
+    if sorted(grid["n"] for grid in grids) != [4, 8]:
+        raise ValueError("could not discover one 4x4 and one 8x8 grid from frame pixels")
+    return grids
+
+
+def _decode_grid(arr: np.ndarray, grid: dict) -> list[list[int]]:
+    result: list[list[int]] = []
+    for row in range(grid["n"]):
+        values: list[int] = []
+        for col in range(grid["n"]):
+            x0, x1 = grid["x"][col], grid["x"][col + 1]
+            y0, y1 = grid["y"][row], grid["y"][row + 1]
+            pad_x = max(7, (x1 - x0) // 7)
+            pad_y = max(7, (y1 - y0) // 7)
+            patch = arr[y0 + pad_y : y1 - pad_y, x0 + pad_x : x1 - pad_x]
+            if patch.size == 0:
+                raise ValueError("grid cell interior is empty")
+            mean = patch.reshape(-1, 3).mean(axis=0)
+            values.append(int(np.linalg.norm(mean - INK) < np.linalg.norm(mean - PAPER)))
+        result.append(values)
+    return result
+
+
+def _marker_cell(arr: np.ndarray, grid: dict, rgb: tuple[int, int, int]) -> tuple[int, int]:
+    mask = np.all(arr == np.array(rgb, dtype=np.uint8), axis=2)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 20:
+        raise ValueError(f"missing visible ring with RGB {rgb}")
+    cx = float(xs.mean())
+    cy = float(ys.mean())
+    columns = [index for index in range(grid["n"]) if grid["x"][index] < cx < grid["x"][index + 1]]
+    rows = [index for index in range(grid["n"]) if grid["y"][index] < cy < grid["y"][index + 1]]
+    if len(rows) != 1 or len(columns) != 1:
+        raise ValueError("ring centroid does not lie inside one decoded cell")
+    return rows[0], columns[0]
+
+
+def _rotate_clockwise(grid: list[list[int]], turns: int) -> list[list[int]]:
+    result = [list(row) for row in grid]
+    for _ in range(turns % 4):
+        result = [list(row) for row in zip(*result[::-1])]
+    return result
+
+
+def _inverse_coordinate(row: int, col: int, size: int, turns: int) -> tuple[int, int]:
+    for _ in range(turns % 4):
+        row, col = size - 1 - col, row
+    return row, col
+
+
+def _assignments(target: list[list[int]], reference: list[list[int]]) -> list[tuple[int, int, int, int]]:
+    crop_size = len(reference)
+    scores: list[tuple[int, int, int, int]] = []
+    for row in range(len(target) - crop_size + 1):
+        for col in range(len(target) - crop_size + 1):
+            window = [line[col : col + crop_size] for line in target[row : row + crop_size]]
+            for turns in range(4):
+                candidate = _rotate_clockwise(window, turns)
+                mismatch = sum(
+                    candidate[r][c] != reference[r][c]
+                    for r in range(crop_size)
+                    for c in range(crop_size)
+                )
+                scores.append((mismatch, row, col, turns))
+    return sorted(scores)
+
+
+def analyze_image(image: Image.Image) -> dict:
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    grids = _find_grids(arr)
+    reference_grid = next(grid for grid in grids if grid["n"] == 4)
+    target_grid = next(grid for grid in grids if grid["n"] == 8)
+    reference = _decode_grid(arr, reference_grid)
+    target = _decode_grid(arr, target_grid)
+    scores = _assignments(target, reference)
+    if len(scores) < 2 or scores[0][0] != 0 or scores[1][0] == 0:
+        raise ValueError("pixels do not expose one unique exact crop-and-rotation assignment")
+    _, crop_row, crop_col, turns = scores[0]
+    shown_row, shown_col = _marker_cell(arr, reference_grid, MAGENTA)
+    local_row, local_col = _inverse_coordinate(shown_row, shown_col, 4, turns)
+    target_cell = (crop_row + local_row, crop_col + local_col)
+    colored_cells = {color: _marker_cell(arr, target_grid, rgb) for color, rgb in RINGS.items()}
+    answers = [color for color, cell in colored_cells.items() if cell == target_cell]
+    if len(answers) != 1:
+        raise ValueError("registered target cell has no unique colored ring")
+    return {
+        "decision": answers[0],
+        "best_mismatch": scores[0][0],
+        "runner_mismatch": scores[1][0],
+        "margin": scores[1][0] - scores[0][0],
+        "crop_row": crop_row,
+        "crop_col": crop_col,
+        "rotation": turns,
+        "target_cell": target_cell,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

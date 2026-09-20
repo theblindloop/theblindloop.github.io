@@ -1,0 +1,266 @@
+"""Pixel-only inverse arm for the lagoon / islet host-binding world.
+
+The oracle receives one rasterized PNG and the public question contract and
+nothing else. It imports no renderer, prompt, generator, verifier or gold code
+and never sees a latent scene.
+
+Pipeline:
+
+1. quantize every pixel to the declared flat palette (cream board, water, four
+   object colours); anything farther than the tolerance is UNKNOWN;
+2. label 4-connected regions with a run-length union-find;
+3. give every region the region that immediately encloses it as its parent, by
+   reading the pixel directly above the region's topmost-leftmost pixel;
+4. validate the declared structure - one rectangular water lagoon clear of the
+   image border, exactly three large rectangular islands inside it, at most one
+   water lake per island, and exactly one region at containment depth four;
+5. answer with the colour of the depth-four region's grandparent island.
+
+Any structural violation raises OracleAbstention, so a damaged, corrupted or
+ambiguous raster is refused rather than guessed.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+PALETTE: tuple[tuple[str, tuple[int, int, int]], ...] = (
+    ("cream", (238, 231, 210)),
+    ("water", (108, 170, 202)),
+    ("red", (198, 56, 48)),
+    ("blue", (72, 76, 208)),
+    ("green", (44, 152, 66)),
+    ("purple", (132, 54, 158)),
+)
+OBJECT_COLORS = frozenset({"red", "blue", "green", "purple"})
+TOLERANCE = 30
+
+MIN_LAGOON_AREA = 4000
+MIN_ISLAND_AREA = 2000
+MAX_PATCH_AREA = 900
+BORDER_CLEARANCE = 4
+
+UNKNOWN = -1
+OUTSIDE = -1
+
+
+class OracleAbstention(Exception):
+    """Raised when the image does not present the declared structure."""
+
+
+def _quantize(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int32)
+    flat = array.reshape(-1, 3)
+    best = np.full(flat.shape[0], UNKNOWN, dtype=np.int32)
+    best_distance = np.full(flat.shape[0], 1 << 30, dtype=np.int64)
+    for index, (_, rgb) in enumerate(PALETTE):
+        delta = flat - np.asarray(rgb, dtype=np.int32)
+        distance = (delta * delta).sum(axis=1)
+        better = distance < best_distance
+        best_distance[better] = distance[better]
+        best[better] = index
+    best[best_distance > TOLERANCE * TOLERANCE] = UNKNOWN
+    return best.reshape(array.shape[:2])
+
+
+class _Regions:
+    """4-connected regions of a label image, with enclosure parents."""
+
+    def __init__(self, labels: np.ndarray) -> None:
+        self.labels = labels
+        self.height, self.width = labels.shape
+        self._parent: list[int] = []
+        self._rows: list[tuple[np.ndarray, np.ndarray, list[int]]] = []
+        self._build()
+        self._collect()
+        self._enclose()
+
+    # union-find -------------------------------------------------------
+    def _find(self, node: int) -> int:
+        root = node
+        while self._parent[root] != root:
+            root = self._parent[root]
+        while self._parent[node] != root:
+            self._parent[node], node = root, self._parent[node]
+        return root
+
+    def _union(self, a: int, b: int) -> None:
+        ra, rb = self._find(a), self._find(b)
+        if ra != rb:
+            self._parent[max(ra, rb)] = min(ra, rb)
+
+    def _build(self) -> None:
+        previous: tuple[np.ndarray, np.ndarray, list[int]] | None = None
+        for y in range(self.height):
+            row = self.labels[y]
+            cuts = np.flatnonzero(row[1:] != row[:-1]) + 1
+            starts = np.concatenate(([0], cuts))
+            ends = np.concatenate((cuts, [self.width]))
+            ids: list[int] = []
+            for _ in range(len(starts)):
+                ids.append(len(self._parent))
+                self._parent.append(len(self._parent))
+            if previous is not None:
+                pstarts, pends, pids = previous
+                i = j = 0
+                while i < len(starts) and j < len(pstarts):
+                    if starts[i] < pends[j] and pstarts[j] < ends[i]:
+                        if row[starts[i]] == self.labels[y - 1][pstarts[j]]:
+                            self._union(ids[i], pids[j])
+                    if ends[i] <= pends[j]:
+                        i += 1
+                    else:
+                        j += 1
+            previous = (starts, ends, ids)
+            self._rows.append(previous)
+
+    def _collect(self) -> None:
+        self.area: dict[int, int] = {}
+        self.bbox: dict[int, list[int]] = {}
+        self.color: dict[int, int] = {}
+        self.first: dict[int, tuple[int, int]] = {}
+        for y, (starts, ends, ids) in enumerate(self._rows):
+            row = self.labels[y]
+            for index, ident in enumerate(ids):
+                root = self._find(ident)
+                x0, x1 = int(starts[index]), int(ends[index])
+                if root not in self.area:
+                    self.area[root] = 0
+                    self.bbox[root] = [x0, y, x1 - 1, y]
+                    self.color[root] = int(row[x0])
+                    self.first[root] = (y, x0)
+                box = self.bbox[root]
+                box[0] = min(box[0], x0)
+                box[1] = min(box[1], y)
+                box[2] = max(box[2], x1 - 1)
+                box[3] = max(box[3], y)
+                self.area[root] += x1 - x0
+        self.roots = sorted(self.area)
+
+    def region_at(self, y: int, x: int) -> int:
+        starts, _, ids = self._rows[y]
+        index = int(np.searchsorted(starts, x, side="right")) - 1
+        return self._find(ids[index])
+
+    def _enclose(self) -> None:
+        self.parent: dict[int, int] = {}
+        self.children: dict[int, list[int]] = {root: [] for root in self.roots}
+        self.depth: dict[int, int] = {}
+        for root in self.roots:
+            y, x = self.first[root]
+            self.parent[root] = OUTSIDE if y == 0 else self.region_at(y - 1, x)
+        for root in self.roots:
+            if self.parent[root] != OUTSIDE:
+                self.children[self.parent[root]].append(root)
+        for root in self.roots:
+            depth, node, guard = 0, root, 0
+            while self.parent[node] != OUTSIDE:
+                node = self.parent[node]
+                depth += 1
+                guard += 1
+                if guard > 64:
+                    raise OracleAbstention("containment chain is not a tree")
+            self.depth[root] = depth  # the enclosing cream board sits at depth 0
+
+    def subtree_area(self, root: int) -> int:
+        total, stack = 0, [root]
+        while stack:
+            node = stack.pop()
+            total += self.area[node]
+            stack.extend(self.children[node])
+        return total
+
+    def is_filled_square(self, root: int) -> bool:
+        x0, y0, x1, y1 = self.bbox[root]
+        side = x1 - x0 + 1
+        if side != y1 - y0 + 1:
+            return False
+        return self.subtree_area(root) == side * side
+
+    def descendants(self, root: int) -> list[int]:
+        found, stack = [], list(self.children[root])
+        while stack:
+            node = stack.pop()
+            found.append(node)
+            stack.extend(self.children[node])
+        return found
+
+
+def _name(index: int) -> str:
+    if index == UNKNOWN:
+        return "unknown"
+    return PALETTE[index][0]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    labels = _quantize(image)
+    regions = _Regions(labels)
+    height, width = labels.shape
+
+    lagoons = [
+        root
+        for root in regions.roots
+        if _name(regions.color[root]) == "water"
+        and regions.depth[root] == 1
+        and regions.area[root] >= MIN_LAGOON_AREA
+    ]
+    if len(lagoons) != 1:
+        raise OracleAbstention(f"expected exactly one lagoon, found {len(lagoons)}")
+    lagoon = lagoons[0]
+
+    x0, y0, x1, y1 = regions.bbox[lagoon]
+    if (
+        x0 < BORDER_CLEARANCE
+        or y0 < BORDER_CLEARANCE
+        or x1 >= width - BORDER_CLEARANCE
+        or y1 >= height - BORDER_CLEARANCE
+    ):
+        raise OracleAbstention("the lagoon is not clear of the image border")
+    if not regions.is_filled_square(lagoon):
+        raise OracleAbstention("the lagoon is not a complete filled square block")
+
+    inside = regions.descendants(lagoon)
+    if any(_name(regions.color[root]) == "unknown" for root in inside):
+        raise OracleAbstention("unreadable colour inside the lagoon")
+    if any(_name(regions.color[root]) == "cream" for root in inside):
+        raise OracleAbstention("board colour intrudes into the lagoon")
+
+    islands = [root for root in regions.children[lagoon] if regions.area[root] >= MIN_ISLAND_AREA]
+    if len(islands) != 3:
+        raise OracleAbstention(f"expected three islands, found {len(islands)}")
+    for island in islands:
+        if _name(regions.color[island]) not in OBJECT_COLORS:
+            raise OracleAbstention("an island does not carry an object colour")
+        if not regions.is_filled_square(island):
+            raise OracleAbstention("an island is not a complete filled square block")
+        lakes = [
+            child
+            for child in regions.children[island]
+            if _name(regions.color[child]) == "water"
+        ]
+        if len(lakes) > 1:
+            raise OracleAbstention("an island carries more than one lake")
+
+    for root in regions.children[lagoon]:
+        if root in islands:
+            continue
+        if regions.area[root] > MAX_PATCH_AREA:
+            raise OracleAbstention("an ambiguous mid-sized region floats on the lagoon")
+
+    deepest = [root for root in inside if regions.depth[root] >= 4]
+    if len(deepest) != 1:
+        raise OracleAbstention(f"expected exactly one depth-four islet, found {len(deepest)}")
+    islet = deepest[0]
+    if regions.depth[islet] != 4:
+        raise OracleAbstention("the islet is nested deeper than the contract allows")
+    if _name(regions.color[islet]) not in OBJECT_COLORS:
+        raise OracleAbstention("the islet does not carry an object colour")
+
+    lake = regions.parent[islet]
+    if _name(regions.color[lake]) != "water":
+        raise OracleAbstention("the islet does not sit in a lake")
+    host = regions.parent[lake]
+    if host not in islands:
+        raise OracleAbstention("the lake's island is not one of the three islands")
+    return _name(regions.color[host])

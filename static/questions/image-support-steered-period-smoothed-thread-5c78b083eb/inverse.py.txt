@@ -1,0 +1,131 @@
+"""Independent pixel-only inverse for the period-smoothed thread.
+
+The inverse locates the two visible color fiducials and the single dark carrier,
+checks that the carrier is intact, samples its vertical position by image column,
+applies the declared one-of-twelve-period box average, and compares the remaining
+curve with three phase templates.  It imports no forward-world module.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+TOOTH_COUNT = 12
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        if seen[y0, x0]:
+            continue
+        stack = [(int(y0), int(x0))]
+        seen[y0, x0] = True
+        points = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        groups.append(np.asarray(points, dtype=np.int32))
+    groups.sort(key=len, reverse=True)
+    return groups
+
+
+def _fiducial(mask: np.ndarray, name: str) -> tuple[float, float, int]:
+    groups = [group for group in _components(mask) if len(group) >= 18]
+    if len(groups) != 1:
+        raise ValueError(f"expected one intact {name} fiducial")
+    group = groups[0]
+    if not 24 <= len(group) <= 80:
+        raise ValueError(f"{name} fiducial area is outside tolerance")
+    ys = group[:, 0]
+    xs = group[:, 1]
+    if xs.max() - xs.min() > 14 or ys.max() - ys.min() > 14:
+        raise ValueError(f"{name} fiducial is malformed")
+    return float(xs.mean()), float(ys.mean()), int(len(group))
+
+
+def _box_average(values: np.ndarray, width: int) -> np.ndarray:
+    width = max(5, int(width) | 1)
+    pad = width // 2
+    padded = np.pad(values, (pad, pad), mode="edge")
+    return np.convolve(padded, np.ones(width, dtype=np.float64) / width, mode="valid")
+
+
+def analyze_image(image: Image.Image) -> dict:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red = (array[:, :, 0] > 155) & (array[:, :, 0] > array[:, :, 1] * 17 // 10) & (array[:, :, 2] < 125)
+    gold = (array[:, :, 0] > 175) & (array[:, :, 1] > 105) & (array[:, :, 1] < 205) & (array[:, :, 2] < 105)
+    rx, ry, _ = _fiducial(red, "red")
+    gx, gy, _ = _fiducial(gold, "gold")
+    if gx - rx < 80 or gx - rx > 105 or abs(gy - ry) > 23:
+        raise ValueError("fiducials do not bound one short horizontal thread")
+
+    spread = array.max(axis=2) - array.min(axis=2)
+    dark = (array.mean(axis=2) < 105) & (spread < 72)
+    groups = [group for group in _components(dark) if len(group) >= 16]
+    if len(groups) != 1:
+        raise ValueError("dark thread is missing or disconnected")
+    carrier = groups[0]
+    if not 230 <= len(carrier) <= 760:
+        raise ValueError("thread ink area is outside tolerance")
+    min_x, max_x = int(carrier[:, 1].min()), int(carrier[:, 1].max())
+    min_y, max_y = int(carrier[:, 0].min()), int(carrier[:, 0].max())
+    span = max_x - min_x + 1
+    if not 80 <= span <= 96 or max_y - min_y > 34:
+        raise ValueError("thread span is outside tolerance")
+    if abs(min_x - rx) > 9 or abs(max_x - gx) > 9:
+        raise ValueError("thread does not meet both visible fiducials")
+
+    x_values = np.arange(min_x, max_x + 1, dtype=np.float64)
+    y_values = np.full(len(x_values), np.nan, dtype=np.float64)
+    for offset, x in enumerate(range(min_x, max_x + 1)):
+        ys = carrier[carrier[:, 1] == x, 0]
+        if len(ys):
+            y_values[offset] = float(np.median(ys))
+    known = np.isfinite(y_values)
+    if known.sum() < 0.90 * len(y_values):
+        raise ValueError("thread has too many missing columns")
+    y_values = np.interp(x_values, x_values[known], y_values[known])
+
+    period = max(5, round(len(y_values) / TOOTH_COUNT))
+    smooth = _box_average(y_values, period)
+    edge = max(5, period)
+    t = np.linspace(0.0, 1.0, len(smooth))
+    keep = np.arange(edge, len(smooth) - edge)
+    if len(keep) < 45:
+        raise ValueError("not enough interior thread for smoothing")
+    observed = smooth[keep] - float(np.mean(smooth[keep]))
+    templates = {
+        "arch": np.cos(2.0 * math.pi * t[keep]),
+        "cup": -np.cos(2.0 * math.pi * t[keep]),
+        "wave": np.sin(2.0 * math.pi * t[keep]),
+    }
+    observed_norm = float(np.linalg.norm(observed))
+    if observed_norm < 12.0:
+        raise ValueError("smoothed thread has insufficient signal")
+    scores = {}
+    for name, template in templates.items():
+        centered = template - float(np.mean(template))
+        scores[name] = float(np.dot(observed, centered) / (observed_norm * np.linalg.norm(centered)))
+    ordered = sorted(scores, key=lambda name: (-scores[name], name))
+    margin = scores[ordered[0]] - scores[ordered[1]]
+    if scores[ordered[0]] < 0.62 or margin < 0.24:
+        raise ValueError("ambiguous smoothed phase")
+    return {
+        "decision": ordered[0],
+        "margin": round(margin, 6),
+        "scores": {name: round(value, 6) for name, value in scores.items()},
+        "period_px": period,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

@@ -1,0 +1,185 @@
+"""Independent pixel-only inverse for the perspective checksum sheet.
+
+This module intentionally reimplements fiducial extraction, projective fitting,
+rectification, coverage checks, and template scoring without importing the
+renderer, prompt, generator, verifier, or analytic-gold modules.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+CANONICAL = 440.0
+RECTIFIED_SIZE = 300
+CANONICAL_MARKERS = np.asarray(((30.0, 30.0), (410.0, 30.0), (410.0, 410.0), (30.0, 410.0)), dtype=float)
+MARKER_COLORS = np.asarray(((226, 165, 54), (231, 174, 63), (218, 157, 48)), dtype=float)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y = int(y)
+        x = int(x)
+        if visited[y, x]:
+            continue
+        stack = [(y, x)]
+        visited[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(points) >= 45:
+            components.append(np.asarray(points, dtype=float))
+    return components
+
+
+def _homography(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    equations = []
+    values = []
+    for (x, y), (u, v) in zip(source, target, strict=True):
+        equations.append([x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y])
+        values.append(u)
+        equations.append([0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y])
+        values.append(v)
+    result = np.linalg.lstsq(np.asarray(equations, dtype=float), np.asarray(values, dtype=float), rcond=None)[0]
+    return np.array([[result[0], result[1], result[2]], [result[3], result[4], result[5]], [result[6], result[7], 1.0]], dtype=float)
+
+
+def _ordered(points: np.ndarray) -> np.ndarray:
+    tl = int(np.argmin(points[:, 0] + points[:, 1]))
+    br = int(np.argmax(points[:, 0] + points[:, 1]))
+    tr = int(np.argmin(points[:, 1] - points[:, 0]))
+    bl = int(np.argmax(points[:, 1] - points[:, 0]))
+    indices = [tl, tr, br, bl]
+    if len(set(indices)) != 4:
+        raise ValueError("fiducials do not define four distinct corners")
+    return points[indices]
+
+
+def _rectify(array: np.ndarray, image_corners: np.ndarray) -> np.ndarray:
+    # The detected marker centroids correspond to the inset canonical points;
+    # extrapolating this mapping recovers the complete sheet, including its
+    # border and all four broad quadrants.
+    transform = _homography(CANONICAL_MARKERS, image_corners)
+    y_grid, x_grid = np.indices((RECTIFIED_SIZE, RECTIFIED_SIZE), dtype=float)
+    canonical = np.stack(
+        (
+            x_grid * CANONICAL / (RECTIFIED_SIZE - 1),
+            y_grid * CANONICAL / (RECTIFIED_SIZE - 1),
+            np.ones_like(x_grid),
+        ),
+        axis=0,
+    ).reshape(3, -1)
+    mapped = transform @ canonical
+    mapped /= mapped[2:3]
+    xx = mapped[0].reshape(RECTIFIED_SIZE, RECTIFIED_SIZE)
+    yy = mapped[1].reshape(RECTIFIED_SIZE, RECTIFIED_SIZE)
+    h, w = array.shape[:2]
+    valid = (xx >= 0) & (yy >= 0) & (xx <= w - 1) & (yy <= h - 1)
+    x0 = np.floor(np.clip(xx, 0, w - 1)).astype(int)
+    y0 = np.floor(np.clip(yy, 0, h - 1)).astype(int)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    dx = (xx - x0)[..., None]
+    dy = (yy - y0)[..., None]
+    top = array[y0, x0] * (1.0 - dx) + array[y0, x1] * dx
+    bottom = array[y1, x0] * (1.0 - dx) + array[y1, x1] * dx
+    result = top * (1.0 - dy) + bottom * dy
+    result[~valid] = 255.0
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def _segment_distance(points: np.ndarray, start: tuple[float, float], end: tuple[float, float]) -> np.ndarray:
+    a = np.asarray(start, dtype=float)
+    b = np.asarray(end, dtype=float)
+    vector = b - a
+    denominator = float(np.dot(vector, vector))
+    t = np.clip(((points - a) @ vector) / denominator, 0.0, 1.0)
+    nearest = a + t[:, None] * vector
+    return np.linalg.norm(points - nearest, axis=1)
+
+
+def _template(symbol: str) -> np.ndarray:
+    yy, xx = np.indices((RECTIFIED_SIZE, RECTIFIED_SIZE), dtype=float)
+    points = np.stack((xx.ravel() * CANONICAL / (RECTIFIED_SIZE - 1), yy.ravel() * CANONICAL / (RECTIFIED_SIZE - 1)), axis=1)
+    if symbol == "lozenge":
+        path = [(40.0, 220.0), (220.0, 40.0), (400.0, 220.0), (220.0, 400.0), (40.0, 220.0)]
+    elif symbol == "chevron":
+        path = [(38.0, 72.0), (128.0, 368.0), (220.0, 72.0), (312.0, 368.0), (402.0, 72.0)]
+    else:
+        raise ValueError(symbol)
+    distance = np.full(len(points), np.inf, dtype=float)
+    for start, end in zip(path, path[1:]):
+        distance = np.minimum(distance, _segment_distance(points, start, end))
+    # The renderer's 23px stroke and the rectification interpolation leave a
+    # broad but discriminative template band.
+    return (distance < 18.0).reshape(RECTIFIED_SIZE, RECTIFIED_SIZE)
+
+
+def _score(observed: np.ndarray, expected: np.ndarray) -> float:
+    overlap = float(np.count_nonzero(observed & expected))
+    observed_count = float(np.count_nonzero(observed))
+    expected_count = float(np.count_nonzero(expected))
+    if observed_count == 0 or expected_count == 0:
+        return 0.0
+    return 2.0 * overlap / (observed_count + expected_count)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover ``lozenge`` or ``chevron`` from the final RGB pixels only."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 64:
+        raise ValueError("invalid raster")
+    distances = np.linalg.norm(array[:, :, None, :] - MARKER_COLORS[None, None, :, :], axis=3)
+    marker_mask = np.min(distances, axis=2) < 62.0
+    components = _components(marker_mask)
+    if len(components) != 4:
+        raise ValueError("expected four visible gold fiducials")
+    centers = np.asarray([(component[:, 1].mean(), component[:, 0].mean()) for component in components], dtype=float)
+    ordered = _ordered(centers)
+    rectified = _rectify(array, ordered)
+
+    canvas_border = np.concatenate((array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3), array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)), axis=0)
+    background = np.median(canvas_border, axis=0)
+    distance_from_background = np.linalg.norm(rectified.astype(np.float32) - background[None, None, :], axis=2)
+    inner = distance_from_background[14:-14, 14:-14]
+    coverage = float(np.mean(inner > 18.0))
+    if coverage < 0.992:
+        raise ValueError("rectified sheet is incomplete")
+
+    # The cream glyph is separated from the dark sheet and from the gold
+    # fiducials by its blue-channel floor.  Corner regions are excluded.
+    red, green, blue = (rectified[:, :, index].astype(int) for index in range(3))
+    observed = (red > 180) & (green > 165) & (blue > 118) & ((green - blue) < 100)
+    yy, xx = np.indices(observed.shape)
+    corner_exclusion = ((xx < 38) & (yy < 38)) | ((xx > RECTIFIED_SIZE - 39) & (yy < 38)) | ((xx > RECTIFIED_SIZE - 39) & (yy > RECTIFIED_SIZE - 39)) | ((xx < 38) & (yy > RECTIFIED_SIZE - 39))
+    observed[corner_exclusion] = False
+    observed_count = int(np.count_nonzero(observed))
+    if observed_count < 1800:
+        raise ValueError("rectified glyph evidence is missing")
+
+    scores = {symbol: _score(observed, _template(symbol)) for symbol in ("lozenge", "chevron")}
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if ranked[0][1] < 0.48 or ranked[0][1] - ranked[1][1] < 0.10:
+        raise ValueError("rectified glyph is ambiguous")
+
+    # Require evidence in all four broad quadrants.  This makes a local cue or
+    # a partially erased sheet an abstention rather than a guessed label.
+    winning_template = _template(ranked[0][0])
+    for ys, xs in (((18, 150), (18, 150)), ((18, 150), (150, 282)), ((150, 282), (18, 150)), ((150, 282), (150, 282))):
+        y0, y1 = ys
+        x0, x1 = xs
+        if np.count_nonzero(observed[y0:y1, x0:x1] & winning_template[y0:y1, x0:x1]) < 90:
+            raise ValueError("one glyph quadrant is missing")
+    return ranked[0][0]

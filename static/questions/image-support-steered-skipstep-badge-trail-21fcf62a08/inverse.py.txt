@@ -1,0 +1,155 @@
+"""Independent image-only inverse arm for the skip-step badge trail."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+BADGE_COUNT = 12
+PROTOTYPES = {
+    "cyan": np.asarray((25, 171, 190), dtype=np.int16),
+    "amber": np.asarray((235, 166, 35), dtype=np.int16),
+    "rose": np.asarray((211, 68, 112), dtype=np.int16),
+}
+START_PROTOTYPE = np.asarray((42, 157, 82), dtype=np.int16)
+END_PROTOTYPE = np.asarray((215, 61, 52), dtype=np.int16)
+
+
+def _near(array: np.ndarray, prototype: np.ndarray, tolerance: int = 32) -> np.ndarray:
+    delta = array.astype(np.int32) - prototype.astype(np.int32)
+    return np.sum(delta * delta, axis=2, dtype=np.int64) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    output: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        queue = deque([(y0, x0)])
+        values: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            values.append((y, x))
+            for ny, nx in (
+                (y - 1, x - 1), (y - 1, x), (y - 1, x + 1),
+                (y, x - 1), (y, x + 1),
+                (y + 1, x - 1), (y + 1, x), (y + 1, x + 1),
+            ):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(values) >= minimum:
+            output.append(np.asarray(values, dtype=np.int32))
+    return output
+
+
+def _center(component: np.ndarray) -> tuple[float, float]:
+    return float(component[:, 1].mean()), float(component[:, 0].mean())
+
+
+def _single_marker(mask: np.ndarray, name: str) -> tuple[float, float]:
+    components = _components(mask, minimum=120)
+    if len(components) != 1:
+        raise ValueError(f"could not isolate the {name} direction marker")
+    return _center(components[0])
+
+
+def _route_mask(array: np.ndarray) -> np.ndarray:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    return (
+        (blue >= 112)
+        & (blue - red >= 28)
+        & (blue - green >= 28)
+        & (red >= 48)
+        & (green <= 125)
+    )
+
+
+def _distance_on_track(mask: np.ndarray, start: tuple[float, float]) -> np.ndarray:
+    points = np.argwhere(mask)
+    if len(points) < 1200:
+        raise ValueError("the connected track has too little visible ink")
+    sx, sy = start
+    nearest = int(np.argmin((points[:, 1] - sx) ** 2 + (points[:, 0] - sy) ** 2))
+    source_y, source_x = (int(value) for value in points[nearest])
+    distances = np.full(mask.shape, -1, dtype=np.int32)
+    distances[source_y, source_x] = 0
+    queue = deque([(source_y, source_x)])
+    height, width = mask.shape
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distances[y, x]) + 1
+        for ny, nx in (
+            (y - 1, x - 1), (y - 1, x), (y - 1, x + 1),
+            (y, x - 1), (y, x + 1),
+            (y + 1, x - 1), (y + 1, x), (y + 1, x + 1),
+        ):
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and distances[ny, nx] < 0:
+                distances[ny, nx] = next_distance
+                queue.append((ny, nx))
+    return distances
+
+
+def _local_track_distance(distances: np.ndarray, center: tuple[float, float], radius: int = 22) -> int:
+    x, y = (round(value) for value in center)
+    y0, y1 = max(0, y - radius), min(distances.shape[0], y + radius + 1)
+    x0, x1 = max(0, x - radius), min(distances.shape[1], x + radius + 1)
+    values = distances[y0:y1, x0:x1]
+    reachable = values[values >= 0]
+    if not len(reachable):
+        raise ValueError("a badge is detached from the directed track")
+    return int(reachable.min())
+
+
+def _parse_badges(array: np.ndarray) -> list[dict]:
+    badges: list[dict] = []
+    for color, prototype in PROTOTYPES.items():
+        for component in _components(_near(array, prototype), minimum=70):
+            ys, xs = component[:, 0], component[:, 1]
+            width = int(xs.max() - xs.min() + 1)
+            height = int(ys.max() - ys.min() + 1)
+            if not (15 <= width <= 31 and 15 <= height <= 31):
+                continue
+            fill_ratio = len(component) / float(width * height)
+            if fill_ratio >= 0.66:
+                command = 1
+            elif fill_ratio <= 0.58:
+                command = 2
+            else:
+                raise ValueError("badge geometry is too close to the round/diamond boundary")
+            badges.append({"center": _center(component), "command": command, "color": color})
+    if len(badges) != BADGE_COUNT:
+        raise ValueError(f"expected {BADGE_COUNT} colored badges, found {len(badges)}")
+    if any(sum(badge["color"] == color for badge in badges) != 4 for color in PROTOTYPES):
+        raise ValueError("the three badge colors are not equally represented")
+    return badges
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 200 or array.shape[1] < 300:
+        raise ValueError("image is too small for the declared visual contract")
+    badges = _parse_badges(array)
+    start = _single_marker(_near(array, START_PROTOTYPE), "START")
+    end = _single_marker(_near(array, END_PROTOTYPE), "END")
+    distances = _distance_on_track(_route_mask(array), start)
+    end_distance = _local_track_distance(distances, end, radius=24)
+    ordered = sorted(badges, key=lambda badge: _local_track_distance(distances, badge["center"]))
+    station_distances = [_local_track_distance(distances, badge["center"]) for badge in ordered]
+    if any(right - left < 24 for left, right in zip(station_distances, station_distances[1:])):
+        raise ValueError("badge order along the track is not uniquely separated")
+    if station_distances[-1] >= end_distance:
+        raise ValueError("END does not follow every badge on the connected track")
+
+    index = 0
+    while index + int(ordered[index]["command"]) < len(ordered):
+        index += int(ordered[index]["command"])
+    return str(ordered[index]["color"])

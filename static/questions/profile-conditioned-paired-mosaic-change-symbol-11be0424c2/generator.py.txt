@@ -1,0 +1,213 @@
+"""Deterministic sampler and renderer for a fiducial-registered change map."""
+
+from __future__ import annotations
+
+import random
+from copy import deepcopy
+
+from PIL import Image, ImageDraw
+
+N = 12
+SYMBOLS = ("plus", "x", "diamond", "dashed_square")
+
+# All prototypes occupy the same 8-by-8 box and contain exactly sixteen cells.
+TEMPLATES: dict[str, frozenset[tuple[int, int]]] = {
+    "plus": frozenset(
+        {(5, column) for column in range(2, 10)}
+        | {(row, 6) for row in range(2, 10)}
+        | {(6, 5)}
+    ),
+    "x": frozenset(
+        {(row, row) for row in range(2, 10)}
+        | {(row, 11 - row) for row in range(2, 10)}
+    ),
+    "diamond": frozenset(
+        (row, column)
+        for row in range(N)
+        for column in range(N)
+        if abs(2 * row - 11) + abs(2 * column - 11) == 8
+    ),
+    "dashed_square": frozenset(
+        {(row, column) for row in (2, 9) for column in (2, 3, 5, 6, 8, 9)}
+        | {(row, column) for row in (4, 7) for column in (2, 9)}
+    ),
+}
+
+PALETTES = (
+    {"zero": (236, 229, 205), "one": (30, 75, 91)},
+    {"zero": (218, 235, 232), "one": (83, 45, 96)},
+    {"zero": (242, 220, 225), "one": (35, 68, 116)},
+)
+BACKGROUNDS = ((246, 244, 238), (235, 242, 245))
+GRID = (91, 101, 111)
+FRAME = (45, 50, 56)
+FIDUCIALS = {
+    "a": (224, 177, 34),   # gold: canonical top-left
+    "b": (225, 92, 42),    # orange: canonical top-right
+    "c": (126, 72, 168),   # purple: canonical bottom-left
+}
+CARD_PAD = 18
+CANVAS_SIZE = (760, 390)
+
+
+def _change_cells(scene: dict) -> frozenset[tuple[int, int]]:
+    row_shift = int(scene["offset_row"])
+    column_shift = int(scene["offset_col"])
+    return frozenset(
+        (row + row_shift, column + column_shift)
+        for row, column in TEMPLATES[str(scene["symbol"])]
+    )
+
+
+def sample_scene(seed: int) -> dict:
+    """Return a class-balanced scene for one integer seed."""
+    seed = int(seed)
+    rng = random.Random((seed ^ 0xD1FF_A11C_E55) & 0xFFFFFFFFFFFFFFFF)
+    block = seed // len(SYMBOLS)
+    symbol = SYMBOLS[seed % len(SYMBOLS)]
+    offset_row = (-1, 0, 1)[block % 3]
+    offset_col = (-1, 1, 0)[(block // 3) % 3]
+    provisional = {
+        "symbol": symbol,
+        "offset_row": offset_row,
+        "offset_col": offset_col,
+    }
+    change = _change_cells(provisional)
+    universe = {(row, column) for row in range(N) for column in range(N)}
+
+    # Exactly eight of the sixteen changed cells start dark. Flipping the mask
+    # therefore preserves the exact 72/72 color balance on both cards.
+    dark = set(rng.sample(sorted(change), 8))
+    dark.update(rng.sample(sorted(universe - change), 64))
+    base_bits = [int((row, column) in dark) for row in range(N) for column in range(N)]
+
+    return {
+        "symbol": symbol,
+        "base_bits": base_bits,
+        "offset_row": offset_row,
+        "offset_col": offset_col,
+        "left_rotation": block % 4,
+        "right_rotation": (3 * block + 1) % 4,
+        "swap_cards": bool((block // 2) % 2),
+        "cell": (18, 20, 22)[block % 3],
+        "origin_x": (34, 42, 50)[(block // 3) % 3],
+        "origin_y": (24, 32, 40)[(block // 5) % 3],
+        "palette_index": block % len(PALETTES),
+        "background_index": (block // 2) % len(BACKGROUNDS),
+    }
+
+
+def _rotated(card: Image.Image, quarter_turns: int) -> Image.Image:
+    operations = (
+        None,
+        Image.Transpose.ROTATE_90,
+        Image.Transpose.ROTATE_180,
+        Image.Transpose.ROTATE_270,
+    )
+    operation = operations[int(quarter_turns) % 4]
+    return card if operation is None else card.transpose(operation)
+
+
+def _draw_card(bits: list[int], cell: int, palette: dict[str, tuple[int, int, int]]) -> Image.Image:
+    side = N * cell + 2 * CARD_PAD + 1
+    card = Image.new("RGB", (side, side), (252, 251, 247))
+    draw = ImageDraw.Draw(card)
+    left = top = CARD_PAD
+    for row in range(N):
+        for column in range(N):
+            value = int(bits[row * N + column])
+            x0 = left + column * cell
+            y0 = top + row * cell
+            draw.rectangle(
+                (x0, y0, x0 + cell, y0 + cell),
+                fill=palette["one" if value else "zero"],
+            )
+    right = left + N * cell
+    bottom = top + N * cell
+    for index in range(N + 1):
+        x = left + index * cell
+        y = top + index * cell
+        draw.line((x, top, x, bottom), fill=GRID, width=2)
+        draw.line((left, y, right, y), fill=GRID, width=2)
+    draw.rectangle((left, top, right, bottom), outline=FRAME, width=3)
+
+    radius = max(6, cell // 3)
+    for (cx, cy), color in (
+        ((left, top), FIDUCIALS["a"]),
+        ((right, top), FIDUCIALS["b"]),
+        ((left, bottom), FIDUCIALS["c"]),
+    ):
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=color)
+    return card
+
+
+def render(scene: dict) -> Image.Image:
+    """Render two independently rotated cards; all registration cues are visible."""
+    base = [int(value) for value in scene["base_bits"]]
+    if len(base) != N * N or any(value not in (0, 1) for value in base):
+        raise ValueError("base_bits must be 144 binary values")
+    change = _change_cells(scene)
+    changed = list(base)
+    for row, column in change:
+        if not (0 <= row < N and 0 <= column < N):
+            raise ValueError("translated symbol lies outside the card")
+        index = row * N + column
+        changed[index] = 1 - changed[index]
+
+    if bool(scene["swap_cards"]):
+        left_bits, right_bits = changed, base
+    else:
+        left_bits, right_bits = base, changed
+    cell = int(scene["cell"])
+    palette = PALETTES[int(scene["palette_index"]) % len(PALETTES)]
+    background = BACKGROUNDS[int(scene["background_index"]) % len(BACKGROUNDS)]
+    left_card = _rotated(_draw_card(left_bits, cell, palette), int(scene["left_rotation"]))
+    right_card = _rotated(_draw_card(right_bits, cell, palette), int(scene["right_rotation"]))
+
+    image = Image.new("RGB", CANVAS_SIZE, background)
+    origin_x = int(scene["origin_x"])
+    origin_y = int(scene["origin_y"])
+    gap = 44
+    image.paste(left_card, (origin_x, origin_y))
+    image.paste(right_card, (origin_x + left_card.width + gap, origin_y))
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["symbol"])
+
+
+def _template_margin(symbol: str) -> int:
+    target = TEMPLATES[symbol]
+    rival_scores: list[int] = []
+    for name, prototype in TEMPLATES.items():
+        if name == symbol:
+            continue
+        best = N * N
+        for row_shift in range(-2, 3):
+            for column_shift in range(-2, 3):
+                shifted = {
+                    (row + row_shift, column + column_shift)
+                    for row, column in prototype
+                }
+                best = min(best, len(target ^ shifted))
+        rival_scores.append(best)
+    return min(rival_scores)
+
+
+def margin(scene: dict) -> float:
+    """Exact target-vs-runner Hamming gap, independent of carrier colors."""
+    return float(_template_margin(str(scene["symbol"])))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < 4.0 or int(scene["cell"]) < 16
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Exercise genuine modulo aliases without changing the rendered raster."""
+    twin = deepcopy(scene)
+    twin["palette_index"] = int(scene["palette_index"]) + len(PALETTES)
+    twin["left_rotation"] = int(scene["left_rotation"]) + 4
+    twin["right_rotation"] = int(scene["right_rotation"]) + 4
+    return [("add_full_palette_and_rotation_periods", twin)]

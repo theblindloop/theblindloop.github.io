@@ -1,0 +1,289 @@
+"""Scene sampling, rasterisation and analytic gold for loop_nesting_depth.
+
+A scene is a laminar family of convex closed outlines drawn over four coloured
+dots.  The answer is the colour of the dot enclosed by the greatest number of
+outlines, i.e. the deepest node of the containment hierarchy that the outlines
+induce.  Outlines are stored as parallel top-level lists so that every latent
+field is a flat scene key.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH = 760
+HEIGHT = 520
+BG = (250, 250, 246)
+INK = (18, 18, 18)
+STROKE = 4
+DOT_RADIUS = 8
+CLEARANCE = 8.0          # minimum px between any drawn curve and any other curve or dot
+QUARANTINE_PX = 14.0     # finite-resolution boundary band
+
+COLOUR_NAMES = ("red", "green", "blue", "orange")
+COLOUR_RGB = {
+    "red": (214, 38, 38),
+    "green": (26, 140, 62),
+    "blue": (36, 84, 210),
+    "orange": (236, 142, 18),
+}
+
+# Laminar templates over abstract site indices 0..3.  Each entry is a node of a
+# containment forest, outermost first.  Repeated identical sets are legal: they
+# render as two concentric outlines around the same dots.
+TEMPLATES = (
+    ((0, 1, 2, 3), (0, 1), (0,)),
+    ((0, 1, 2, 3), (0, 1, 2), (0, 1), (0,)),
+    ((0, 1), (0,), (2, 3)),
+    ((0, 1, 2, 3), (0,), (0,)),
+    ((0, 1), (0,), (2, 3), (2,), (2,)),
+    ((0, 1, 2, 3), (2, 3), (3,), (3,)),
+    ((0,), (0,), (1,), (2, 3)),
+    ((0, 1, 2), (1, 2), (1,)),
+    ((0, 1, 2, 3), (1, 2), (1,), (1,)),
+    ((0, 1, 2), (0, 1), (0,), (3,)),
+)
+
+OFFSET_MAX = 58.0
+OFFSET_STEP = 13.0
+TIGHT_PROB = 0.3
+LOOP_KEYS = ("loop_members", "loop_offsets", "loop_centers", "loop_levels")
+
+
+# --------------------------------------------------------------------------- geometry
+def _hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Andrew monotone chain, counter-clockwise in image coordinates."""
+    pts = sorted(set((round(x, 4), round(y, 4)) for x, y in points))
+    if len(pts) <= 2:
+        return pts
+
+    def half(seq):
+        out: list[tuple[float, float]] = []
+        for p in seq:
+            while len(out) >= 2:
+                (ax, ay), (bx, by) = out[-2], out[-1]
+                if (bx - ax) * (p[1] - ay) - (by - ay) * (p[0] - ax) <= 0:
+                    out.pop()
+                else:
+                    break
+            out.append(p)
+        return out[:-1]
+
+    return half(pts) + half(reversed(pts))
+
+
+def _polygon(sites, members, offset, center) -> list[tuple[float, float]]:
+    offset = float(offset)
+    centres = [tuple(sites[i]) for i in members] or [tuple(center)]
+    pts: list[tuple[float, float]] = []
+    for cx, cy in centres:
+        for k in range(48):
+            a = 2.0 * math.pi * k / 48.0
+            pts.append((cx + offset * math.cos(a), cy + offset * math.sin(a)))
+    return _hull(pts)
+
+
+def _polygons(scene: dict) -> list[list[tuple[float, float]]]:
+    sites = scene["sites"]
+    members = scene["loop_members"]
+    offsets = scene["loop_offsets"]
+    centers = scene["loop_centers"]
+    return [_polygon(sites, members[i], offsets[i], centers[i]) for i in range(len(offsets))]
+
+
+def _signed_dist(poly: list[tuple[float, float]], px: float, py: float) -> float:
+    """Distance to the polygon boundary, negative outside and positive inside."""
+    best = float("inf")
+    inside = True
+    n = len(poly)
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % n]
+        ex, ey = bx - ax, by - ay
+        wx, wy = px - ax, py - ay
+        t = 0.0 if ex == ey == 0 else max(0.0, min(1.0, (wx * ex + wy * ey) / (ex * ex + ey * ey)))
+        dx, dy = wx - t * ex, wy - t * ey
+        best = min(best, math.hypot(dx, dy))
+        if ex * wy - ey * wx <= 0.0:   # right of a CCW edge => outside
+            inside = False
+    return best if inside else -best
+
+
+def _boundary_gap(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> float:
+    """Minimum distance between two convex polygon boundaries (vertex sampled)."""
+    return min(abs(_signed_dist(b, x, y)) for x, y in a)
+
+
+# --------------------------------------------------------------------------- sampling
+def _sample_sites(rng: random.Random) -> list[list[float]]:
+    cells = [(232, 176), (528, 176), (232, 344), (528, 344)]
+    return [[c[0] + rng.uniform(-34, 34), c[1] + rng.uniform(-30, 30)] for c in cells]
+
+
+def _add_decoys(rng: random.Random, scene: dict, polys) -> None:
+    for _ in range(rng.choice((0, 1, 1, 2))):
+        for _attempt in range(24):
+            cx = rng.uniform(80, WIDTH - 80)
+            cy = rng.uniform(80, HEIGHT - 80)
+            rad = round(rng.uniform(16, 26), 3)
+            poly = _polygon(scene["sites"], [], rad, [round(cx, 3), round(cy, 3)])
+            if any(abs(_signed_dist(poly, sx, sy)) < DOT_RADIUS + 14 for sx, sy in scene["sites"]):
+                continue
+            if any(_signed_dist(poly, sx, sy) > 0 for sx, sy in scene["sites"]):
+                continue
+            if any(_boundary_gap(poly, other) < CLEARANCE + 6 for other in polys):
+                continue
+            if not (12 < min(x for x, _ in poly) and max(x for x, _ in poly) < WIDTH - 12):
+                continue
+            if not (12 < min(y for _, y in poly) and max(y for _, y in poly) < HEIGHT - 12):
+                continue
+            scene["loop_members"].append([])
+            scene["loop_offsets"].append(rad)
+            scene["loop_centers"].append([round(cx, 3), round(cy, 3)])
+            scene["loop_levels"].append(-1)
+            polys.append(poly)
+            break
+
+
+def _valid(scene: dict, polys) -> bool:
+    """Curves stay on canvas, never touch, and no dot sits on a curve."""
+    for poly in polys:
+        if min(x for x, _ in poly) < 10 or max(x for x, _ in poly) > WIDTH - 10:
+            return False
+        if min(y for _, y in poly) < 10 or max(y for _, y in poly) > HEIGHT - 10:
+            return False
+    for i in range(len(polys)):
+        for j in range(i + 1, len(polys)):
+            if _boundary_gap(polys[i], polys[j]) < CLEARANCE:
+                return False
+    for sx, sy in scene["sites"]:
+        for poly in polys:
+            if abs(_signed_dist(poly, sx, sy)) < DOT_RADIUS + 2:
+                return False
+    return True
+
+
+def _depths(scene: dict) -> list[int]:
+    polys = _polygons(scene)
+    return [sum(1 for p in polys if _signed_dist(p, sx, sy) > 0) for sx, sy in scene["sites"]]
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    for _attempt in range(400):
+        template = list(TEMPLATES[rng.randrange(len(TEMPLATES))])
+        perm = list(range(4))
+        rng.shuffle(perm)
+        template = [tuple(sorted(perm[i] for i in node)) for node in template]
+        sites = _sample_sites(rng)
+        colours = list(COLOUR_NAMES)
+        rng.shuffle(colours)
+        members: list[list[int]] = []
+        offsets: list[float] = []
+        centers: list[list[float] | None] = []
+        levels: list[int] = []
+        for idx, node in enumerate(template):
+            level = sum(
+                1
+                for j, other in enumerate(template)
+                if j < idx and set(node).issubset(set(other))
+            )
+            members.append(list(node))
+            offsets.append(round(OFFSET_MAX - OFFSET_STEP * level + rng.uniform(-2.0, 2.0), 3))
+            centers.append(None)
+            levels.append(level)
+        if rng.random() < TIGHT_PROB and offsets:
+            innermost = max(range(len(levels)), key=lambda k: levels[k])
+            offsets[innermost] = round(DOT_RADIUS + rng.uniform(2.0, 16.0), 3)
+        scene = {
+            "width": WIDTH,
+            "height": HEIGHT,
+            "bg": list(BG),
+            "ink": list(INK),
+            "stroke": STROKE,
+            "dot_radius": DOT_RADIUS,
+            "sites": [[round(x, 3), round(y, 3)] for x, y in sites],
+            "colours": colours,
+            "loop_members": members,
+            "loop_offsets": offsets,
+            "loop_centers": centers,
+            "loop_levels": levels,
+        }
+        polys = _polygons(scene)
+        if not _valid(scene, polys):
+            continue
+        depths_now = _depths(scene)
+        order = sorted(depths_now, reverse=True)
+        if order[0] - order[1] < 1:
+            continue
+        _add_decoys(rng, scene, polys)
+        return scene
+    raise RuntimeError(f"scene sampling failed for seed {seed}")
+
+
+# --------------------------------------------------------------------------- gold
+def depths(scene: dict) -> list[int]:
+    """Containment depth of every dot, in scene order (diagnostic accessor)."""
+    return _depths(scene)
+
+
+def analytic_gold(scene: dict) -> str:
+    values = _depths(scene)
+    best = max(range(4), key=lambda i: values[i])
+    return scene["colours"][best]
+
+
+def margin(scene: dict) -> float:
+    """Pixels to the nearest answer-changing perturbation of a dot position."""
+    values = _depths(scene)
+    polys = _polygons(scene)
+    top = max(values)
+    worst = float("inf")
+    for i, (sx, sy) in enumerate(scene["sites"]):
+        if values[i] < top - 1:
+            continue                      # cannot reach the top through one flip
+        clear = min(abs(_signed_dist(p, sx, sy)) for p in polys)
+        worst = min(worst, clear)
+    return round(float(worst), 4)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def _reordered(scene: dict, order: list[int]) -> dict:
+    alias = dict(scene)
+    for key in LOOP_KEYS:
+        alias[key] = [scene[key][i] for i in order]
+    return alias
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """Pixel-identical relabellings of the unordered outline container."""
+    count = len(scene["loop_offsets"])
+    return [
+        ("loop_order_reversal", _reordered(scene, list(reversed(range(count))))),
+        ("loop_order_rotation", _reordered(scene, list(range(1, count)) + [0])),
+    ]
+
+
+# --------------------------------------------------------------------------- render
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (scene["width"], scene["height"]), tuple(scene["bg"]))
+    draw = ImageDraw.Draw(image)
+    for i in range(len(scene["loop_offsets"])):
+        poly = _polygon(
+            scene["sites"],
+            scene["loop_members"][i],
+            scene["loop_offsets"][i],
+            scene["loop_centers"][i],
+        )
+        points = [(round(x, 2), round(y, 2)) for x, y in poly]
+        draw.line(points + [points[0]], fill=tuple(scene["ink"]), width=scene["stroke"], joint="curve")
+    r = scene["dot_radius"]
+    for (cx, cy), name in zip(scene["sites"], scene["colours"]):
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=COLOUR_RGB[name])
+    return image

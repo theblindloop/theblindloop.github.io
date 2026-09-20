@@ -1,0 +1,336 @@
+"""Curve-loop crossing-count world renderer.
+
+A single closed black ring (a loop) is drawn on a white canvas. A thick red
+polyline (an open "thread") starts at a green dot and ends at a blue dot, and
+crosses the loop some number of times. Each time the thread crosses the boundary
+ring it switches from the inside to the outside of the loop (or back). The
+decision is the INTEGER number of times the red thread crosses the black loop, in
+{0,1,2,3}.
+
+A closed curve separates the plane into an inside and an outside.  A straight
+segment whose two endpoints lie on opposite sides of the loop (one strictly
+inside, one strictly outside) crosses the closed curve exactly once, transversely
+and non-tangentially.  The scene is built so that consecutive thread vertices
+alternate between strictly inside and strictly outside the loop, so the crossing
+count equals the number of inside/outside side-transitions along the thread.
+
+    z = {
+        "width": 400, "height": 400, "background": "white",
+        "loop": {"cx":.., "cy":.., "r":.., "color":"black", "width":10.0},
+        "path": {"vertices":[[x,y],...], "color":"red", "width":12.0},
+        "start_dot": {"color":"green", "x":.., "y":.., "r":9.0},
+        "end_dot":   {"color":"blue",  "x":.., "y":.., "r":9.0},
+    }
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections.abc import Iterator
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "curve_loop_crossings-0.4.0"
+
+PATH_COLOR = (220, 30, 40)
+DOT_COLORS = {"green": (0, 128, 0), "blue": (0, 0, 200)}
+LOOP_COLOR = (10, 10, 10)
+
+DOT_RADIUS = 9.0
+PATH_WIDTH = 12.0
+LOOP_WIDTH = 10.0
+
+CENTER = (200.0, 200.0)
+R_MIN = 66.0
+R_MAX = 88.0
+
+CLEAR = 20.0          # vertex radial clearance from the ring rim (inside and out)
+MIN_CROSS_SEP = 42.0  # min separation between consecutive crossing points on the ring
+MIN_CROSS_ANGLE = 0.32  # transverse crossing: |dir . radial| must exceed this
+K_MIN = 0
+K_MAX = 3
+QUARANTINE_MIN = 8.0
+
+
+def _d2(ax, ay, bx, by):
+    return math.hypot(ax - bx, ay - by)
+
+
+def _crossing_ok(center, r, a, b, prev_crossings, min_sep, min_angle):
+    """Return (crossing_point, angle_ok) for segment a->b crossing circle (center,r).
+
+    Returns None if the segment ends up not crossing (e.g. a graze)."""
+    (cx, cy) = center
+    ax, ay = a
+    bx, by = b
+    da = _d2(cx, cy, ax, ay)
+    db = _d2(cx, cy, bx, by)
+    inside_a = da < r
+    inside_b = db < r
+    if inside_a == inside_b:
+        return None
+    # param t in [0,1] where dist(point(t), C) == r
+    vx, vy = bx - ax, by - ay
+    fx, fy = ax - cx, ay - cy
+    A = vx * vx + vy * vy
+    B = 2.0 * (fx * vx + fy * vy)
+    C = fx * fx + fy * fy - r * r
+    disc = B * B - 4.0 * A * C
+    if disc < 1e-9:
+        return None
+    sqrtd = math.sqrt(disc)
+    t1 = (-B - sqrtd) / (2.0 * A)
+    t2 = (-B + sqrtd) / (2.0 * A)
+    t = None
+    # choose the root inside (0,1)
+    for cand in (t1, t2):
+        if 0.0 < cand < 1.0:
+            t = cand
+            break
+    if t is None:
+        return None
+    px = ax + t * vx
+    py = ay + t * vy
+    # transverse check: |seg_dir . radial| > min_angle (radial = from center to crossing)
+    seg_len = math.hypot(vx, vy)
+    if seg_len < 1e-9:
+        return None
+    ux, uy = vx / seg_len, vy / seg_len
+    rx, ry = px - cx, py - cy
+    rlen = math.hypot(rx, ry)
+    if rlen < 1e-9:
+        return None
+    rx, ry = rx / rlen, ry / rlen
+    dot = abs(ux * rx + uy * ry)
+    if dot < min_angle:
+        return None
+    crossing = (px, py)
+    for (qx, qy) in prev_crossings:
+        if _d2(px, py, qx, qy) < min_sep:
+            return None
+    return crossing
+
+
+def _build_vertices(rng, r):
+    """Return a vertex list with k crossings, plus the chosen k (0..3)."""
+    k = rng.randint(K_MIN, K_MAX)
+    cx, cy = CENTER
+    for _attempt in range(4000):
+        vertices = []
+        prev_crossings = []
+        if k == 0:
+            # a short thread entirely outside the loop, kept clear of the ring
+            ang = rng.uniform(0.0, 2.0 * math.pi)
+            radius = r + rng.uniform(CLEAR + 16.0, CLEAR + 40.0)
+            px = cx + radius * math.cos(ang)
+            py = cy + radius * math.sin(ang)
+            p2x = cx + radius * math.cos(ang + 0.7)
+            p2y = cy + radius * math.sin(ang + 0.7)
+            pts = [(px, py), (p2x, p2y)]
+            # ensure the whole segment stays clear of the ring
+            if _d2(cx, cy, px, py) < r + CLEAR:
+                continue
+            ok = True
+            for i in range(len(pts) - 1):
+                seg = _segment_clearance(cx, cy, pts[i], pts[i + 1])
+                if seg < r + CLEAR:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            return pts, k
+        # k >= 1: alternate inside/outside radial vertices
+        base_angle = rng.uniform(0.0, 2.0 * math.pi)
+        span = 1.6 + 0.6 * k  # radians covered by the fan of crossing radials
+        angles = []
+        for i in range(k + 1):
+            angles.append(base_angle + span * i / max(1, k))
+        radials = []
+        for i in range(k + 1):
+            inside = (i % 2 == 0)
+            if inside:
+                delta = rng.uniform(CLEAR + 10.0, CLEAR + 32.0)
+                d = r - delta
+            else:
+                delta = rng.uniform(CLEAR + 10.0, CLEAR + 32.0)
+                d = r + delta
+            a = angles[i]
+            radials.append((cx + d * math.cos(a), cy + d * math.sin(a)))
+        pts = radials
+        for i in range(k):
+            crossing = _crossing_ok(
+                (cx, cy), r, pts[i], pts[i + 1], prev_crossings,
+                MIN_CROSS_SEP, MIN_CROSS_ANGLE,
+            )
+            if crossing is None:
+                ok = False
+                break
+            prev_crossings.append(crossing)
+        else:
+            ok = True
+        if not ok:
+            continue
+        return pts, k
+    return None
+
+
+def _segment_clearance(cx, cy, a, b):
+    """Min distance from (cx,cy) to segment a-b."""
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    L2 = vx * vx + vy * vy
+    if L2 < 1e-12:
+        return _d2(cx, cy, ax, ay)
+    t = ((cx - ax) * vx + (cy - ay) * vy) / L2
+    t = max(0.0, min(1.0, t))
+    qx = ax + t * vx
+    qy = ay + t * vy
+    return _d2(cx, cy, qx, qy)
+
+
+def sample_scene(rng, width: int = 400, height: int = 400) -> dict:
+    """Sample a valid scene: one loop and a thread crossing it k times."""
+    for _attempt in range(4000):
+        r = rng.uniform(R_MIN, R_MAX)
+        built = _build_vertices(rng, r)
+        if built is None:
+            continue
+        vertices, k = built
+        scene = {
+            "width": width,
+            "height": height,
+            "background": "white",
+            "loop": {
+                "cx": CENTER[0], "cy": CENTER[1], "r": float(r),
+                "color": "black", "width": LOOP_WIDTH,
+            },
+            "path": {"vertices": vertices, "color": "red", "width": PATH_WIDTH},
+            "start_dot": {
+                "color": "green", "x": vertices[0][0], "y": vertices[0][1], "r": DOT_RADIUS,
+            },
+            "end_dot": {
+                "color": "blue", "x": vertices[-1][0], "y": vertices[-1][1], "r": DOT_RADIUS,
+            },
+        }
+        return scene
+    return _fallback_scene()
+
+
+def _fallback_scene() -> dict:
+    cx, cy = CENTER
+    r = 74.0
+    vertices = [
+        (cx, cy - r + 30.0),
+        (cx + r + 26.0, cy),
+        (cx, cy + r - 30.0),
+    ]
+    return {
+        "width": 400, "height": 400, "background": "white",
+        "loop": {"cx": cx, "cy": cy, "r": r, "color": "black", "width": LOOP_WIDTH},
+        "path": {"vertices": vertices, "color": "red", "width": PATH_WIDTH},
+        "start_dot": {"color": "green", "x": vertices[0][0], "y": vertices[0][1], "r": DOT_RADIUS},
+        "end_dot": {"color": "blue", "x": vertices[-1][0], "y": vertices[-1][1], "r": DOT_RADIUS},
+    }
+
+
+def render(scene: dict, supersample: int = 2) -> Image.Image:
+    width = int(scene["width"])
+    height = int(scene["height"])
+    background = scene["background"]
+    ss = supersample
+    img = Image.new("RGB", (width * ss, height * ss), background)
+    draw = ImageDraw.Draw(img)
+
+    loop = scene["loop"]
+    cx, cy = float(loop["cx"]), float(loop["cy"])
+    r = float(loop["r"])
+    lw = max(1, int(round(float(loop["width"]) * ss)))
+    box = [(cx - r) * ss, (cy - r) * ss, (cx + r) * ss, (cy + r) * ss]
+    draw.ellipse(box, outline=LOOP_COLOR, width=lw)
+
+    path = scene["path"]
+    pw = float(path["width"]) * ss
+    pts = [(float(x) * ss, float(y) * ss) for (x, y) in path["vertices"]]
+    draw.line(pts, fill=PATH_COLOR, width=max(1, int(round(pw))), joint="curve")
+    for (px, py) in pts:
+        rr = pw / 2.0
+        draw.ellipse([px - rr, py - rr, px + rr, py + rr], fill=PATH_COLOR)
+
+    for dot in (scene["start_dot"], scene["end_dot"]):
+        dr = float(dot["r"]) * ss
+        dx, dy = float(dot["x"]) * ss, float(dot["y"]) * ss
+        draw.ellipse([dx - dr, dy - dr, dx + dr, dy + dr], fill=DOT_COLORS[dot["color"]])
+
+    if ss > 1:
+        img = img.resize((width, height), Image.LANCZOS)
+    return img
+
+
+def _count_crossings_simple(cx, cy, r, vertices):
+    count = 0
+    for i in range(len(vertices) - 1):
+        d0 = _d2(cx, cy, vertices[i][0], vertices[i][1])
+        d1 = _d2(cx, cy, vertices[i + 1][0], vertices[i + 1][1])
+        if (d0 < r) != (d1 < r):
+            count += 1
+    return count
+
+
+def analytic_gold(scene: dict) -> str:
+    loop = scene["loop"]
+    path = scene["path"]
+    cx = float(loop["cx"])
+    cy = float(loop["cy"])
+    r = float(loop["r"])
+    verts = [(float(x), float(y)) for (x, y) in path["vertices"]]
+    count = _count_crossings_simple(cx, cy, r, verts)
+    return str(count)
+
+
+def margin(scene: dict) -> float:
+    loop = scene["loop"]
+    path = scene["path"]
+    cx, cy = float(loop["cx"]), float(loop["cy"])
+    r = float(loop["r"])
+    verts = [(float(x), float(y)) for (x, y) in path["vertices"]]
+    best = float("inf")
+
+    # vertex clearance from the ring rim
+    for (x, y) in verts:
+        best = min(best, abs(_d2(cx, cy, x, y) - r))
+
+    crossings = []
+    for i in range(len(verts) - 1):
+        d0 = _d2(cx, cy, verts[i][0], verts[i][1])
+        d1 = _d2(cx, cy, verts[i + 1][0], verts[i + 1][1])
+        if (d0 < r) != (d1 < r):
+            c = _crossing_ok((cx, cy), r, verts[i], verts[i + 1], [], 0.0, 0.0)
+            if c is not None:
+                crossings.append(c)
+
+    # separation between crossing points
+    m = len(crossings)
+    for i in range(m):
+        for j in range(i + 1, m):
+            best = min(best, _d2(crossings[i][0], crossings[i][1],
+                                 crossings[j][0], crossings[j][1]))
+
+    if not crossings:
+        # path does not cross: keep whole thread clear of ring
+        for i in range(len(verts) - 1):
+            seg = _segment_clearance(cx, cy, verts[i], verts[i + 1])
+            best = min(best, seg - r)
+
+    if not verts or math.isinf(best):
+        return float("inf")
+    return max(0.0, float(best))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MIN
+
+
+def latent_symmetries(scene: dict) -> Iterator:
+    return iter(())

@@ -1,0 +1,378 @@
+"""Clearance-gated corridor reachability world (``fat_rover_reach``).
+
+A single connected, thick, area-like corridor structure is drawn: one central
+hub chamber, four peripheral chambers at widely separated locations, and eight
+corridors (four spokes, four ring links) of *varying width*.  A rover disk of a
+visible radius sits inside one peripheral chamber; three colored dots sit at the
+centers of the other three.  The rover may slide anywhere as long as the whole
+rover body stays on the corridor structure, so a corridor is traversable only if
+its half-width is at least the rover radius.
+
+The analytic answer is the reachability profile of the three dots.  It is a
+purely combinatorial consequence of the latent capsule graph: a corridor of
+half-width ``r`` admits the rover of radius ``rho`` exactly when ``r >= rho``
+(the sampler keeps non-incident corridors far enough apart that unions never
+create a shortcut, and keeps every chamber wide enough to hold the rover).
+
+The image-only inverse arm in ``oracle.py`` shares no code with this module: it
+segments the raster, measures the rover radius from its ink, morphologically
+erodes the corridor mask by that radius, and runs connected components on the
+eroded free-configuration set.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "fat_rover_reach-renderer-0.1.0"
+
+CANVAS = 448
+SUPERSAMPLE = 3
+
+BACKGROUND = (255, 255, 255)
+CORRIDOR = (58, 102, 158)
+ROVER = (25, 25, 25)
+MARKER_COLORS = {
+    "red": (211, 47, 47),
+    "orange": (245, 140, 20),
+    "green": (46, 160, 67),
+}
+MARKER_ORDER = ("red", "orange", "green")
+
+# Node 0 is the hub; nodes 1..4 are the peripheral chambers in angular order.
+EDGE_ENDPOINTS = (
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (0, 4),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (4, 1),
+)
+# Thick-edge count is held to this set for *every* answer class, so the amount
+# of wide corridor ink carries no information about the reachability profile.
+THICK_COUNT_CHOICES = (3, 4, 5)
+
+ROVER_RADIUS = 15.0
+CLEAR_DELTA_RANGE = (5.0, 9.0)
+NEAR_BOUNDARY_RANGE = (3.2, 4.5)
+NEAR_BOUNDARY_PROB = 0.35
+
+QUARANTINE_MARGIN_PX = 3.0
+CHAMBER_SLACK_PX = 8.0
+# A non-incident corridor/chamber pair must stay this far apart (on top of the
+# two half-widths) so that no union of primitives creates an unintended wide
+# shortcut and the graph rule stays exact.
+SEPARATION_SLACK_PX = 3.0
+
+
+# --------------------------------------------------------------------------
+# latent graph reasoning (analytic gold)
+# --------------------------------------------------------------------------
+def _components(edges, rho):
+    """Union-find over corridors whose half-width admits a rover of ``rho``."""
+
+    parent = list(range(5))
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for edge in edges:
+        if float(edge[2]) >= rho:
+            left, right = find(int(edge[0])), find(int(edge[1]))
+            if left != right:
+                parent[left] = right
+    return [find(node) for node in range(5)]
+
+
+def _reach_profile(edges, markers, rover_node, rho):
+    """Ordered ``color=0/1`` reachability string for the three marker dots."""
+
+    roots = _components(edges, rho)
+    home = roots[int(rover_node)]
+    flags = {}
+    for marker in markers:
+        flags[str(marker[1])] = 1 if roots[int(marker[0])] == home else 0
+    return "|".join(f"{color}={flags.get(color, 0)}" for color in MARKER_ORDER)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Reachability profile of the three dots, from the latent capsule graph."""
+
+    return _reach_profile(
+        scene["edges"],
+        scene["markers"],
+        scene["rover_node"],
+        float(scene["rover_radius"]),
+    )
+
+
+# --------------------------------------------------------------------------
+# geometry helpers (shared by sampling, margin and rendering)
+# --------------------------------------------------------------------------
+def _node_centers(scene):
+    centers = [tuple(scene["hub"][:2])]
+    centers.extend(tuple(chamber[:2]) for chamber in scene["chambers"])
+    return centers
+
+
+def _node_radii(scene):
+    radii = [float(scene["hub"][2])]
+    radii.extend(float(chamber[2]) for chamber in scene["chambers"])
+    return radii
+
+
+def _point_segment_distance(px, py, ax, ay, bx, by):
+    vx, vy = bx - ax, by - ay
+    length2 = vx * vx + vy * vy
+    t = 0.0 if length2 <= 0.0 else ((px - ax) * vx + (py - ay) * vy) / length2
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def _segment_distance(a, b, c, d):
+    return min(
+        _point_segment_distance(a[0], a[1], c[0], c[1], d[0], d[1]),
+        _point_segment_distance(b[0], b[1], c[0], c[1], d[0], d[1]),
+        _point_segment_distance(c[0], c[1], a[0], a[1], b[0], b[1]),
+        _point_segment_distance(d[0], d[1], a[0], a[1], b[0], b[1]),
+    )
+
+
+def separation_slack(scene: dict) -> float:
+    """Smallest clearance between primitives that are not graph-incident.
+
+    While this stays positive, non-incident primitives are disjoint, so the
+    union of capsules and chambers cannot create a shortcut around a narrow
+    corridor and the combinatorial gold rule is exact.  The last term keeps the
+    middle of every corridor clear of both of its chambers, so a corridor whose
+    half-width is below the rover radius really does block.  ``is_quarantined``
+    rejects any scene where this slack fails.
+    """
+
+    centers = _node_centers(scene)
+    radii = _node_radii(scene)
+    edges = [(int(e[0]), int(e[1]), float(e[2])) for e in scene["edges"]]
+    rho = float(scene["rover_radius"])
+    worst = 1e9
+    for index, (a, b, r) in enumerate(edges):
+        for node in range(5):
+            if node in (a, b):
+                continue
+            gap = _point_segment_distance(
+                centers[node][0], centers[node][1],
+                centers[a][0], centers[a][1], centers[b][0], centers[b][1],
+            ) - r - radii[node]
+            worst = min(worst, gap)
+        for other, (c, d, r2) in enumerate(edges):
+            if other <= index or {a, b} & {c, d}:
+                continue
+            gap = _segment_distance(centers[a], centers[b], centers[c], centers[d]) - r - r2
+            worst = min(worst, gap)
+        # A narrow corridor only blocks if its middle is clear of both chambers.
+        half = 0.5 * math.dist(centers[a], centers[b])
+        worst = min(worst, half - max(radii[a], radii[b]) - rho - 4.0)
+    return worst
+
+
+def margin(scene: dict) -> float:
+    """Smallest decision-relevant clearance, in pixels.
+
+    The decision flips when a corridor half-width crosses the rover radius, so
+    the margin is the smallest ``|r - rho|`` over all corridors, capped by the
+    slack with which every chamber still admits the rover.
+    """
+
+    rho = float(scene["rover_radius"])
+    widths = [abs(float(edge[2]) - rho) for edge in scene["edges"]]
+    chambers = [radius - rho - CHAMBER_SLACK_PX for radius in _node_radii(scene)]
+    return round(min(widths + chambers), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """True when the pixel-scale decision is not safely resolvable."""
+
+    return bool(margin(scene) < QUARANTINE_MARGIN_PX or separation_slack(scene) < SEPARATION_SLACK_PX)
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _reach_count(mask, rover_node):
+    parent = list(range(5))
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for index, (a, b) in enumerate(EDGE_ENDPOINTS):
+        if mask >> index & 1:
+            left, right = find(a), find(b)
+            if left != right:
+                parent[left] = right
+    home = find(rover_node)
+    return sum(1 for node in (1, 2, 3, 4) if node != rover_node and find(node) == home)
+
+
+def _build_counterbalance_table():
+    """(rover_node, answer_count, thick_edge_count) -> list of thick-edge masks."""
+
+    table = {}
+    for rover_node in (1, 2, 3, 4):
+        for mask in range(1 << len(EDGE_ENDPOINTS)):
+            popcount = bin(mask).count("1")
+            if popcount not in THICK_COUNT_CHOICES:
+                continue
+            key = (rover_node, _reach_count(mask, rover_node), popcount)
+            table.setdefault(key, []).append(mask)
+    return table
+
+
+_TABLE = _build_counterbalance_table()
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    rho = ROVER_RADIUS
+
+    rover_node = rng.choice((1, 2, 3, 4))
+    answer_count = rng.choice((0, 1, 2, 3))
+    thick_count = rng.choice(THICK_COUNT_CHOICES)
+    while (rover_node, answer_count, thick_count) not in _TABLE:
+        thick_count = rng.choice(THICK_COUNT_CHOICES)
+    mask = rng.choice(_TABLE[(rover_node, answer_count, thick_count)])
+
+    center = CANVAS / 2.0
+    hub = [
+        round(center + rng.uniform(-9.0, 9.0), 3),
+        round(center + rng.uniform(-9.0, 9.0), 3),
+        round(rng.uniform(42.0, 48.0), 3),
+    ]
+    chambers = []
+    for index in range(4):
+        angle = math.radians(45.0 + 90.0 * index + rng.uniform(-6.0, 6.0))
+        span = rng.uniform(165.0, 178.0)
+        chambers.append(
+            [
+                round(center + span * math.cos(angle), 3),
+                round(center + span * math.sin(angle), 3),
+                round(rng.uniform(31.0, 37.0), 3),
+            ]
+        )
+
+    near_boundary_edge = -1
+    if rng.random() < NEAR_BOUNDARY_PROB:
+        near_boundary_edge = rng.randrange(len(EDGE_ENDPOINTS))
+    edges = []
+    for index, (a, b) in enumerate(EDGE_ENDPOINTS):
+        if index == near_boundary_edge:
+            delta = rng.uniform(*NEAR_BOUNDARY_RANGE)
+        else:
+            delta = rng.uniform(*CLEAR_DELTA_RANGE)
+        wide = bool(mask >> index & 1)
+        edges.append([a, b, round(rho + delta if wide else rho - delta, 3)])
+
+    marker_nodes = [node for node in (1, 2, 3, 4) if node != rover_node]
+    colors = list(MARKER_ORDER)
+    rng.shuffle(colors)
+    markers = [[node, color] for node, color in zip(marker_nodes, colors)]
+
+    return {
+        "width": CANVAS,
+        "height": CANVAS,
+        "hub": hub,
+        "chambers": chambers,
+        "edges": edges,
+        "rover_node": rover_node,
+        "rover_radius": rho,
+        "markers": markers,
+        "marker_radius": 7.0,
+    }
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def _disk(draw, cx, cy, r, color):
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+
+
+def _capsule(draw, ax, ay, bx, by, r, color):
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy)
+    if length <= 0.0:
+        return
+    nx, ny = -dy / length * r, dx / length * r
+    draw.polygon(
+        [(ax + nx, ay + ny), (bx + nx, by + ny), (bx - nx, by - ny), (ax - nx, ay - ny)],
+        fill=color,
+    )
+    _disk(draw, ax, ay, r, color)
+    _disk(draw, bx, by, r, color)
+
+
+def render(scene: dict) -> Image.Image:
+    scale = SUPERSAMPLE
+    width, height = int(scene["width"]), int(scene["height"])
+    image = Image.new("RGB", (width * scale, height * scale), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    centers = _node_centers(scene)
+    radii = _node_radii(scene)
+    for edge in scene["edges"]:
+        a, b = int(edge[0]), int(edge[1])
+        _capsule(
+            draw,
+            centers[a][0] * scale, centers[a][1] * scale,
+            centers[b][0] * scale, centers[b][1] * scale,
+            float(edge[2]) * scale,
+            CORRIDOR,
+        )
+    for node in range(5):
+        _disk(draw, centers[node][0] * scale, centers[node][1] * scale, radii[node] * scale, CORRIDOR)
+
+    rover = centers[int(scene["rover_node"])]
+    _disk(draw, rover[0] * scale, rover[1] * scale, float(scene["rover_radius"]) * scale, ROVER)
+
+    marker_radius = float(scene["marker_radius"]) * scale
+    for marker in scene["markers"]:
+        spot = centers[int(marker[0])]
+        _disk(draw, spot[0] * scale, spot[1] * scale, marker_radius, MARKER_COLORS[str(marker[1])])
+
+    return image.resize((width, height), Image.BOX)
+
+
+# --------------------------------------------------------------------------
+# declared latent aliases
+# --------------------------------------------------------------------------
+def latent_symmetries(scene: dict) -> list:
+    """Latent rewrites that are pixel-identical and gold-preserving.
+
+    All corridor primitives share one ink color and the three marker dots are
+    mutually disjoint, so paint order and corridor endpoint order are genuine
+    aliases of the same raster.
+    """
+
+    reversed_edges = dict(scene)
+    reversed_edges["edges"] = list(reversed(scene["edges"]))
+
+    swapped = dict(scene)
+    swapped["edges"] = [[int(e[1]), int(e[0]), float(e[2])] for e in scene["edges"]]
+
+    rotated = dict(scene)
+    rotated["markers"] = scene["markers"][1:] + scene["markers"][:1]
+
+    return [
+        ("edge_paint_order_reversed", reversed_edges),
+        ("corridor_endpoints_swapped", swapped),
+        ("marker_paint_order_rotated", rotated),
+    ]

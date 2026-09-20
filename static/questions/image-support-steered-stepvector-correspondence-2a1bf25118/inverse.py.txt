@@ -1,0 +1,194 @@
+"""Independent PNG-only inverse for Right-Step Tracker.
+
+This module deliberately shares no imports or state with the renderer.  It
+discovers the cell lattice from visible connected components rather than using
+absolute layout coordinates, classifies shapes by their raster geometry, then
+performs correspondence and displacement reasoning.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+DARK = (35, 40, 48)
+GRID = (166, 174, 186)
+TAB_RGB = {
+    "amber": (222, 145, 0),
+    "cyan": (0, 154, 188),
+    "violet": (130, 83, 190),
+}
+
+
+@dataclass(frozen=True)
+class Component:
+    area: int
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    cx: float
+    cy: float
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0 + 1
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0 + 1
+
+
+def _mask(arr: np.ndarray, rgb: tuple[int, int, int]) -> np.ndarray:
+    return np.all(arr == np.asarray(rgb, dtype=np.uint8), axis=2)
+
+
+def _components(mask: np.ndarray) -> list[Component]:
+    """Return four-connected exact-color components and their pixel moments."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), dtype=bool)
+    result: list[Component] = []
+    starts = np.argwhere(mask)
+    for sy_value, sx_value in starts:
+        sy, sx = int(sy_value), int(sx_value)
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        area = 0
+        x0 = x1 = sx
+        y0 = y1 = sy
+        sum_x = 0
+        sum_y = 0
+        while stack:
+            y, x = stack.pop()
+            area += 1
+            sum_x += x
+            sum_y += y
+            x0, x1 = min(x0, x), max(x1, x)
+            y0, y1 = min(y0, y), max(y1, y)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        result.append(Component(area, x0, y0, x1, y1, sum_x / area, sum_y / area))
+    return result
+
+
+def _split_panels(cells: list[Component]) -> tuple[list[Component], list[Component]]:
+    # A destructive crop may remove several empty cell outlines.  The remaining
+    # disconnected outlines still visibly determine both lattices, so do not make
+    # irrelevant empty cells part of the decision support.
+    if len(cells) < 16:
+        raise ValueError(f"too few visible cell outlines: {len(cells)}")
+    ordered = sorted(cells, key=lambda c: c.cx)
+    gaps = [ordered[i + 1].cx - ordered[i].cx for i in range(len(ordered) - 1)]
+    split = int(np.argmax(gaps)) + 1
+    left, right = ordered[:split], ordered[split:]
+    if len(left) < 8 or len(right) < 8 or max(c.cx for c in left) >= min(c.cx for c in right):
+        raise ValueError("visible cell outlines do not form two separated 4-by-4 grids")
+    return left, right
+
+
+def _axis_centers(cells: list[Component], attr: str) -> list[float]:
+    values = sorted(getattr(comp, attr) for comp in cells)
+    groups: list[list[float]] = []
+    for value in values:
+        if not groups or abs(value - sum(groups[-1]) / len(groups[-1])) > 8.0:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    if len(groups) != 4 or any(not group for group in groups):
+        raise ValueError("cell outlines do not expose four rows and four columns")
+    return [sum(group) / len(group) for group in groups]
+
+
+def _shape_name(comp: Component) -> str:
+    fill = comp.area / float(comp.width * comp.height)
+    if not (24 <= comp.width <= 40 and 24 <= comp.height <= 40):
+        raise ValueError("shape component has unsupported extent")
+    if fill >= 0.92:
+        return "square"
+    if fill >= 0.68:
+        return "circle"
+    if 0.42 <= fill <= 0.62:
+        return "triangle"
+    raise ValueError(f"unrecognized shape fill ratio {fill:.3f}")
+
+
+def _nearest_cell(comp: Component, xs: list[float], ys: list[float]) -> tuple[int, int]:
+    col = min(range(4), key=lambda i: abs(comp.cx - xs[i]))
+    row = min(range(4), key=lambda i: abs(comp.cy - ys[i]))
+    x_step = min(xs[i + 1] - xs[i] for i in range(3))
+    y_step = min(ys[i + 1] - ys[i] for i in range(3))
+    if abs(comp.cx - xs[col]) > 0.42 * x_step or abs(comp.cy - ys[row]) > 0.42 * y_step:
+        raise ValueError("component is not centered in a visible cell")
+    return row, col
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return amber/cyan/violet, or ``abstain`` when visual evidence is incomplete."""
+    try:
+        arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+        cells = [
+            comp
+            for comp in _components(_mask(arr, GRID))
+            if 50 <= comp.width <= 75 and 50 <= comp.height <= 75 and comp.area >= 500
+        ]
+        left_cells, right_cells = _split_panels(cells)
+        left_xs = _axis_centers(left_cells, "cx")
+        left_ys = _axis_centers(left_cells, "cy")
+        right_xs = _axis_centers(right_cells, "cx")
+        right_ys = _axis_centers(right_cells, "cy")
+        panel_cut = (max(left_xs) + min(right_xs)) / 2.0
+
+        ink = [
+            comp
+            for comp in _components(_mask(arr, DARK))
+            if comp.area >= 450 and 24 <= comp.width <= 40 and 24 <= comp.height <= 40
+        ]
+
+        before: dict[str, tuple[int, int]] = {}
+        after: dict[str, tuple[int, int]] = {}
+        for comp in ink:
+            try:
+                name = _shape_name(comp)
+            except ValueError:
+                # A partly erased distractor carries no usable identity evidence.
+                continue
+            if comp.cx < panel_cut:
+                if name in before:
+                    raise ValueError("duplicate shape identity in BEFORE")
+                before[name] = _nearest_cell(comp, left_xs, left_ys)
+            else:
+                if name in after:
+                    raise ValueError("duplicate shape identity in AFTER")
+                after[name] = _nearest_cell(comp, right_xs, right_ys)
+        tags_by_cell: dict[tuple[int, int], str] = {}
+        for color, rgb in TAB_RGB.items():
+            comps = [comp for comp in _components(_mask(arr, rgb)) if comp.area >= 100]
+            if not comps:
+                continue
+            if len(comps) != 1:
+                raise ValueError(f"ambiguous visible {color} tab")
+            cell = _nearest_cell(comps[0], right_xs, right_ys)
+            if cell in tags_by_cell:
+                raise ValueError("two tabs occupy one destination cell")
+            tags_by_cell[cell] = color
+        matches = []
+        for shape in sorted(set(before) & set(after)):
+            br, bc = before[shape]
+            ar, ac = after[shape]
+            if ar - br == 0 and ac - bc == 1:
+                matches.append(shape)
+        if len(matches) != 1:
+            raise ValueError("requested displacement is not visually unique")
+        selected_cell = after[matches[0]]
+        if selected_cell not in tags_by_cell:
+            raise ValueError("selected landmark's destination tab is missing")
+        return tags_by_cell[selected_cell]
+    except (ValueError, IndexError, TypeError, ZeroDivisionError):
+        return "abstain"

@@ -1,0 +1,154 @@
+"""Independent pixel-only oracle for the conjunctive-bar reference world.
+
+Receives only the final PNG. Never imports the renderer, prompts, generator,
+verifier, or analytic-gold code, and never accepts latent scene data.
+
+Algorithm: segment the saturated red/blue/green bar pixels and isolate the
+connected components of the bars. The reference is the single coloured bar whose
+centroid lies in the left band; the candidate bars are those whose centroids lie
+in the right band. For each bar component we classify its colour (nearest RGB
+prototype) and its tilt (principal-axis angle). A bar is a full match when it
+shares BOTH the reference colour and the reference tilt; the answer is that
+bar's grid position (left/right and top/bottom relative to the candidate grid).
+When the reference is missing, or no unique full match exists, it abstains and
+returns "none".
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_RESPONSE = None
+
+PROTOTYPES = {
+    "red": np.asarray([214, 48, 49], dtype=np.float64),
+    "blue": np.asarray([41, 82, 214], dtype=np.float64),
+    "green": np.asarray([38, 166, 91], dtype=np.float64),
+}
+
+_LABELS = {("tl", 0, 0), ("tr", 1, 0), ("bl", 0, 1), ("br", 1, 1)}
+
+
+def _classify_color(rgb) -> str | None:
+    dist = {name: float(np.linalg.norm(rgb - proto)) for name, proto in PROTOTYPES.items()}
+    best = min(dist, key=dist.get)
+    return best if dist[best] < 130.0 else None
+
+
+def _orientation_angle(coords_yx) -> float:
+    pts = np.asarray(coords_yx, dtype=np.float64)
+    pts = pts - pts.mean(axis=0)
+    cov = pts.T @ pts
+    if cov.size == 0:
+        return 0.0
+    vals, vecs = np.linalg.eigh(cov)
+    principal = vecs[:, int(np.argmax(vals))]
+    return math.degrees(math.atan2(principal[1], principal[0])) % 180.0
+
+
+def _classify_tilt(angle: float) -> str | None:
+    targets = {"horizontal": 0.0, "slant_r": 45.0, "vertical": 90.0, "slant_l": 135.0}
+    best = None
+    best_d = None
+    for name, target in targets.items():
+        d = abs(angle - target) % 180.0
+        d = min(d, 180.0 - d)
+        if best_d is None or d < best_d:
+            best_d = d
+            best = name
+    return best if best_d <= 30.0 else None
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    comps = []
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x] or visited[y, x]:
+                continue
+            stack = [(y, x)]
+            visited[y, x] = True
+            pixels = []
+            while stack:
+                cy, cx = stack.pop()
+                pixels.append((cy, cx))
+                for ny in range(max(0, cy - 1), min(height, cy + 2)):
+                    for nx in range(max(0, cx - 1), min(width, cx + 2)):
+                        if mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+            comps.append(np.asarray(pixels))
+    return comps
+
+
+def _describe(component: np.ndarray, arr: np.ndarray):
+    color_counts = {"red": 0, "blue": 0, "green": 0}
+    for cy, cx in component:
+        rgb = arr[cy, cx]
+        name = _classify_color(rgb)
+        if name in color_counts:
+            color_counts[name] += 1
+    total = len(component)
+    if total == 0:
+        return None
+    color = max(color_counts, key=color_counts.get)
+    if color_counts[color] < 0.6 * total:
+        color = None
+    centroid = component.mean(axis=0)
+    tilt = _classify_tilt(_orientation_angle(component))
+    if color is None or tilt is None:
+        return None
+    return {"centroid": (float(centroid[0]), float(centroid[1])), "color": color, "tilt": tilt}
+
+
+def decision_from_image(image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int32)
+    if arr.ndim != 3:
+        return "none"
+    r = arr[..., 0]
+    g = arr[..., 1]
+    b = arr[..., 2]
+
+    mask = np.zeros(arr.shape[:2], dtype=bool)
+    for name, (R, G, B) in {
+        "red": (214, 48, 49),
+        "blue": (41, 82, 214),
+        "green": (38, 166, 91),
+    }.items():
+        mask |= (np.abs(r - R) < 90) & (np.abs(g - G) < 90) & (np.abs(b - B) < 90)
+
+    comps = _components(mask)
+    described = []
+    for comp in comps:
+        if len(comp) < 120:
+            continue
+        info = _describe(comp, arr)
+        if info is not None:
+            described.append(info)
+
+    reference = [d for d in described if d["centroid"][1] < 250]
+    candidates = [d for d in described if d["centroid"][1] >= 250]
+
+    if len(reference) != 1:
+        return "none"
+    ref = reference[0]
+
+    matches = [
+        d for d in candidates
+        if d["color"] == ref["color"] and d["tilt"] == ref["tilt"]
+    ]
+    if len(matches) != 1 or len(candidates) == 0:
+        return "none"
+
+    winner = matches[0]
+    mean_y = sum(d["centroid"][0] for d in candidates) / len(candidates)
+    mean_x = sum(d["centroid"][1] for d in candidates) / len(candidates)
+    left = winner["centroid"][1] < mean_x
+    top = winner["centroid"][0] < mean_y
+    label = ("tl" if top else "bl") if left else ("tr" if top else "br")
+    return label

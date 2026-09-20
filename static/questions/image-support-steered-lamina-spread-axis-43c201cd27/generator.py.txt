@@ -1,0 +1,167 @@
+"""Deterministic renderer and analytic arm for directional lamina spread."""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH = 640
+HEIGHT = 512
+GRID_SIDE = 14
+CELL_PX = 28
+LAMINA_PX = GRID_SIDE * CELL_PX
+QUARANTINE_PX2 = 700.0
+BACKGROUND = (247, 245, 239)
+INK = (42, 46, 51)
+RULE = (205, 205, 198)
+PALETTE = (
+    (19, 132, 157),
+    (38, 132, 96),
+    (73, 89, 172),
+    (190, 83, 48),
+    (151, 70, 146),
+    (184, 116, 20),
+)
+
+# (top/bottom notch width, depth, left/right notch width, depth).  The final
+# profile is a deliberate near-boundary case; all others have broad margins.
+_PROFILES = (
+    (8, 1, 0, 1),
+    (7, 1, 1, 1),
+    (6, 1, 2, 1),
+    (5, 1, 3, 1),
+)
+
+
+def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(name, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _canonical_cells(profile: tuple[int, int, int, int]) -> list[list[int]]:
+    tb_width, tb_depth, lr_width, lr_depth = profile
+    cells = {(x, y) for y in range(GRID_SIDE) for x in range(GRID_SIDE)}
+    x_start = (GRID_SIDE - tb_width) // 2
+    for depth in range(tb_depth):
+        for x in range(x_start, x_start + tb_width):
+            cells.discard((x, depth))
+            cells.discard((x, GRID_SIDE - 1 - depth))
+    y_start = (GRID_SIDE - lr_width) // 2
+    for depth in range(lr_depth):
+        for y in range(y_start, y_start + lr_width):
+            cells.discard((depth, y))
+            cells.discard((GRID_SIDE - 1 - depth, y))
+    return [[x, y] for x, y in sorted(cells, key=lambda point: (point[1], point[0]))]
+
+
+def _rotate_clockwise(cells: list[list[int]]) -> list[list[int]]:
+    return [[int(y), GRID_SIDE - 1 - int(x)] for x, y in cells]
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Return a deterministic paired scene with counterbalanced answer identity."""
+
+    pair_seed = int(seed) // 2
+    rng = random.Random(0x1A61_2026 + pair_seed * 1_000_003)
+    # One pair in seven is near the equality boundary; the safe profiles rotate
+    # across the rest of the deterministic stress range.
+    if pair_seed % 7 == 0:
+        profile = _PROFILES[-1]
+    else:
+        profile = _PROFILES[pair_seed % (len(_PROFILES) - 1)]
+    cells = _canonical_cells(profile)
+    if int(seed) % 2:
+        cells = _rotate_clockwise(cells)
+    rng.shuffle(cells)  # storage order is deliberately non-semantic
+    return {
+        "cells": cells,
+        "fill_rgb": list(PALETTE[pair_seed % len(PALETTE)]),
+        "x0": 122 + 3 * (pair_seed % 5),
+        "y0": 78 + 2 * (pair_seed % 4),
+    }
+
+
+def _cell_moments(scene: dict[str, Any]) -> tuple[float, float]:
+    cells = scene["cells"]
+    if not isinstance(cells, list) or len(cells) < 80:
+        raise ValueError("cells must describe a substantial lamina")
+    points = [(int(cell[0]), int(cell[1])) for cell in cells]
+    if len(points) != len(set(points)):
+        raise ValueError("filled cells must be unique")
+    if any(not (0 <= x < GRID_SIDE and 0 <= y < GRID_SIDE) for x, y in points):
+        raise ValueError("filled cell lies outside the public lattice")
+    mean_x = sum(x for x, _ in points) / len(points)
+    mean_y = sum(y for _, y in points) / len(points)
+    horizontal = sum((x - mean_x) ** 2 for x, _ in points) / len(points)
+    vertical = sum((y - mean_y) ** 2 for _, y in points) / len(points)
+    return horizontal * CELL_PX**2, vertical * CELL_PX**2
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    horizontal, vertical = _cell_moments(scene)
+    if math.isclose(horizontal, vertical, abs_tol=1e-12):
+        raise ValueError("equal directional moments have no unique answer")
+    return "horizontal" if horizontal > vertical else "vertical"
+
+
+def margin(scene: dict[str, Any]) -> float:
+    """Runner-up margin: absolute second-moment difference in square pixels."""
+
+    horizontal, vertical = _cell_moments(scene)
+    return abs(horizontal - vertical)
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    return margin(scene) <= QUARANTINE_PX2
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    twin = dict(scene)
+    twin["cells"] = list(reversed(scene["cells"]))
+    return [("reverse_cell_storage_order", twin)]
+
+
+def render(scene: dict[str, Any]) -> Image.Image:
+    cells = scene["cells"]
+    fill = tuple(int(value) for value in scene["fill_rgb"])
+    x0 = int(scene["x0"])
+    y0 = int(scene["y0"])
+    if not isinstance(cells, list) or not cells:
+        raise ValueError("renderer requires filled cells")
+    if not all(0 <= channel <= 255 for channel in fill):
+        raise ValueError("fill_rgb is outside RGB range")
+    if x0 < 92 or x0 + LAMINA_PX > WIDTH - 92:
+        raise ValueError("lamina does not fit horizontally")
+    if y0 < 68 or y0 + LAMINA_PX > HEIGHT - 34:
+        raise ValueError("lamina does not fit vertically")
+
+    array = np.empty((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    array[:, :] = BACKGROUND
+    seen: set[tuple[int, int]] = set()
+    for raw_x, raw_y in cells:
+        x, y = int(raw_x), int(raw_y)
+        if (x, y) in seen or not (0 <= x < GRID_SIDE and 0 <= y < GRID_SIDE):
+            raise ValueError("invalid or repeated filled cell")
+        seen.add((x, y))
+        left = x0 + x * CELL_PX
+        top = y0 + y * CELL_PX
+        array[top : top + CELL_PX, left : left + CELL_PX] = fill
+
+    image = Image.fromarray(array, mode="RGB")
+    draw = ImageDraw.Draw(image)
+    title_font = _font(21, bold=True)
+    label_font = _font(15, bold=True)
+    small_font = _font(13)
+    draw.text((x0, 16), "UNIFORM LAMINA", font=title_font, fill=INK)
+    draw.line((x0, 58, x0 + LAMINA_PX, 58), fill=RULE, width=2)
+    draw.text((x0 + 116, 48), "HORIZONTAL (x)", font=label_font, fill=INK)
+    draw.text((18, y0 + 184), "VERTICAL", font=label_font, fill=INK)
+    draw.text((x0 + LAMINA_PX - 116, y0 + LAMINA_PX + 8), "filled area", font=small_font, fill=INK)
+    return image

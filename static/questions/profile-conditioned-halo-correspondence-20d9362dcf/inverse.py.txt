@@ -1,0 +1,158 @@
+"""Independent pixel-only inverse arm for the halo-correspondence world.
+
+Receives ONLY the final rasterized PNG and the public question contract (the
+visual spec). It never imports the renderer, prompt, generator, verifier, or
+analytic-gold code, and never reads scene data.
+
+The public visual spec (duplicated here as the oracle's own specification):
+
+  * a solid reference disk (no halo) sits in the upper panel;
+  * a row of candidate objects (fill disk + surrounding halo ring) sits below
+    a dark horizontal divider line;
+  * each candidate's fill and halo colors come from two disjoint palettes;
+  * the task: find the candidate whose FILL color equals the reference FILL,
+    then report that candidate's HALO color.
+
+The oracle recovers, from pixels alone: the divider line, the reference fill
+color, each candidate's fill and halo colors, and finally the answer halo after
+cross-panel matching.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "halo_correspondence-oracle-0.1.0"
+
+FILL_PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (255, 0, 0),
+    "green": (0, 180, 0),
+    "blue": (0, 0, 255),
+    "orange": (255, 140, 0),
+}
+HALO_PALETTE: dict[str, tuple[int, int, int]] = {
+    "cyan": (0, 200, 200),
+    "magenta": (255, 0, 255),
+    "yellow": (240, 230, 0),
+    "purple": (160, 30, 220),
+}
+
+# Public geometry constants reused for band sampling and component confidence.
+FILL_R = 38
+HALO_R = 58
+BAND_LO = 45.0
+BAND_HI = 53.0
+MIN_COMPONENT_PX = 800  # a fill disk covers pi*38^2 ~= 4536 px; far above noise
+
+
+def _background_mask(arr: np.ndarray) -> np.ndarray:
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    return (r > 200) & (g > 200) & (b > 200)
+
+
+def _line_mask(arr: np.ndarray) -> np.ndarray:
+    return arr.max(axis=2) < 110
+
+
+def _nearest_names(pixels: np.ndarray, palette: dict[str, tuple[int, int, int]]) -> np.ndarray:
+    names = list(palette)
+    rgbs = np.array([palette[n] for n in names], dtype=np.float32)
+    d = np.linalg.norm(pixels[..., None, :] - rgbs[None, None, :, :], axis=-1)
+    return np.array(names)[d.argmin(axis=-1)]
+
+
+def _connected_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    """4-connectivity connected components; returns pixel (x, y) lists."""
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    comps = []
+    for y in range(h):
+        for x in range(w):
+            if mask[y, x] and not visited[y, x]:
+                queue = deque([(x, y)])
+                visited[y, x] = True
+                cur = []
+                while queue:
+                    cx, cy = queue.popleft()
+                    cur.append((cx, cy))
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < w and 0 <= ny < h and mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            queue.append((nx, ny))
+                comps.append(cur)
+    return comps
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB")).astype(np.float32)
+    h, w = arr.shape[:2]
+
+    bg = _background_mask(arr)
+    line = _line_mask(arr)
+    ink = ~(bg | line)
+
+    # Locate the horizontal divider line from its very-dark rows.
+    line_counts = line.sum(axis=1)
+    divider_rows = np.where(line_counts > 0.5 * w)[0]
+    if divider_rows.size == 0:
+        divider_y = h // 2
+    else:
+        divider_y = int(round(float(divider_rows.mean())))
+
+    # Reference fill: the sole ink color in the upper panel, nearest fill name.
+    ref_mask = ink[:divider_y, :]
+    ref_pix = arr[:divider_y][ref_mask]
+    ref_fill = "red"
+    if len(ref_pix):
+        names = _nearest_names(ref_pix[None, :, :], FILL_PALETTE)[0]
+        vals, counts = np.unique(names, return_counts=True)
+        ref_fill = vals[int(np.argmax(counts))]
+
+    # Candidate panel: label ink into the combined palette; split fill vs halo.
+    low = divider_y + 1
+    cand_region = slice(low, h)
+    cand_ink = ink[cand_region]
+    combined = {**FILL_PALETTE, **HALO_PALETTE}
+    if cand_ink.any():
+        region_pix = arr[cand_region]
+        labels = _nearest_names(region_pix[None, :, :], combined)[0]
+        fill_mask = np.isin(labels, list(FILL_PALETTE))
+
+        best_hit = None
+        grid = np.zeros((h - low, w), dtype=int)
+        grid[fill_mask] = 1
+        for comp in _connected_components(grid):
+            if len(comp) < MIN_COMPONENT_PX:
+                continue
+            pts = np.array(comp, dtype=np.float32)
+            cx = float(pts[:, 0].mean())
+            cy = float(pts[:, 1].mean())
+            ys = pts[:, 1].astype(int)
+            xs = pts[:, 0].astype(int)
+            comp_names = labels[ys, xs]
+            vals, counts = np.unique(comp_names, return_counts=True)
+            comp_fill = vals[int(np.argmax(counts))]
+            # Sample the halo annulus band around the recovered center.
+            yloc = np.arange(h - low)[:, None]
+            xloc = np.arange(w)[None, :]
+            r2 = np.sqrt((xloc - cx) ** 2 + (yloc - cy) ** 2)
+            band = (r2 >= BAND_LO) & (r2 <= BAND_HI) & cand_ink
+            if band.any():
+                halo_names = _nearest_names(arr[cand_region][band][None, :, :], HALO_PALETTE)[0]
+                hv, hc = np.unique(halo_names, return_counts=True)
+                comp_halo = hv[int(np.argmax(hc))]
+            else:
+                comp_halo = None
+            if comp_fill == ref_fill:
+                best_hit = comp_halo
+
+        if best_hit is not None:
+            return best_hit
+
+    # Defensive fallback: return a deterministic but wrong-free signal is not
+    # possible without correspondence; raise to force abstention semantics.
+    raise ValueError("could not establish cross-panel correspondence from pixels")

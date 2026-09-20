@@ -1,0 +1,357 @@
+"""Renderer for ``chain_walk_rank``.
+
+One connected chain is drawn on a plain canvas: a single thin dark cord that
+threads exactly five filled beads, laid out as a wandering open polyline inside a
+medium-sized region of the canvas.  Exactly one bead -- always an endpoint of the
+chain -- is drawn clearly larger than the other four and marks where the walk
+starts.  The decision is
+
+    decision = "<colour of the bead three steps along the cord from the start
+                 bead>|<left|right half of the canvas that bead lies in>"
+
+so the answer is an *ordinal position along a traced route*, not a property of a
+single mark.  Because the cord folds back on itself, the third bead after the
+start is deliberately never the third bead of any left-to-right, right-to-left,
+top-to-bottom or bottom-to-top scan (enforced at sampling time): the walk has to
+be followed.
+
+Prior conflict (discovery profile ``paper-semantic@0.3.0:prior_conflict``).  The
+familiar canonical prior here is the spectral / rainbow colour order
+red-orange-yellow-green-blue-indigo-violet.  Every scene shows five beads whose
+colours are a contiguous five-colour run of that spectrum, and
+
+* ``control`` scenes place that run along the chain in spectral order (increasing
+  or decreasing), so a solver that simply continues the visible spectral pattern
+  from the start bead lands on the truth;
+* ``counterfactual`` scenes place the *same five colours* along the chain in a
+  permuted order that is certified to defeat spectral continuation in either
+  direction.
+
+The variant is sampled independently of the answer, the wording is identical, and
+the target colour of a counterfactual scene is drawn from exactly the same
+distribution as the control target colour, so neither the palette, the colour
+multiset, the answer identity, the geometry nor the wording predicts whether a
+scene is canonical.  The canonical prior answer is recorded for analysis only and
+is never used as gold (``label_inputs`` are ``path``, ``colors``, ``radii`` and
+``start_index``).
+
+Margin.  ``margin`` is the smallest distance (canvas px) to any event that would
+make the answer ill-defined:
+
+* ``clearance``  -- free space before non-adjacent parts of the chain touch and
+  create a shortcut that reorders the walk;
+* ``size_gap``   -- how much bigger the start bead is than the largest other bead
+  (the start of the walk stops being identifiable at 0);
+* ``link``       -- the visible cord gap between consecutive beads;
+* ``side``       -- how far the target bead sits from the vertical midline (the
+  left/right prompt family flips at 0).
+
+Scenes with ``margin < 6 px`` are quarantined; the sampler never emits them.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "chain_walk_rank-renderer-0.1.0"
+
+WIDTH = HEIGHT = 512
+N_BEADS = 5
+TARGET_STEP = 3  # "the third bead after the start bead"
+
+# The canonical spectral order (the prior under test) and the ink palette.
+SPECTRUM: tuple[str, ...] = ("red", "orange", "yellow", "green", "blue", "indigo", "violet")
+RGB: dict[str, tuple[int, int, int]] = {
+    "red": (214, 32, 42),
+    "orange": (240, 140, 10),
+    "yellow": (238, 222, 45),
+    "green": (30, 158, 64),
+    "blue": (40, 90, 220),
+    "indigo": (78, 20, 140),
+    "violet": (176, 60, 206),
+}
+CORD_RGB = (24, 24, 24)
+BACKGROUND_RGB = (255, 255, 255)
+
+# Colours that can appear as the answer, identical for both variants.
+ANSWER_POOL: tuple[str, ...] = ("orange", "yellow", "green", "blue", "indigo")
+
+BEAD_R_RANGE = (13.0, 17.0)
+START_R_RANGE = (25.0, 33.0)
+CORD_W_RANGE = (5.0, 7.0)
+STEP_RANGE = (58.0, 94.0)
+TURN_RANGE = (0.60, 2.15)  # radians, magnitude of each turn (folds the chain back)
+PAD = 66.0  # keep the whole chain this far from every canvas edge
+EXTENT_MIN = 150.0  # the chain must span a substantial region in both axes
+QUARANTINE_PX = 6.0
+
+MARGIN_BINS: dict[str, tuple[float, float]] = {
+    "tight": (6.0, 9.0),
+    "clear": (9.0, 12.0),
+    "wide": (12.0, 400.0),
+}
+SAMPLED_BINS: tuple[str, ...] = ("tight", "clear", "wide")
+
+
+# --------------------------------------------------------------------------- #
+# geometry helpers
+# --------------------------------------------------------------------------- #
+def _pt_seg(p, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    dx, dy = bx - ax, by - ay
+    den = dx * dx + dy * dy
+    t = 0.0 if den == 0.0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / den))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _cross(o, a, b) -> float:
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _seg_seg(a, b, c, d) -> float:
+    d1, d2 = _cross(c, d, a), _cross(c, d, b)
+    d3, d4 = _cross(a, b, c), _cross(a, b, d)
+    if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)):
+        return 0.0
+    return min(_pt_seg(a, c, d), _pt_seg(b, c, d), _pt_seg(c, a, b), _pt_seg(d, a, b))
+
+
+def _spectral_step(color: str, step: int) -> str:
+    """Colour ``step`` places along the canonical spectrum, or ``"none"``."""
+    i = SPECTRUM.index(color) + step
+    return SPECTRUM[i] if 0 <= i < len(SPECTRUM) else "none"
+
+
+# --------------------------------------------------------------------------- #
+# scene structure
+# --------------------------------------------------------------------------- #
+def traversal(scene: dict) -> list[int]:
+    """Path-index order of the beads when walking the cord from the start bead."""
+    order = list(range(len(scene["path"])))
+    return order if int(scene["start_index"]) == 0 else order[::-1]
+
+
+def target_index(scene: dict) -> int:
+    return traversal(scene)[TARGET_STEP]
+
+
+def analytic_gold(scene: dict) -> str:
+    """Closed-form decision ``"<colour>|<side>"`` from path, colours and start."""
+    t = target_index(scene)
+    color = scene["colors"][t]
+    side = "left" if scene["path"][t][0] < scene["width"] / 2.0 else "right"
+    return f"{color}|{side}"
+
+
+def _radii(scene: dict) -> list[float]:
+    """Drawn radius of every bead: the start bead is the oversized one."""
+    si = int(scene["start_index"])
+    return [
+        float(scene["start_r"]) if i == si else float(r)
+        for i, r in enumerate(scene["bead_r"])
+    ]
+
+
+def margin(scene: dict) -> float:
+    path = [tuple(p) for p in scene["path"]]
+    radii = _radii(scene)
+    cw = float(scene["cord_w"])
+    segs = [(path[i], path[i + 1]) for i in range(len(path) - 1)]
+
+    clear = min(
+        _seg_seg(*segs[i], *segs[j])
+        for i in range(len(segs))
+        for j in range(i + 2, len(segs))
+    ) - (max(radii) + cw / 2.0 + 1.0)
+
+    si = int(scene["start_index"])
+    size_gap = float(scene["start_r"]) - max(
+        float(r) for k, r in enumerate(scene["bead_r"]) if k != si
+    )
+    link = min(
+        math.hypot(path[i][0] - path[i + 1][0], path[i][1] - path[i + 1][1]) - radii[i] - radii[i + 1]
+        for i in range(len(path) - 1)
+    )
+    t = target_index(scene)
+    side = abs(path[t][0] - scene["width"] / 2.0)
+    return float(min(clear, size_gap, link, side))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def margin_bin(scene: dict) -> str:
+    m = margin(scene)
+    if m < QUARANTINE_PX:
+        return "boundary"
+    for name, (lo, hi) in MARGIN_BINS.items():
+        if lo <= m < hi:
+            return name
+    return "wide"
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """One nontrivial pixel-identical, gold-preserving latent alias.
+
+    The chain is stored head-to-tail, but an open polyline has no intrinsic
+    storage direction: reversing ``path``, ``colors`` and ``bead_r`` together and
+    mapping ``start_index`` to the mirrored slot describes the *same* physical
+    chain from the other end.  The renderer canonicalises every draw call by
+    position, so the alias is byte-identical, and the walk still begins at the
+    same physical bead, so gold must not move.  This catches any gold rule keyed
+    to list position instead of to the traced route.
+    """
+    n = len(scene["path"])
+    alias = dict(scene)
+    alias["path"] = [list(p) for p in reversed(scene["path"])]
+    alias["colors"] = list(reversed(scene["colors"]))
+    alias["bead_r"] = list(reversed(scene["bead_r"]))
+    alias["start_index"] = n - 1 - int(scene["start_index"])
+    return [("reverse_chain_storage", alias)]
+
+
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+def _sample_geometry(rng: random.Random) -> list[tuple[float, float]] | None:
+    x = rng.uniform(PAD + 40, WIDTH - PAD - 40)
+    y = rng.uniform(PAD + 40, HEIGHT - PAD - 40)
+    ang = rng.uniform(0.0, 2 * math.pi)
+    pts = [(x, y)]
+    for _ in range(N_BEADS - 1):
+        ang += rng.choice((-1.0, 1.0)) * rng.uniform(*TURN_RANGE)
+        step = rng.uniform(*STEP_RANGE)
+        x, y = x + step * math.cos(ang), y + step * math.sin(ang)
+        if not (PAD <= x <= WIDTH - PAD and PAD <= y <= HEIGHT - PAD):
+            return None
+        pts.append((x, y))
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    if max(xs) - min(xs) < EXTENT_MIN or max(ys) - min(ys) < EXTENT_MIN:
+        return None
+    return pts
+
+
+def _colour_sequence(rng: random.Random, variant: str) -> tuple[list[str], str, str] | None:
+    """Return (traversal-order colours, canonical prior answer, target colour)."""
+    off = rng.randrange(0, len(SPECTRUM) - N_BEADS + 1)
+    run = list(SPECTRUM[off : off + N_BEADS])
+    direction = rng.choice((1, -1))
+    canonical = run if direction == 1 else run[::-1]
+    target = canonical[TARGET_STEP]
+    if target not in ANSWER_POOL:
+        return None
+    if variant == "control":
+        prior = _spectral_step(canonical[0], TARGET_STEP * direction)
+        return canonical, prior, target
+    others = [c for c in run if c != target]
+    for _ in range(60):
+        rng.shuffle(others)
+        seq = others[:TARGET_STEP] + [target] + others[TARGET_STEP:]
+        if seq == run or seq == run[::-1]:
+            continue
+        if target in (_spectral_step(seq[0], TARGET_STEP), _spectral_step(seq[0], -TARGET_STEP)):
+            continue
+        return seq, _spectral_step(seq[0], TARGET_STEP), target
+    return None
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one scene; the margin bin and the target side cycle with ``seed``."""
+    rng = random.Random(int(seed) * 6364136223846793005 % (2**61 - 1) + 17)
+    want_bin = SAMPLED_BINS[int(seed) % len(SAMPLED_BINS)]
+    want_side = "left" if (int(seed) // len(SAMPLED_BINS)) % 2 == 0 else "right"
+    variant = "control" if (int(seed) // (2 * len(SAMPLED_BINS))) % 2 == 0 else "counterfactual"
+
+    for attempt in range(90000):
+        # Deterministic relaxation ladder: the bin target is dropped after 40000
+        # attempts and the side target after 70000, so every seed yields a scene.
+        relax_bin = attempt >= 40000
+        relax_side = attempt >= 70000
+        cols = _colour_sequence(rng, variant)
+        if cols is None:
+            continue
+        seq, prior, _target = cols
+        pts = _sample_geometry(rng)
+        if pts is None:
+            continue
+        start_index = rng.choice((0, N_BEADS - 1))
+        bead_r = [rng.uniform(*BEAD_R_RANGE) for _ in range(N_BEADS)]
+        start_r = rng.uniform(*START_R_RANGE)
+        order = list(range(N_BEADS)) if start_index == 0 else list(range(N_BEADS))[::-1]
+        colors = [""] * N_BEADS
+        for k, idx in enumerate(order):
+            colors[idx] = seq[k]
+        t = order[TARGET_STEP]
+
+        # No axis scan may reproduce the traced ordinal: the target bead must not
+        # be the third mark of any left/right/top/bottom sweep.
+        rank_x = sorted(range(N_BEADS), key=lambda i: pts[i][0]).index(t)
+        rank_y = sorted(range(N_BEADS), key=lambda i: pts[i][1]).index(t)
+        if rank_x in (1, 3) or rank_y in (1, 3):
+            continue
+
+        scene = {
+            "path": [[p[0], p[1]] for p in pts],
+            "colors": colors,
+            "bead_r": bead_r,
+            "start_r": start_r,
+            "start_index": start_index,
+            "cord_w": rng.uniform(*CORD_W_RANGE),
+            "width": WIDTH,
+            "height": HEIGHT,
+            "variant": variant,
+            "canonical_prior_answer": prior,
+        }
+        side = "left" if pts[t][0] < WIDTH / 2.0 else "right"
+        if side != want_side and not relax_side:
+            continue
+        m = margin(scene)
+        lo, hi = MARGIN_BINS[want_bin]
+        if m < QUARANTINE_PX:
+            continue
+        if not (lo <= m < hi) and not relax_bin:
+            continue
+        return scene
+    raise RuntimeError(f"could not sample a {want_bin}/{want_side} scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+def render(scene: dict, supersample: int = 3) -> Image.Image:
+    """Rasterise the scene.  Every draw call is canonicalised by position, so the
+    raster depends on the drawn geometry alone and not on list storage order."""
+    ss = int(supersample)
+    w, h = int(scene["width"]), int(scene["height"])
+    img = Image.new("RGB", (w * ss, h * ss), BACKGROUND_RGB)
+    draw = ImageDraw.Draw(img)
+    path = [(float(p[0]), float(p[1])) for p in scene["path"]]
+    cw = float(scene["cord_w"])
+
+    segs = sorted(tuple(sorted((path[i], path[i + 1]))) for i in range(len(path) - 1))
+    for a, b in segs:
+        draw.line(
+            [a[0] * ss, a[1] * ss, b[0] * ss, b[1] * ss],
+            fill=CORD_RGB,
+            width=max(1, int(round(cw * ss))),
+        )
+    r = cw / 2.0
+    for x, y in sorted(path[1:-1]):
+        draw.ellipse([(x - r) * ss, (y - r) * ss, (x + r) * ss, (y + r) * ss], fill=CORD_RGB)
+
+    radii = _radii(scene)
+    beads = sorted(
+        (path[i][0], path[i][1], radii[i], scene["colors"][i]) for i in range(len(path))
+    )
+    for x, y, rad, color in beads:
+        draw.ellipse(
+            [(x - rad) * ss, (y - rad) * ss, (x + rad) * ss, (y + rad) * ss], fill=RGB[color]
+        )
+    return img.resize((w, h), Image.LANCZOS) if ss > 1 else img

@@ -1,0 +1,136 @@
+"""Independent image-only inverse for the ordered-checkpoint trace.
+
+This module intentionally duplicates only public color conventions.  It never
+imports the renderer or reads a latent scene.  The route is reduced to a
+coarse pixel graph so the answer depends on connected traversal from the
+green start mark, not on a fitted coordinate shortcut.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+
+BLOCK = 4
+MIN_MARKER_PIXELS = 18
+ORANGE_PROTOTYPES = np.asarray(
+    ((239, 126, 42), (226, 111, 48), (244, 143, 51)), dtype=np.float32
+)
+VIOLET_PROTOTYPES = np.asarray(
+    ((143, 78, 181), (126, 73, 171), (158, 86, 184)), dtype=np.float32
+)
+START_PROTOTYPES = np.asarray(
+    ((28, 157, 116), (27, 142, 128), (40, 166, 105)), dtype=np.float32
+)
+
+
+def _color_mask(array: np.ndarray, prototypes: np.ndarray, threshold: float = 52.0) -> np.ndarray:
+    differences = array[:, :, None, :].astype(np.float32) - prototypes[None, None, :, :]
+    distances = np.sqrt(np.sum(differences * differences, axis=3))
+    return np.min(distances, axis=2) <= threshold
+
+
+def _centroid(mask: np.ndarray, name: str) -> tuple[float, float]:
+    points = np.argwhere(mask)
+    if len(points) < MIN_MARKER_PIXELS:
+        raise ValueError(f"{name} marker is missing or too damaged")
+    y, x = points.mean(axis=0)
+    return float(y), float(x)
+
+
+def _trace_mask(array: np.ndarray) -> np.ndarray:
+    # The route is a dark neutral stroke.  Saturated colored marker rims are
+    # excluded by the channel-spread test even where they touch the line.
+    spread = array.max(axis=2).astype(np.int16) - array.min(axis=2).astype(np.int16)
+    mean = array.mean(axis=2)
+    return (spread <= 48) & (mean <= 172)
+
+
+def _coarse_mask(mask: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    coarse_height = height // BLOCK
+    coarse_width = width // BLOCK
+    trimmed = mask[: coarse_height * BLOCK, : coarse_width * BLOCK]
+    return trimmed.reshape(coarse_height, BLOCK, coarse_width, BLOCK).any(axis=(1, 3))
+
+
+def _nearest_cell(mask: np.ndarray, point: tuple[float, float]) -> tuple[int, int]:
+    y, x = point
+    cy = int(round(y / BLOCK))
+    cx = int(round(x / BLOCK))
+    height, width = mask.shape
+    best: tuple[int, int] | None = None
+    best_distance = float("inf")
+    for radius in range(0, 12):
+        y0, y1 = max(0, cy - radius), min(height, cy + radius + 1)
+        x0, x1 = max(0, cx - radius), min(width, cx + radius + 1)
+        for yy in range(y0, y1):
+            for xx in range(x0, x1):
+                if not mask[yy, xx]:
+                    continue
+                distance = (yy - cy) ** 2 + (xx - cx) ** 2
+                if distance < best_distance:
+                    best_distance = distance
+                    best = (yy, xx)
+        if best is not None and radius >= 2:
+            break
+    if best is None:
+        raise ValueError("trace is absent near a required marker")
+    return best
+
+
+def _walk_distances(mask: np.ndarray, start: tuple[int, int]) -> np.ndarray:
+    height, width = mask.shape
+    distances = np.full((height, width), -1, dtype=np.int32)
+    sy, sx = start
+    if not mask[sy, sx]:
+        raise ValueError("green start is not attached to the trace")
+    queue: deque[tuple[int, int]] = deque([(sy, sx)])
+    distances[sy, sx] = 0
+    while queue:
+        y, x = queue.popleft()
+        next_distance = int(distances[y, x]) + 1
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                yy, xx = y + dy, x + dx
+                if (
+                    0 <= yy < height
+                    and 0 <= xx < width
+                    and mask[yy, xx]
+                    and distances[yy, xx] < 0
+                ):
+                    distances[yy, xx] = next_distance
+                    queue.append((yy, xx))
+    return distances
+
+
+def _distance_at(distances: np.ndarray, cell: tuple[int, int], name: str) -> int:
+    y, x = cell
+    distance = int(distances[y, x])
+    if distance < 0:
+        raise ValueError(f"{name} is not connected to the green start")
+    return distance
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 64 or array.shape[1] < 64:
+        raise ValueError("image is too small for a route decision")
+    orange = _centroid(_color_mask(array, ORANGE_PROTOTYPES), "orange")
+    violet = _centroid(_color_mask(array, VIOLET_PROTOTYPES), "violet")
+    start = _centroid(_color_mask(array, START_PROTOTYPES), "green start")
+    trace = _coarse_mask(_trace_mask(array))
+    start_cell = _nearest_cell(trace, start)
+    orange_cell = _nearest_cell(trace, orange)
+    violet_cell = _nearest_cell(trace, violet)
+    distances = _walk_distances(trace, start_cell)
+    orange_distance = _distance_at(distances, orange_cell, "orange checkpoint")
+    violet_distance = _distance_at(distances, violet_cell, "violet checkpoint")
+    if abs(orange_distance - violet_distance) < 3:
+        raise ValueError("checkpoint order is too close to resolve in the raster")
+    return "orange" if orange_distance < violet_distance else "violet"

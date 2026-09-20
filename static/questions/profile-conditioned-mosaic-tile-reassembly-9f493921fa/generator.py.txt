@@ -1,0 +1,226 @@
+"""Renderer and analytic gold for a marked four-tile reconstruction world."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 960
+HEIGHT = 720
+TILE = 160
+MOSAIC = 320
+MARK = 14
+CARRIER_PERIOD = 16
+INK_PER_TILE = 2300
+
+SYMBOLS = ("spiral", "fork", "bracket", "petal")
+MARKER_COLORS = (
+    (220, 52, 58),
+    (38, 126, 224),
+    (38, 178, 92),
+    (201, 70, 188),
+)
+
+# Offsets are the top-left coordinates of the two marks relative to the panel
+# interior. Their signs expose the destination sides, but their palette is not
+# semantically meaningful.
+SLOT_OFFSETS: dict[int, tuple[tuple[int, int], tuple[int, int]]] = {
+    0: ((-24, 18), (18, -24)),
+    1: ((TILE + 6, 18), (TILE - 38, -24)),
+    2: ((-24, TILE - 38), (18, TILE + 6)),
+    3: ((TILE + 6, TILE - 38), (TILE - 38, TILE + 6)),
+}
+
+_ZONES = ((82, 74), (602, 74), (82, 424), (602, 424))
+_TRANSLATIONS = (-12, -6, 0, 6, 12)
+
+
+def _segment_distance(
+    x: np.ndarray,
+    y: np.ndarray,
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> np.ndarray:
+    ax, ay = a
+    bx, by = b
+    vx = bx - ax
+    vy = by - ay
+    denom = vx * vx + vy * vy
+    t = ((x - ax) * vx + (y - ay) * vy) / denom
+    t = np.clip(t, 0.0, 1.0)
+    return np.hypot(x - (ax + t * vx), y - (ay + t * vy))
+
+
+def _polyline_distance(
+    x: np.ndarray, y: np.ndarray, points: list[tuple[float, float]], closed: bool = False
+) -> np.ndarray:
+    segments = list(zip(points, points[1:]))
+    if closed:
+        segments.append((points[-1], points[0]))
+    return np.minimum.reduce([_segment_distance(x, y, a, b) for a, b in segments])
+
+
+def _glyph_score(symbol: str, x: np.ndarray, y: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    """Distance-to-stroke score in centered coordinates; lower is darker."""
+
+    cx = (MOSAIC - 1) / 2.0 + float(dx)
+    cy = (MOSAIC - 1) / 2.0 + float(dy)
+    u = x - cx
+    v = y - cy
+    if symbol == "spiral":
+        points = []
+        for theta in np.linspace(0.15, 4.8 * math.pi, 160):
+            radius = 5.0 + 5.2 * theta
+            points.append((radius * math.cos(theta), radius * math.sin(theta)))
+        score = _polyline_distance(u, v, points)
+    elif symbol == "fork":
+        points = [
+            (-76.0, 64.0),
+            (0.0, 4.0),
+            (0.0, -76.0),
+            (0.0, 4.0),
+            (76.0, 64.0),
+        ]
+        score = _polyline_distance(u, v, points)
+    elif symbol == "bracket":
+        left = [(-48.0, -74.0), (-78.0, -74.0), (-78.0, 74.0), (-48.0, 74.0)]
+        right = [(48.0, -74.0), (78.0, -74.0), (78.0, 74.0), (48.0, 74.0)]
+        score = np.minimum(_polyline_distance(u, v, left), _polyline_distance(u, v, right))
+    elif symbol == "petal":
+        points = []
+        for theta in np.linspace(0.0, 2.0 * math.pi, 220, endpoint=False):
+            radius = 58.0 + 22.0 * math.sin(4.0 * theta)
+            points.append((radius * math.cos(theta), radius * math.sin(theta)))
+        score = _polyline_distance(u, v, points, closed=True)
+    else:
+        raise ValueError(f"unknown symbol {symbol!r}")
+    return score + 0.001 * np.hypot(u, v)
+
+
+def _glyph_mask(symbol: str, dx: int, dy: int) -> np.ndarray:
+    yy, xx = np.indices((MOSAIC, MOSAIC), dtype=np.float64)
+    scores = _glyph_score(symbol, xx, yy, int(dx), int(dy))
+    mask = np.zeros((MOSAIC, MOSAIC), dtype=bool)
+    # Equalize each visible panel's dark-pixel mass so tile order and fragment
+    # ink statistics do not carry the label.
+    for qy in range(2):
+        for qx in range(2):
+            tile_scores = scores[qy * TILE : (qy + 1) * TILE, qx * TILE : (qx + 1) * TILE]
+            order = np.argsort(tile_scores, axis=None, kind="stable")[:INK_PER_TILE]
+            tile_mask = np.zeros(TILE * TILE, dtype=bool)
+            tile_mask[order] = True
+            mask[qy * TILE : (qy + 1) * TILE, qx * TILE : (qx + 1) * TILE] = tile_mask.reshape(
+                (TILE, TILE)
+            )
+    return mask
+
+
+def _tile_pixels(
+    symbol_tile: np.ndarray,
+    *,
+    base_level: int,
+    carrier_amplitude: int,
+    carrier_phase: int,
+    signal_strength: int,
+) -> np.ndarray:
+    yy, xx = np.indices(symbol_tile.shape, dtype=np.float64)
+    carrier = np.sin(
+        2.0 * math.pi * (xx + 1.7 * yy + float(carrier_phase)) / float(CARRIER_PERIOD)
+    )
+    values = float(base_level) + float(carrier_amplitude) * carrier
+    values = values - float(signal_strength) * symbol_tile.astype(np.float64)
+    return np.clip(np.rint(values), 0, 255).astype(np.uint8)
+
+
+def _marker_color(value: list[int] | tuple[int, int, int]) -> tuple[int, int, int]:
+    return tuple(int(item) for item in value)
+
+
+def sample_scene(seed: int) -> dict:
+    rng = np.random.default_rng(int(seed))
+    symbol = SYMBOLS[int(seed) % len(SYMBOLS)]
+    panel_slots = [int(value) for value in rng.permutation(4)]
+    palette = [MARKER_COLORS[int(value)] for value in rng.permutation(4)]
+    panels = []
+    for index, ((zone_x, zone_y), slot, color) in enumerate(zip(_ZONES, panel_slots, palette)):
+        jitter_x = int(rng.integers(-18, 19))
+        jitter_y = int(rng.integers(-16, 17))
+        panels.append(
+            {
+                "slot": int(slot),
+                "x": int(zone_x + jitter_x),
+                "y": int(zone_y + jitter_y),
+                "color": [int(channel) for channel in color],
+                "panel_index": int(index),
+            }
+        )
+    boundary = int(seed) % 17 == 0
+    if boundary:
+        signal_strength = int(rng.integers(57, 64))
+        carrier_amplitude = int(rng.integers(35, 41))
+    else:
+        signal_strength = int(rng.integers(80, 101))
+        carrier_amplitude = int(rng.integers(12, 25))
+    return {
+        "symbol": symbol,
+        "panels": panels,
+        "carrier_phase": int(rng.integers(0, CARRIER_PERIOD)),
+        "carrier_amplitude": carrier_amplitude,
+        "signal_strength": signal_strength,
+        "base_level": int(rng.integers(128, 178)),
+        "symbol_dx": int(rng.choice(_TRANSLATIONS)),
+        "symbol_dy": int(rng.choice(_TRANSLATIONS)),
+    }
+
+
+def render(scene: dict) -> Image.Image:
+    mask = _glyph_mask(str(scene["symbol"]), int(scene["symbol_dx"]), int(scene["symbol_dy"]))
+    background = np.full((HEIGHT, WIDTH, 3), 246, dtype=np.uint8)
+    image = Image.fromarray(background, mode="RGB")
+    draw = ImageDraw.Draw(image)
+    for panel in scene["panels"]:
+        slot = int(panel["slot"])
+        qx = slot % 2
+        qy = slot // 2
+        symbol_tile = mask[qy * TILE : (qy + 1) * TILE, qx * TILE : (qx + 1) * TILE]
+        tile = _tile_pixels(
+            symbol_tile,
+            base_level=int(scene["base_level"]),
+            carrier_amplitude=int(scene["carrier_amplitude"]),
+            carrier_phase=int(scene["carrier_phase"]),
+            signal_strength=int(scene["signal_strength"]),
+        )
+        x = int(panel["x"])
+        y = int(panel["y"])
+        rgb_tile = np.repeat(tile[:, :, None], 3, axis=2)
+        image.paste(Image.fromarray(rgb_tile, mode="RGB"), (x, y))
+        draw.rectangle((x - 3, y - 3, x + TILE + 2, y + TILE + 2), outline=(24, 24, 24), width=3)
+        color = _marker_color(panel["color"])
+        for ox, oy in SLOT_OFFSETS[slot]:
+            draw.rectangle(
+                (x + ox, y + oy, x + ox + MARK - 1, y + oy + MARK - 1),
+                fill=color,
+            )
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    return str(scene["symbol"])
+
+
+def margin(scene: dict) -> float:
+    return float(
+        int(scene["signal_strength"]) - int(scene["carrier_amplitude"]) - 28
+    )
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 0.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = dict(scene)
+    twin["carrier_phase"] = int(scene["carrier_phase"]) + CARRIER_PERIOD
+    return [("carrier_phase_period", twin)]

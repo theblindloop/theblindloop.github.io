@@ -1,0 +1,266 @@
+"""Scene sampler, rasteriser and analytic gold for the loop-depth duel world.
+
+The world draws two clusters of disjoint closed loops (star-shaped Fourier
+curves) plus one red and one blue dot.  Every loop is a closed curve, loops
+never touch, and each dot sits strictly between curves.  The latent decision is
+which dot is enclosed by a larger number of loops - a nesting-depth comparison,
+not a distance, size or count judgement: both clusters always carry the same
+number of loops, so only the radial slot of each dot decides the answer.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "loop_depth_duel-renderer-0.1.0"
+
+CANVAS = [880, 460]
+SUPERSAMPLE = 2
+BACKGROUND = [255, 255, 255]
+INK_COLOR = [17, 17, 17]
+RED = [206, 32, 41]
+BLUE = [26, 72, 196]
+STROKE_WIDTH = 4
+MARKER_RADIUS = 8
+CURVE_SAMPLES = 512
+QUARANTINE_PX = 10.0
+
+CENTERS = [[215.0, 230.0], [665.0, 230.0]]
+OUTER_RADIUS = 170.0
+RING_SPACING = 52.0
+DISTRACTOR_SLOTS = [[440.0, 86.0], [440.0, 374.0]]
+
+
+# --------------------------------------------------------------------------
+# curve geometry
+# --------------------------------------------------------------------------
+def _radius_at(loop, theta: float) -> float:
+    """Loop records are positional: [cx, cy, base_radius, harmonics, samples]."""
+    value = 1.0
+    for order, amplitude, phase in loop[3]:
+        value += amplitude * math.cos(order * theta + phase)
+    return loop[2] * value
+
+
+def _loop_points(loop) -> list[list[float]]:
+    center = (loop[0], loop[1])
+    samples = int(loop[4])
+    points = []
+    for index in range(samples):
+        theta = 2.0 * math.pi * index / samples
+        radius = _radius_at(loop, theta)
+        points.append([center[0] + radius * math.cos(theta), center[1] + radius * math.sin(theta)])
+    return points
+
+
+def _contains(loop, point) -> bool:
+    """Even-odd point-in-polygon test against the closed sampled curve."""
+    polygon = np.asarray(_loop_points(loop), dtype=np.float64)
+    x, y = float(point[0]), float(point[1])
+    xs, ys = polygon[:, 0], polygon[:, 1]
+    xs2, ys2 = np.roll(xs, -1), np.roll(ys, -1)
+    straddles = (ys > y) != (ys2 > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cross = xs + (y - ys) * (xs2 - xs) / np.where(ys2 == ys, np.nan, ys2 - ys)
+    crossings = int(np.count_nonzero(straddles & (np.nan_to_num(cross, nan=-1e18) > x)))
+    return bool(crossings % 2 == 1)
+
+
+def _depth_of(scene, color: str) -> int:
+    """Marker records are positional: [color, rgb, position]."""
+    marker = next(item for item in scene["markers"] if item[0] == color)
+    return sum(1 for loop in scene["loops"] if _contains(loop, marker[2]))
+
+
+# --------------------------------------------------------------------------
+# gold, margin, quarantine
+# --------------------------------------------------------------------------
+def analytic_gold(scene) -> str:
+    """"red" / "blue" if that dot lies inside more loops, else "tie"."""
+    red_depth, blue_depth = _depth_of(scene, "red"), _depth_of(scene, "blue")
+    if red_depth > blue_depth:
+        return "red"
+    if blue_depth > red_depth:
+        return "blue"
+    return "tie"
+
+
+def margin(scene) -> float:
+    """Smallest visible clearance in pixels: dot-to-curve and curve-to-curve."""
+    curves = [np.asarray(_loop_points(loop), dtype=np.float64) for loop in scene["loops"]]
+    smallest = float("inf")
+    for marker in scene["markers"]:
+        point = np.asarray(marker[2], dtype=np.float64)
+        for curve in curves:
+            distance = float(np.min(np.hypot(*(curve - point).T)))
+            smallest = min(smallest, distance - MARKER_RADIUS - STROKE_WIDTH / 2.0)
+    for first in range(len(curves)):
+        for second in range(first + 1, len(curves)):
+            deltas = curves[first][:, None, :] - curves[second][None, :, :]
+            distance = float(np.min(np.hypot(deltas[..., 0], deltas[..., 1])))
+            smallest = min(smallest, distance - STROKE_WIDTH)
+    return round(float(smallest), 6)
+
+
+def is_quarantined(scene) -> bool:
+    return bool(margin(scene) < QUARANTINE_PX)
+
+
+def latent_symmetries(scene) -> list:
+    """Pixel-identical relabelings of the latent scene that must preserve gold.
+
+    Loops are pairwise disjoint and the two dots never overlap anything, so the
+    order in which loops and dots are painted is pure bookkeeping.
+    """
+    transforms = []
+    reordered = dict(scene)
+    reordered["loops"] = list(reversed(scene["loops"]))
+    transforms.append(("loop_draw_order_reversal", reordered))
+    swapped = dict(scene)
+    swapped["markers"] = [list(scene["markers"][1]), list(scene["markers"][0])]
+    transforms.append(("marker_slot_swap", swapped))
+    return transforms
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _sample_loop(rng, center, base_radius):
+    orders = rng.sample([2, 3, 4], 2)
+    budget = 0.040
+    harmonics = []
+    for order in orders:
+        amplitude = rng.uniform(0.30, 0.60) * budget
+        harmonics.append([order, round(amplitude, 5), round(rng.uniform(0.0, 2.0 * math.pi), 5)])
+        budget -= amplitude
+    return [
+        round(center[0], 4),
+        round(center[1], 4),
+        round(base_radius, 4),
+        harmonics,
+        CURVE_SAMPLES,
+    ]
+
+
+def _build_stack(rng, center, ring_count, jitter):
+    """Nested loops around one cluster centre; inner loops may sit off-centre."""
+    scale = rng.uniform(0.93, 1.0)
+    loops: list = []
+    for index in range(ring_count):
+        base = (OUTER_RADIUS - RING_SPACING * index) * scale
+        offset = [0.0, 0.0] if index == 0 else [rng.uniform(-jitter, jitter) for _ in range(2)]
+        loops.append(_sample_loop(rng, [center[0] + offset[0], center[1] + offset[1]], base))
+    return loops
+
+
+def _place_marker(rng, loops, center, ring_count, depth):
+    """Sample one radial slot; the caller rejects placements of the wrong depth."""
+    theta = rng.uniform(0.0, 2.0 * math.pi)
+    if depth == 0:
+        radius = _radius_at(loops[0], theta) + rng.uniform(24.0, 40.0)
+    elif depth == ring_count:
+        radius = rng.uniform(0.15, 0.50) * _radius_at(loops[ring_count - 1], theta)
+    else:
+        inner = _radius_at(loops[depth], theta)
+        outer = _radius_at(loops[depth - 1], theta)
+        radius = inner + (outer - inner) * rng.uniform(0.40, 0.60)
+    return [
+        round(center[0] + radius * math.cos(theta), 4),
+        round(center[1] + radius * math.sin(theta), 4),
+    ]
+
+
+def _clearance(loops, position) -> float:
+    point = np.asarray(position, dtype=np.float64)
+    return min(
+        float(np.min(np.hypot(*(np.asarray(_loop_points(loop), dtype=np.float64) - point).T)))
+        - MARKER_RADIUS
+        - STROKE_WIDTH / 2.0
+        for loop in loops
+    )
+
+
+def _sample_stack(rng, center, ring_count, depth):
+    """Return (loops, marker_pos) for one cluster whose dot has the given depth."""
+    for attempt in range(6):
+        jitter = 7.0 if attempt < 5 else 0.0
+        loops = _build_stack(rng, center, ring_count, jitter)
+        for _ in range(12):
+            position = _place_marker(rng, loops, center, ring_count, depth)
+            enclosing = sum(1 for loop in loops if _contains(loop, position))
+            if enclosing == depth and _clearance(loops, position) >= 5.0:
+                return loops, position
+    return loops, position
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    target = ("red", "blue", "tie")[int(seed) % 3]
+    if target == "tie":
+        red_depth = blue_depth = rng.choice([0, 1, 2, 3])
+    else:
+        deeper = rng.choice([1, 2, 3])
+        shallower = rng.randrange(0, deeper)
+        red_depth, blue_depth = (
+            (deeper, shallower) if target == "red" else (shallower, deeper)
+        )
+    ring_count = max(red_depth, blue_depth)
+    if ring_count < 3:
+        ring_count += rng.choice([0, 1])
+    ring_count = max(1, min(3, ring_count))
+
+    red_side = rng.choice([0, 1])
+    loops: list = []
+    markers: list = []
+    for side in (0, 1):
+        is_red = side == red_side
+        depth = red_depth if is_red else blue_depth
+        stack, position = _sample_stack(rng, CENTERS[side], ring_count, depth)
+        loops.extend(stack)
+        markers.append(["red" if is_red else "blue", list(RED if is_red else BLUE), position])
+    markers.sort(key=lambda marker: marker[0])  # blue slot first, red second
+
+    slots = list(DISTRACTOR_SLOTS)
+    rng.shuffle(slots)
+    for slot in slots[: rng.choice([0, 1, 2])]:
+        loops.append(_sample_loop(rng, slot, rng.uniform(28.0, 42.0)))
+
+    return {
+        "canvas": list(CANVAS),
+        "supersample": SUPERSAMPLE,
+        "background": list(BACKGROUND),
+        "ink_color": list(INK_COLOR),
+        "stroke_width": STROKE_WIDTH,
+        "marker_radius": MARKER_RADIUS,
+        "ring_count_per_cluster": ring_count,
+        "loops": loops,
+        "markers": markers,
+    }
+
+
+# --------------------------------------------------------------------------
+# rasterisation
+# --------------------------------------------------------------------------
+def render(scene) -> Image.Image:
+    scale = int(scene["supersample"])
+    width, height = int(scene["canvas"][0]), int(scene["canvas"][1])
+    image = Image.new("RGB", (width * scale, height * scale), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    stroke = int(scene["stroke_width"]) * scale
+    for loop in scene["loops"]:
+        points = [(x * scale, y * scale) for x, y in _loop_points(loop)]
+        draw.line(points + [points[0]], fill=tuple(scene["ink_color"]), width=stroke, joint="curve")
+        for point in (points[0],):
+            draw.ellipse(
+                [point[0] - stroke / 2, point[1] - stroke / 2, point[0] + stroke / 2, point[1] + stroke / 2],
+                fill=tuple(scene["ink_color"]),
+            )
+    radius = float(scene["marker_radius"]) * scale
+    for marker in scene["markers"]:
+        x, y = float(marker[2][0]) * scale, float(marker[2][1]) * scale
+        draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=tuple(marker[1]))
+    return image.resize((width, height), Image.LANCZOS)

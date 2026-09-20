@@ -1,0 +1,155 @@
+"""Independent image-only inverse arm for Shared Loop Pair.
+
+This module deliberately imports no candidate module.  It segments colored
+station interiors, estimates their centroids, detects navy links by dark-pixel
+corridors, validates the recovered seven-vertex cactus, and independently asks
+whether two internally vertex-disjoint routes join the marked pair.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """Raised when the raster does not expose one unambiguous valid graph."""
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    remaining = {tuple(map(int, point)) for point in np.argwhere(mask)}
+    output: list[np.ndarray] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        component = [start]
+        while stack:
+            y, x = stack.pop()
+            for nxt in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= nxt[0] < height and 0 <= nxt[1] < width and nxt in remaining:
+                    remaining.remove(nxt)
+                    stack.append(nxt)
+                    component.append(nxt)
+        if 28 <= len(component) <= 220:
+            output.append(np.asarray(component, dtype=np.int32))
+    return output
+
+
+def _corridor_dark_fraction(dark: np.ndarray, first: np.ndarray, second: np.ndarray) -> float:
+    vector = second - first
+    length = float(np.linalg.norm(vector))
+    if length < 18.0:
+        return 0.0
+    unit = vector / length
+    normal = np.asarray([-unit[1], unit[0]])
+    # Exclude the outlined station disks at both ends.  Five parallel samples
+    # cover the opaque core of the five-pixel link without relying on one row.
+    along = np.linspace(10.0, length - 10.0, max(7, int(length - 19.0)))
+    offsets = np.linspace(-1.5, 1.5, 5)
+    samples = first[None, None, :] + along[:, None, None] * unit + offsets[None, :, None] * normal
+    xs = np.rint(samples[..., 0]).astype(int)
+    ys = np.rint(samples[..., 1]).astype(int)
+    valid = (ys >= 0) & (ys < dark.shape[0]) & (xs >= 0) & (xs < dark.shape[1])
+    if not bool(valid.all()):
+        return 0.0
+    # A link must be continuously present.  Averaging the whole corridor would
+    # incorrectly join two shallow diagonals whose separated halves happen to
+    # align; the weakest cross-section cleanly distinguishes that case.
+    cross_sections = np.mean(dark[ys, xs], axis=1)
+    return float(np.min(cross_sections))
+
+
+def _paths(adjacency: dict[int, set[int]], start: int, goal: int) -> list[tuple[int, ...]]:
+    found: list[tuple[int, ...]] = []
+
+    def walk(node: int, path: tuple[int, ...]) -> None:
+        if node == goal:
+            found.append(path)
+            return
+        for nxt in sorted(adjacency[node]):
+            if nxt not in path:
+                walk(nxt, path + (nxt,))
+
+    walk(start, (start,))
+    return found
+
+
+def _pair_on_cycle(adjacency: dict[int, set[int]], first: int, second: int) -> bool:
+    routes = _paths(adjacency, first, second)
+    for index, route_a in enumerate(routes):
+        inner_a = set(route_a[1:-1])
+        edges_a = {frozenset(edge) for edge in zip(route_a, route_a[1:])}
+        for route_b in routes[index + 1 :]:
+            inner_b = set(route_b[1:-1])
+            edges_b = {frozenset(edge) for edge in zip(route_b, route_b[1:])}
+            if inner_a.isdisjoint(inner_b) and edges_a.isdisjoint(edges_b):
+                return True
+    return False
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise OracleAbstention("expected an RGB raster")
+    red, green, blue = array[..., 0], array[..., 1], array[..., 2]
+
+    green_fill = (green > 115) & (green - red > 55) & (green - blue > 18)
+    orange_fill = (red > 185) & (red - green > 55) & (green - blue > 28)
+    neutral_fill = (
+        (red > 135)
+        & (green > 170)
+        & (blue > 175)
+        & ((green - red > 22) | (blue - red > 22))
+    )
+    station_fill = green_fill | orange_fill | neutral_fill
+    components = _components(station_fill)
+    if len(components) != 7:
+        raise OracleAbstention(f"expected 7 station interiors, recovered {len(components)}")
+
+    records = []
+    for component in components:
+        ys, xs = component[:, 0], component[:, 1]
+        center = np.asarray([float(xs.mean()), float(ys.mean())])
+        g_fraction = float(np.mean(green_fill[ys, xs]))
+        o_fraction = float(np.mean(orange_fill[ys, xs]))
+        kind = "green" if g_fraction > 0.55 else "orange" if o_fraction > 0.55 else "neutral"
+        records.append((center, kind))
+    records.sort(key=lambda item: (item[0][0], item[0][1]))
+    green_ids = [i for i, (_, kind) in enumerate(records) if kind == "green"]
+    orange_ids = [i for i, (_, kind) in enumerate(records) if kind == "orange"]
+    if len(green_ids) != 1 or len(orange_ids) != 1:
+        raise OracleAbstention("colored station identities are not unique")
+
+    dark = (red < 105) & (green < 105) & (blue < 115) & ((np.maximum.reduce((red, green, blue)) - np.minimum.reduce((red, green, blue))) < 70)
+    adjacency = {i: set() for i in range(7)}
+    edge_count = 0
+    for i in range(7):
+        for j in range(i + 1, 7):
+            score = _corridor_dark_fraction(dark, records[i][0], records[j][0])
+            if score >= 0.72:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+                edge_count += 1
+
+    # A clean scene is exactly a pair of four-edge cycles sharing one station.
+    # These checks are also principled abstention under destructive evidence
+    # erasure: the inverse arm will not hallucinate a decision from fragments.
+    degrees = sorted(len(values) for values in adjacency.values())
+    if edge_count != 8 or degrees != [2, 2, 2, 2, 2, 2, 4]:
+        raise OracleAbstention(f"invalid recovered graph: edges={edge_count}, degrees={degrees}")
+    seen = set()
+    stack = [0]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(adjacency[node] - seen)
+    if len(seen) != 7:
+        raise OracleAbstention("recovered graph is disconnected")
+
+    answer = _pair_on_cycle(adjacency, green_ids[0], orange_ids[0])
+    return "yes" if answer else "no"

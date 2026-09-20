@@ -1,0 +1,415 @@
+"""Renderer for the common-loop-pair world.
+
+A connected rectilinear pipe network is drawn on a jittered lattice. It carries
+two vertex-disjoint closed loops joined by a bridging chain of pipe, plus a few
+dead-end stubs. Three hubs are painted red, green and blue: two of them sit on
+one loop and the third sits on the other loop, so all three lie on some loop and
+all three have pipe degree two, but only one pair shares a loop.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "common_loop_pair-renderer-0.1.0"
+
+CANVAS = (720, 560)
+SUPERSAMPLE = 3
+BACKGROUND = (255, 255, 255)
+PIPE_COLOR = (150, 150, 150)
+HUB_COLOR = (30, 30, 30)
+STROKE_WIDTH = 9
+HUB_RADIUS = 17
+MARKER_RADIUS = 17
+
+MARKER_COLORS = {
+    "red": (215, 45, 45),
+    "green": (35, 150, 60),
+    "blue": (45, 80, 215),
+}
+COLOR_ORDER = ("red", "green", "blue")
+
+COLS = 7
+ROWS = 5
+MARGIN = 60
+PITCH_X = (CANVAS[0] - 2 * MARGIN) // (COLS - 1)
+PITCH_Y = (CANVAS[1] - 2 * MARGIN) // (ROWS - 1)
+
+QUARANTINE_MARGIN = 24.0
+HARD_REJECT_MARGIN = 14.0
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+def _seg_point_dist(ax: float, ay: float, bx: float, by: float, px: float, py: float) -> float:
+    vx, vy = bx - ax, by - ay
+    wx, wy = px - ax, py - ay
+    den = vx * vx + vy * vy
+    t = 0.0 if den == 0.0 else max(0.0, min(1.0, (wx * vx + wy * vy) / den))
+    dx, dy = ax + t * vx - px, ay + t * vy - py
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _seg_seg_dist(p1, p2, p3, p4) -> float:
+    return min(
+        _seg_point_dist(p1[0], p1[1], p2[0], p2[1], p3[0], p3[1]),
+        _seg_point_dist(p1[0], p1[1], p2[0], p2[1], p4[0], p4[1]),
+        _seg_point_dist(p3[0], p3[1], p4[0], p4[1], p1[0], p1[1]),
+        _seg_point_dist(p3[0], p3[1], p4[0], p4[1], p2[0], p2[1]),
+    )
+
+
+# --------------------------------------------------------------------------
+# scene sampling
+# --------------------------------------------------------------------------
+def _rect_cycle(c0: int, c1: int, r0: int, r1: int) -> list[tuple[int, int]]:
+    """Lattice cells on the perimeter of a rectangle, in cyclic order."""
+    ring: list[tuple[int, int]] = []
+    for c in range(c0, c1 + 1):
+        ring.append((c, r0))
+    for r in range(r0 + 1, r1 + 1):
+        ring.append((c1, r))
+    for c in range(c1 - 1, c0 - 1, -1):
+        ring.append((c, r1))
+    for r in range(r1 - 1, r0, -1):
+        ring.append((c0, r))
+    return ring
+
+
+def _try_layout(rng: random.Random) -> dict[str, Any] | None:
+    """Sample one candidate layout in lattice coordinates."""
+    transpose = rng.random() < 0.5
+    ncols, nrows = (COLS, ROWS) if not transpose else (ROWS, COLS)
+
+    c0a = rng.randint(0, 1)
+    c1a = c0a + rng.randint(1, 2)
+    r0a = rng.randint(0, max(0, nrows - 3))
+    r1a = min(nrows - 1, r0a + rng.randint(1, 2))
+    if r1a <= r0a:
+        return None
+
+    gap = rng.randint(1, 2)
+    c0b = c1a + gap
+    c1b = c0b + rng.randint(1, 2)
+    if c1b > ncols - 1:
+        return None
+
+    bridge_row = rng.randint(r0a, r1a)
+    span = rng.randint(1, 2)
+    r0b = max(0, min(bridge_row - rng.randint(0, span), nrows - 2))
+    r1b = min(nrows - 1, max(bridge_row, r0b + span))
+    if r1b <= r0b or not (r0b <= bridge_row <= r1b):
+        return None
+
+    ring_a = _rect_cycle(c0a, c1a, r0a, r1a)
+    ring_b = _rect_cycle(c0b, c1b, r0b, r1b)
+    if len(set(ring_a) & set(ring_b)) > 0:
+        return None
+
+    bridge = [(c, bridge_row) for c in range(c1a, c0b + 1)]
+    if (c1a, bridge_row) not in ring_a or (c0b, bridge_row) not in ring_b:
+        return None
+    if any(cell in ring_a or cell in ring_b for cell in bridge[1:-1]):
+        return None
+
+    edges: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for ring in (ring_a, ring_b):
+        for i in range(len(ring)):
+            edges.append((ring[i], ring[(i + 1) % len(ring)]))
+    for i in range(len(bridge) - 1):
+        edges.append((bridge[i], bridge[i + 1]))
+
+    used = set(ring_a) | set(ring_b) | set(bridge)
+    attach = {(c1a, bridge_row), (c0b, bridge_row)}
+
+    # dead-end stubs on free lattice sites
+    stub_cells: list[tuple[int, int]] = []
+    for _ in range(rng.randint(1, 2)):
+        base = rng.choice(sorted(used))
+        rng.shuffle(stub_cells)
+        options = []
+        for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            cell = (base[0] + dc, base[1] + dr)
+            if 0 <= cell[0] <= ncols - 1 and 0 <= cell[1] <= nrows - 1 and cell not in used:
+                options.append(cell)
+        if not options:
+            continue
+        tip = rng.choice(options)
+        edges.append((base, tip))
+        used.add(tip)
+        stub_cells.append(tip)
+        attach.add(base)
+
+    # markers: two degree-two hubs on one loop, one degree-two hub on the other
+    pair_ring, solo_ring = (ring_a, ring_b) if rng.random() < 0.5 else (ring_b, ring_a)
+    pair_free = [cell for cell in pair_ring if cell not in attach]
+    solo_free = [cell for cell in solo_ring if cell not in attach]
+    if len(pair_free) < 2 or len(solo_free) < 1:
+        return None
+    pair_cells = rng.sample(pair_free, 2)
+    solo_cell = rng.choice(solo_free)
+
+    odd_color = rng.choice(COLOR_ORDER)
+    pair_colors = [c for c in COLOR_ORDER if c != odd_color]
+    rng.shuffle(pair_colors)
+    markers = {
+        pair_colors[0]: pair_cells[0],
+        pair_colors[1]: pair_cells[1],
+        odd_color: solo_cell,
+    }
+
+    if transpose:
+        def flip(cell):
+            return (cell[1], cell[0])
+
+        edges = [(flip(u), flip(v)) for u, v in edges]
+        ring_a = [flip(cell) for cell in ring_a]
+        ring_b = [flip(cell) for cell in ring_b]
+        markers = {k: flip(v) for k, v in markers.items()}
+
+    return {"edges": edges, "ring_a": ring_a, "ring_b": ring_b, "markers": markers}
+
+
+def _clearances(scene: dict[str, Any]) -> float:
+    """Smallest visible white clearance between pieces of ink that do not touch."""
+    nodes = [tuple(p) for p in scene["nodes"]]
+    edges = [tuple(e) for e in scene["edges"]]
+    half = scene["stroke_width"] / 2.0
+    hub_r = float(scene["hub_radius"])
+    worst = float("inf")
+
+    for i in range(len(edges)):
+        ui, vi = edges[i]
+        for j in range(i + 1, len(edges)):
+            uj, vj = edges[j]
+            if {ui, vi} & {uj, vj}:
+                continue
+            gap = _seg_seg_dist(nodes[ui], nodes[vi], nodes[uj], nodes[vj]) - 2 * half
+            worst = min(worst, gap)
+
+    for idx, (u, v) in enumerate(edges):
+        for n in range(len(nodes)):
+            if n in (u, v):
+                continue
+            d = _seg_point_dist(*nodes[u], *nodes[v], *nodes[n])
+            worst = min(worst, d - half - hub_r)
+
+    for a in range(len(nodes)):
+        for b in range(a + 1, len(nodes)):
+            if (a, b) in {(u, v) for u, v in edges} or (b, a) in {(u, v) for u, v in edges}:
+                continue
+            dx = nodes[a][0] - nodes[b][0]
+            dy = nodes[a][1] - nodes[b][1]
+            worst = min(worst, (dx * dx + dy * dy) ** 0.5 - 2 * hub_r)
+
+    return float(worst)
+
+
+def _min_exposed_pipe(scene: dict[str, Any]) -> float:
+    """Shortest stretch of pipe left visible between the two hubs it joins."""
+    nodes = [tuple(p) for p in scene["nodes"]]
+    hub_r = float(scene["hub_radius"])
+    worst = float("inf")
+    for u, v in scene["edges"]:
+        dx = nodes[u][0] - nodes[v][0]
+        dy = nodes[u][1] - nodes[v][1]
+        worst = min(worst, (dx * dx + dy * dy) ** 0.5 - 2 * hub_r)
+    return float(worst)
+
+
+MIN_EXPOSED_PIPE = 34.0
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    """Deterministically sample one latent scene."""
+    for attempt in range(400):
+        rng = random.Random((seed * 1_000_003 + attempt) & 0xFFFFFFFF)
+        layout = _try_layout(rng)
+        if layout is None:
+            continue
+
+        cells = sorted({cell for e in layout["edges"] for cell in e})
+        index = {cell: i for i, cell in enumerate(cells)}
+        jitter = rng.choice([6, 12, 20, 28, 36, 44])
+        nodes = []
+        for c, r in cells:
+            jx = rng.uniform(-jitter, jitter)
+            jy = rng.uniform(-jitter, jitter)
+            nodes.append([round(MARGIN + c * PITCH_X + jx, 3), round(MARGIN + r * PITCH_Y + jy, 3)])
+
+        scene: dict[str, Any] = {
+            "canvas": list(CANVAS),
+            "supersample": SUPERSAMPLE,
+            "background": list(BACKGROUND),
+            "pipe_color": list(PIPE_COLOR),
+            "hub_color": list(HUB_COLOR),
+            "stroke_width": STROKE_WIDTH,
+            "hub_radius": HUB_RADIUS,
+            "marker_radius": MARKER_RADIUS,
+            "nodes": nodes,
+            "edges": sorted(tuple(sorted((index[u], index[v]))) for u, v in layout["edges"]),
+            "loop_a": [index[cell] for cell in layout["ring_a"]],
+            "loop_b": [index[cell] for cell in layout["ring_b"]],
+            "markers": {k: index[v] for k, v in layout["markers"].items()},
+        }
+        scene["edges"] = [list(e) for e in scene["edges"]]
+
+        if _clearances(scene) < HARD_REJECT_MARGIN:
+            continue
+        if _min_exposed_pipe(scene) < MIN_EXPOSED_PIPE:
+            continue
+        if _decision_or_none(scene) is None:
+            continue
+        return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+# --------------------------------------------------------------------------
+# analytic gold
+# --------------------------------------------------------------------------
+def _blocks(nodes: int, edges: list[list[int]]) -> list[int]:
+    """Two-edge-connected block id of every node (components after bridge removal)."""
+    adj: dict[int, list[tuple[int, int]]] = {i: [] for i in range(nodes)}
+    for idx, (u, v) in enumerate(edges):
+        adj[u].append((v, idx))
+        adj[v].append((u, idx))
+
+    disc = [-1] * nodes
+    low = [0] * nodes
+    bridges: set[int] = set()
+    timer = 0
+    for root in range(nodes):
+        if disc[root] != -1:
+            continue
+        stack = [(root, -1, iter(adj[root]))]
+        disc[root] = low[root] = timer
+        timer += 1
+        while stack:
+            node, parent_edge, it = stack[-1]
+            advanced = False
+            for nxt, eidx in it:
+                if eidx == parent_edge:
+                    continue
+                if disc[nxt] == -1:
+                    disc[nxt] = low[nxt] = timer
+                    timer += 1
+                    stack.append((nxt, eidx, iter(adj[nxt])))
+                    advanced = True
+                    break
+                low[node] = min(low[node], disc[nxt])
+            if advanced:
+                continue
+            stack.pop()
+            if stack:
+                pnode = stack[-1][0]
+                low[pnode] = min(low[pnode], low[node])
+                if low[node] > disc[pnode]:
+                    bridges.add(parent_edge)
+
+    block = [-1] * nodes
+    current = 0
+    for start in range(nodes):
+        if block[start] != -1:
+            continue
+        block[start] = current
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            for nxt, eidx in adj[node]:
+                if eidx in bridges or block[nxt] != -1:
+                    continue
+                block[nxt] = current
+                queue.append(nxt)
+        current += 1
+    return block
+
+
+def _decision_or_none(scene: dict[str, Any]) -> str | None:
+    block = _blocks(len(scene["nodes"]), [list(e) for e in scene["edges"]])
+    markers = scene["markers"]
+    hits = []
+    for i in range(len(COLOR_ORDER)):
+        for j in range(i + 1, len(COLOR_ORDER)):
+            a, b = COLOR_ORDER[i], COLOR_ORDER[j]
+            if block[markers[a]] == block[markers[b]]:
+                hits.append(f"{a}_{b}")
+    return hits[0] if len(hits) == 1 else None
+
+
+def analytic_gold(scene: dict[str, Any]) -> str:
+    decision = _decision_or_none(scene)
+    if decision is None:
+        raise ValueError("scene does not carry exactly one common-loop pair")
+    return decision
+
+
+def margin(scene: dict[str, Any]) -> float:
+    """Smallest white clearance in px; the decision flips when it closes."""
+    return round(_clearances(scene), 6)
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Pixel-identical, gold-preserving relabellings of the latent scene."""
+    out: list[tuple[str, dict[str, Any]]] = []
+
+    reversed_edges = dict(scene)
+    reversed_edges["edges"] = [list(reversed(e)) for e in reversed(scene["edges"])]
+    out.append(("edge_order_and_orientation", reversed_edges))
+
+    n = len(scene["nodes"])
+    perm = [(i * 7 + 3) % n for i in range(n)]
+    while len(set(perm)) != n:  # fall back to a rotation when 7 is not coprime with n
+        perm = [(i + 1) % n for i in range(n)]
+    relabelled = dict(scene)
+    new_nodes = [None] * n
+    for old, new in enumerate(perm):
+        new_nodes[new] = list(scene["nodes"][old])
+    relabelled["nodes"] = new_nodes
+    relabelled["edges"] = [[perm[u], perm[v]] for u, v in scene["edges"]]
+    relabelled["loop_a"] = [perm[i] for i in scene["loop_a"]]
+    relabelled["loop_b"] = [perm[i] for i in scene["loop_b"]]
+    relabelled["markers"] = {k: perm[v] for k, v in scene["markers"].items()}
+    out.append(("node_relabelling", relabelled))
+
+    swapped = dict(scene)
+    swapped["loop_a"] = list(scene["loop_b"])
+    swapped["loop_b"] = list(scene["loop_a"])
+    out.append(("loop_naming_swap", swapped))
+    return out
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+def render(scene: dict[str, Any]) -> Image.Image:
+    ss = int(scene["supersample"])
+    w, h = (int(scene["canvas"][0]) * ss, int(scene["canvas"][1]) * ss)
+    img = Image.new("RGB", (w, h), tuple(scene["background"]))
+    draw = ImageDraw.Draw(img)
+
+    nodes = [(float(p[0]) * ss, float(p[1]) * ss) for p in scene["nodes"]]
+    width = int(scene["stroke_width"] * ss)
+    for u, v in scene["edges"]:
+        draw.line([nodes[u], nodes[v]], fill=tuple(scene["pipe_color"]), width=width)
+
+    hub_r = scene["hub_radius"] * ss
+    marker_r = scene["marker_radius"] * ss
+    marked = {v: k for k, v in scene["markers"].items()}
+    for idx, (x, y) in enumerate(nodes):
+        if idx in marked:
+            colour = MARKER_COLORS[marked[idx]]
+            radius = marker_r
+        else:
+            colour = tuple(scene["hub_color"])
+            radius = hub_r
+        draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=colour)
+
+    return img.resize(tuple(scene["canvas"]), Image.BOX)

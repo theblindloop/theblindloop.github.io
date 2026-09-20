@@ -1,0 +1,190 @@
+"""Independent pixel-only inverse arm for two disconnected routes."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+
+PALETTE = {
+    "navy": np.array([31, 55, 82], dtype=np.int16),
+    "green": np.array([34, 160, 92], dtype=np.int16),
+    "red": np.array([218, 67, 64], dtype=np.int16),
+    "blue": np.array([45, 119, 210], dtype=np.int16),
+    "orange": np.array([238, 145, 42], dtype=np.int16),
+}
+
+
+def _mask(array: np.ndarray, name: str, tolerance: int = 58) -> np.ndarray:
+    delta = array.astype(np.int32) - PALETTE[name].astype(np.int32)
+    return np.sum(delta * delta, axis=2) <= tolerance * tolerance
+
+
+def _components(mask: np.ndarray, minimum: int):
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        seen[y, x] = True
+        queue = [(y, x)]
+        points = []
+        while queue:
+            cy, cx = queue.pop()
+            points.append((cy, cx))
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            components.append(np.asarray(points, dtype=np.int32))
+    return components
+
+
+def _centers(array: np.ndarray, name: str):
+    points = np.argwhere(_mask(array, name))
+    if len(points) < 120:
+        raise ValueError(f"insufficient {name} marker ink")
+    # There is one marker of each color on each widely separated route island.
+    # Split only at the largest observed horizontal gap, never at fixed columns.
+    order = np.argsort(points[:, 1])
+    sorted_points = points[order]
+    gaps = np.diff(sorted_points[:, 1])
+    split = int(np.argmax(gaps)) + 1
+    if not len(gaps) or int(gaps[split - 1]) < 60 or split < 45 or len(points) - split < 45:
+        raise ValueError(f"expected two horizontally separated {name} markers")
+    return [sorted_points[:split].mean(axis=0), sorted_points[split:].mean(axis=0)]
+
+
+def _nearest_component(point, components):
+    scores = []
+    for component in components:
+        stride = max(1, len(component) // 1400)
+        delta = component[::stride].astype(np.float64) - point
+        scores.append(float(np.min(np.sum(delta * delta, axis=1))))
+    order = np.argsort(scores)
+    if len(scores) < 2 or scores[int(order[1])] - scores[int(order[0])] < 400.0:
+        raise ValueError("marker ownership is ambiguous")
+    return int(order[0])
+
+
+def _graph_distances(mask: np.ndarray, source):
+    height, width = mask.shape
+    points = np.argwhere(mask)
+    if not len(points):
+        raise ValueError("empty route")
+    nearest = points[int(np.argmin(np.sum((points.astype(np.float64) - source) ** 2, axis=1)))]
+    distances = np.full(mask.shape, -1, dtype=np.int32)
+    sy, sx = int(nearest[0]), int(nearest[1])
+    distances[sy, sx] = 0
+    queue = deque([(sy, sx)])
+    while queue:
+        y, x = queue.popleft()
+        value = distances[y, x] + 1
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and distances[ny, nx] < 0:
+                distances[ny, nx] = value
+                queue.append((ny, nx))
+    if int(np.count_nonzero(distances >= 0)) < int(np.count_nonzero(mask) * 0.94):
+        raise ValueError("route centerline is broken")
+    return distances
+
+
+def _paint_bridge(mask: np.ndarray, start, end, radius: int = 5):
+    """Join two visible fragment tips with a narrow straight interpolation."""
+    y0, x0 = (int(start[0]), int(start[1]))
+    y1, x1 = (int(end[0]), int(end[1]))
+    steps = max(abs(y1 - y0), abs(x1 - x0), 1)
+    height, width = mask.shape
+    for step in range(steps + 1):
+        ratio = step / steps
+        y = int(round(y0 + ratio * (y1 - y0)))
+        x = int(round(x0 + ratio * (x1 - x0)))
+        mask[max(0, y - radius):min(height, y + radius + 1),
+             max(0, x - radius):min(width, x + radius + 1)] = True
+
+
+def _closest_visible_pair(left: np.ndarray, right: np.ndarray):
+    """Approximate then locally refine the nearest pixels of two fragments."""
+    left_step = max(1, len(left) // 260)
+    right_step = max(1, len(right) // 260)
+    a, b = left[::left_step], right[::right_step]
+    delta = a[:, None, :].astype(np.int32) - b[None, :, :].astype(np.int32)
+    distances = np.sum(delta * delta, axis=2)
+    ia, ib = np.unravel_index(int(np.argmin(distances)), distances.shape)
+    pa, pb = a[ia], b[ib]
+    near_a = left[np.sum((left - pa) ** 2, axis=1) <= 35 * 35]
+    near_b = right[np.sum((right - pb) ** 2, axis=1) <= 35 * 35]
+    if len(near_a) and len(near_b):
+        # Bound the refinement matrix while retaining a dense local sample.
+        near_a = near_a[::max(1, len(near_a) // 500)]
+        near_b = near_b[::max(1, len(near_b) // 500)]
+        delta = near_a[:, None, :].astype(np.int32) - near_b[None, :, :].astype(np.int32)
+        distances = np.sum(delta * delta, axis=2)
+        ia, ib = np.unravel_index(int(np.argmin(distances)), distances.shape)
+        pa, pb = near_a[ia], near_b[ib]
+    return pa, pb, float(np.hypot(*(pa.astype(float) - pb.astype(float))))
+
+
+def _heal_single_ablation(mask: np.ndarray) -> np.ndarray:
+    """Reconnect route fragments made by one coarse rectangular erasure.
+
+    Clean images take the ordinary connected-pixel path. This recovery branch is
+    intentionally limited to a few large fragments and a 170-pixel maximum gap.
+    """
+    healed = mask.copy()
+    for _ in range(4):
+        fragments = _components(healed, 35)
+        if len(fragments) == 1:
+            return healed
+        if not 2 <= len(fragments) <= 5:
+            raise ValueError("route has too many disconnected fragments")
+        best = None
+        for i in range(len(fragments)):
+            for j in range(i + 1, len(fragments)):
+                pa, pb, gap = _closest_visible_pair(fragments[i], fragments[j])
+                if best is None or gap < best[0]:
+                    best = (gap, pa, pb)
+        if best is None or best[0] > 170.0:
+            raise ValueError("missing route span is too large to interpolate")
+        _paint_bridge(healed, best[1], best[2])
+    raise ValueError("route fragments could not be reconnected")
+
+
+def _distance_near(distances, point):
+    y, x = int(round(float(point[0]))), int(round(float(point[1])))
+    y0, y1 = max(0, y - 11), min(distances.shape[0], y + 12)
+    x0, x1 = max(0, x - 11), min(distances.shape[1], x + 12)
+    values = distances[y0:y1, x0:x1]
+    values = values[values >= 0]
+    if not len(values):
+        raise ValueError("checkpoint does not touch its route")
+    return int(np.median(values))
+
+
+def decision_from_image(image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    navy_mask = _mask(array, "navy")
+    greens = _centers(array, "green")
+    blues = _centers(array, "blue")
+    oranges = _centers(array, "orange")
+    left_x = max(float(greens[0][1]), float(blues[0][1]), float(oranges[0][1]))
+    right_x = min(float(greens[1][1]), float(blues[1][1]), float(oranges[1][1]))
+    if right_x - left_x < 35.0:
+        raise ValueError("route-island ownership is ambiguous")
+    divider = int(round((left_x + right_x) / 2.0))
+    route_masks = [navy_mask.copy(), navy_mask.copy()]
+    route_masks[0][:, divider:] = False
+    route_masks[1][:, :divider] = False
+    orders = []
+    for index, component_mask in enumerate(route_masks):
+        component_mask = _heal_single_ablation(component_mask)
+        distances = _graph_distances(component_mask, greens[index])
+        blue_distance = _distance_near(distances, blues[index])
+        orange_distance = _distance_near(distances, oranges[index])
+        if abs(blue_distance - orange_distance) < 70:
+            raise ValueError("checkpoint order has insufficient pixel margin")
+        orders.append(blue_distance < orange_distance)
+    return "same" if orders[0] == orders[1] else "reversed"

@@ -1,0 +1,159 @@
+"""Independent pixel-only inverse for the scanline phase reveal.
+
+The inverse finds the connected rectangular carpet against its border-estimated
+background, infers the frame and grid scale, locates one cyan phase fiducial per
+band, performs each cyclic raster shift, and classifies by an independently
+implemented equal-ink template bank. It receives no latent scene state.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ROWS = 15
+DATA_COLS = 15
+BAND_COLS = 16
+NAMES = ("cross", "oval", "chevron", "wave")
+FRAME_RGB = np.asarray((18, 24, 38), dtype=np.int16)
+
+
+def _four_closest(centers: tuple[float, ...]) -> list[int]:
+    ranked = sorted(
+        range(DATA_COLS),
+        key=lambda column: (
+            min(abs(column - center) for center in centers),
+            abs(column - 7),
+            column,
+        ),
+    )
+    return sorted(ranked[:4])
+
+
+def _reference(label: str) -> np.ndarray:
+    result = np.zeros((ROWS, DATA_COLS), dtype=np.uint8)
+    for band in range(ROWS):
+        if label == "cross":
+            anchors = (float(band), float(14 - band))
+        elif label == "oval":
+            vertical = (band - 7) / 7.0
+            horizontal = 5.5 * math.sqrt(max(0.0, 1.0 - vertical * vertical))
+            anchors = (7.0 - horizontal, 7.0 + horizontal)
+        elif label == "chevron":
+            horizontal = 6.0 * (1.0 - band / 14.0)
+            anchors = (7.0 - horizontal, 7.0 + horizontal)
+        elif label == "wave":
+            anchors = (
+                7.0 + 4.0 * math.sin(band / 14.0 * 2.0 * math.pi + math.pi / 2.0),
+            )
+        else:
+            raise ValueError(label)
+        result[band, _four_closest(anchors)] = 1
+    return result
+
+
+REFERENCES = {name: _reference(name) for name in NAMES}
+
+
+def _background(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (array[:4].reshape(-1, 3), array[-4:].reshape(-1, 3),
+         array[:, :4].reshape(-1, 3), array[:, -4:].reshape(-1, 3)),
+        axis=0,
+    )
+    return np.median(border, axis=0)
+
+
+def _infer_frame_thickness(crop: np.ndarray) -> int:
+    frame_distance = np.linalg.norm(crop.astype(np.int16) - FRAME_RGB, axis=2)
+    row_fraction = np.mean(frame_distance < 8.0, axis=1)
+    col_fraction = np.mean(frame_distance < 8.0, axis=0)
+    top = next((index for index, value in enumerate(row_fraction[:16]) if value < 0.95), None)
+    left = next((index for index, value in enumerate(col_fraction[:16]) if value < 0.95), None)
+    if top is None or left is None or top != left or not 3 <= top <= 10:
+        raise ValueError("the visible frame is missing or ambiguous")
+    return int(top)
+
+
+def _is_marker(rgb: np.ndarray) -> bool:
+    red, green, blue = [int(value) for value in rgb]
+    return red < 45 and green > 185 and blue > 190 and abs(green - blue) < 55
+
+
+def _extract(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 64 or array.shape[1] < 64:
+        raise ValueError("raster is too small")
+    background = _background(array)
+    distance = np.linalg.norm(array.astype(np.int16) - background.astype(np.int16), axis=2)
+    foreground = distance > 24.0
+    points = np.argwhere(foreground)
+    if not len(points):
+        raise ValueError("no carpet is visible")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    crop = array[y0 : y1 + 1, x0 : x1 + 1]
+    frame = _infer_frame_thickness(crop)
+    inner = crop[frame:-frame, frame:-frame]
+    if inner.shape[1] % BAND_COLS or inner.shape[0] % ROWS:
+        raise ValueError("the visible grid dimensions are not integral")
+    cell_x = inner.shape[1] // BAND_COLS
+    cell_y = inner.shape[0] // ROWS
+    if cell_x != cell_y or not 18 <= cell_x <= 30:
+        raise ValueError("the inferred grid scale is invalid")
+
+    # A declared band is a continuous colored strip. White erasure anywhere in
+    # the field invalidates the transform instead of being silently imputed.
+    inner_distance = np.linalg.norm(
+        inner.astype(np.int16) - background.astype(np.int16), axis=2
+    )
+    if np.any(inner_distance < 24.0):
+        raise ValueError("the connected carpet has an erased region")
+    frame_mask = np.ones(crop.shape[:2], dtype=bool)
+    frame_mask[frame:-frame, frame:-frame] = False
+    frame_distance = np.linalg.norm(crop.astype(np.int16) - FRAME_RGB, axis=2)
+    if np.any(frame_distance[frame_mask] >= 8.0):
+        raise ValueError("the connected carpet frame is damaged")
+
+    samples = np.zeros((ROWS, BAND_COLS, 3), dtype=np.uint8)
+    for row in range(ROWS):
+        for col in range(BAND_COLS):
+            cy = row * cell_y + cell_y // 2
+            cx = col * cell_x + cell_x // 2
+            samples[row, col] = inner[cy, cx]
+
+    rectified = np.zeros((ROWS, DATA_COLS), dtype=np.uint8)
+    for row in range(ROWS):
+        markers = [col for col in range(BAND_COLS) if _is_marker(samples[row, col])]
+        if len(markers) != 1:
+            raise ValueError("each band must expose exactly one cyan phase fiducial")
+        phase = markers[0]
+        aligned = np.roll(samples[row], -phase, axis=0)
+        if not _is_marker(aligned[0]):
+            raise ValueError("phase alignment failed")
+        data = aligned[1:]
+        luminance = data @ np.asarray((0.2126, 0.7152, 0.0722))
+        order = np.argsort(luminance)
+        # The public construction fixes four dark cells per rectified band;
+        # ranking is palette-independent and exposes row-count shortcut balance.
+        rectified[row, order[:4]] = 1
+        if float(luminance[order[4]] - luminance[order[3]]) < 28.0:
+            raise ValueError("dark/light separation is ambiguous")
+    return rectified
+
+
+def decision_and_margin_from_image(image: Image.Image) -> tuple[str, float]:
+    observed = _extract(image)
+    ranked = sorted(
+        (int(np.count_nonzero(observed != reference)), name)
+        for name, reference in REFERENCES.items()
+    )
+    if ranked[0][0] == ranked[1][0]:
+        raise ValueError("symbol classification is tied")
+    return ranked[0][1], float(ranked[1][0] - ranked[0][0])
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return decision_and_margin_from_image(image)[0]

@@ -1,0 +1,210 @@
+"""Pixel-only inverse arm for the corner-notch rectification reveal world.
+
+The oracle receives one RGB image and nothing else. It thresholds the image at
+the midpoint of its own darkest and lightest tones, finds the four bordered
+tiles as connected ink components, measures each tile's border thickness,
+locates the paper-coloured notch that marks the tile's original top-left corner,
+undoes that quarter-turn on the tile's 4x4 cell readout, reassembles the four
+rectified quadrants in their rendered 2x2 arrangement and classifies the
+resulting 8x8 pattern against the declared symbol alphabet. It abstains by
+raising when the fiducials, the turn, or the symbol decision are ambiguous.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "corner_notch_rectify_reveal-oracle-0.1.0"
+
+CELLS = 4
+GLYPH_CELLS = 8
+CORNERS = ("top_left", "bottom_left", "bottom_right", "top_right")
+MIN_TILE_PX = 26
+MAX_TILE_PX = 64
+MAX_GLYPH_ERRORS = 5
+MIN_GLYPH_GAP = 4
+
+
+def _templates() -> dict[str, np.ndarray]:
+    grids: dict[str, np.ndarray] = {}
+
+    def build(cells: set[tuple[int, int]]) -> np.ndarray:
+        grid = np.zeros((GLYPH_CELLS, GLYPH_CELLS), dtype=np.uint8)
+        for row, col in cells:
+            grid[row, col] = 1
+        return grid
+
+    plus = {(r, c) for r in (3, 4) for c in range(1, 7)}
+    plus |= {(r, c) for c in (3, 4) for r in range(1, 7)}
+    grids["plus"] = build(plus)
+
+    box = {(1, c) for c in range(1, 7)} | {(6, c) for c in range(1, 7)}
+    box |= {(r, 1) for r in range(2, 6)} | {(r, 6) for r in range(2, 6)}
+    grids["box"] = build(box)
+
+    hourglass = {(1, c) for c in range(1, 7)} | {(6, c) for c in range(1, 7)}
+    hourglass |= {(2, 2), (3, 3), (4, 4), (5, 5), (2, 5), (3, 4), (4, 3), (5, 2)}
+    grids["hourglass"] = build(hourglass)
+
+    diamond = {
+        (0, 3), (0, 4), (1, 2), (1, 5), (2, 1), (2, 6), (3, 0), (3, 7),
+        (4, 0), (4, 7), (5, 1), (5, 6), (6, 2), (6, 5), (7, 3), (7, 4),
+    }
+    diamond |= {(3, 3), (3, 4), (4, 3), (4, 4)}
+    grids["diamond"] = build(diamond)
+    return grids
+
+
+TEMPLATES = _templates()
+
+
+def _ink_mask(array: np.ndarray) -> np.ndarray:
+    luma = 0.299 * array[:, :, 0] + 0.587 * array[:, :, 1] + 0.114 * array[:, :, 2]
+    darkest = float(np.percentile(luma, 0.2))
+    lightest = float(np.percentile(luma, 99.8))
+    if lightest - darkest < 20.0:
+        raise ValueError("image has no usable ink-to-paper contrast")
+    return luma < 0.5 * (darkest + lightest)
+
+
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Return bounding boxes of 4-connected ink components, largest first."""
+
+    seen = np.zeros(mask.shape, dtype=bool)
+    boxes: list[tuple[int, int, int, int, int]] = []
+    height, width = mask.shape
+    for start_y, start_x in np.argwhere(mask):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(int(start_y), int(start_x))]
+        seen[start_y, start_x] = True
+        y0 = y1 = int(start_y)
+        x0 = x1 = int(start_x)
+        size = 0
+        while stack:
+            cy, cx = stack.pop()
+            size += 1
+            y0, y1 = min(y0, cy), max(y1, cy)
+            x0, x1 = min(x0, cx), max(x1, cx)
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        boxes.append((size, y0, x0, y1, x1))
+    boxes.sort(reverse=True)
+    return [(y0, x0, y1, x1) for _, y0, x0, y1, x1 in boxes]
+
+
+def _tiles(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    tiles = []
+    for y0, x0, y1, x1 in _components(mask):
+        height = y1 - y0 + 1
+        width = x1 - x0 + 1
+        if not (MIN_TILE_PX <= height <= MAX_TILE_PX and MIN_TILE_PX <= width <= MAX_TILE_PX):
+            continue
+        if abs(height - width) > 3:
+            continue
+        tiles.append((y0, x0, y1, x1))
+    if len(tiles) != 4:
+        raise ValueError(f"expected four bordered tiles, found {len(tiles)}")
+    return tiles
+
+
+def _frame_thickness(mask: np.ndarray, box: tuple[int, int, int, int]) -> int:
+    y0, x0, y1, x1 = box
+    window = mask[y0:y1 + 1, x0:x1 + 1]
+    runs = []
+    for lines in (window, window[:, ::-1], window.T, window.T[:, ::-1]):
+        for line in lines:
+            run = 0
+            while run < line.size and line[run]:
+                run += 1
+            if run:
+                runs.append(int(run))
+    if not runs:
+        raise ValueError("tile has no measurable border")
+    thickness = min(runs)
+    if thickness < 2 or thickness > 8:
+        raise ValueError("tile border thickness is out of range")
+    return thickness
+
+
+def _notch_corner(mask: np.ndarray, box: tuple[int, int, int, int], frame: int) -> str:
+    y0, x0, y1, x1 = box
+    probe = frame + 6
+    band = np.zeros(mask.shape, dtype=bool)
+    band[y0:y1 + 1, x0:x1 + 1] = True
+    inner = np.zeros(mask.shape, dtype=bool)
+    inner[y0 + frame:y1 + 1 - frame, x0 + frame:x1 + 1 - frame] = True
+    band &= ~inner
+    counts = {}
+    for corner in CORNERS:
+        cy = y0 if corner.startswith("top") else y1 + 1 - probe
+        cx = x0 if corner.endswith("left") else x1 + 1 - probe
+        window = mask[cy:cy + probe, cx:cx + probe] & band[cy:cy + probe, cx:cx + probe]
+        counts[corner] = int(window.sum())
+    order = sorted(counts.items(), key=lambda item: item[1])
+    if order[0][1] * 3 >= max(1, order[1][1]):
+        raise ValueError("tile notch corner is ambiguous")
+    return order[0][0]
+
+
+def _read_cells(mask: np.ndarray, box: tuple[int, int, int, int], frame: int) -> np.ndarray:
+    y0, x0, y1, x1 = box
+    inner_h = (y1 + 1 - frame) - (y0 + frame)
+    inner_w = (x1 + 1 - frame) - (x0 + frame)
+    if inner_h < CELLS * 4 or inner_w < CELLS * 4:
+        raise ValueError("tile interior is too small to hold a 4x4 lattice")
+    grid = np.zeros((CELLS, CELLS), dtype=np.uint8)
+    for row in range(CELLS):
+        for col in range(CELLS):
+            cy0 = y0 + frame + round(row * inner_h / CELLS)
+            cy1 = y0 + frame + round((row + 1) * inner_h / CELLS)
+            cx0 = x0 + frame + round(col * inner_w / CELLS)
+            cx1 = x0 + frame + round((col + 1) * inner_w / CELLS)
+            patch = mask[cy0 + 1:cy1 - 1, cx0 + 1:cx1 - 1]
+            if patch.size == 0:
+                raise ValueError("tile cell patch is empty")
+            share = float(patch.mean())
+            if 0.2 < share < 0.8:
+                raise ValueError("tile cell tone is ambiguous")
+            grid[row, col] = 1 if share >= 0.8 else 0
+    return grid
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover the revealed symbol from the final pixels alone."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    mask = _ink_mask(array)
+    tiles = _tiles(mask)
+    readouts = []
+    for box in tiles:
+        frame = _frame_thickness(mask, box)
+        corner = _notch_corner(mask, box, frame)
+        turns = CORNERS.index(corner)
+        rendered = _read_cells(mask, box, frame)
+        readouts.append((box, np.rot90(rendered, -turns)))
+
+    centers = [((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0) for box, _ in readouts]
+    order = sorted(range(4), key=lambda i: centers[i][0])
+    top = sorted(order[:2], key=lambda i: centers[i][1])
+    bottom = sorted(order[2:], key=lambda i: centers[i][1])
+    if centers[top[1]][0] > centers[bottom[0]][0]:
+        raise ValueError("tile arrangement is not a clean two-by-two block")
+    grid = np.zeros((GLYPH_CELLS, GLYPH_CELLS), dtype=np.uint8)
+    grid[0:4, 0:4] = readouts[top[0]][1]
+    grid[0:4, 4:8] = readouts[top[1]][1]
+    grid[4:8, 0:4] = readouts[bottom[0]][1]
+    grid[4:8, 4:8] = readouts[bottom[1]][1]
+
+    scores = sorted(
+        (int(np.abs(grid.astype(int) - template.astype(int)).sum()), name)
+        for name, template in TEMPLATES.items()
+    )
+    if scores[0][0] > MAX_GLYPH_ERRORS:
+        raise ValueError("rectified pattern matches no declared symbol")
+    if scores[1][0] - scores[0][0] < MIN_GLYPH_GAP:
+        raise ValueError("rectified pattern is ambiguous between two symbols")
+    return scores[0][1]

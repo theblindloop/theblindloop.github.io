@@ -1,0 +1,174 @@
+"""Independent pixel-only inverse for broad-petal cyclic pairing.
+
+Only the final RGB image is accepted.  The inverse segments the sole compact
+chromatic seal, recovers its enclosed pale cavity, samples an annulus through
+that cavity, and measures four angular occupancy runs.  It never reads latent
+state, renderer geometry, metadata, filenames, or analytic gold.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+import math
+
+import numpy as np
+from PIL import Image
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose one unambiguous instance of the public rule."""
+
+
+@dataclass(frozen=True)
+class Measurement:
+    decision: str
+    runner_up_gap_deg: float
+    broad_center_separation_deg: float
+    petal_widths_deg: tuple[float, float, float, float]
+    seal_bbox: tuple[int, int, int, int]
+    cavity_area: int
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    work = np.asarray(mask, dtype=bool).copy()
+    height, width = work.shape
+    components: list[np.ndarray] = []
+    for start_y, start_x in np.argwhere(work):
+        sy, sx = int(start_y), int(start_x)
+        if not work[sy, sx]:
+            continue
+        work[sy, sx] = False
+        queue: deque[tuple[int, int]] = deque([(sy, sx)])
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and work[ny, nx]:
+                    work[ny, nx] = False
+                    queue.append((ny, nx))
+        components.append(np.asarray(points, dtype=np.int32))
+    return sorted(components, key=len, reverse=True)
+
+
+def _chromatic_mask(array: np.ndarray) -> np.ndarray:
+    border = np.concatenate(
+        (
+            array[:3].reshape(-1, 3),
+            array[-3:].reshape(-1, 3),
+            array[:, :3].reshape(-1, 3),
+            array[:, -3:].reshape(-1, 3),
+        ),
+        axis=0,
+    )
+    background = np.median(border.astype(np.float32), axis=0)
+    delta = np.linalg.norm(array.astype(np.float32) - background, axis=2)
+    chroma = array.max(axis=2).astype(np.int16) - array.min(axis=2).astype(np.int16)
+    return (delta >= 55.0) & (chroma >= 45)
+
+
+def _cyclic_runs(values: np.ndarray) -> list[np.ndarray]:
+    data = np.asarray(values, dtype=bool)
+    if data.all() or not data.any():
+        return []
+    start = int(np.flatnonzero(~data)[0])
+    ordered = np.roll(data, -start)
+    runs: list[np.ndarray] = []
+    index = 0
+    while index < len(ordered):
+        if not ordered[index]:
+            index += 1
+            continue
+        end = index
+        while end < len(ordered) and ordered[end]:
+            end += 1
+        original = (np.arange(index, end) + start) % len(data)
+        runs.append(original)
+        index = end
+    return runs
+
+
+def _circular_mean_degrees(indices: np.ndarray, sample_count: int) -> float:
+    radians = 2.0 * math.pi * indices.astype(np.float64) / sample_count
+    vector = np.exp(1j * radians).mean()
+    return math.degrees(math.atan2(vector.imag, vector.real)) % 360.0
+
+
+def measure_image(image: Image.Image) -> Measurement:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or array.shape[:2] != (512, 512):
+        raise OracleAbstention("unsupported raster dimensions")
+
+    chromatic = _chromatic_mask(array)
+    components = _components(chromatic)
+    sizable = [component for component in components if len(component) >= 3000]
+    if len(sizable) != 1:
+        raise OracleAbstention("expected one compact chromatic seal")
+    seal = sizable[0]
+    y0, x0 = seal.min(axis=0)
+    y1, x1 = seal.max(axis=0) + 1
+    width, height = int(x1 - x0), int(y1 - y0)
+    if not (100 <= width <= 109 and 100 <= height <= 109 and abs(width - height) <= 2):
+        raise OracleAbstention("chromatic seal has the wrong compact extent")
+    cx = (float(x0) + float(x1 - 1)) / 2.0
+    cy = (float(y0) + float(y1 - 1)) / 2.0
+
+    yy, xx = np.indices(chromatic.shape)
+    distance = np.hypot(xx - cx, yy - cy)
+    # The cavity lies well inside the chromatic outer rim.  The radius cap keeps
+    # the exterior background and achromatic remote marks out of the inverse.
+    cavity_mask = (~chromatic) & (distance <= 43.0)
+    cavity_components = _components(cavity_mask)
+    cavity_components = [part for part in cavity_components if len(part) >= 100]
+    if len(cavity_components) != 1:
+        raise OracleAbstention("the seal must contain one connected pale rosette")
+    cavity = cavity_components[0]
+    cavity_area = int(len(cavity))
+    if not 1200 <= cavity_area <= 2100:
+        raise OracleAbstention("pale cavity area is outside the declared range")
+
+    sample_count = 720
+    angles = 2.0 * math.pi * np.arange(sample_count, dtype=np.float64) / sample_count
+    radii = np.asarray((23.0, 26.0, 29.0, 32.0, 35.0), dtype=np.float64)
+    occupancy_rows = []
+    for radius in radii:
+        xs = np.rint(cx + radius * np.cos(angles)).astype(int)
+        ys = np.rint(cy + radius * np.sin(angles)).astype(int)
+        occupancy_rows.append(cavity_mask[ys, xs])
+    occupancy = np.mean(np.asarray(occupancy_rows, dtype=np.float64), axis=0) >= 0.6
+    runs = [run for run in _cyclic_runs(occupancy) if len(run) >= 20]
+    if len(runs) != 4:
+        raise OracleAbstention(f"expected four resolvable petal sectors, recovered {len(runs)}")
+
+    centers = [_circular_mean_degrees(run, sample_count) for run in runs]
+    widths = [360.0 * len(run) / sample_count for run in runs]
+    order = sorted(range(4), key=lambda index: centers[index])
+    centers = [centers[index] for index in order]
+    widths = [widths[index] for index in order]
+    gaps = [((centers[(i + 1) % 4] - centers[i]) % 360.0) for i in range(4)]
+    if max(abs(gap - 90.0) for gap in gaps) > 7.0:
+        raise OracleAbstention("petal centers do not form one fourfold organization")
+
+    ranked = sorted(range(4), key=lambda index: widths[index], reverse=True)
+    runner_up_gap = float(widths[ranked[1]] - widths[ranked[2]])
+    if runner_up_gap <= 7.0:
+        raise OracleAbstention("broad and narrow petals are not visibly separated")
+    broad = sorted(ranked[:2])
+    raw_separation = abs(centers[broad[1]] - centers[broad[0]])
+    separation = min(raw_separation, 360.0 - raw_separation)
+    if abs(separation - 135.0) <= 8.0:
+        raise OracleAbstention("broad-petal separation is too close to the relation boundary")
+    decision = "adjacent" if separation < 135.0 else "opposite"
+    return Measurement(
+        decision=decision,
+        runner_up_gap_deg=runner_up_gap,
+        broad_center_separation_deg=float(separation),
+        petal_widths_deg=tuple(float(value) for value in widths),
+        seal_bbox=(int(x0), int(y0), int(x1), int(y1)),
+        cavity_area=cavity_area,
+    )
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return measure_image(image).decision

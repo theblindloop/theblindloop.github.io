@@ -1,0 +1,220 @@
+"""Deterministic latent sampler, renderer, and analytic arm.
+
+The only answer-bearing state is the visible unordered mark set.  Analytic gold
+reconstructs the Euclidean minimum spanning tree (MST) from those centers, just
+as the independent pixel arm will do after segmentation.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw
+
+WIDTH = 512
+HEIGHT = 512
+BACKGROUND = (248, 248, 244)
+DARK = (38, 43, 50)
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (214, 58, 67),
+    "blue": (48, 105, 205),
+    "green": (34, 151, 91),
+    "orange": (229, 133, 35),
+}
+ANSWER_COLORS = tuple(PALETTE)
+MARK_COUNT = 18
+OUTER_RADIUS = 9
+INNER_RADIUS = 7
+MIN_CENTER_SEPARATION = 40.0
+SAMPLE_MARGIN_FLOOR = 0.8
+QUARANTINE_GAP = 1.2
+
+
+def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _minimum_tree(
+    points: list[tuple[float, float]],
+) -> list[tuple[int, int, float]]:
+    """Kruskal MST with stable ordering; accepted scenes have no near tie."""
+
+    n = len(points)
+    if n < 2:
+        raise ValueError("at least two points are required")
+    edges = sorted(
+        (_distance(points[i], points[j]), i, j)
+        for i in range(n)
+        for j in range(i + 1, n)
+    )
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    tree: list[tuple[int, int, float]] = []
+    for weight, left, right in edges:
+        root_left, root_right = find(left), find(right)
+        if root_left == root_right:
+            continue
+        if rank[root_left] < rank[root_right]:
+            root_left, root_right = root_right, root_left
+        parent[root_right] = root_left
+        if rank[root_left] == rank[root_right]:
+            rank[root_left] += 1
+        tree.append((left, right, weight))
+        if len(tree) == n - 1:
+            break
+    if len(tree) != n - 1:
+        raise ValueError("point graph is disconnected")
+    return tree
+
+
+def _degrees(point_count: int, tree: Iterable[tuple[int, int, float]]) -> list[int]:
+    values = [0] * point_count
+    for left, right, _ in tree:
+        values[left] += 1
+        values[right] += 1
+    return values
+
+
+def _exchange_gap(
+    points: list[tuple[float, float]], tree: list[tuple[int, int, float]]
+) -> float:
+    """Minimum weight increase for one legal tree-edge exchange.
+
+    For every non-tree edge (u,v), adding it creates one cycle. Replacing the
+    heaviest edge on the u-v tree path gives the nearest competing tree. The
+    smallest positive cost increase is the exact MST stability margin.
+    """
+
+    adjacency: list[list[tuple[int, float]]] = [[] for _ in points]
+    tree_pairs: set[tuple[int, int]] = set()
+    for left, right, weight in tree:
+        adjacency[left].append((right, weight))
+        adjacency[right].append((left, weight))
+        tree_pairs.add((min(left, right), max(left, right)))
+
+    def path_max(start: int, goal: int) -> float:
+        stack = [(start, -1, 0.0)]
+        while stack:
+            node, previous, maximum = stack.pop()
+            if node == goal:
+                return maximum
+            for neighbor, weight in adjacency[node]:
+                if neighbor != previous:
+                    stack.append((neighbor, node, max(maximum, weight)))
+        raise ValueError("tree path not found")
+
+    best = math.inf
+    for left in range(len(points)):
+        for right in range(left + 1, len(points)):
+            if (left, right) in tree_pairs:
+                continue
+            candidate = _distance(points[left], points[right]) - path_max(left, right)
+            best = min(best, candidate)
+    if not math.isfinite(best):
+        raise ValueError("no exchange edge exists")
+    return best
+
+
+def _points_from_marks(marks: list[dict]) -> list[tuple[float, float]]:
+    return [(float(mark["x"]), float(mark["y"])) for mark in marks]
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample a balanced, stable scene from one integer seed."""
+
+    rng = random.Random(int(seed))
+    for _attempt in range(5000):
+        points: list[tuple[int, int]] = []
+        for _ in range(MARK_COUNT):
+            placed = False
+            for _trial in range(2000):
+                point = (rng.randint(50, WIDTH - 50), rng.randint(50, HEIGHT - 50))
+                if all(_distance(point, existing) >= MIN_CENTER_SEPARATION for existing in points):
+                    points.append(point)
+                    placed = True
+                    break
+            if not placed:
+                break
+        if len(points) != MARK_COUNT:
+            continue
+
+        float_points = [(float(x), float(y)) for x, y in points]
+        tree = _minimum_tree(float_points)
+        degrees = _degrees(len(points), tree)
+        targets = [index for index, degree in enumerate(degrees) if degree == 3]
+        distractor_pool = [index for index, degree in enumerate(degrees) if degree != 3]
+        gap = _exchange_gap(float_points, tree)
+        if not targets or len(distractor_pool) < 3 or gap <= SAMPLE_MARGIN_FLOOR:
+            continue
+
+        target = rng.choice(targets)
+        distractors = rng.sample(distractor_pool, 3)
+        answer = ANSWER_COLORS[int(seed) % len(ANSWER_COLORS)]
+        remaining_colors = [color for color in ANSWER_COLORS if color != answer]
+        rng.shuffle(remaining_colors)
+        assigned = {target: answer}
+        assigned.update(zip(distractors, remaining_colors, strict=True))
+        marks = [
+            {"x": x, "y": y, "color": assigned.get(index, "dark")}
+            for index, (x, y) in enumerate(points)
+        ]
+        rng.shuffle(marks)
+        scene = {"marks": marks}
+        # Recompute through the public analytic path before accepting.
+        if analytic_gold(scene) != answer:
+            continue
+        return scene
+    raise RuntimeError(f"could not sample a stable scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    marks = scene["marks"]
+    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for mark in marks:
+        x, y = int(mark["x"]), int(mark["y"])
+        outer = (x - OUTER_RADIUS, y - OUTER_RADIUS, x + OUTER_RADIUS, y + OUTER_RADIUS)
+        draw.ellipse(outer, fill=DARK)
+        color = str(mark["color"])
+        if color != "dark":
+            inner = (x - INNER_RADIUS, y - INNER_RADIUS, x + INNER_RADIUS, y + INNER_RADIUS)
+            draw.ellipse(inner, fill=PALETTE[color])
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    marks = scene["marks"]
+    points = _points_from_marks(marks)
+    degrees = _degrees(len(points), _minimum_tree(points))
+    matches = [
+        str(mark["color"])
+        for index, mark in enumerate(marks)
+        if mark["color"] != "dark" and degrees[index] == 3
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one colored degree-three vertex, found {matches}")
+    return matches[0]
+
+
+def margin(scene: dict) -> float:
+    marks = scene["marks"]
+    points = _points_from_marks(marks)
+    return _exchange_gap(points, _minimum_tree(points))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_GAP
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    marks = scene["marks"]
+    return [("reverse_unordered_marks", {"marks": list(reversed(marks))})]

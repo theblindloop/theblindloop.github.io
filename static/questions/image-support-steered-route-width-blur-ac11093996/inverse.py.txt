@@ -1,0 +1,165 @@
+"""Independent pixel-only inverse for the ribbon-width blur world."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+N_SAMPLES = 32
+BOW = tuple(int(bit) for bit in "10011001011001100110011010011001")
+HARP = tuple(int(bit) for bit in "11100111100000011000000111100111")
+
+
+def _components(mask: np.ndarray, minimum: int) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            pixels.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dx or dy):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(pixels) >= minimum:
+            result.append(np.asarray(pixels, dtype=np.float64))
+    return result
+
+
+def _center(points: np.ndarray) -> tuple[float, float]:
+    mean = points.mean(axis=0)
+    return float(mean[1]), float(mean[0])
+
+
+def _masks(array: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    red = array[:, :, 0].astype(np.int16)
+    green = array[:, :, 1].astype(np.int16)
+    blue = array[:, :, 2].astype(np.int16)
+    route = (blue - red > 22) & (blue - green > 8) & (red < 135) & (green < 155)
+    red_cap = (red > 135) & (red - green > 38) & (red - blue > 22) & (green < 170)
+    green_cap = (green > 90) & (green - red > 20) & (green - blue > 4) & (red < 155)
+    return route, red_cap, green_cap
+
+
+def _center_y(route: np.ndarray, x: float, radius: int = 2) -> float:
+    column = int(round(float(x)))
+    x0 = max(0, column - radius)
+    x1 = min(route.shape[1], column + radius + 1)
+    ys = np.argwhere(route[:, x0:x1])[:, 0] if route[:, x0:x1].any() else np.asarray([])
+    if len(ys) < 4:
+        raise ValueError("route section is missing from the raster")
+    return float(np.median(ys))
+
+
+def _section_width(route: np.ndarray, x: float, center_y: float, slope: float) -> float:
+    column = int(round(float(x)))
+    x0 = max(0, column - 2)
+    x1 = min(route.shape[1], column + 3)
+    yy, xx = np.where(route[:, x0:x1])
+    if len(yy) < 8:
+        raise ValueError("route width section is incomplete")
+    absolute_x = xx.astype(np.float64) + float(x0)
+    predicted = float(center_y) + float(slope) * (absolute_x - float(x))
+    normal_distance = np.abs(yy.astype(np.float64) - predicted) / np.sqrt(1.0 + slope * slope)
+    # The 92nd percentile avoids a single antialias fringe pixel while still
+    # measuring the solid cross-section independently of the renderer width.
+    radius = float(np.percentile(normal_distance, 92.0))
+    return 2.0 * radius + 1.0
+
+
+def _two_cluster(values: np.ndarray) -> np.ndarray:
+    low = float(np.percentile(values, 25.0))
+    high = float(np.percentile(values, 75.0))
+    if high - low < 1.4:
+        raise ValueError("ribbon widths do not separate into narrow and wide clusters")
+    for _ in range(12):
+        threshold = (low + high) / 2.0
+        left = values[values < threshold]
+        right = values[values >= threshold]
+        if len(left) < 4 or len(right) < 4:
+            raise ValueError("ribbon width clusters are underpopulated")
+        new_low, new_high = float(left.mean()), float(right.mean())
+        if abs(new_low - low) + abs(new_high - high) < 1e-4:
+            break
+        low, high = new_low, new_high
+    return (values >= (low + high) / 2.0).astype(np.int8)
+
+
+def _blur_bits(bits: tuple[int, ...]) -> tuple[int, ...]:
+    values: list[int] = []
+    for index in range(N_SAMPLES):
+        values.append(
+            int(
+                (bits[max(0, index - 1)] + bits[index] + bits[min(N_SAMPLES - 1, index + 1)])
+                / 3.0
+                >= 0.5
+            )
+        )
+    return tuple(values)
+
+
+def _hamming(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+    return sum(a != b for a, b in zip(left, right))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover caps, one route, section widths, and the declared blur result."""
+
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    route, red_mask, green_mask = _masks(array)
+    red_components = _components(red_mask, 30)
+    green_components = _components(green_mask, 30)
+    if len(red_components) != 1 or len(green_components) != 1:
+        raise ValueError("expected exactly one red start and one green end cap")
+    red_x, _ = _center(red_components[0])
+    green_x, _ = _center(green_components[0])
+
+    route_components = _components(route, 350)
+    if len(route_components) != 1:
+        raise ValueError("the ribbon is absent or not one connected component")
+    component = route_components[0]
+    if len(component) < 1100:
+        raise ValueError("ribbon evidence is incomplete")
+    route_only = np.zeros_like(route, dtype=bool)
+    route_only[component[:, 0].astype(int), component[:, 1].astype(int)] = True
+
+    left, right = min(red_x, green_x), max(red_x, green_x)
+    if right - left < 270.0:
+        raise ValueError("colored caps do not expose the declared route span")
+    pitch = (right - left) / float(N_SAMPLES)
+    centers = []
+    for index in range(N_SAMPLES):
+        # The small endpoint markers leave the section midpoint exposed.
+        x = left + (index + 0.5) * pitch
+        centers.append(_center_y(route_only, x))
+
+    widths = []
+    for index, center in enumerate(centers):
+        if index == 0:
+            slope = (centers[1] - centers[0]) / pitch
+        elif index == N_SAMPLES - 1:
+            slope = (centers[-1] - centers[-2]) / pitch
+        else:
+            slope = (centers[index + 1] - centers[index - 1]) / (2.0 * pitch)
+        x = left + (index + 0.5) * pitch
+        widths.append(_section_width(route_only, x, center, slope))
+
+    bits_left_to_right = _two_cluster(np.asarray(widths, dtype=np.float64))
+    bits = tuple(int(value) for value in bits_left_to_right)
+    if red_x > green_x:
+        bits = tuple(reversed(bits))
+    blurred = _blur_bits(bits)
+    distance_a = _hamming(blurred, BOW)
+    distance_b = _hamming(blurred, HARP)
+    return "A" if distance_a <= distance_b else "B"

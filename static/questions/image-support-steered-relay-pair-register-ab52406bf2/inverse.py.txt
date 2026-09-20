@@ -1,0 +1,154 @@
+"""Independent PNG-only inverse for a paired-lamp relay cord.
+
+The inverse discovers the long dark carrier, its two start lamps, and four
+bright relay interiors without knowing the card's absolute position, spacing,
+palette, latent program, or analytic answer.  It classifies each relay from its
+silhouette fill ratio and replays the observed operations from left to right.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_DECISIONS = {
+    (0, 0): "neither",
+    (1, 0): "left only",
+    (0, 1): "right only",
+    (1, 1): "both",
+}
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    output: list[np.ndarray] = []
+    for y0, x0 in np.argwhere(mask):
+        y0, x0 = int(y0), int(x0)
+        if visited[y0, x0]:
+            continue
+        queue = deque([(y0, x0)])
+        visited[y0, x0] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(points) >= minimum:
+            output.append(np.asarray(points, dtype=np.int32))
+    return output
+
+
+def _bounds(points: np.ndarray) -> tuple[int, int, int, int]:
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def _main_carrier(array: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    dark = np.max(array, axis=2) < 105
+    parts = _components(dark, minimum=40)
+    if not parts:
+        raise ValueError("no intact dark relay carrier found")
+    measured = []
+    for part in parts:
+        x0, y0, x1, y1 = _bounds(part)
+        measured.append((x1 - x0 + 1, len(part), part, (x0, y0, x1, y1)))
+    measured.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    span, _, carrier, bounds = measured[0]
+    height = bounds[3] - bounds[1] + 1
+    if not (165 <= span <= 220 and 24 <= height <= 40):
+        raise ValueError(f"relay carrier is incomplete or malformed ({span}x{height})")
+    return carrier, bounds
+
+
+def _read_lamps(
+    array: np.ndarray,
+    carrier: np.ndarray,
+    carrier_bounds: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    dark = np.max(array, axis=2) < 105
+    x0, y0, x1, y1 = carrier_bounds
+    candidates = []
+    carrier_set = {(int(y), int(x)) for y, x in carrier}
+    for part in _components(dark, minimum=18):
+        if any((int(y), int(x)) in carrier_set for y, x in part):
+            continue
+        px0, py0, px1, py1 = _bounds(part)
+        width, height = px1 - px0 + 1, py1 - py0 + 1
+        center_x = (px0 + px1) / 2.0
+        center_y = (py0 + py1) / 2.0
+        if (
+            x0 + 3 <= center_x <= x0 + 29
+            and y0 + 4 <= center_y <= y1 - 4
+            and 7 <= width <= 11
+            and 7 <= height <= 11
+        ):
+            candidates.append((center_x, center_y, (px0, py0, px1, py1)))
+    if len(candidates) != 2:
+        raise ValueError(f"expected two readable start lamps, found {len(candidates)}")
+    candidates.sort()
+    states = []
+    for _, _, (px0, py0, px1, py1) in candidates:
+        cx = round((px0 + px1) / 2.0)
+        cy = round((py0 + py1) / 2.0)
+        crop = dark[max(0, cy - 1) : cy + 2, max(0, cx - 1) : cx + 2]
+        if crop.shape != (3, 3):
+            raise ValueError("lamp center is clipped")
+        states.append(int(float(crop.mean()) > 0.75))
+    return states[0], states[1]
+
+
+def _read_relays(
+    array: np.ndarray, carrier_bounds: tuple[int, int, int, int]
+) -> list[str]:
+    values = array.astype(np.int16)
+    chroma = values.max(axis=2) - values.min(axis=2)
+    brightness = values.mean(axis=2)
+    distance = np.linalg.norm(values - 255, axis=2)
+    colored = (chroma > 42) & (brightness > 95) & (distance > 55)
+    x0, y0, x1, y1 = carrier_bounds
+    relays = []
+    for part in _components(colored, minimum=35):
+        px0, py0, px1, py1 = _bounds(part)
+        width, height = px1 - px0 + 1, py1 - py0 + 1
+        center_x = (px0 + px1) / 2.0
+        center_y = (py0 + py1) / 2.0
+        if not (x0 + 35 < center_x < x1 - 20 and y0 <= center_y <= y1):
+            continue
+        if not (9 <= width <= 15 and 9 <= height <= 15):
+            raise ValueError("relay interior has an ambiguous silhouette")
+        fill = len(part) / float(width * height)
+        if fill >= 0.86:
+            operation = "copy"
+        elif 0.42 <= fill <= 0.72:
+            operation = "flip"
+        else:
+            raise ValueError(f"relay fill ratio {fill:.3f} is ambiguous")
+        relays.append((center_x, operation))
+    if len(relays) != 4:
+        raise ValueError(f"expected four relay beads, found {len(relays)}")
+    relays.sort()
+    operations = [operation for _, operation in relays]
+    if set(operations) != {"flip", "copy"}:
+        raise ValueError("relay cord must visibly contain both operation types")
+    return operations
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[0] < 32 or array.shape[1] < 32:
+        raise ValueError("raster is too small")
+    carrier, bounds = _main_carrier(array)
+    left, right = _read_lamps(array, carrier, bounds)
+    for operation in _read_relays(array, bounds):
+        if operation == "flip":
+            left = 1 - left
+        else:
+            right = left
+    return _DECISIONS[(left, right)]

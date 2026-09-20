@@ -1,0 +1,219 @@
+"""Renderer and analytic decision for the bilateral-glyph search world.
+
+The scene stores only the four visible glyph masks.  Each mask is a 32 by 32
+binary bitmap and is painted at a fixed six-pixel cell scale.  One mask is
+exactly invariant under a left-right reflection; the other masks preserve area,
+bounding box, and placement while shifting a short row band sideways.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Iterable
+
+from PIL import Image, ImageDraw, ImageFont
+
+CANVAS_SIZE = (760, 580)
+GRID = 32
+CELL = 6
+GLYPH_SIZE = GRID * CELL
+LABELS = ("A", "B", "C", "D")
+
+# Tile boxes are public geometry: two equal columns and two equal rows.
+PANEL_BOXES = (
+    (20, 20, 370, 275),
+    (390, 20, 740, 275),
+    (20, 305, 370, 560),
+    (390, 305, 740, 560),
+)
+
+BACKGROUND = (255, 255, 253)
+PANEL_FILL = (249, 249, 246)
+PANEL_EDGE = (205, 205, 198)
+LABEL_INK = (112, 112, 108)
+GLYPH_INK = (18, 20, 24)
+
+# At or below this top-two residual gap the visual distinction is deliberately
+# quarantined.  The generator includes a few exactly-one-row near-boundary
+# scenes, but never emits a tied winner.
+QUARANTINE_MARGIN = 144.0
+
+
+def _interval(width: int) -> tuple[int, int]:
+    """Return an even-width interval centered between columns 15 and 16."""
+
+    return GRID // 2 - width, GRID // 2 + width - 1
+
+
+def _base_mask(rng: random.Random) -> list[list[bool]]:
+    """Build a connected silhouette with exact vertical mirror symmetry."""
+
+    mask = [[False for _ in range(GRID)] for _ in range(GRID)]
+    for y in range(3, 29):
+        if y <= 5:
+            width = rng.choice((3, 4))
+        elif y <= 9:
+            width = rng.choice((5, 6))
+        elif y <= 13:
+            width = rng.choice((7, 8))
+        elif y <= 15:
+            width = rng.choice((9, 10))
+        elif y == 16:
+            width = 10
+        elif y <= 18:
+            width = rng.choice((9, 10))
+        elif y <= 22:
+            width = rng.choice((6, 7))
+        elif y <= 25:
+            width = rng.choice((4, 5))
+        else:
+            width = rng.choice((3, 4))
+        left, right = _interval(width)
+        for x in range(left, right + 1):
+            mask[y][x] = True
+    return mask
+
+
+def _shifted_mask(
+    base: list[list[bool]],
+    *,
+    band: tuple[int, int],
+    direction: int,
+    near: bool,
+) -> list[list[bool]]:
+    """Shift a contiguous safe row band sideways without changing its area."""
+
+    result = [row[:] for row in base]
+    delta = 1 if near else 2
+    y0, y1 = band
+    for y in range(y0, y1 + 1):
+        occupied = [x for x, value in enumerate(base[y]) if value]
+        left, right = min(occupied), max(occupied)
+        for x in range(left, right + 1):
+            result[y][x] = False
+        shifted_left = left + direction * delta
+        shifted_right = right + direction * delta
+        for x in range(shifted_left, shifted_right + 1):
+            result[y][x] = True
+    return result
+
+
+def _mask_rows(mask: list[list[bool]]) -> list[str]:
+    return ["".join("1" if cell else "0" for cell in row) for row in mask]
+
+
+def _rows_to_mask(rows: Iterable[str]) -> list[list[bool]]:
+    parsed = [list(row) for row in rows]
+    if len(parsed) != GRID or any(len(row) != GRID for row in parsed):
+        raise ValueError("glyph masks must be 32x32")
+    if any(cell not in {"0", "1"} for row in parsed for cell in row):
+        raise ValueError("glyph masks must contain only 0 and 1")
+    return [[cell == "1" for cell in row] for row in parsed]
+
+
+def _reflection_residual(rows: Iterable[str]) -> int:
+    """Count occupied-cell disagreements with the vertical reflection."""
+
+    mask = _rows_to_mask(rows)
+    return sum(
+        mask[y][x] != mask[y][GRID - 1 - x]
+        for y in range(GRID)
+        for x in range(GRID)
+    )
+
+
+def _scores(scene: dict) -> list[int]:
+    tiles = scene["tiles"]
+    if not isinstance(tiles, list) or len(tiles) != 4:
+        raise ValueError("scene must contain four tiles")
+    return [_reflection_residual(tile["mask"]) for tile in tiles]
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced four-tile scene deterministically from ``seed``."""
+
+    rng = random.Random(seed)
+    base = _base_mask(rng)
+    target_slot = seed % len(LABELS)
+    near = seed % 6 == 0
+    tiles: list[dict] = []
+
+    for index, label in enumerate(LABELS):
+        if index == target_slot:
+            mask = base
+        else:
+            if near:
+                band = (8 + ((seed + index) % 3), 8 + ((seed + index) % 3))
+            elif (index + seed) % 2:
+                start = 6 + ((seed + index) % 3)
+                band = (start, start + 2 + ((seed + index) % 2))
+            else:
+                start = 19 + ((seed + index) % 3)
+                band = (start, start + 2 + ((seed + index) % 2))
+            direction = -1 if (seed + index) % 2 else 1
+            mask = _shifted_mask(base, band=band, direction=direction, near=near)
+        tiles.append({"label": label, "mask": _mask_rows(mask)})
+
+    scene = {"tiles": tiles}
+    # Fail early if a future sampler edit accidentally loses the construction
+    # invariants on which the pixel oracle relies.
+    scores = _scores(scene)
+    if scores[target_slot] != 0 or scores.count(0) != 1:
+        raise AssertionError("sampler did not create one symmetric glyph")
+    if len({sum(row.count("1") for row in tile["mask"]) for tile in tiles}) != 1:
+        raise AssertionError("sampler changed glyph ink totals")
+    return scene
+
+
+def render(scene: dict) -> Image.Image:
+    """Render the public 2x2 tile layout with hard, deterministic pixels."""
+
+    image = Image.new("RGB", CANVAS_SIZE, BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    for tile, (x0, y0, x1, y1) in zip(scene["tiles"], PANEL_BOXES, strict=True):
+        draw.rectangle((x0, y0, x1 - 1, y1 - 1), fill=PANEL_FILL, outline=PANEL_EDGE, width=2)
+        draw.text((x0 + 13, y0 + 10), str(tile["label"]), font=font, fill=LABEL_INK)
+        rows = tile["mask"]
+        _rows_to_mask(rows)
+        gx = (x0 + x1 - GLYPH_SIZE) // 2
+        gy = (y0 + y1 - GLYPH_SIZE) // 2
+        for gy_index, row in enumerate(rows):
+            for gx_index, cell in enumerate(row):
+                if cell == "1":
+                    px = gx + gx_index * CELL
+                    py = gy + gy_index * CELL
+                    draw.rectangle((px, py, px + CELL - 1, py + CELL - 1), fill=GLYPH_INK)
+    return image
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return the label of the unique minimum-reflection-residual tile."""
+
+    scores = _scores(scene)
+    best = min(scores)
+    if scores.count(best) != 1:
+        raise ValueError("scene has no unique symmetry winner")
+    return str(scene["tiles"][scores.index(best)]["label"])
+
+
+def margin(scene: dict) -> float:
+    """Return the rendered-cell runner-up gap, scaled to image pixels."""
+
+    scores = sorted(_scores(scene))
+    if len(scores) < 2:
+        raise ValueError("need at least two candidate tiles")
+    return float((scores[1] - scores[0]) * CELL * CELL)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Quarantine small top-two residual gaps at finite raster resolution."""
+
+    return margin(scene) <= QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """There are no unused latent aliases: all label inputs are visible masks."""
+
+    return []

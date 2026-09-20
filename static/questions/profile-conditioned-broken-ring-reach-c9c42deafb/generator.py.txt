@@ -1,0 +1,388 @@
+"""Broken-ring reachability world.
+
+Latent scene z: one or two closed, star-shaped Fourier rings drawn as thick
+strokes of a single ink colour. Each ring has one or more arc-length GAPS where
+no ink is painted, so a ring falls apart into a set of open arcs. Two black dot
+markers sit on the centreline of one ring.
+
+The decision is purely topological: the markers are on the "same" piece of ink
+iff they lie in the same maximal gap-free arc, otherwise "different". No metric
+relation (distance, size, side, order) determines it - only which breaks lie
+between the two markers along the curve.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "broken_ring_reach-0.1.0"
+
+CANVAS = 448
+SUPERSAMPLE = 2
+BACKGROUND = [255, 255, 255]
+INK_COLOR = [28, 82, 196]
+MARKER_COLOR = [17, 17, 17]
+STROKE_WIDTH = 24
+MARKER_RADIUS = 6
+CURVE_SAMPLES = 480
+
+# Below this clearance (px) the configuration is a finite-resolution boundary
+# case: a gap that is barely open, a marker that nearly sits on a break, or two
+# ink strands that nearly merge. Those scenes are quarantined, never dropped.
+QUARANTINE_MARGIN_PX = 14.0
+
+
+# --------------------------------------------------------------------------
+# curve geometry (no scene dictionaries below this line take a scene as their
+# first positional argument, so the protected rendered-field audit sees exactly
+# the two label inputs read by analytic_gold: "loops" and "markers")
+# --------------------------------------------------------------------------
+def _curve_points(center, base_radius, harmonics, samples):
+    """Sampled centreline of a star-shaped closed curve r(theta)."""
+    cx, cy = float(center[0]), float(center[1])
+    points = []
+    for index in range(int(samples)):
+        theta = 2.0 * math.pi * index / float(samples)
+        radius = float(base_radius)
+        for term in harmonics:
+            radius += float(term[1]) * math.cos(float(term[0]) * theta + float(term[2]))
+        points.append([cx + radius * math.cos(theta), cy + radius * math.sin(theta)])
+    return points
+
+
+def _arc_table(points):
+    """Cumulative arc length of each sample plus the closed total length."""
+    cumulative = [0.0]
+    count = len(points)
+    for index in range(1, count):
+        previous, current = points[index - 1], points[index]
+        cumulative.append(cumulative[-1] + math.dist(previous, current))
+    total = cumulative[-1] + math.dist(points[-1], points[0])
+    return cumulative, total
+
+
+def _sorted_gaps(gaps):
+    return sorted([[float(item[0]), float(item[1])] for item in gaps], key=lambda item: item[0])
+
+
+def _in_gap(total, gaps, position, pad=0.0):
+    for item in _sorted_gaps(gaps):
+        delta = abs(position - item[0]) % total
+        delta = min(delta, total - delta)
+        if delta <= item[1] + float(pad):
+            return True
+    return False
+
+
+def _arc_index(total, gaps, position):
+    """Index of the maximal gap-free arc containing ``position`` (-1 in a gap)."""
+    ordered = _sorted_gaps(gaps)
+    if _in_gap(total, ordered, position):
+        return -1
+    count = len(ordered)
+    for index in range(count):
+        start = (ordered[index][0] + ordered[index][1]) % total
+        stop = (ordered[(index + 1) % count][0] - ordered[(index + 1) % count][1]) % total
+        span = (stop - start) % total
+        offset = (position - start) % total
+        if offset <= span:
+            return index
+    return -1
+
+
+def _gap_edge_clearance(total, gaps, position):
+    """Arc-length distance from ``position`` to the nearest break edge."""
+    best = total
+    for item in _sorted_gaps(gaps):
+        for edge in (item[0] - item[1], item[0] + item[1]):
+            delta = abs(position - edge) % total
+            best = min(best, min(delta, total - delta))
+    return best
+
+
+def _kept_runs(cumulative, total, gaps, pad):
+    """Cyclic runs of sample indices that carry ink.
+
+    Samples within ``pad`` of a gap are dropped so that the round joins painted
+    at every retained sample end exactly on the declared gap edge: the white
+    opening the viewer sees is the declared gap length, not a shortened one.
+    """
+    ordered = _sorted_gaps(gaps)
+    kept = [not _in_gap(total, ordered, value, pad) for value in cumulative]
+    count = len(kept)
+    if all(kept):
+        return [list(range(count)) + [0]]
+    start = next(index for index in range(count) if kept[index] and not kept[index - 1])
+    runs, current = [], []
+    for step in range(count):
+        index = (start + step) % count
+        if kept[index]:
+            current.append(index)
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _position_at(points, cumulative, total, position):
+    value = float(position) % total
+    count = len(points)
+    for index in range(count):
+        low = cumulative[index]
+        high = cumulative[index + 1] if index + 1 < count else total
+        if low <= value <= high:
+            span = high - low
+            ratio = 0.0 if span <= 0 else (value - low) / span
+            head = points[index]
+            tail = points[(index + 1) % count]
+            return [
+                head[0] + ratio * (tail[0] - head[0]),
+                head[1] + ratio * (tail[1] - head[1]),
+            ]
+    return list(points[0])
+
+
+def _loop_geometry(center, base_radius, harmonics, samples):
+    """Centreline samples, cumulative arc lengths and closed length of one ring."""
+    points = _curve_points(center, base_radius, harmonics, samples)
+    cumulative, total = _arc_table(points)
+    return points, cumulative, total
+
+
+def _self_clearance(points, cumulative, total, stroke_width):
+    """Smallest painted-band clearance between non-adjacent parts of one curve."""
+    array = np.asarray(points, dtype=np.float64)
+    arcs = np.asarray(cumulative, dtype=np.float64)
+    distance = np.hypot(
+        array[:, None, 0] - array[None, :, 0], array[:, None, 1] - array[None, :, 1]
+    )
+    along = np.abs(arcs[:, None] - arcs[None, :])
+    along = np.minimum(along, total - along)
+    distance[along < 3.0 * float(stroke_width)] = np.inf
+    return float(distance.min()) - float(stroke_width)
+
+
+def _pair_clearance(left, right, stroke_width):
+    first = np.asarray(left, dtype=np.float64)
+    second = np.asarray(right, dtype=np.float64)
+    distance = np.hypot(
+        first[:, None, 0] - second[None, :, 0], first[:, None, 1] - second[None, :, 1]
+    )
+    return float(distance.min()) - float(stroke_width)
+
+
+# --------------------------------------------------------------------------
+# public world interface
+# --------------------------------------------------------------------------
+def analytic_gold(scene) -> str:
+    """"same" iff both markers lie in one gap-free arc of one ring."""
+    loops = scene["loops"]
+    markers = scene["markers"]
+    first, second = markers[0], markers[1]
+    if int(first[0]) != int(second[0]):
+        return "different"
+    loop = loops[int(first[0])]
+    points, cumulative, total = _loop_geometry(
+        loop["center"], loop["base_radius"], loop["harmonics"], loop["samples"]
+        )
+    left = _arc_index(total, loop["gaps"], float(first[1]))
+    right = _arc_index(total, loop["gaps"], float(second[1]))
+    return "same" if left >= 0 and left == right else "different"
+
+
+def render(scene) -> Image.Image:
+    size = int(scene["canvas"])
+    scale = int(scene["supersample"])
+    image = Image.new("RGB", (size * scale, size * scale), tuple(scene["background"]))
+    draw = ImageDraw.Draw(image)
+    ink = tuple(scene["ink_color"])
+    width = int(scene["stroke_width"]) * scale
+    for loop in scene["loops"]:
+        points, cumulative, total = _loop_geometry(
+        loop["center"], loop["base_radius"], loop["harmonics"], loop["samples"]
+        )
+        for run in _kept_runs(cumulative, total, loop["gaps"], scene["stroke_width"] / 2.0):
+            polyline = [(points[index][0] * scale, points[index][1] * scale) for index in run]
+            if len(polyline) >= 2:
+                draw.line(polyline, fill=ink, width=width)
+            for spot in polyline:
+                draw.ellipse(
+                    [spot[0] - width / 2.0, spot[1] - width / 2.0,
+                     spot[0] + width / 2.0, spot[1] + width / 2.0],
+                    fill=ink,
+                )
+    radius = float(scene["marker_radius"])
+    for marker in scene["markers"]:
+        loop = scene["loops"][int(marker[0])]
+        points, cumulative, total = _loop_geometry(
+        loop["center"], loop["base_radius"], loop["harmonics"], loop["samples"]
+        )
+        spot = _position_at(points, cumulative, total, float(marker[1]))
+        box = [
+            (spot[0] - radius) * scale,
+            (spot[1] - radius) * scale,
+            (spot[0] + radius) * scale,
+            (spot[1] + radius) * scale,
+        ]
+        draw.ellipse(box, fill=tuple(scene["marker_color"]))
+    return image.resize((size, size), Image.LANCZOS)
+
+
+def margin(scene) -> float:
+    """Smallest visible clearance (px) protecting the topological answer."""
+    stroke = float(scene["stroke_width"])
+    values = []
+    geometry = []
+    for loop in scene["loops"]:
+        points, cumulative, total = _loop_geometry(
+        loop["center"], loop["base_radius"], loop["harmonics"], loop["samples"]
+        )
+        geometry.append((points, cumulative, total))
+        for item in loop["gaps"]:
+            values.append(2.0 * float(item[1]))
+        values.append(_self_clearance(points, cumulative, total, stroke))
+    for index in range(len(geometry)):
+        for other in range(index + 1, len(geometry)):
+            values.append(_pair_clearance(geometry[index][0], geometry[other][0], stroke))
+    for marker in scene["markers"]:
+        loop = scene["loops"][int(marker[0])]
+        total = geometry[int(marker[0])][2]
+        clearance = _gap_edge_clearance(total, loop["gaps"], float(marker[1]))
+        values.append(clearance - float(scene["marker_radius"]))
+    return round(min(values), 6)
+
+
+def is_quarantined(scene) -> bool:
+    return bool(margin(scene) < QUARANTINE_MARGIN_PX)
+
+
+def latent_symmetries(scene):
+    """Pixel-identical relabelings of the latent scene that must preserve gold."""
+    transforms = []
+    swapped = dict(scene)
+    swapped["markers"] = [list(scene["markers"][1]), list(scene["markers"][0])]
+    transforms.append(("marker_slot_swap", swapped))
+    reversed_gaps = dict(scene)
+    reversed_gaps["loops"] = [dict(loop) for loop in scene["loops"]]
+    for loop in reversed_gaps["loops"]:
+        loop["gaps"] = list(reversed(loop["gaps"]))
+    transforms.append(("gap_list_reversal", reversed_gaps))
+    if len(scene["loops"]) == 2:
+        reordered = dict(scene)
+        reordered["loops"] = [scene["loops"][1], scene["loops"][0]]
+        reordered["markers"] = [
+            [1 - int(marker[0]), float(marker[1])] for marker in scene["markers"]
+        ]
+        transforms.append(("loop_draw_order_swap", reordered))
+    return transforms
+
+
+# --------------------------------------------------------------------------
+# sampling
+# --------------------------------------------------------------------------
+def _sample_loop(rng, center, base, amplitude, gap_count, gap_half_range, min_separation):
+    harmonics = []
+    orders = rng.sample([2, 3, 4], 2)
+    budget = amplitude
+    for order in orders:
+        value = rng.uniform(0.35, 0.65) * budget
+        harmonics.append([order, round(value, 4), round(rng.uniform(0.0, 2.0 * math.pi), 4)])
+        budget -= value
+    loop = {
+        "center": [round(center[0], 4), round(center[1], 4)],
+        "base_radius": round(base, 4),
+        "harmonics": harmonics,
+        "samples": CURVE_SAMPLES,
+        "gaps": [],
+    }
+    points, cumulative, total = _loop_geometry(
+        loop["center"], loop["base_radius"], loop["harmonics"], loop["samples"]
+        )
+    for _ in range(500):
+        centers = sorted(rng.uniform(0.0, total) for _ in range(gap_count))
+        spread = [
+            min(abs(centers[i] - centers[j]), total - abs(centers[i] - centers[j]))
+            for i in range(gap_count)
+            for j in range(i + 1, gap_count)
+        ]
+        if gap_count > 1 and min(spread) < min_separation:
+            continue
+        loop["gaps"] = [
+            [round(value, 4), round(rng.uniform(*gap_half_range), 4)] for value in centers
+        ]
+        return loop, points, cumulative, total
+    raise RuntimeError("could not place gaps")
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministic balanced scene sampler; the class alternates with the seed."""
+    rng = random.Random((int(seed) * 7919 + 104729) % (2**63))
+    target = "same" if int(seed) % 2 == 0 else "different"
+    near_boundary = int(seed) % 8 in (3, 6)
+    half = CANVAS / 2.0
+    for _ in range(400):
+        center = [half + rng.uniform(-10, 10), half + rng.uniform(-10, 10)]
+        gap_count = rng.choice([2, 2, 3, 4])
+        loop, points, cumulative, total = _sample_loop(
+            rng,
+            center,
+            rng.uniform(138.0, 155.0),
+            rng.uniform(16.0, 28.0),
+            gap_count,
+            (14.0, 24.0),
+            95.0,
+        )
+        if near_boundary:
+            index = rng.randrange(gap_count)
+            loop["gaps"][index][1] = round(rng.uniform(4.6, 6.2), 4)
+        loops = [loop]
+        if rng.random() < 0.75:
+            inner, _points, _cumulative, _total = _sample_loop(
+                rng,
+                [center[0] + rng.uniform(-8, 8), center[1] + rng.uniform(-8, 8)],
+                rng.uniform(30.0, 42.0),
+                rng.uniform(2.0, 5.0),
+                rng.choice([1, 2, 3]),
+                (12.0, 22.0),
+                42.0,
+            )
+            loops.append(inner)
+        for _attempt in range(300):
+            first = rng.uniform(0.0, total)
+            step = rng.uniform(60.0, min(0.42 * total, 260.0)) * rng.choice([1.0, -1.0])
+            second = (first + step) % total
+            if min(
+                _gap_edge_clearance(total, loop["gaps"], first),
+                _gap_edge_clearance(total, loop["gaps"], second),
+            ) < 30.0:
+                continue
+            head = _position_at(points, cumulative, total, first)
+            tail = _position_at(points, cumulative, total, second)
+            if math.dist(head, tail) < 46.0:
+                continue
+            scene = {
+                "canvas": CANVAS,
+                "supersample": SUPERSAMPLE,
+                "background": list(BACKGROUND),
+                "ink_color": list(INK_COLOR),
+                "marker_color": list(MARKER_COLOR),
+                "stroke_width": STROKE_WIDTH,
+                "marker_radius": MARKER_RADIUS,
+                "loops": loops,
+                "markers": [[0, round(first, 4)], [0, round(second, 4)]],
+            }
+            if analytic_gold(scene) != target:
+                continue
+            value = margin(scene)
+            if value < 8.0 or (near_boundary and value >= QUARANTINE_MARGIN_PX):
+                continue
+            if not near_boundary and value < QUARANTINE_MARGIN_PX:
+                continue
+            return scene
+    raise RuntimeError(f"could not sample a scene for seed {seed}")

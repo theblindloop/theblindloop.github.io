@@ -1,0 +1,376 @@
+"""Renderer for the split-calibrator length-interval tally world.
+
+A wide instrument sheet carries two gauge columns pinned to its opposite side
+edges.  Each column holds one coloured calibration bar - one red, one blue - and
+a stack of pure-black measurement bars.  The two calibration bars are the only
+coloured marks and they are always in *different* columns, so the length
+interval that the question asks about can only be built by measuring one bar at
+the far left of the sheet and one bar at the far right of the sheet.  The
+decision counts the black bars whose own length lies strictly inside that
+interval, and those black bars are themselves split across both columns.
+
+Everything between the two columns is decoration in neutral grey and pale grey:
+it never carries information, and no grey mark is ever counted.
+
+Only Pillow and NumPy are used.  Every mark is an axis-aligned rectangle drawn
+at integer coordinates, so no edge is antialiased and every bar length is an
+exact integer number of pixels in the final raster.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "span_bracket_tally-renderer-0.1.0"
+
+WIDTH = 1040
+HEIGHT = 560
+
+# Slot geometry.  Six vertical slots per column; one holds the calibration bar.
+SLOTS = 6
+SLOT_CENTERS = tuple(45 + 94 * index for index in range(SLOTS))
+BAR_HEIGHT = 9
+
+# The two columns are pinned inside the extreme left and extreme right strips of
+# the sheet with a wide empty corridor between them.  A crop of either strip
+# alone contains only one calibration bar and therefore cannot bound the
+# interval that the decision needs.
+LEFT_X = 12
+RIGHT_X = 786
+X_JITTER = 6
+MAX_BAR = 235
+LEFT_LIMIT = 255
+RIGHT_LIMIT = 1030
+
+# Decoration lives strictly inside the corridor and never touches a column.
+CORRIDOR = (305, 755)
+
+BACKGROUND = (255, 255, 255)
+BLACK = (0, 0, 0)
+RED = (206, 32, 38)
+BLUE = (26, 64, 196)
+GREY = (152, 152, 152)
+PALE = (233, 233, 233)
+FRAME = (176, 176, 176)
+
+MIN_ENDPOINT_GAP = 7.0
+QUARANTINE_GAP = 6.0
+
+
+def _interval(scene: dict) -> tuple[int, int]:
+    """Sorted calibration lengths: the open interval the tally uses."""
+    lengths = sorted(int(ref["w"]) for ref in scene["refs"])
+    return lengths[0], lengths[1]
+
+
+def _black_widths(scene: dict) -> list[int]:
+    return [int(bar["w"]) for bar in scene["bars"] if bar["kind"] == "black"]
+
+
+def interval(scene: dict) -> tuple[int, int]:
+    """Public accessor for the calibration interval measured in px."""
+    return _interval(scene)
+
+
+def qualifying_widths(scene: dict) -> list[int]:
+    """Black-bar lengths strictly inside the calibration interval."""
+    low, high = _interval(scene)
+    return [width for width in _black_widths(scene) if low < width < high]
+
+
+def per_side_counts(scene: dict) -> dict[str, int]:
+    """Diagnostic: how many qualifying black bars sit in each column."""
+    low, high = _interval(scene)
+    counts = {"left": 0, "right": 0}
+    for bar in scene["bars"]:
+        if bar["kind"] == "black" and low < int(bar["w"]) < high:
+            counts[bar["side"]] += 1
+    return counts
+
+
+def column_boxes(scene: dict) -> list[list[int]]:
+    """Bounding boxes of the two decisive gauge columns."""
+    boxes = []
+    for side in ("left", "right"):
+        marks = [
+            mark
+            for mark in list(scene["bars"]) + list(scene["refs"])
+            if mark["side"] == side and mark["kind"] != "grey"
+        ]
+        x0 = min(int(m["x"]) for m in marks)
+        x1 = max(int(m["x"]) + int(m["w"]) - 1 for m in marks)
+        y0 = min(int(m["y"]) - BAR_HEIGHT // 2 for m in marks)
+        y1 = max(int(m["y"]) + BAR_HEIGHT // 2 for m in marks)
+        boxes.append([x0, y0, x1, y1])
+    return boxes
+
+
+def endpoint_gap(scene: dict) -> float:
+    """Smallest distance in px between a black bar and either interval end."""
+    low, high = _interval(scene)
+    widths = _black_widths(scene)
+    if not widths:
+        return 0.0
+    return float(min(min(abs(w - low), abs(w - high)) for w in widths))
+
+
+def margin(scene: dict) -> float:
+    """Runner-up decision margin in px.
+
+    The tally changes only when some black bar crosses a calibration length, so
+    the margin is the smallest length change that would move any bar across
+    either end of the interval.
+    """
+    return endpoint_gap(scene)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Flag finite-resolution boundary cases."""
+    return margin(scene) < QUARANTINE_GAP
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """No latent aliases are declared for this world."""
+    return []
+
+
+def analytic_gold(scene: dict) -> str:
+    """Number of black bars strictly inside the calibration interval."""
+    return str(len(qualifying_widths(scene)))
+
+
+def _grey_bar(rng: random.Random, side: str, slot: int, low: int, high: int) -> dict:
+    """A grey distractor inside a column, often inside the interval."""
+    if rng.random() < 0.7 and high - low > 26:
+        width = rng.randint(low + 8, high - 8)
+    else:
+        width = rng.randint(34, MAX_BAR)
+    base = LEFT_X if side == "left" else RIGHT_X
+    return {
+        "side": side,
+        "slot": slot,
+        "kind": "grey",
+        "x": base + rng.randint(0, X_JITTER),
+        "y": SLOT_CENTERS[slot] + rng.randint(-5, 5),
+        "w": width,
+    }
+
+
+def _column(
+    rng: random.Random,
+    side: str,
+    color: str,
+    ref_len: int,
+    widths: list[int],
+) -> tuple[dict, list[dict]]:
+    """Lay one gauge column out: one calibration bar plus the given bar lengths."""
+    slots = list(range(SLOTS))
+    rng.shuffle(slots)
+    ref_slot = slots.pop()
+    base = LEFT_X if side == "left" else RIGHT_X
+    ref = {
+        "side": side,
+        "slot": ref_slot,
+        "kind": color,
+        "x": base + rng.randint(0, X_JITTER),
+        "y": SLOT_CENTERS[ref_slot] + rng.randint(-5, 5),
+        "w": int(ref_len),
+    }
+    bars = []
+    for width in widths:
+        slot = slots.pop()
+        bars.append(
+            {
+                "side": side,
+                "slot": slot,
+                "kind": "black",
+                "x": base + rng.randint(0, X_JITTER),
+                "y": SLOT_CENTERS[slot] + rng.randint(-5, 5),
+                "w": int(width),
+            }
+        )
+    return ref, bars, slots
+
+
+def _decor(rng: random.Random) -> list[dict]:
+    """Corridor decoration: pale plates, grey bars and a grey tick lattice."""
+    decor: list[dict] = []
+    x0, x1 = CORRIDOR
+    for _ in range(rng.randint(2, 3)):
+        px = rng.randint(x0, x1 - 150)
+        py = rng.randint(20, HEIGHT - 130)
+        decor.append(
+            {
+                "type": "plate",
+                "x": px,
+                "y": py,
+                "w": rng.randint(110, 150),
+                "h": rng.randint(60, 110),
+            }
+        )
+    for _ in range(rng.randint(4, 7)):
+        width = rng.randint(45, 170)
+        decor.append(
+            {
+                "type": "bar",
+                "x": rng.randint(x0, x1 - width),
+                "y": rng.randint(30, HEIGHT - 30),
+                "w": width,
+                "h": BAR_HEIGHT,
+            }
+        )
+    ticks = rng.randint(6, 10)
+    step = rng.randint(16, 24)
+    decor.append(
+        {
+            "type": "lattice",
+            "x": rng.randint(x0, x1 - ticks * step),
+            "y": rng.randint(40, HEIGHT - 60),
+            "count": ticks,
+            "step": step,
+            "h": rng.randint(14, 24),
+        }
+    )
+    return decor
+
+
+def _attempt(rng: random.Random) -> dict | None:
+    """One rejection-sampling attempt at a balanced answerable scene."""
+    low = rng.randint(66, 100)
+    high = low + rng.randint(70, 90)
+    if high > 190:
+        return None
+
+    target = rng.choice([2, 3, 4, 5])
+    n_left = rng.choice([4, 5])
+    n_right = rng.choice([4, 5])
+
+    # Split the qualifying bars across both columns so that neither column can
+    # be dropped without changing the tally.
+    q_left = rng.randint(1, target - 1)
+    q_right = target - q_left
+    if q_left > n_left or q_right > n_right:
+        return None
+
+    def lengths(n_bars: int, inside: int, tight: bool) -> list[int] | None:
+        out = []
+        for index in range(inside):
+            if tight and index == 0:
+                if rng.random() < 0.5:
+                    out.append(low + rng.randint(7, 11))
+                else:
+                    out.append(high - rng.randint(7, 11))
+            else:
+                out.append(rng.randint(low + 14, high - 14))
+        outside = n_bars - inside
+        for _ in range(outside):
+            if rng.random() < 0.5:
+                out.append(rng.randint(34, low - 12))
+            else:
+                out.append(rng.randint(high + 12, MAX_BAR))
+        if len(out) != n_bars:
+            return None
+        return out
+
+    tight_side = rng.choice(["left", "right", "none"])
+    left_widths = lengths(n_left, q_left, tight_side == "left")
+    right_widths = lengths(n_right, q_right, tight_side == "right")
+    if left_widths is None or right_widths is None:
+        return None
+    all_widths = left_widths + right_widths
+
+    # Both interval ends must actually bind: at least one black bar is shorter
+    # than the short calibrator and at least one is longer than the long one.
+    if not any(w < low for w in all_widths):
+        return None
+    if not any(w > high for w in all_widths):
+        return None
+
+    # Counterbalance colour against side and against which calibrator is longer.
+    left_color, right_color = ("red", "blue") if rng.random() < 0.5 else ("blue", "red")
+    left_len, right_len = (low, high) if rng.random() < 0.5 else (high, low)
+
+    left_ref, left_bars, left_free = _column(rng, "left", left_color, left_len, left_widths)
+    right_ref, right_bars, right_free = _column(rng, "right", right_color, right_len, right_widths)
+
+    bars = left_bars + right_bars
+    for side, free in (("left", left_free), ("right", right_free)):
+        for slot in free:
+            if rng.random() < 0.75:
+                bars.append(_grey_bar(rng, side, slot, low, high))
+
+    for bar in bars + [left_ref, right_ref]:
+        limit = LEFT_LIMIT if bar["side"] == "left" else RIGHT_LIMIT
+        if bar["x"] + bar["w"] - 1 > limit:
+            return None
+
+    scene = {
+        "width": WIDTH,
+        "height": HEIGHT,
+        "frame_inset": rng.choice([5, 6, 7]),
+        "refs": sorted([left_ref, right_ref], key=lambda item: (item["side"], item["slot"])),
+        "bars": sorted(bars, key=lambda item: (item["side"], item["slot"])),
+        "decor": _decor(rng),
+    }
+    if analytic_gold(scene) != str(target):
+        return None
+    if endpoint_gap(scene) < MIN_ENDPOINT_GAP:
+        return None
+    counts = per_side_counts(scene)
+    if counts["left"] < 1 or counts["right"] < 1:
+        return None
+    return scene
+
+
+def sample_scene(seed: int) -> dict:
+    """Deterministically sample one answerable scene."""
+    rng = random.Random(seed * 7919 + 13)
+    for _ in range(4000):
+        scene = _attempt(rng)
+        if scene is not None:
+            return scene
+    raise RuntimeError(f"no answerable scene for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    """Rasterize one scene.  Integer rectangles only, so nothing is antialiased."""
+    image = Image.new("RGB", (int(scene["width"]), int(scene["height"])), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    inset = int(scene["frame_inset"])
+    draw.rectangle(
+        [inset, inset, int(scene["width"]) - 1 - inset, int(scene["height"]) - 1 - inset],
+        outline=FRAME,
+        width=2,
+    )
+
+    for item in scene["decor"]:
+        if item["type"] == "plate":
+            draw.rectangle(
+                [item["x"], item["y"], item["x"] + item["w"] - 1, item["y"] + item["h"] - 1],
+                fill=PALE,
+            )
+    for item in scene["decor"]:
+        if item["type"] == "bar":
+            draw.rectangle(
+                [item["x"], item["y"], item["x"] + item["w"] - 1, item["y"] + item["h"] - 1],
+                fill=GREY,
+            )
+        elif item["type"] == "lattice":
+            for index in range(int(item["count"])):
+                tick_x = int(item["x"]) + index * int(item["step"])
+                draw.rectangle(
+                    [tick_x, item["y"], tick_x + 2, item["y"] + int(item["h"]) - 1], fill=GREY
+                )
+
+    half = BAR_HEIGHT // 2
+    fills = {"black": BLACK, "grey": GREY, "red": RED, "blue": BLUE}
+    for mark in list(scene["bars"]) + list(scene["refs"]):
+        x0 = int(mark["x"])
+        y0 = int(mark["y"]) - half
+        draw.rectangle(
+            [x0, y0, x0 + int(mark["w"]) - 1, y0 + BAR_HEIGHT - 1], fill=fills[mark["kind"]]
+        )
+    return image

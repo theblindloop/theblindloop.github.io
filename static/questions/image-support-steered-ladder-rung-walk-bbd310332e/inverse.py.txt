@@ -1,0 +1,175 @@
+"""Pixel-only oracle for the ladder_rung_walk world.
+
+Receives one RGB image and nothing else: no scene, no renderer, no gold.  It
+segments the dark ink, recovers the rails from tall vertical runs, recovers the
+rungs from the ink bridges between neighbouring rails, reads the start rail from
+the dark tab above the ladder, replays the walk top to bottom, and finally names
+the coloured cap under the finishing rail.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "ladder_rung_walk-oracle-0.1.0"
+
+_DARK_MAX = 110
+_SATURATION = 55
+_REFERENCE = {
+    "red": (198, 42, 42),
+    "green": (32, 138, 66),
+    "blue": (40, 84, 200),
+    "purple": (142, 48, 168),
+}
+ABSTAIN = "abstain"
+
+
+def _longest_run(column: np.ndarray) -> tuple[int, int, int]:
+    """Longest contiguous True run in a boolean column: (length, start, end)."""
+    best = (0, -1, -1)
+    run_start = None
+    for index, value in enumerate(column):
+        if value and run_start is None:
+            run_start = index
+        elif not value and run_start is not None:
+            if index - run_start > best[0]:
+                best = (index - run_start, run_start, index - 1)
+            run_start = None
+    if run_start is not None and len(column) - run_start > best[0]:
+        best = (len(column) - run_start, run_start, len(column) - 1)
+    return best
+
+
+def _rails(dark: np.ndarray) -> list[dict]:
+    height, width = dark.shape
+    per_column = []
+    for x in range(width):
+        length, y_lo, y_hi = _longest_run(dark[:, x])
+        per_column.append((length, y_lo, y_hi))
+    threshold = max(40, int(0.08 * height))
+    tall = [x for x in range(width) if per_column[x][0] >= threshold]
+    if not tall:
+        return []
+    groups: list[list[int]] = [[tall[0]]]
+    for x in tall[1:]:
+        if x - groups[-1][-1] <= 1:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    rails = []
+    for group in groups:
+        lengths = [per_column[x][0] for x in group]
+        pick = group[int(np.argmax(lengths))]
+        rails.append(
+            {
+                "x": float(sum(group) / len(group)),
+                "top": per_column[pick][1],
+                "bottom": per_column[pick][2],
+            }
+        )
+    return rails
+
+
+def _rungs(dark: np.ndarray, rails: list[dict]) -> list[tuple[float, int]]:
+    """(y, left_rail_index) rungs found as full ink bridges between neighbours."""
+    top = min(rail["top"] for rail in rails)
+    bottom = max(rail["bottom"] for rail in rails)
+    hits: list[tuple[int, int]] = []
+    for left in range(len(rails) - 1):
+        x_lo = int(round(rails[left]["x"]))
+        x_hi = int(round(rails[left + 1]["x"]))
+        if x_hi - x_lo < 4:
+            continue
+        for y in range(top, bottom + 1):
+            if dark[y, x_lo + 1 : x_hi].all():
+                hits.append((y, left))
+    grouped: list[tuple[float, int]] = []
+    for left in {left for _y, left in hits}:
+        ys = sorted(y for y, other in hits if other == left)
+        run = [ys[0]]
+        for y in ys[1:]:
+            if y - run[-1] <= 1:
+                run.append(y)
+            else:
+                grouped.append((sum(run) / len(run), left))
+                run = [y]
+        grouped.append((sum(run) / len(run), left))
+    grouped.sort()
+    return grouped
+
+
+def _start_rail(dark: np.ndarray, rails: list[dict]) -> int | None:
+    top = min(rail["top"] for rail in rails)
+    band = dark[:top, :]
+    ys, xs = np.nonzero(band)
+    if xs.size == 0:
+        return None
+    centre = float(xs.mean())
+    distances = [abs(centre - rail["x"]) for rail in rails]
+    order = sorted(range(len(rails)), key=lambda i: distances[i])
+    if len(order) > 1 and distances[order[1]] - distances[order[0]] < 3.0:
+        return None
+    return order[0]
+
+
+def _caps(rgb: np.ndarray, rails: list[dict]) -> dict[int, str]:
+    channel_max = rgb.max(axis=2).astype(np.int16)
+    channel_min = rgb.min(axis=2).astype(np.int16)
+    coloured = (channel_max - channel_min) >= _SATURATION
+    bottom = max(rail["bottom"] for rail in rails)
+    coloured[: bottom + 1, :] = False
+    ys, xs = np.nonzero(coloured)
+    assignment: dict[int, str] = {}
+    if xs.size == 0:
+        return assignment
+    buckets: dict[int, list[tuple[int, int]]] = {}
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        index = min(range(len(rails)), key=lambda i: abs(x - rails[i]["x"]))
+        if abs(x - rails[index]["x"]) > 12:
+            continue
+        buckets.setdefault(index, []).append((y, x))
+    for index, pixels in buckets.items():
+        values = np.array([rgb[y, x] for y, x in pixels], dtype=np.float64)
+        mean = values.mean(axis=0)
+        name = min(
+            _REFERENCE,
+            key=lambda key: float(np.linalg.norm(mean - np.array(_REFERENCE[key], dtype=np.float64))),
+        )
+        assignment[index] = name
+    return assignment
+
+
+def decision_from_image(image: Image.Image) -> str:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    dark = rgb.max(axis=2) < _DARK_MAX
+
+    rails = _rails(dark)
+    if len(rails) < 2:
+        return ABSTAIN
+
+    rungs = _rungs(dark, rails)
+    if not rungs:
+        return ABSTAIN
+    ys = [y for y, _left in rungs]
+    for previous, following in zip(ys, ys[1:]):
+        if following - previous < 4.0:
+            return ABSTAIN
+
+    start = _start_rail(dark, rails)
+    if start is None:
+        return ABSTAIN
+
+    current = start
+    for _y, left in rungs:
+        if current == left:
+            current = left + 1
+        elif current == left + 1:
+            current = left
+
+    caps = _caps(rgb, rails)
+    if current not in caps:
+        return ABSTAIN
+    if len(set(caps.values())) != len(caps):
+        return ABSTAIN
+    return caps[current]

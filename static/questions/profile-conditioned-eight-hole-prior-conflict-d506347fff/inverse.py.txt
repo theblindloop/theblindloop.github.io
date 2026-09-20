@@ -1,0 +1,121 @@
+"""Independent pixel-only inverse arm for enclosed-component counting."""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import Any
+
+import numpy as np
+from PIL import Image
+
+MIN_HOLE_AREA_PX = 300
+MIN_CONTRAST = 80.0
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _threshold_ink(image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    lum = 0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]
+    dark = float(np.percentile(lum, 5.0))
+    light = float(np.percentile(lum, 95.0))
+    if light - dark < MIN_CONTRAST:
+        raise OracleError("image lacks a separable dark figure and light canvas")
+    ink = lum < (dark + light) / 2.0
+    if int(ink.sum()) < 2000:
+        raise OracleError("dark figure is missing or too small")
+    return arr.astype(np.uint8), ink
+
+
+def _light_components(ink: np.ndarray) -> list[dict[str, Any]]:
+    ys, xs = np.nonzero(ink)
+    if len(xs) == 0:
+        raise OracleError("no dark pixels")
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    crop_light = (~ink[y0 : y1 + 1, x0 : x1 + 1]).copy()
+    h, w = crop_light.shape
+    seen = np.zeros((h, w), dtype=np.bool_)
+    components: list[dict[str, Any]] = []
+
+    for start_y in range(h):
+        for start_x in range(w):
+            if not crop_light[start_y, start_x] or seen[start_y, start_x]:
+                continue
+            queue: deque[tuple[int, int]] = deque([(start_y, start_x)])
+            seen[start_y, start_x] = True
+            pixels: list[tuple[int, int]] = []
+            touches_edge = False
+            while queue:
+                yy, xx = queue.popleft()
+                pixels.append((yy + y0, xx + x0))
+                if yy == 0 or xx == 0 or yy == h - 1 or xx == w - 1:
+                    touches_edge = True
+                if yy > 0 and crop_light[yy - 1, xx] and not seen[yy - 1, xx]:
+                    seen[yy - 1, xx] = True
+                    queue.append((yy - 1, xx))
+                if yy + 1 < h and crop_light[yy + 1, xx] and not seen[yy + 1, xx]:
+                    seen[yy + 1, xx] = True
+                    queue.append((yy + 1, xx))
+                if xx > 0 and crop_light[yy, xx - 1] and not seen[yy, xx - 1]:
+                    seen[yy, xx - 1] = True
+                    queue.append((yy, xx - 1))
+                if xx + 1 < w and crop_light[yy, xx + 1] and not seen[yy, xx + 1]:
+                    seen[yy, xx + 1] = True
+                    queue.append((yy, xx + 1))
+            components.append(
+                {"area": len(pixels), "touches_edge": touches_edge, "pixels": pixels}
+            )
+    return components
+
+
+def measure_from_image(image: Image.Image) -> dict[str, Any]:
+    """Return count and the accepted-vs-runner-up component-area gap."""
+
+    _, ink = _threshold_ink(image)
+    components = _light_components(ink)
+    enclosed = [item for item in components if not item["touches_edge"]]
+    accepted = [item for item in enclosed if item["area"] >= MIN_HOLE_AREA_PX]
+    rejected_areas = [item["area"] for item in enclosed if item["area"] < MIN_HOLE_AREA_PX]
+    if not accepted:
+        raise OracleError("no clearly enclosed light component")
+    count = len(accepted)
+    if count not in (1, 2, 3):
+        raise OracleError(f"unsupported enclosed-hole count {count}")
+    weakest = min(int(item["area"]) for item in accepted)
+    runner_up = max(rejected_areas, default=0)
+    decision_margin = float(weakest - max(MIN_HOLE_AREA_PX, runner_up))
+    if decision_margin <= 0:
+        raise OracleError("component-area decision has no positive runner-up margin")
+    return {
+        "decision": str(count),
+        "hole_areas_px": sorted((int(item["area"]) for item in accepted), reverse=True),
+        "runner_up_area_px": int(runner_up),
+        "runner_up_margin_px": decision_margin,
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(measure_from_image(image)["decision"])
+
+
+def erase_one_visible_hole(image: Image.Image) -> Image.Image:
+    """Pixel-only evidence erasure used by tests: fill the smallest visible hole."""
+
+    arr, ink = _threshold_ink(image)
+    enclosed = [
+        item
+        for item in _light_components(ink)
+        if not item["touches_edge"] and item["area"] >= MIN_HOLE_AREA_PX
+    ]
+    if not enclosed:
+        raise OracleError("no hole to erase")
+    target = min(enclosed, key=lambda item: item["area"])
+    ink_pixels = arr[ink]
+    fill = np.median(ink_pixels, axis=0).astype(np.uint8)
+    for yy, xx in target["pixels"]:
+        arr[yy, xx] = fill
+    return Image.fromarray(arr, mode="RGB")
+

@@ -1,0 +1,122 @@
+"""Independent pixel-only inverse arm for serpentine spur correspondence."""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+TAG_RGB = {
+    "gold": np.array((226, 174, 38), dtype=np.int16),
+    "red": np.array((214, 60, 60), dtype=np.int16),
+    "green": np.array((45, 157, 91), dtype=np.int16),
+    "blue": np.array((53, 105, 210), dtype=np.int16),
+}
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    seen = np.zeros(mask.shape, dtype=bool)
+    results: list[np.ndarray] = []
+    height, width = mask.shape
+    for sy, sx in np.argwhere(mask):
+        if seen[sy, sx]:
+            continue
+        stack = [(int(sy), int(sx))]
+        seen[sy, sx] = True
+        points = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        results.append(np.asarray(points, dtype=np.int32))
+    return results
+
+
+def _tag_centroid(array: np.ndarray, name: str) -> tuple[float, float]:
+    delta = np.linalg.norm(array.astype(np.int16) - TAG_RGB[name], axis=2)
+    comps = [points for points in _components(delta < 18.0) if len(points) >= 20]
+    if len(comps) != 1:
+        raise OracleAbstention(f"expected one intact {name} bead")
+    y, x = comps[0].mean(axis=0)
+    return float(x), float(y)
+
+
+def _groups(indices: np.ndarray) -> list[np.ndarray]:
+    if not len(indices):
+        return []
+    cuts = np.where(np.diff(indices) > 1)[0] + 1
+    return [part for part in np.split(indices, cuts) if len(part)]
+
+
+def _read_code(dark: np.ndarray, bead: tuple[float, float], extent: tuple[int, int]) -> list[int]:
+    bx, by = bead
+    y = int(round(by))
+    x_min, x_max = extent
+    midpoint = (x_min + x_max) / 2.0
+    direction = 1 if bx < midpoint else -1
+
+    # A vertical spur contributes several dark pixels beyond the 3-pixel trunk.
+    candidates = []
+    for x in range(x_min + 14, x_max - 13):
+        # Require attachment immediately beside this trunk. A more distant
+        # window would accidentally see a spur growing from the neighboring
+        # run, which is only twelve pixels away in the focal rendering.
+        above = int(dark[max(0, y - 5) : max(0, y - 2), x].sum())
+        below = int(dark[min(dark.shape[0], y + 3) : min(dark.shape[0], y + 6), x].sum())
+        if max(above, below) >= 2:
+            candidates.append(x)
+    groups = _groups(np.asarray(candidates, dtype=np.int32))
+    if len(groups) != 4:
+        raise OracleAbstention(f"expected four intact spurs, saw {len(groups)}")
+
+    observed = []
+    centers = []
+    for group in groups:
+        x = int(round(float(group.mean())))
+        centers.append(x)
+        above = int(dark[max(0, y - 9) : max(0, y - 2), group].sum())
+        below = int(dark[min(dark.shape[0], y + 3) : min(dark.shape[0], y + 10), group].sum())
+        if above == below:
+            raise OracleAbstention("spur side is ambiguous")
+        page_sign = -1 if above > below else 1
+        # traversal-left has page sign -direction; traversal-right +direction
+        observed.append(0 if page_sign == -direction else 1)
+    order = np.argsort(np.asarray(centers))
+    if direction < 0:
+        order = order[::-1]
+    return [observed[int(i)] for i in order]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tags = {name: _tag_centroid(array, name) for name in TAG_RGB}
+    ys = sorted(round(point[1]) for point in tags.values())
+    if len(ys) != 4 or any(b - a < 8 for a, b in zip(ys, ys[1:])):
+        raise OracleAbstention("beads do not define four separated runs")
+
+    # Every supported ink palette is dark; semantic tag colors are excluded by
+    # requiring all channels below 100.
+    dark = np.all(array < 100, axis=2)
+    points = np.argwhere(dark)
+    if len(points) < 1000:
+        raise OracleAbstention("serpentine ink is missing")
+    x_min = int(points[:, 1].min())
+    x_max = int(points[:, 1].max())
+    if x_max - x_min < 140:
+        raise OracleAbstention("serpentine run is truncated")
+
+    reference = _read_code(dark, tags["gold"], (x_min, x_max))
+    distances: dict[str, int] = {}
+    for name in ("red", "green", "blue"):
+        code = _read_code(dark, tags[name], (x_min, x_max))
+        distances[name] = sum(int(a != b) for a, b in zip(reference, code, strict=True))
+    winners = [name for name, distance in distances.items() if distance == min(distances.values())]
+    if len(winners) != 1 or distances[winners[0]] != 0:
+        raise OracleAbstention("there is no unique exact spur-code match")
+    return winners[0]

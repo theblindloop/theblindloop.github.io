@@ -1,0 +1,199 @@
+"""Independent PNG-only inverse arm for Barrier Tilt Packing.
+
+The parser locates the connected console by color and geometry, validates its
+frame and grid gutters, decodes its four arrow tips and 25 cell interiors, then
+reimplements stable segment packing without importing candidate modules.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_SIZE = 5
+_CELL = 36
+_HEADER = 38
+_FOOTER = 24
+_PANEL_WIDTH = 180
+_PANEL_HEIGHT = 242
+_PAD = 4
+_LETTERS = "ABCDE"
+_PANEL = np.array((43, 47, 55), dtype=np.int16)
+_EMPTY = np.array((248, 246, 238), dtype=np.int16)
+_WALL = np.array((184, 82, 76), dtype=np.int16)
+_COMMAND_BG = np.array((235, 220, 174), dtype=np.int16)
+_COMMAND_TIP = np.array((216, 74, 63), dtype=np.int16)
+_TRACK = np.array((242, 157, 38), dtype=np.int16)
+_BEADS = tuple(
+    np.array(color, dtype=np.int16)
+    for color in ((39, 119, 145), (54, 130, 94), (117, 83, 153), (183, 103, 43))
+)
+
+
+class OracleAbstention(ValueError):
+    pass
+
+
+def _near(values: np.ndarray, color: np.ndarray, tolerance: float = 14.0) -> np.ndarray:
+    delta = values.astype(np.int32) - color.astype(np.int32)
+    return np.sqrt(np.sum(delta * delta, axis=2)) < tolerance
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    groups: list[np.ndarray] = []
+    for start_y, start_x in np.argwhere(mask):
+        if seen[start_y, start_x]:
+            continue
+        queue = deque([(int(start_y), int(start_x))])
+        seen[start_y, start_x] = True
+        points: list[tuple[int, int]] = []
+        while queue:
+            y, x = queue.popleft()
+            points.append((y, x))
+            for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= yy < height and 0 <= xx < width and mask[yy, xx] and not seen[yy, xx]:
+                    seen[yy, xx] = True
+                    queue.append((yy, xx))
+        groups.append(np.asarray(points, dtype=np.int32))
+    return groups
+
+
+def _find_panel(array: np.ndarray) -> tuple[int, int]:
+    dark = _near(array, _PANEL)
+    groups = _components(dark)
+    if not groups:
+        raise OracleAbstention("connected chamber panel is missing")
+    panel = max(groups, key=len)
+    if len(panel) < 10500:
+        raise OracleAbstention("connected chamber panel is incomplete")
+    y_min, x_min = panel.min(axis=0)
+    y_max, x_max = panel.max(axis=0)
+    if int(x_max - x_min + 1) != _PANEL_WIDTH or int(y_max - y_min + 1) != _PANEL_HEIGHT:
+        raise OracleAbstention("chamber panel geometry is invalid")
+
+    patch = dark[y_min : y_max + 1, x_min : x_max + 1]
+    expected = np.zeros_like(patch)
+    expected[:3, 5:-5] = True
+    expected[-3:, 5:-5] = True
+    expected[5:-5, :3] = True
+    expected[5:-5, -3:] = True
+    yy, xx = np.indices((_SIZE * _CELL, _SIZE * _CELL))
+    gutters = (
+        (xx % _CELL < _PAD)
+        | (xx % _CELL >= _CELL - _PAD)
+        | (yy % _CELL < _PAD)
+        | (yy % _CELL >= _CELL - _PAD)
+    )
+    expected[_HEADER : _HEADER + _SIZE * _CELL] |= gutters
+    if float(patch[expected].mean()) < 0.985:
+        raise OracleAbstention("panel frame or connected grid gutters are damaged")
+    return int(x_min), int(y_min)
+
+
+def _parse_commands(array: np.ndarray, x0: int, y0: int) -> list[str]:
+    header = array[y0 : y0 + _HEADER, x0 : x0 + _PANEL_WIDTH]
+    groups = [group for group in _components(_near(header, _COMMAND_BG)) if len(group) > 650]
+    if len(groups) != 4:
+        raise OracleAbstention("exactly four intact command tiles are required")
+    groups.sort(key=lambda group: float(group[:, 1].mean()))
+    commands: list[str] = []
+    for group in groups:
+        gy0, gx0 = group.min(axis=0)
+        gy1, gx1 = group.max(axis=0)
+        if int(gx1 - gx0 + 1) != 34 or int(gy1 - gy0 + 1) != 30:
+            raise OracleAbstention("command tile geometry is damaged")
+        crop = header[gy0 : gy1 + 1, gx0 : gx1 + 1]
+        tips = np.argwhere(_near(crop, _COMMAND_TIP, 10.0))
+        if not 9 <= len(tips) <= 30:
+            raise OracleAbstention("command arrow tip is missing or ambiguous")
+        center = np.array(((gy1 - gy0) / 2.0, (gx1 - gx0) / 2.0))
+        dy, dx = tips.mean(axis=0) - center
+        if max(abs(float(dx)), abs(float(dy))) < 7.0:
+            raise OracleAbstention("command arrow has no clear direction")
+        if abs(float(dx)) > abs(float(dy)):
+            commands.append("right" if dx > 0 else "left")
+        else:
+            commands.append("down" if dy > 0 else "up")
+    if set(commands) != {"left", "up", "right", "down"}:
+        raise OracleAbstention("command row must show one arrow in each direction")
+    return commands
+
+
+def _parse_grid(array: np.ndarray, x0: int, y0: int) -> list[list[int]]:
+    board_y = y0 + _HEADER
+    grid: list[list[int]] = []
+    target_count = 0
+    for row in range(_SIZE):
+        output_row: list[int] = []
+        for col in range(_SIZE):
+            cx = x0 + col * _CELL + _CELL // 2
+            cy = board_y + row * _CELL + _CELL // 2
+            crop = array[cy - 13 : cy + 14, cx - 13 : cx + 14]
+            if crop.shape[:2] != (27, 27):
+                raise OracleAbstention("cell interior is clipped")
+            wall_pixels = int(_near(crop, _WALL).sum())
+            bead_pixels = max(int(_near(crop, color).sum()) for color in _BEADS)
+            track_pixels = int(_near(crop, _TRACK).sum())
+            empty_pixels = int(_near(crop, _EMPTY).sum())
+            if wall_pixels >= 180 and bead_pixels < 50 and track_pixels < 30:
+                value = 3
+            elif bead_pixels >= 170 and wall_pixels < 50:
+                if track_pixels >= 120:
+                    value = 2
+                    target_count += 1
+                elif track_pixels < 30:
+                    value = 1
+                else:
+                    raise OracleAbstention("tracked ring is incomplete")
+            elif empty_pixels >= 650 and wall_pixels < 30 and bead_pixels < 30 and track_pixels < 30:
+                value = 0
+            else:
+                raise OracleAbstention("cell state is damaged or ambiguous")
+            output_row.append(value)
+        grid.append(output_row)
+    flat = [value for row in grid for value in row]
+    if flat.count(0) != 13 or flat.count(1) != 7 or target_count != 1 or flat.count(3) != 4:
+        raise OracleAbstention("chamber must contain four walls and eight beads with one ring")
+    return grid
+
+
+def _tilt(grid: list[list[int]], direction: str) -> list[list[int]]:
+    output = [row[:] for row in grid]
+    horizontal = direction in ("left", "right")
+    toward_start = direction in ("left", "up")
+    for fixed in range(_SIZE):
+        line = [grid[fixed][moving] if horizontal else grid[moving][fixed] for moving in range(_SIZE)]
+        walls = [index for index, value in enumerate(line) if value == 3]
+        for start, stop in zip([-1, *walls], [*walls, _SIZE]):
+            cells = list(range(start + 1, stop))
+            beads = [line[index] for index in cells if line[index] in (1, 2)]
+            for index in cells:
+                line[index] = 0
+            destinations = cells[: len(beads)] if toward_start else cells[len(cells) - len(beads) :]
+            for index, bead in zip(destinations, beads):
+                line[index] = bead
+        for moving, value in enumerate(line):
+            if horizontal:
+                output[fixed][moving] = value
+            else:
+                output[moving][fixed] = value
+    return output
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 300:
+        raise OracleAbstention("unsupported raster dimensions")
+    x0, y0 = _find_panel(array)
+    commands = _parse_commands(array, x0, y0)
+    grid = _parse_grid(array, x0, y0)
+    for command in commands:
+        grid = _tilt(grid, command)
+    positions = [(row, col) for row in range(_SIZE) for col in range(_SIZE) if grid[row][col] == 2]
+    if len(positions) != 1:
+        raise OracleAbstention("replay lost the tracked bead")
+    return _LETTERS[positions[0][1]]

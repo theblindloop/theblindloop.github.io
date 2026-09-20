@@ -1,0 +1,288 @@
+"""Renderer, analytic gold and margin for shelf_insert_shift.
+
+A shelf of six slots holds coloured discs; one slot is ringed.  Below the shelf
+an ordered row of cards each names one slot with a drawn pointer and either
+inserts a disc there (everything from that slot rightwards shifts one slot right
+and the last slot's disc falls off) or removes whatever that slot holds
+(everything to its right shifts one slot left and the last slot ends empty).
+Only the starting shelf is drawn.  The decision is the colour of the disc that
+occupies the ringed slot after every card has acted in drawn left-to-right
+order.
+
+The scene is a plain JSON-able dict.  Cards live in an unordered bag: each card
+carries its own drawn slot, so the bag may be permuted without changing either
+the raster or the answer.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "shelf_insert_shift-renderer-0.1.0"
+
+# ---------------------------------------------------------------- palette ---
+COLOURS: dict[str, tuple[int, int, int]] = {
+    "red": (206, 48, 42),
+    "orange": (238, 150, 26),
+    "blue": (46, 86, 196),
+    "green": (36, 142, 72),
+}
+COLOUR_NAMES = ("red", "orange", "blue", "green")
+EMPTY = "empty"
+
+BG = (245, 247, 250)
+CELL_FILL = (228, 228, 232)
+CELL_EDGE = (160, 160, 168)
+CARD_FILL = (250, 238, 205)
+CARD_EDGE = (176, 162, 128)
+MINI_FILL = (255, 255, 255)
+MINI_EDGE = (150, 150, 150)
+INK = (15, 15, 15)            # ring and pointers
+DELETE_GREY = (90, 90, 90)    # the "remove" glyph
+ARROW_GREY = (150, 150, 150)
+
+# ----------------------------------------------------------------- layout ---
+W, H = 800, 300
+N_SLOTS = 6
+CELL, CELL_GAP = 56, 10
+SHELF_X0, SHELF_Y0 = 48, 34
+RING_PAD, RING_W = 6, 5
+DISC_R = 19
+
+CARD_W, CARD_H, CARD_GAP = 134, 118, 16
+CARD_Y0 = 150
+MINI_W, MINI_H, MINI_PITCH = 18, 20, 20
+MINI_DY = 56
+GLYPH_DY = 28
+POINTER_DY = 80
+HALF_PITCH = MINI_PITCH / 2.0
+JITTER_MAX = 6.8              # ordinary scenes stay this far from a boundary
+QUARANTINE_MARGIN = 3.0
+
+
+def _cell_box(i: int) -> tuple[int, int, int, int]:
+    x0 = SHELF_X0 + i * (CELL + CELL_GAP)
+    return x0, SHELF_Y0, x0 + CELL, SHELF_Y0 + CELL
+
+
+def _cards_x0(n_cards: int) -> int:
+    total = n_cards * CARD_W + (n_cards - 1) * CARD_GAP
+    return (W - total) // 2
+
+
+def _card_x0(n_cards: int, slot: int) -> int:
+    return _cards_x0(n_cards) + slot * (CARD_W + CARD_GAP)
+
+
+def _mini_x0(card_x0: int) -> int:
+    strip = N_SLOTS * MINI_PITCH - (MINI_PITCH - MINI_W)
+    return card_x0 + (CARD_W - strip) // 2
+
+
+def _mini_centre(mini_x0: int, index: int) -> float:
+    """x of the drawn white interior of mini-cell `index` (outline is 1px)."""
+    left = mini_x0 + index * MINI_PITCH
+    return (left + 1 + left + MINI_W - 2) / 2.0
+
+
+# --------------------------------------------------------------- sampling ---
+def _ordered_cards(scene: dict[str, Any]) -> list[dict[str, Any]]:
+    return sorted(scene["cards"], key=lambda c: int(c["slot"]))
+
+
+def _read_target(scene: dict[str, Any], card: dict[str, Any]) -> int:
+    """The declared reading: the mini-cell nearest the drawn pointer."""
+    n = len(scene["cards"])
+    mini_x0 = _mini_x0(_card_x0(n, int(card["slot"])))
+    px = _mini_centre(mini_x0, int(card["target"])) + float(card["jitter"])
+    best, best_d = 0, None
+    for i in range(N_SLOTS):
+        d = abs(px - _mini_centre(mini_x0, i))
+        if best_d is None or d < best_d:
+            best, best_d = i, d
+    return best
+
+
+def _replay(initial: list[str], cards: list[dict[str, Any]], targets: list[int]) -> list[str]:
+    state = list(initial)
+    for card, k in zip(cards, targets):
+        if card["op"] == "ins":
+            state = state[:k] + [card["colour"]] + state[k:]
+            state = state[:N_SLOTS]
+        else:
+            state = state[:k] + state[k + 1:] + [EMPTY]
+    return state
+
+
+def _final_state(scene: dict[str, Any]) -> list[str]:
+    cards = _ordered_cards(scene)
+    targets = [_read_target(scene, c) for c in cards]
+    return _replay(list(scene["initial"]), cards, targets)
+
+
+def _unique_mode(values: list[str]) -> str | None:
+    counts: dict[str, int] = {}
+    for v in values:
+        if v != EMPTY:
+            counts[v] = counts.get(v, 0) + 1
+    if not counts:
+        return None
+    top = max(counts.values())
+    winners = [k for k, v in counts.items() if v == top]
+    return winners[0] if len(winners) == 1 else None
+
+
+def sample_scene(seed: int) -> dict[str, Any]:
+    rng = random.Random(seed)
+    target_answer = COLOUR_NAMES[seed % len(COLOUR_NAMES)]
+    near_boundary = (seed % 7) == 3
+
+    relax_after = 2500
+    for attempt in range(5000):
+        n_cards = rng.choice([3, 4, 5])
+        initial = [
+            rng.choice(COLOUR_NAMES) if rng.random() < 0.82 else EMPTY
+            for _ in range(N_SLOTS)
+        ]
+        if sum(1 for v in initial if v != EMPTY) < 4:
+            continue
+        ring_slot = rng.randrange(N_SLOTS)
+
+        cards: list[dict[str, Any]] = []
+        for slot in range(n_cards):
+            op = "ins" if rng.random() < 0.55 else "del"
+            cards.append(
+                {
+                    "slot": slot,
+                    "op": op,
+                    "colour": rng.choice(COLOUR_NAMES) if op == "ins" else EMPTY,
+                    "target": rng.randrange(N_SLOTS),
+                    "jitter": round(rng.uniform(-JITTER_MAX, JITTER_MAX), 4),
+                }
+            )
+        ops = {c["op"] for c in cards}
+        if ops != {"ins", "del"}:
+            continue
+        if near_boundary:
+            pick = rng.randrange(n_cards)
+            mag = rng.uniform(HALF_PITCH - 2.8, HALF_PITCH - 0.4)
+            cards[pick]["jitter"] = round(mag * rng.choice([-1.0, 1.0]), 4)
+
+        rng.shuffle(cards)  # the bag order carries nothing
+        scene = {
+            "canvas": [W, H],
+            "n_slots": N_SLOTS,
+            "n_cards": n_cards,
+            "ring_slot": ring_slot,
+            "initial": initial,
+            "cards": cards,
+        }
+        final = _final_state(scene)
+        answer = final[ring_slot]
+        if answer == EMPTY or answer != target_answer:
+            continue
+        if attempt < relax_after:
+            ordered = _ordered_cards(scene)
+            if initial[ring_slot] == answer:
+                continue                                   # "read the ring now"
+            if ordered[-1]["colour"] == answer:
+                continue                                   # "last card's colour"
+            if ordered[0]["colour"] == answer:
+                continue                                   # "first card's colour"
+            if _unique_mode(initial) == answer:
+                continue                                   # "commonest disc"
+            if _unique_mode([c["colour"] for c in ordered]) == answer:
+                continue                                   # "commonest card"
+        return scene
+    raise RuntimeError(f"sampling failed for seed {seed}")
+
+
+# ------------------------------------------------------------------ gold ----
+def analytic_gold(scene: dict[str, Any]) -> str:
+    return _final_state(scene)[int(scene["ring_slot"])]
+
+
+def margin(scene: dict[str, Any]) -> float:
+    worst = min(HALF_PITCH - abs(float(c["jitter"])) for c in scene["cards"])
+    return round(float(worst), 6)
+
+
+def is_quarantined(scene: dict[str, Any]) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Permutations of the card bag: pixel-identical and answer preserving."""
+    bag = list(scene["cards"])
+    out: list[tuple[str, dict[str, Any]]] = []
+    for name, perm in (
+        ("card_bag_reversed", list(reversed(bag))),
+        ("card_bag_rotated", bag[1:] + bag[:1]),
+        ("card_bag_slot_sorted", sorted(bag, key=lambda c: int(c["slot"]))),
+    ):
+        alt = dict(scene)
+        alt["cards"] = [dict(c) for c in perm]
+        out.append((name, alt))
+    return out
+
+
+# ---------------------------------------------------------------- render ----
+def render(scene: dict[str, Any]) -> Image.Image:
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+
+    for i in range(N_SLOTS):
+        x0, y0, x1, y1 = _cell_box(i)
+        d.rectangle([x0, y0, x1, y1], fill=CELL_FILL, outline=CELL_EDGE, width=2)
+        content = scene["initial"][i]
+        if content != EMPTY:
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            d.ellipse(
+                [cx - DISC_R, cy - DISC_R, cx + DISC_R, cy + DISC_R],
+                fill=COLOURS[content],
+            )
+    rx0, ry0, rx1, ry1 = _cell_box(int(scene["ring_slot"]))
+    d.rectangle(
+        [rx0 - RING_PAD, ry0 - RING_PAD, rx1 + RING_PAD, ry1 + RING_PAD],
+        outline=INK,
+        width=RING_W,
+    )
+
+    n = int(scene["n_cards"])
+    for card in _ordered_cards(scene):
+        cx0 = _card_x0(n, int(card["slot"]))
+        d.rectangle(
+            [cx0, CARD_Y0, cx0 + CARD_W, CARD_Y0 + CARD_H],
+            fill=CARD_FILL,
+            outline=CARD_EDGE,
+            width=2,
+        )
+        gx, gy = cx0 + CARD_W / 2, CARD_Y0 + GLYPH_DY
+        if card["op"] == "ins":
+            d.ellipse([gx - 17, gy - 17, gx + 17, gy + 17], fill=COLOURS[card["colour"]])
+        else:
+            d.rectangle([gx - 17, gy - 17, gx + 17, gy + 17], fill=DELETE_GREY)
+
+        mx0 = _mini_x0(cx0)
+        my0 = CARD_Y0 + MINI_DY
+        for i in range(N_SLOTS):
+            left = mx0 + i * MINI_PITCH
+            d.rectangle(
+                [left, my0, left + MINI_W - 1, my0 + MINI_H - 1],
+                fill=MINI_FILL,
+                outline=MINI_EDGE,
+                width=1,
+            )
+        px = int(round(_mini_centre(mx0, int(card["target"])) + float(card["jitter"])))
+        py = CARD_Y0 + POINTER_DY
+        d.polygon([(px, py), (px - 7, py + 12), (px + 7, py + 12)], fill=INK)
+
+    ax0 = _cards_x0(n)
+    ax1 = ax0 + n * CARD_W + (n - 1) * CARD_GAP
+    ay = CARD_Y0 + CARD_H + 20
+    d.line([ax0, ay, ax1, ay], fill=ARROW_GREY, width=4)
+    d.polygon([(ax1 + 12, ay), (ax1 - 6, ay - 9), (ax1 - 6, ay + 9)], fill=ARROW_GREY)
+    return img

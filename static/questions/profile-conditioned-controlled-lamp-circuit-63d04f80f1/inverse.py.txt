@@ -1,0 +1,113 @@
+"""Independent pixel-only inverse for the controlled lamp circuit.
+
+The decoder finds colored glyph runs, counts vertically separated pips, recovers
+filled-versus-ring lamps from their interiors, and replays the recovered gates.
+It uses neither latent data nor renderer code.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+
+class OracleDecodeError(ValueError):
+    """Raised when the raster does not contain one unambiguous circuit."""
+
+
+_LAMP_COLORS = np.array(((28, 125, 154), (16, 110, 140)), dtype=np.int32)
+_CONTROL_COLORS = np.array(((103, 73, 180), (122, 76, 174)), dtype=np.int32)
+_TARGET_COLORS = np.array(((232, 126, 34), (216, 112, 28)), dtype=np.int32)
+
+
+def _mask_near(arr: np.ndarray, colors: np.ndarray, radius: int = 52) -> np.ndarray:
+    pixels = arr.astype(np.int32)
+    distances = ((pixels[:, :, None, :] - colors[None, None, :, :]) ** 2).sum(axis=3)
+    return distances.min(axis=2) <= radius * radius
+
+
+def _runs(active: np.ndarray, minimum_width: int) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(active)
+    if not len(indices):
+        return []
+    cuts = np.flatnonzero(np.diff(indices) > 1)
+    starts = np.r_[0, cuts + 1]
+    ends = np.r_[cuts, len(indices) - 1]
+    runs = [(int(indices[a]), int(indices[b]) + 1) for a, b in zip(starts, ends)]
+    return [(a, b) for a, b in runs if b - a >= minimum_width]
+
+
+def _x_components(mask: np.ndarray, minimum_width: int) -> list[tuple[int, int]]:
+    return _runs(mask.sum(axis=0) >= 2, minimum_width)
+
+
+def _pip_count(mask: np.ndarray, x_interval: tuple[int, int]) -> int:
+    left, right = x_interval
+    vertical = mask[:, left:right].sum(axis=1) >= 2
+    bands = _runs(vertical, 4)
+    if not 1 <= len(bands) <= 4:
+        raise OracleDecodeError(f"pip stack has {len(bands)} components, expected 1-4")
+    heights = [bottom - top for top, bottom in bands]
+    if max(heights) - min(heights) > 3:
+        raise OracleDecodeError("pip stack components have inconsistent sizes")
+    return len(bands)
+
+
+def _starting_bits(mask: np.ndarray) -> list[int]:
+    components = _x_components(mask, 24)
+    if len(components) != 4:
+        raise OracleDecodeError(f"found {len(components)} starting lamps, expected 4")
+    bits: list[int] = []
+    for left, right in components:
+        ys, xs = np.nonzero(mask[:, left:right])
+        if len(ys) < 180:
+            raise OracleDecodeError("starting lamp has too little colored ink")
+        top, bottom = int(ys.min()), int(ys.max()) + 1
+        width = right - left
+        height = bottom - top
+        inner_left = left + int(width * 0.34)
+        inner_right = left + int(width * 0.66)
+        inner_top = top + int(height * 0.34)
+        inner_bottom = top + int(height * 0.66)
+        interior = mask[inner_top:inner_bottom, inner_left:inner_right]
+        if interior.size < 30:
+            raise OracleDecodeError("starting lamp interior is unresolved")
+        fill_fraction = float(interior.mean())
+        if fill_fraction >= 0.72:
+            bits.append(1)
+        elif fill_fraction <= 0.12:
+            bits.append(0)
+        else:
+            raise OracleDecodeError(
+                f"starting lamp fill is ambiguous ({fill_fraction:.3f})"
+            )
+    return bits
+
+
+def _gate_labels(mask: np.ndarray, role: str) -> list[int]:
+    components = _x_components(mask, 6)
+    if len(components) != 8:
+        raise OracleDecodeError(f"found {len(components)} {role} stacks, expected 8")
+    return [_pip_count(mask, component) - 1 for component in components]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover and replay the unique circuit encoded in ``image``."""
+    rgb = image.convert("RGB")
+    if rgb.width < 800 or rgb.height < 300:
+        raise OracleDecodeError(f"raster is too small to contain the circuit: {rgb.size}")
+    arr = np.asarray(rgb, dtype=np.uint8)
+    lamp_mask = _mask_near(arr, _LAMP_COLORS)
+    control_mask = _mask_near(arr, _CONTROL_COLORS)
+    target_mask = _mask_near(arr, _TARGET_COLORS)
+
+    bits = _starting_bits(lamp_mask)
+    controls = _gate_labels(control_mask, "control")
+    targets = _gate_labels(target_mask, "target")
+    if any(control == target for control, target in zip(controls, targets)):
+        raise OracleDecodeError("a card ambiguously names the same control and target")
+
+    for control, target in zip(controls, targets):
+        if bits[control]:
+            bits[target] ^= 1
+    return "".join(str(value) for value in bits)

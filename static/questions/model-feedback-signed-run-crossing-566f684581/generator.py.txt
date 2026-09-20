@@ -1,0 +1,230 @@
+"""Scene sampler and renderer for the signed-run crossing world.
+
+A black target bar is drawn at the top.  Below a gray rule, six colored bars
+hang off a vertical black spine: a bar drawn to the right of the spine is a
+gain, a bar drawn to the left is a loss, and every bar's magnitude is its drawn
+length.  A running total starts at zero and is updated row by row from top to
+bottom.  The label is the color of the row at which that running total first
+reaches or passes the target length.
+
+Only axis-aligned filled rectangles are drawn, so the raster is free of
+antialiasing and is byte-deterministic.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+WIDTH, HEIGHT = 1180, 980
+
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+GRAY = (150, 150, 150)
+
+HUES = {
+    "blue": (37, 86, 196),
+    "crimson": (200, 26, 64),
+    "green": (24, 140, 66),
+    "orange": (232, 124, 20),
+    "purple": (128, 52, 168),
+    "teal": (0, 150, 160),
+}
+COLOR_NAMES = tuple(sorted(HUES))
+
+UNIT = 62           # pixels per length unit
+BAR_H = 46          # height of every drawn bar
+ROWS = 6
+ROW_PITCH = 105
+ROW_Y0 = 290        # top of the first row's bar before jitter
+
+TARGET_Y = 70       # top of the black target bar
+TARGET_X0 = 100     # left end of the black target bar before jitter
+RULE_Y = 180        # top of the gray separator rule
+RULE_H = 8
+RULE_X0, RULE_X1 = 40, 1140
+
+SPINE_X0, SPINE_X1 = 584, 595   # inclusive pixel columns of the black spine
+SPINE_TOP, SPINE_BOT = 250, 930
+GAP = 14            # clear pixels between the spine and any colored bar
+
+MAX_UNITS = 8       # longest colored bar, in units
+MIN_TARGET, MAX_TARGET = 3, 7   # target length, in units
+
+QUARANTINE_MARGIN = 11.0
+
+
+# --------------------------------------------------------------------------
+# scene model
+# --------------------------------------------------------------------------
+def _running(signed: list) -> list:
+    """Partial sums S_1..S_n of the signed row values."""
+    out, acc = [], 0
+    for value in signed:
+        acc += value
+        out.append(acc)
+    return out
+
+
+def _crossing(signed: list, target: int):
+    """Index of the first row whose running total reaches or passes target."""
+    for index, total in enumerate(_running(signed)):
+        if total >= target:
+            return index
+    return None
+
+
+def _signed(scene: dict) -> list:
+    return [
+        length if sign > 0 else -length
+        for length, sign in zip(scene["lengths"], scene["signs"])
+    ]
+
+
+def _accept(lengths: list, signs: list, target: int, min_slack: int = 1) -> bool:
+    signed = [length if sign > 0 else -length for length, sign in zip(lengths, signs)]
+    totals = _running(signed)
+    star = _crossing(signed, target)
+    if star is None or star not in (2, 3, 4):
+        return False
+
+    # Decisive slack on both sides of the crossing, in units.
+    before = 0 if star == 0 else totals[star - 1]
+    if min(target - before, totals[star] - target) < min_slack:
+        return False
+
+    # At least two losses, and at least one of them strictly before the crossing.
+    if sum(1 for s in signs if s < 0) < 2:
+        return False
+    if not any(signs[i] < 0 for i in range(star)):
+        return False
+
+    # Reading every bar as a gain must cross strictly earlier: an ignored sign
+    # lands on a different, earlier row.
+    unsigned = _crossing(lengths, target)
+    if unsigned is None or unsigned >= star:
+        return False
+
+    # The longest drawn bar is never the answer.
+    if lengths.index(max(lengths)) == star:
+        return False
+
+    # Some bar drawn before the crossing is already at least as long as the
+    # target, so "the first bar that is as long as the target" is a decoy.
+    if not any(lengths[i] >= target for i in range(star)):
+        return False
+
+    # The running total falls back below the target after the crossing, so no
+    # reading of the final state can produce the label.
+    if all(totals[k] >= target for k in range(star + 1, len(totals))):
+        return False
+    return True
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed)
+    for _ in range(200000):
+        lengths = [rng.randint(1, MAX_UNITS) for _ in range(ROWS)]
+        signs = [rng.choice((1, -1)) for _ in range(ROWS)]
+        target = rng.randint(MIN_TARGET, MAX_TARGET)
+        # Most scenes clear the boundary by two whole units; a minority sit on
+        # the one-unit boundary and are quarantined by ``margin``.
+        min_slack = 1 if rng.random() < 0.18 else 2
+        if _accept(lengths, signs, target, min_slack):
+            colors = list(COLOR_NAMES)
+            rng.shuffle(colors)
+            return {
+                "lengths": lengths,
+                "signs": signs,
+                "target": target,
+                "colors": colors,
+                "vjit": [rng.randint(-6, 6) for _ in range(ROWS)],
+                "tjit": rng.randint(0, 40),
+            }
+    raise RuntimeError("scene sampling failed")
+
+
+def analytic_gold(scene: dict) -> str:
+    star = _crossing(_signed(scene), scene["target"])
+    if star is None:
+        raise ValueError("scene has no crossing row")
+    return scene["colors"][star]
+
+
+# --------------------------------------------------------------------------
+# geometry
+# --------------------------------------------------------------------------
+def _row_top(scene: dict, index: int) -> int:
+    return ROW_Y0 + index * ROW_PITCH + scene["vjit"][index]
+
+
+def _row_box(scene: dict, index: int):
+    """Pixel box (x0, y0, x1, y1) of one colored bar, inclusive."""
+    span = scene["lengths"][index] * UNIT
+    top = _row_top(scene, index)
+    if scene["signs"][index] > 0:
+        x0 = SPINE_X1 + 1 + GAP
+        x1 = x0 + span - 1
+    else:
+        x1 = SPINE_X0 - 1 - GAP
+        x0 = x1 - span + 1
+    return x0, top, x1, top + BAR_H - 1
+
+
+def render(scene: dict) -> Image.Image:
+    image = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
+    draw = ImageDraw.Draw(image)
+
+    tx0 = TARGET_X0 + scene["tjit"]
+    draw.rectangle(
+        [tx0, TARGET_Y, tx0 + scene["target"] * UNIT - 1, TARGET_Y + BAR_H - 1],
+        fill=BLACK,
+    )
+    draw.rectangle([RULE_X0, RULE_Y, RULE_X1, RULE_Y + RULE_H - 1], fill=GRAY)
+    draw.rectangle([SPINE_X0, SPINE_TOP, SPINE_X1, SPINE_BOT], fill=BLACK)
+
+    for index in range(ROWS):
+        x0, y0, x1, y1 = _row_box(scene, index)
+        draw.rectangle([x0, y0, x1, y1], fill=HUES[scene["colors"][index]])
+    return image
+
+
+def margin(scene: dict) -> float:
+    signed = _signed(scene)
+    totals = _running(signed)
+    star = _crossing(signed, scene["target"])
+    before = 0 if star == 0 else totals[star - 1]
+    slack = min(scene["target"] - before, totals[star] - scene["target"])
+
+    boxes = [_row_box(scene, index) for index in range(ROWS)]
+    vertical = min(
+        boxes[i + 1][1] - boxes[i][3] - 1 for i in range(ROWS - 1)
+    )
+    horizontal = min(min(box[0], WIDTH - 1 - box[2]) for box in boxes)
+    tx0 = TARGET_X0 + scene["tjit"]
+    target_clear = min(
+        RULE_Y - (TARGET_Y + BAR_H),
+        SPINE_TOP - (RULE_Y + RULE_H),
+        tx0,
+        WIDTH - 1 - (tx0 + scene["target"] * UNIT - 1),
+        TARGET_Y,
+    )
+    return float(
+        min(
+            float(GAP),
+            float(vertical),
+            float(horizontal),
+            float(target_clear),
+            UNIT / 8.0 * slack,
+        )
+    )
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list:
+    """No scene transform holds the raster fixed; the alias mode is not_applicable."""
+    return []

@@ -1,0 +1,155 @@
+"""Pixel-only decision arm.
+
+Receives a rasterised image and nothing else: no scene, no renderer, no gold.
+It re-derives the two panels from generic palette anchors, measures both spoke
+length profiles, solves the cyclic alignment between them, transfers the marked
+spoke across the alignment, and only then reads the bound square color.
+Returns ``"abstain"`` whenever the visual evidence it needs is not present.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+ORACLE_VERSION = "ring_cut_code_transfer-oracle-0.1.0"
+
+_SLOTS = 12
+_STROKE = (70, 70, 70)
+_HUB = (120, 120, 120)
+_SEPARATOR = (160, 160, 160)
+_MARKER = (0, 0, 0)
+_ANSWERS = {
+    "red": (214, 39, 40),
+    "blue": (31, 84, 190),
+    "green": (23, 140, 60),
+    "orange": (240, 150, 20),
+}
+_COLOR_TOLERANCE = 60.0
+_ABSTAIN = "abstain"
+
+
+def _mask(array: np.ndarray, rgb: tuple[int, int, int], tolerance: int = 12) -> np.ndarray:
+    diff = np.abs(array.astype(np.int16) - np.array(rgb, dtype=np.int16))
+    return np.all(diff <= tolerance, axis=2)
+
+
+def _components(mask: np.ndarray, min_pixels: int = 12) -> list[np.ndarray]:
+    """Four-connected components of a boolean mask, as arrays of (y, x)."""
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    found = []
+    ys, xs = np.nonzero(mask)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(start_y, start_x)]
+        seen[start_y, start_x] = True
+        pixels = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pixels) >= min_pixels:
+            found.append(np.array(pixels, dtype=np.int32))
+    return found
+
+
+def _separator_row(array: np.ndarray) -> int | None:
+    rows = np.nonzero(_mask(array, _SEPARATOR).sum(axis=1) > 0.7 * array.shape[1])[0]
+    return int(rows.mean()) if rows.size else None
+
+
+def _strip_profile(array: np.ndarray, split: int) -> tuple[list[float], list[str]] | None:
+    top = array[:split]
+    bars = _components(_mask(top, _STROKE), min_pixels=60)
+    if len(bars) != _SLOTS:
+        return None
+    bars.sort(key=lambda pixels: float(pixels[:, 1].mean()))
+    lengths = [float(pixels[:, 0].max() - pixels[:, 0].min() + 1) for pixels in bars]
+    bar_x = [float(pixels[:, 1].mean()) for pixels in bars]
+
+    squares: list[tuple[float, str]] = []
+    for name, rgb in _ANSWERS.items():
+        for pixels in _components(_mask(top, rgb, tolerance=40), min_pixels=120):
+            squares.append((float(pixels[:, 1].mean()), name))
+    if len(squares) != _SLOTS:
+        return None
+    squares.sort()
+    colors = []
+    for x, (square_x, name) in zip(bar_x, squares):
+        if abs(x - square_x) > 12.0:
+            return None
+        colors.append(name)
+    return lengths, colors
+
+
+def _ring_profile(array: np.ndarray, split: int) -> tuple[list[float], int] | None:
+    bottom = array[split:]
+    hubs = _components(_mask(bottom, _HUB), min_pixels=80)
+    if len(hubs) != 1:
+        return None
+    cy = float(hubs[0][:, 0].mean())
+    cx = float(hubs[0][:, 1].mean())
+
+    spokes = _components(_mask(bottom, _STROKE), min_pixels=60)
+    if len(spokes) != _SLOTS:
+        return None
+    measured = []
+    for pixels in spokes:
+        radii = np.hypot(pixels[:, 0] - cy, pixels[:, 1] - cx)
+        angle = math.atan2(float(pixels[:, 0].mean()) - cy, float(pixels[:, 1].mean()) - cx)
+        measured.append((angle, float(radii.max() - radii.min() + 1)))
+    measured.sort()  # ascending atan2 with y down: clockwise around the hub
+    angles = [item[0] for item in measured]
+    lengths = [item[1] for item in measured]
+
+    markers = _components(_mask(bottom, _MARKER), min_pixels=80)
+    if len(markers) != 1:
+        return None
+    marker_angle = math.atan2(
+        float(markers[0][:, 0].mean()) - cy, float(markers[0][:, 1].mean()) - cx
+    )
+    gaps = [abs(math.atan2(math.sin(a - marker_angle), math.cos(a - marker_angle))) for a in angles]
+    marker_index = int(min(range(_SLOTS), key=lambda i: gaps[i]))
+    if gaps[marker_index] > math.radians(12.0):
+        return None
+    return lengths, marker_index
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Return the bound color name, or ``"abstain"`` if evidence is missing."""
+    array = np.array(image.convert("RGB"))
+    split = _separator_row(array)
+    if split is None or split < 40 or split > array.shape[0] - 40:
+        return _ABSTAIN
+    strip = _strip_profile(array, split)
+    ring = _ring_profile(array, split)
+    if strip is None or ring is None:
+        return _ABSTAIN
+    strip_lengths, colors = strip
+    ring_lengths, marker_index = ring
+
+    strip_mean = sum(strip_lengths) / _SLOTS
+    ring_mean = sum(ring_lengths) / _SLOTS
+    if strip_mean <= 0.0 or ring_mean <= 0.0:
+        return _ABSTAIN
+    strip_norm = [value / strip_mean for value in strip_lengths]
+    ring_norm = [value / ring_mean for value in ring_lengths]
+
+    costs = []
+    for shift in range(_SLOTS):
+        cost = sum(
+            abs(ring_norm[i] - strip_norm[(i + shift) % _SLOTS]) for i in range(_SLOTS)
+        ) / _SLOTS
+        costs.append(cost)
+    order = sorted(range(_SLOTS), key=lambda shift: costs[shift])
+    best, second = order[0], order[1]
+    if 100.0 * (costs[second] - costs[best]) < 2.0:
+        return _ABSTAIN
+    return colors[(marker_index + best) % _SLOTS]

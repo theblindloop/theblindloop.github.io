@@ -1,0 +1,235 @@
+"""Deterministic scene sampler and renderer for Paired Slant Agreement Reveal."""
+
+from __future__ import annotations
+
+import copy
+import random
+from typing import Iterable
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WIDTH = 1024
+HEIGHT = 768
+CARD_SIZE = 112
+GRID_N = 6
+CELL = 14
+GRID_ORIGIN = 14
+
+BACKGROUND = (247, 244, 237)
+CARD_FILL = (253, 252, 248)
+FRAME = (18, 170, 190)
+MARKER = (224, 42, 151)
+GRID_LINE = (210, 218, 222)
+DECORATION = (218, 214, 205)
+INK_PALETTES = (
+    ((31, 45, 69), (74, 34, 64)),
+    ((62, 38, 72), (28, 58, 67)),
+    ((42, 49, 76), (76, 44, 31)),
+    ((35, 62, 57), (67, 35, 72)),
+)
+
+SLOT_CENTERS = {
+    "left": (288, 384),
+    "right": (736, 384),
+}
+
+TEMPLATE_ROWS: dict[str, tuple[str, ...]] = {
+    "h": (
+        "100001",
+        "100001",
+        "111111",
+        "111111",
+        "100001",
+        "100001",
+    ),
+    "diamond": (
+        "001100",
+        "011110",
+        "110011",
+        "110011",
+        "011110",
+        "001100",
+    ),
+    "box": (
+        "111111",
+        "100001",
+        "100001",
+        "100001",
+        "100001",
+        "111111",
+    ),
+}
+CLASSES = tuple(TEMPLATE_ROWS)
+
+
+def _template(name: str) -> np.ndarray:
+    return np.asarray([[ch == "1" for ch in row] for row in TEMPLATE_ROWS[name]], dtype=bool)
+
+
+def _classify_grid(grid: np.ndarray) -> tuple[str, float, dict[str, int]]:
+    distances = {
+        name: int(np.count_nonzero(grid != _template(name))) for name in CLASSES
+    }
+    ordered = sorted(distances.items(), key=lambda item: (item[1], item[0]))
+    if ordered[0][1] == ordered[1][1]:
+        return "ambiguous", 0.0, distances
+    return ordered[0][0], float(ordered[1][1] - ordered[0][1]), distances
+
+
+def _paired_perturbation(name: str, seed: int, rng: random.Random) -> np.ndarray:
+    """Move toward a runner-up in balanced 1->0 / 0->1 pairs.
+
+    The result always retains twenty dark cells, keeping total agreement ink
+    independent of the answer. Every fourth class-cycle approaches a visible
+    Hamming boundary while remaining strictly on the named side.
+    """
+
+    grid = _template(name).copy()
+    runner_name = {"h": "box", "box": "h", "diamond": "h"}[name]
+    runner = _template(runner_name)
+    lose = list(zip(*np.nonzero(grid & ~runner), strict=True))
+    gain = list(zip(*np.nonzero(~grid & runner), strict=True))
+    rng.shuffle(lose)
+    rng.shuffle(gain)
+    near = ((seed // len(CLASSES)) % 4) == 0
+    requested = min(len(lose), len(gain)) - 1 if near else (1 if seed % 2 else 0)
+    requested = max(0, requested)
+    for pairs in range(requested, -1, -1):
+        trial = grid.copy()
+        for y, x in lose[:pairs]:
+            trial[y, x] = False
+        for y, x in gain[:pairs]:
+            trial[y, x] = True
+        decision, margin_value, _ = _classify_grid(trial)
+        if decision == name and margin_value >= 2.0:
+            return trial
+    return grid
+
+
+def _encode_agreement(result: np.ndarray, rng: random.Random) -> list[list[list[int]]]:
+    """Create two individually balanced random fields whose equality is result."""
+
+    on = list(zip(*np.nonzero(result), strict=True))
+    off = list(zip(*np.nonzero(~result), strict=True))
+    if len(on) != 20 or len(off) != 16:
+        raise ValueError("agreement raster must contain exactly twenty dark cells")
+    rng.shuffle(on)
+    rng.shuffle(off)
+    first = np.zeros((GRID_N, GRID_N), dtype=bool)
+    for y, x in on[:10]:
+        first[y, x] = True
+    for y, x in off[:8]:
+        first[y, x] = True
+    second = np.where(result, first, ~first)
+    if int(first.sum()) != 18 or int(second.sum()) != 18:
+        raise AssertionError("both stitch fields must be exactly balanced")
+    cards = [first.astype(int).tolist(), second.astype(int).tolist()]
+    if rng.random() < 0.5:
+        cards.reverse()
+    return cards
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(int(seed))
+    class_name = CLASSES[int(seed) % len(CLASSES)]
+    result = _paired_perturbation(class_name, int(seed), rng)
+    cards = _encode_agreement(result, rng)
+    rotations = [rng.randrange(4), rng.randrange(4)]
+    slots = ["left", "right"]
+    if rng.random() < 0.5:
+        slots.reverse()
+    decorations = [
+        [118 + rng.randint(-8, 8), 122 + rng.randint(-8, 8), 8],
+        [904 + rng.randint(-8, 8), 146 + rng.randint(-8, 8), 7],
+        [888 + rng.randint(-8, 8), 650 + rng.randint(-8, 8), 9],
+    ]
+    return {
+        "cards": cards,
+        "rotations": rotations,
+        "slots": slots,
+        "palette_variant": rng.randrange(len(INK_PALETTES)),
+        "offset": [rng.randint(-4, 4), rng.randint(-4, 4)],
+        "decorations": decorations,
+    }
+
+
+def _draw_card(bits: Iterable[Iterable[int]], ink: tuple[int, int, int]) -> Image.Image:
+    card = Image.new("RGB", (CARD_SIZE, CARD_SIZE), CARD_FILL)
+    draw = ImageDraw.Draw(card)
+    draw.rectangle((0, 0, CARD_SIZE - 1, CARD_SIZE - 1), outline=FRAME, width=4)
+    rows = [list(row) for row in bits]
+    if len(rows) != GRID_N or any(len(row) != GRID_N for row in rows):
+        raise ValueError("cards must be 6 by 6")
+    for row in range(GRID_N):
+        for col in range(GRID_N):
+            x0 = GRID_ORIGIN + col * CELL
+            y0 = GRID_ORIGIN + row * CELL
+            draw.rectangle((x0, y0, x0 + CELL - 1, y0 + CELL - 1), outline=GRID_LINE, width=1)
+            if int(rows[row][col]) == 0:
+                points = ((x0 + 3, y0 + CELL - 4), (x0 + CELL - 4, y0 + 3))
+            else:
+                points = ((x0 + 3, y0 + 3), (x0 + CELL - 4, y0 + CELL - 4))
+            draw.line(points, fill=ink, width=3)
+    draw.rectangle((0, 0, 10, 10), fill=MARKER)
+    return card
+
+
+def _rotate_card(card: Image.Image, quarter_turns: int) -> Image.Image:
+    output = card
+    for _ in range(int(quarter_turns) % 4):
+        output = output.transpose(Image.Transpose.ROTATE_90)
+    return output
+
+
+def render(scene: dict) -> Image.Image:
+    cards = scene["cards"]
+    rotations = scene["rotations"]
+    slots = scene["slots"]
+    palette_variant = int(scene["palette_variant"])
+    offset = scene["offset"]
+    decorations = scene["decorations"]
+    if len(cards) != 2 or len(rotations) != 2 or sorted(slots) != ["left", "right"]:
+        raise ValueError("scene must contain two cards in the two declared slots")
+    canvas = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(canvas)
+    for cx, cy, radius in decorations:
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=DECORATION, width=2)
+    inks = INK_PALETTES[palette_variant % len(INK_PALETTES)]
+    dx, dy = int(offset[0]), int(offset[1])
+    for index in range(2):
+        card = _rotate_card(_draw_card(cards[index], inks[index]), int(rotations[index]))
+        center_x, center_y = SLOT_CENTERS[slots[index]]
+        x = center_x + dx - CARD_SIZE // 2
+        y = center_y + dy - CARD_SIZE // 2
+        canvas.paste(card, (x, y))
+    return canvas
+
+
+def _agreement_grid(scene: dict) -> np.ndarray:
+    cards = scene["cards"]
+    first = np.asarray(cards[0], dtype=int)
+    second = np.asarray(cards[1], dtype=int)
+    if first.shape != (GRID_N, GRID_N) or second.shape != (GRID_N, GRID_N):
+        raise ValueError("cards must be 6 by 6")
+    return first == second
+
+
+def analytic_gold(scene: dict) -> str:
+    decision, _, _ = _classify_grid(_agreement_grid(scene))
+    return decision
+
+
+def margin(scene: dict) -> float:
+    _, margin_value, _ = _classify_grid(_agreement_grid(scene))
+    return margin_value
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 0.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    twin["decorations"] = list(reversed(twin["decorations"]))
+    return [("reverse_decorations", twin)]

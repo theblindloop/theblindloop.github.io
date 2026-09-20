@@ -1,0 +1,249 @@
+"""Deterministic renderer and analytic arm for Two-Peel Core Reveal."""
+
+from __future__ import annotations
+
+import copy
+import random
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+WORLD_VERSION = "two-peel-core-reveal-0.1.0"
+N = 15
+CANVAS = 512
+FRAME = 4
+LABELS = ("cross", "tee", "elbow")
+INK_TARGET = 150
+
+PALETTES = (
+    ((39, 45, 78), (239, 194, 104)),
+    ((88, 42, 65), (174, 220, 163)),
+    ((39, 72, 58), (231, 174, 189)),
+)
+CYAN = (27, 174, 191)
+BACKGROUND = (248, 246, 240)
+GRID = (27, 174, 191)
+
+
+def _dilate_once(mask: np.ndarray) -> np.ndarray:
+    p = np.pad(mask.astype(bool), 1, constant_values=False)
+    return (
+        p[1:-1, 1:-1]
+        | p[:-2, 1:-1]
+        | p[2:, 1:-1]
+        | p[1:-1, :-2]
+        | p[1:-1, 2:]
+    )
+
+
+def _peel_once(mask: np.ndarray) -> np.ndarray:
+    p = np.pad(mask.astype(bool), 1, constant_values=False)
+    return (
+        p[1:-1, 1:-1]
+        & p[:-2, 1:-1]
+        & p[2:, 1:-1]
+        & p[1:-1, :-2]
+        & p[1:-1, 2:]
+    )
+
+
+def _peel_twice(mask: np.ndarray) -> np.ndarray:
+    return _peel_once(_peel_once(mask))
+
+
+def _skeleton(label: str) -> np.ndarray:
+    mask = np.zeros((N, N), dtype=bool)
+    if label == "cross":
+        mask[3:12, 7] = True
+        mask[7, 3:12] = True
+    elif label == "tee":
+        mask[3, 3:12] = True
+        mask[3:12, 7] = True
+    elif label == "elbow":
+        mask[3:12, 3] = True
+        mask[11, 3:12] = True
+    else:
+        raise KeyError(label)
+    return mask
+
+
+def _templates() -> dict[str, np.ndarray]:
+    result = {}
+    for label in LABELS:
+        precursor = _dilate_once(_dilate_once(_skeleton(label)))
+        result[label] = _peel_twice(precursor)
+    return result
+
+
+TEMPLATES = _templates()
+
+
+def _variants(mask: np.ndarray) -> list[np.ndarray]:
+    variants = []
+    for turns in range(4):
+        rotated = np.rot90(mask, turns)
+        variants.extend((rotated, np.fliplr(rotated)))
+    return variants
+
+
+def _classify(mask: np.ndarray) -> tuple[str, float, dict[str, int]]:
+    distances = {
+        label: min(int(np.count_nonzero(mask ^ variant)) for variant in _variants(template))
+        for label, template in TEMPLATES.items()
+    }
+    ranked = sorted((distance, label) for label, distance in distances.items())
+    decision = "ambiguous" if ranked[0][0] == ranked[1][0] else ranked[0][1]
+    return decision, float(ranked[1][0] - ranked[0][0]), distances
+
+
+def _connected_candidates(mask: np.ndarray) -> list[tuple[int, int]]:
+    candidates = []
+    for y in range(1, N - 1):
+        for x in range(1, N - 1):
+            if mask[y, x]:
+                continue
+            if mask[y - 1, x] or mask[y + 1, x] or mask[y, x - 1] or mask[y, x + 1]:
+                candidates.append((y, x))
+    return candidates
+
+
+def _camouflaged_precursor(label: str, rng: random.Random) -> np.ndarray:
+    """Add one-cell-deep camouflage while preserving the exact twice-peeled core."""
+
+    mask = _dilate_once(_dilate_once(_skeleton(label)))
+    target = _peel_twice(mask)
+    while int(mask.sum()) < INK_TARGET:
+        candidates = _connected_candidates(mask)
+        rng.shuffle(candidates)
+        accepted = False
+        for y, x in candidates:
+            mask[y, x] = True
+            if np.array_equal(_peel_twice(mask), target):
+                accepted = True
+                break
+            mask[y, x] = False
+        if not accepted:
+            raise RuntimeError("could not construct equal-ink camouflage")
+    return mask
+
+
+def _swap_noise(mask: np.ndarray, count: int, rng: random.Random) -> np.ndarray:
+    result = mask.copy()
+    for _ in range(count):
+        dark = [tuple(map(int, point)) for point in np.argwhere(result)]
+        light = [tuple(map(int, point)) for point in np.argwhere(~result)]
+        y1, x1 = rng.choice(dark)
+        y0, x0 = rng.choice(light)
+        result[y1, x1] = False
+        result[y0, x0] = True
+    return result
+
+
+def _difficulty_accepts(kind: str, value: float) -> bool:
+    if kind == "easy":
+        return value >= 13.0
+    if kind == "medium":
+        return 6.0 <= value <= 12.0
+    return 1.0 <= value <= 5.0
+
+
+def _sample_cells(label: str, difficulty: str, seed: int) -> np.ndarray:
+    construction_rng = random.Random(seed ^ 0x5A17D39B)
+    base = _camouflaged_precursor(label, construction_rng)
+    base_decision, base_margin, _ = _classify(_peel_twice(base))
+    if difficulty == "easy" and base_decision == label and _difficulty_accepts("easy", base_margin):
+        return base
+    for _ in range(4000):
+        swaps = construction_rng.randint(2, 8)
+        candidate = _swap_noise(base, swaps, construction_rng)
+        decision, candidate_margin, _ = _classify(_peel_twice(candidate))
+        if decision == label and _difficulty_accepts(difficulty, candidate_margin):
+            return candidate
+    raise RuntimeError(f"could not sample {difficulty} precursor for {label}")
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one balanced scene solely from an integer seed."""
+
+    label = LABELS[seed % len(LABELS)]
+    difficulty = ("easy", "medium", "near")[(seed // 3) % 3]
+    cells = _sample_cells(label, difficulty, seed)
+    presentation = random.Random(seed ^ 0x31C4E72D)
+    cell_size = 11 + ((seed // 9) % 2)
+    outer = N * cell_size + 2 * FRAME
+    centered = (CANVAS - outer) // 2
+    return {
+        "cells": cells.astype(int).tolist(),
+        "rotation": presentation.randrange(4),
+        "mirror": bool(presentation.randrange(2)),
+        "cell_size": cell_size,
+        "offset_x": centered + presentation.randint(-7, 7),
+        "offset_y": centered + presentation.randint(-7, 7),
+        "palette": (seed // 3) % len(PALETTES),
+        "distractor_phase": presentation.randrange(8),
+    }
+
+
+def _display_cells(scene: dict) -> np.ndarray:
+    cells = np.asarray(scene["cells"], dtype=np.uint8).astype(bool)
+    if bool(scene["mirror"]):
+        cells = np.fliplr(cells)
+    return np.rot90(cells, int(scene["rotation"]) % 4)
+
+
+def render(scene: dict) -> Image.Image:
+    """Render a complete RGB scene; no analytic answer is drawn or encoded."""
+
+    image = Image.new("RGB", (CANVAS, CANVAS), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    phase = int(scene["distractor_phase"])
+    pale = (218, 216, 208)
+    for index in range(6):
+        side = index % 2
+        x = 42 + 420 * side + ((phase * 7 + index * 11) % 17 - 8)
+        y = 58 + index * 70 + ((phase * 13 + index * 5) % 19 - 9)
+        radius = 5 + (index + phase) % 4
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=pale, width=2)
+
+    cells = _display_cells(scene)
+    size = int(scene["cell_size"])
+    x0, y0 = int(scene["offset_x"]), int(scene["offset_y"])
+    outer = N * size + 2 * FRAME
+    draw.rectangle((x0, y0, x0 + outer - 1, y0 + outer - 1), fill=CYAN)
+    dark, light = PALETTES[int(scene["palette"])]
+    left, top = x0 + FRAME, y0 + FRAME
+    for y in range(N):
+        for x in range(N):
+            color = dark if cells[y, x] else light
+            xa, ya = left + x * size, top + y * size
+            draw.rectangle((xa, ya, xa + size - 1, ya + size - 1), fill=color)
+    for k in range(N + 1):
+        x = left + k * size
+        y = top + k * size
+        draw.line((x, top, x, top + N * size), fill=GRID, width=1)
+        draw.line((left, y, left + N * size, y), fill=GRID, width=1)
+    return image
+
+
+def _scene_cells(scene: dict) -> np.ndarray:
+    return np.asarray(scene["cells"], dtype=np.uint8).astype(bool)
+
+
+def analytic_gold(scene: dict) -> str:
+    return _classify(_peel_twice(_scene_cells(scene)))[0]
+
+
+def margin(scene: dict) -> float:
+    return _classify(_peel_twice(_scene_cells(scene)))[1]
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) <= 1.0
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    twin = copy.deepcopy(scene)
+    cells = np.asarray(scene["cells"], dtype=np.uint8)
+    twin["cells"] = np.rot90(cells, 2).astype(int).tolist()
+    twin["rotation"] = (int(scene["rotation"]) - 2) % 4
+    return [("rotate_precursor_180_counterrotate_display", twin)]

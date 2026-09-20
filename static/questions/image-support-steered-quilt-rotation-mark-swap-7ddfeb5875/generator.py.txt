@@ -1,0 +1,284 @@
+"""Rotated-quilt mark-transposition world.
+
+One square quilt of ROWS x (2 * BLOCK_COLS) abutting tiles fills the canvas as a
+single connected area. Its right block's white marks were copied from its left
+block by a 180-degree rotation of the block, except that exactly two right-block
+tiles had their marks exchanged with each other. The decision is the fill colour
+of whichever of those two tiles comes first in reading order.
+
+Fill colours are drawn from a count-balanced palette and are statistically
+independent of the transposed positions, so the answer is only readable after
+the cross-block correspondence has been solved.
+"""
+
+from __future__ import annotations
+
+import random
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "quilt_rotation_mark_swap-0.1.0"
+
+ROWS = 6
+BLOCK_COLS = 3
+TILE = 80
+ORIGIN = 16
+CANVAS = ORIGIN * 2 + TILE * BLOCK_COLS * 2  # 512, square quilt inside a white frame
+SUPERSAMPLE = 3
+GRID_INK = (18, 18, 18)
+MARK_INK = (255, 255, 255)
+BACKGROUND = (255, 255, 255)
+
+PALETTE: dict[str, tuple[int, int, int]] = {
+    "red": (176, 42, 42),
+    "blue": (36, 78, 168),
+    "green": (26, 112, 66),
+    "purple": (104, 52, 148),
+}
+COLOR_NAMES = ("red", "blue", "green", "purple")
+
+# Mark vocabulary. Graded near-twins (disc/disc_small, square/square_small)
+# supply near-boundary stimuli whose transposition is only just visible.
+MARKS = (
+    "disc",
+    "disc_small",
+    "ring",
+    "bar",
+    "vbar",
+    "cross",
+    "square",
+    "square_small",
+)
+NEAR_TWIN_PAIRS = (
+    ("disc", "disc_small"),
+    ("square", "square_small"),
+    ("ring", "disc"),
+)
+
+QUARANTINE_MARGIN = 20.0
+
+
+def _draw_mark(draw: ImageDraw.ImageDraw, mark: str, cx: float, cy: float, size: float) -> None:
+    """Draw one white mark centred at (cx, cy) inside a tile of side ``size``."""
+    if mark == "disc":
+        r = 0.30 * size
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=MARK_INK)
+    elif mark == "disc_small":
+        r = 0.283 * size
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=MARK_INK)
+    elif mark == "ring":
+        r = 0.30 * size
+        draw.ellipse(
+            [cx - r, cy - r, cx + r, cy + r],
+            outline=MARK_INK,
+            width=max(1, int(round(0.095 * size))),
+        )
+    elif mark == "bar":
+        w, h = 0.62 * size, 0.16 * size
+        draw.rectangle([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], fill=MARK_INK)
+    elif mark == "vbar":
+        w, h = 0.16 * size, 0.62 * size
+        draw.rectangle([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], fill=MARK_INK)
+    elif mark == "cross":
+        w, h = 0.62 * size, 0.16 * size
+        draw.rectangle([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], fill=MARK_INK)
+        draw.rectangle([cx - h / 2, cy - w / 2, cx + h / 2, cy + w / 2], fill=MARK_INK)
+    elif mark == "square":
+        s = 0.48 * size
+        draw.rectangle([cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2], fill=MARK_INK)
+    elif mark == "square_small":
+        s = 0.455 * size
+        draw.rectangle([cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2], fill=MARK_INK)
+    else:
+        raise ValueError(f"unknown mark {mark!r}")
+
+
+def _mark_mask(mark: str, side: int = TILE) -> list[list[bool]]:
+    """Rasterize one mark alone, at tile resolution, for analytic dissimilarity."""
+    ss = SUPERSAMPLE
+    image = Image.new("L", (side * ss, side * ss), 0)
+    draw = ImageDraw.Draw(image)
+    _draw_mark_gray(draw, mark, side * ss / 2, side * ss / 2, side * ss)
+    image = image.resize((side, side), Image.LANCZOS)
+    pixels = image.load()
+    return [[pixels[x, y] > 127 for x in range(side)] for y in range(side)]
+
+
+def _draw_mark_gray(draw: ImageDraw.ImageDraw, mark: str, cx: float, cy: float, size: float) -> None:
+    """Same geometry as :func:`_draw_mark` but on an 8-bit mask canvas."""
+    saved = globals()["MARK_INK"]
+    globals()["MARK_INK"] = 255
+    try:
+        _draw_mark(draw, mark, cx, cy, size)
+    finally:
+        globals()["MARK_INK"] = saved
+
+
+_MASK_CACHE: dict[str, list[list[bool]]] = {}
+
+
+def _mask(mark: str) -> list[list[bool]]:
+    if mark not in _MASK_CACHE:
+        _MASK_CACHE[mark] = _mark_mask(mark)
+    return _MASK_CACHE[mark]
+
+
+def mark_dissimilarity(a: str, b: str) -> float:
+    """Normalized symmetric difference (IoU distance) of two mark masks."""
+    if a == b:
+        return 0.0
+    mask_a, mask_b = _mask(a), _mask(b)
+    union = 0
+    xor = 0
+    for row_a, row_b in zip(mask_a, mask_b, strict=True):
+        for pa, pb in zip(row_a, row_b, strict=True):
+            if pa or pb:
+                union += 1
+                if pa != pb:
+                    xor += 1
+    return xor / union if union else 0.0
+
+
+def _rotated_partner(row: int, col: int) -> tuple[int, int]:
+    """180-degree rotation inside a ROWS x BLOCK_COLS block."""
+    return ROWS - 1 - row, BLOCK_COLS - 1 - col
+
+
+def right_marks(scene: dict) -> list[list[str]]:
+    """Displayed right-block marks: rotated copy of the left block, then one swap."""
+    left = scene["left_marks"]
+    grid = [
+        [left[_rotated_partner(r, c)[0]][_rotated_partner(r, c)[1]] for c in range(BLOCK_COLS)]
+        for r in range(ROWS)
+    ]
+    (r1, c1), (r2, c2) = (tuple(item) for item in scene["swap"])
+    grid[r1][c1], grid[r2][c2] = grid[r2][c2], grid[r1][c1]
+    return grid
+
+
+def sample_scene(seed: int) -> dict:
+    """Sample one latent quilt. Balanced answer classes and colour counts."""
+    rng = random.Random(seed * 7919 + 13)
+    total = ROWS * BLOCK_COLS * 2
+    target = COLOR_NAMES[seed % len(COLOR_NAMES)]
+    near_boundary = seed % 4 == 0
+
+    for _ in range(500):
+        left_marks = [[rng.choice(MARKS) for _ in range(BLOCK_COLS)] for _ in range(ROWS)]
+        positions = [(r, c) for r in range(ROWS) for c in range(BLOCK_COLS)]
+        first, second = rng.sample(positions, 2)
+        if near_boundary:
+            twin = list(rng.choice(NEAR_TWIN_PAIRS))
+            rng.shuffle(twin)
+            pa, pb = _rotated_partner(*first), _rotated_partner(*second)
+            left_marks[pa[0]][pa[1]] = twin[0]
+            left_marks[pb[0]][pb[1]] = twin[1]
+        pa, pb = _rotated_partner(*first), _rotated_partner(*second)
+        mark_a = left_marks[pa[0]][pa[1]]
+        mark_b = left_marks[pb[0]][pb[1]]
+        if mark_a == mark_b:
+            continue
+        dissimilarity = mark_dissimilarity(mark_a, mark_b)
+        if dissimilarity < 0.08:
+            continue
+
+        bag = [name for name in COLOR_NAMES for _ in range(total // len(COLOR_NAMES))]
+        rng.shuffle(bag)
+        left_colors = [
+            [bag[r * BLOCK_COLS + c] for c in range(BLOCK_COLS)] for r in range(ROWS)
+        ]
+        offset = ROWS * BLOCK_COLS
+        right_colors = [
+            [bag[offset + r * BLOCK_COLS + c] for c in range(BLOCK_COLS)] for r in range(ROWS)
+        ]
+        answer_cell = min(first, second)
+        if right_colors[answer_cell[0]][answer_cell[1]] != target:
+            donors = [
+                (block, r, c)
+                for block, grid in (("left", left_colors), ("right", right_colors))
+                for r in range(ROWS)
+                for c in range(BLOCK_COLS)
+                if grid[r][c] == target
+            ]
+            block, dr, dc = donors[rng.randrange(len(donors))]
+            donor_grid = left_colors if block == "left" else right_colors
+            held = right_colors[answer_cell[0]][answer_cell[1]]
+            donor_grid[dr][dc] = held
+            right_colors[answer_cell[0]][answer_cell[1]] = target
+        return {
+            "left_marks": left_marks,
+            "left_colors": left_colors,
+            "right_colors": right_colors,
+            "swap": [list(first), list(second)],
+        }
+    raise RuntimeError(f"could not sample a quilt for seed {seed}")
+
+
+def render(scene: dict) -> Image.Image:
+    """I = R(z): one connected quilt of coloured tiles carrying white marks."""
+    ss = SUPERSAMPLE
+    image = Image.new("RGB", (CANVAS * ss, CANVAS * ss), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    right = right_marks(scene)
+    blocks = (
+        (0, scene["left_colors"], scene["left_marks"]),
+        (BLOCK_COLS, scene["right_colors"], right),
+    )
+    for col_offset, colors, marks in blocks:
+        for r in range(ROWS):
+            for c in range(BLOCK_COLS):
+                x0 = (ORIGIN + (col_offset + c) * TILE) * ss
+                y0 = (ORIGIN + r * TILE) * ss
+                draw.rectangle(
+                    [x0, y0, x0 + TILE * ss - 1, y0 + TILE * ss - 1],
+                    fill=PALETTE[colors[r][c]],
+                )
+                _draw_mark(draw, marks[r][c], x0 + TILE * ss / 2, y0 + TILE * ss / 2, TILE * ss)
+    line = max(1, int(round(0.03 * TILE * ss)))
+    span = TILE * BLOCK_COLS * 2
+    lo, hi = ORIGIN * ss, (ORIGIN + span) * ss - 1
+    # Lattice rules are clamped to the quilt so its raster bounding box stays
+    # exactly the tile lattice: the inverse arm re-derives the grid from it.
+    for index in range(BLOCK_COLS * 2 + 1):
+        offset = (ORIGIN + index * TILE) * ss
+        draw.rectangle([max(lo, offset - line), lo, min(hi, offset + line), hi], fill=GRID_INK)
+    for index in range(ROWS + 1):
+        offset = (ORIGIN + index * TILE) * ss
+        draw.rectangle([lo, max(lo, offset - line), hi, min(hi, offset + line)], fill=GRID_INK)
+    return image.resize((CANVAS, CANVAS), Image.LANCZOS)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Fill colour of the reading-order-first transposed right-block tile."""
+    pair = sorted(tuple(item) for item in scene["swap"])
+    row, col = pair[0]
+    return str(scene["right_colors"][row][col])
+
+
+def margin(scene: dict) -> float:
+    """Runner-up margin: weakest true mark mismatch minus the strongest false one.
+
+    Every non-transposed right-block tile matches its rotated partner exactly,
+    so the strongest false mismatch is zero and the margin is the smaller of the
+    two transposed tiles' mask dissimilarities, in percent of mark area.
+    """
+    left = scene["left_marks"]
+    displayed = right_marks(scene)
+    scores = []
+    for r in range(ROWS):
+        for c in range(BLOCK_COLS):
+            pr, pc = _rotated_partner(r, c)
+            scores.append(mark_dissimilarity(displayed[r][c], left[pr][pc]))
+    scores.sort(reverse=True)
+    return round(100.0 * (scores[1] - scores[2]), 6)
+
+
+def is_quarantined(scene: dict) -> bool:
+    """Near-twin transpositions below the visible-difference floor."""
+    return margin(scene) < QUARANTINE_MARGIN
+
+
+def latent_symmetries(scene: dict) -> list[tuple[str, dict]]:
+    """The stored transposed pair is an unordered set: its order is an alias."""
+    reversed_pair = {**scene, "swap": [list(scene["swap"][1]), list(scene["swap"][0])]}
+    return [("swap_pair_order", reversed_pair)]

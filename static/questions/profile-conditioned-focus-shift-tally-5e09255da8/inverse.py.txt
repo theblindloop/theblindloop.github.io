@@ -1,0 +1,181 @@
+"""Scene-free pixel inverse arm for focus_shift_tally.
+
+Receives one rasterised PNG and nothing else: no latent scene, no renderer, no
+prompt or gold code.  It re-discovers the horizontal bands of the picture, the
+four towers and their block counts, which tower is ringed, which tower the
+pointer starts under, and the ordered row of operation cards, then replays the
+programme it has read and reports the same decision string the analytic gold
+uses: ``"<final blocks in the ringed tower>|<colour under the final pointer>"``.
+"""
+
+from __future__ import annotations
+
+from PIL import Image
+
+# Palette knowledge only; no renderer import and no layout constants are shared.
+_TOWER_ANCHORS = {
+    "red": (208, 58, 50),
+    "blue": (46, 96, 190),
+    "green": (34, 140, 72),
+    "orange": (226, 140, 28),
+    "purple": (128, 62, 170),
+}
+_CARD_ANCHORS = {"add": (60, 66, 84), "shift": (120, 120, 124)}
+
+
+def _nearest(rgb, anchors: dict) -> str:
+    return min(
+        anchors,
+        key=lambda k: sum((rgb[i] - anchors[k][i]) ** 2 for i in range(3)),
+    )
+
+
+def _runs(flags: list[bool]) -> list[tuple[int, int]]:
+    out, start = [], None
+    for i, f in enumerate(flags):
+        if f and start is None:
+            start = i
+        elif not f and start is not None:
+            out.append((start, i - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def _components(mask: list[list[bool]]) -> int:
+    h, w = len(mask), len(mask[0]) if mask else 0
+    seen = [[False] * w for _ in range(h)]
+    count = 0
+    for y in range(h):
+        for x in range(w):
+            if not mask[y][x] or seen[y][x]:
+                continue
+            count += 1
+            stack = [(y, x)]
+            seen[y][x] = True
+            while stack:
+                cy, cx = stack.pop()
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < h and 0 <= nx < w and mask[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((ny, nx))
+    return count
+
+
+def _median(values: list[int]) -> int:
+    s = sorted(values)
+    return s[len(s) // 2]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    im = image.convert("RGB")
+    w, h = im.size
+    px = im.load()
+
+    def ink(x: int, y: int) -> bool:
+        r, g, b = px[x, y]
+        return r + g + b < 720
+
+    row_has = [any(ink(x, y) for x in range(w)) for y in range(h)]
+    bands = _runs(row_has)
+    if len(bands) != 5:
+        raise ValueError(f"expected 5 horizontal bands, found {len(bands)}")
+    ring_band, tower_band, ptr_band, _arrow_band, card_band = bands
+
+    def col_runs(band, min_width=2):
+        y0, y1 = band
+        flags = [any(ink(x, y) for y in range(y0, y1 + 1)) for x in range(w)]
+        return [r for r in _runs(flags) if r[1] - r[0] + 1 >= min_width]
+
+    # --- towers: four columns of unit blocks on one baseline -----------------
+    tower_runs = col_runs(tower_band)
+    if len(tower_runs) != 4:
+        raise ValueError(f"expected 4 towers, found {len(tower_runs)}")
+    ty0, ty1 = tower_band
+    towers = []
+    for c0, c1 in tower_runs:
+        cx = (c0 + c1) // 2
+        # a unit block is a run of coloured pixels; consecutive blocks are
+        # separated by a dark seam, which is far darker than any tower colour.
+        column = [160 <= sum(px[cx, y]) < 720 for y in range(ty0, ty1 + 1)]
+        blocks = len(_runs(column))
+        reds, greens, blues = [], [], []
+        for y in range(ty0, ty1 + 1):
+            if 160 <= sum(px[cx, y]) < 720:
+                r, g, b = px[cx, y]
+                reds.append(r)
+                greens.append(g)
+                blues.append(b)
+        rgb = (_median(reds), _median(greens), _median(blues))
+        towers.append(
+            {"cx": cx, "blocks": blocks, "name": _nearest(rgb, _TOWER_ANCHORS)}
+        )
+    towers.sort(key=lambda t: t["cx"])
+
+    def nearest_tower(x: float) -> int:
+        return min(range(4), key=lambda i: abs(towers[i]["cx"] - x))
+
+    def centroid_x(band) -> float:
+        y0, y1 = band
+        xs = [x for y in range(y0, y1 + 1) for x in range(w) if ink(x, y)]
+        if not xs:
+            raise ValueError("empty band")
+        return sum(xs) / len(xs)
+
+    ring_pos = nearest_tower(centroid_x(ring_band))
+    focus = nearest_tower(centroid_x(ptr_band))
+
+    # --- operation cards, in drawn left-to-right order -----------------------
+    cy0, cy1 = card_band
+    cards = []
+    for c0, c1 in col_runs(card_band, min_width=8):
+        reds, greens, blues = [], [], []
+        white = []
+        rows = []
+        for y in range(cy0, cy1 + 1):
+            row = []
+            any_ink = False
+            for x in range(c0, c1 + 1):
+                r, g, b = px[x, y]
+                if r + g + b < 720:
+                    any_ink = True
+                    reds.append(r)
+                    greens.append(g)
+                    blues.append(b)
+                    row.append(False)
+                else:
+                    row.append(True)
+            if any_ink:
+                rows.append(y)
+                white.append(row)
+        if not white:
+            continue
+        # trim white rows above/below the solid card body
+        top = min(rows)
+        bottom = max(rows)
+        body = [white[i] for i, y in enumerate(rows) if top <= y <= bottom]
+        kind = _nearest((_median(reds), _median(greens), _median(blues)), _CARD_ANCHORS)
+        # glyph = white pixels strictly inside the solid card rectangle
+        gxs = [x for row in body for x, v in enumerate(row) if v]
+        if kind == "add":
+            cards.append({"kind": "add", "pips": _components(body), "dir": 0})
+        else:
+            mid = (min(gxs) + max(gxs)) / 2.0
+            left = sum(1 for x in gxs if x < mid)
+            right = sum(1 for x in gxs if x > mid)
+            cards.append({"kind": "shift", "pips": 0, "dir": 1 if left > right else -1})
+
+    if not cards:
+        raise ValueError("no operation cards found")
+
+    # --- replay --------------------------------------------------------------
+    heights = [t["blocks"] for t in towers]
+    for card in cards:
+        if card["kind"] == "add":
+            heights[focus] += card["pips"]
+        else:
+            focus += card["dir"]
+        if not 0 <= focus < 4:
+            raise ValueError("replayed focus left the row of towers")
+    return f"{heights[ring_pos]}|{towers[focus]['name']}"

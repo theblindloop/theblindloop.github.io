@@ -1,0 +1,393 @@
+"""Scene sampling, rendering and analytic gold for the door-merge world.
+
+A rectangular plate is ruled into a 4x4 grid of square rooms by black walls.
+Some interior grid edges carry no wall at all, so the rooms they separate are
+already joined into one larger apartment; travel between rooms is possible
+through any such missing wall, and only through those.  Three interior walls
+each carry one shut coloured door - orange, purple and teal.  Opening one door
+punches a doorway through that one piece of wall and joins the apartment on one
+side of it to the apartment on the other side.  Exactly one of the three doors
+joins the apartment holding the green dot to the apartment holding the red dot.
+
+Gold reads the open-edge set and the two marker rooms, runs a union-find over
+the rooms, and asks which door's two rooms sit in the two marker apartments.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PIL import Image, ImageDraw
+
+ROWS = 4
+COLS = 4
+CELL = 84
+ORIGIN = 32
+CANVAS = 400
+SUPERSAMPLE = 3
+DOOR_LEN = 40
+DOT_R = 10
+
+PAPER = (255, 255, 255)
+WALL = (20, 20, 20)
+DOOR_COLORS = {
+    "orange": (245, 150, 10),
+    "purple": (150, 55, 200),
+    "teal": (0, 160, 175),
+}
+MARKER_COLORS = {
+    "green": (25, 130, 45),
+    "red": (205, 30, 35),
+}
+DOOR_ORDER = ("orange", "purple", "teal")
+MARKER_ORDER = ("green", "red")
+
+QUARANTINE_PX = 8.0
+MIN_SAMPLED_MARGIN = 9.0
+
+_PERMS = [
+    ("orange", "purple", "teal"),
+    ("orange", "teal", "purple"),
+    ("purple", "orange", "teal"),
+    ("purple", "teal", "orange"),
+    ("teal", "orange", "purple"),
+    ("teal", "purple", "orange"),
+]
+
+
+# ---------------------------------------------------------------- grid helpers
+
+
+def _interior_edges():
+    edges = []
+    for i in range(ROWS):
+        for j in range(COLS - 1):
+            edges.append(["V", i, j])
+    for i in range(ROWS - 1):
+        for j in range(COLS):
+            edges.append(["H", i, j])
+    return edges
+
+
+def _edge_cells(edge):
+    kind, i, j = edge[0], int(edge[1]), int(edge[2])
+    if kind == "V":
+        return (i, j), (i, j + 1)
+    return (i, j), (i + 1, j)
+
+
+def _cell_index(cell):
+    return int(cell[0]) * COLS + int(cell[1])
+
+
+def _components(open_edges):
+    parent = list(range(ROWS * COLS))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for edge in open_edges:
+        ca, cb = _edge_cells(edge)
+        union(_cell_index(ca), _cell_index(cb))
+    return [find(k) for k in range(ROWS * COLS)]
+
+
+def _cell_center(cell):
+    i, j = int(cell[0]), int(cell[1])
+    return (ORIGIN + j * CELL + CELL / 2.0, ORIGIN + i * CELL + CELL / 2.0)
+
+
+def _edge_span(edge, w):
+    """Axis-aligned rectangle (x0, y0, x1, y1) of the wall drawn on one edge."""
+    kind, i, j = edge[0], int(edge[1]), int(edge[2])
+    h = w / 2.0
+    if kind == "V":
+        x = ORIGIN + (j + 1) * CELL
+        y0 = ORIGIN + i * CELL
+        return (x - h, y0 - h, x + h, y0 + CELL + h)
+    y = ORIGIN + (i + 1) * CELL
+    x0 = ORIGIN + j * CELL
+    return (x0 - h, y - h, x0 + CELL + h, y + h)
+
+
+def _door_span(edge, w):
+    kind, i, j = edge[0], int(edge[1]), int(edge[2])
+    h = w / 2.0
+    if kind == "V":
+        x = ORIGIN + (j + 1) * CELL
+        yc = ORIGIN + i * CELL + CELL / 2.0
+        return (x - h, yc - DOOR_LEN / 2.0, x + h, yc + DOOR_LEN / 2.0)
+    y = ORIGIN + (i + 1) * CELL
+    xc = ORIGIN + j * CELL + CELL / 2.0
+    return (xc - DOOR_LEN / 2.0, y - h, xc + DOOR_LEN / 2.0, y + h)
+
+
+def _wall_rects(scene):
+    w = float(scene["wall_thickness"])
+    h = w / 2.0
+    x0 = ORIGIN
+    y0 = ORIGIN
+    x1 = ORIGIN + COLS * CELL
+    y1 = ORIGIN + ROWS * CELL
+    rects = [
+        (x0 - h, y0 - h, x1 + h, y0 + h),
+        (x0 - h, y1 - h, x1 + h, y1 + h),
+        (x0 - h, y0 - h, x0 + h, y1 + h),
+        (x1 - h, y0 - h, x1 + h, y1 + h),
+    ]
+    open_keys = {tuple(e) for e in scene["open_edges"]}
+    for edge in _interior_edges():
+        if tuple(edge) not in open_keys:
+            rects.append(_edge_span(edge, w))
+    return rects
+
+
+def _rect_distance(px, py, rect):
+    x0, y0, x1, y1 = rect
+    dx = max(x0 - px, 0.0, px - x1)
+    dy = max(y0 - py, 0.0, py - y1)
+    return math.hypot(dx, dy)
+
+
+def _clearance(scene, pos):
+    rects = _wall_rects(scene)
+    return min(_rect_distance(pos[0], pos[1], r) for r in rects) - float(scene["dot_radius"])
+
+
+# ------------------------------------------------------------------- sampling
+
+
+def sample_scene(seed: int) -> dict:
+    rng = random.Random(seed * 7919 + 13)
+    perm = _PERMS[seed % 6]
+    want_correct_nearest = ((seed // 6) % 2) == 0
+    edges = _interior_edges()
+
+    best = None
+    for attempt in range(20000):
+        w = float(rng.choice([11, 12, 13, 14]))
+        p_open = rng.uniform(0.24, 0.36)
+        open_edges = [e for e in edges if rng.random() < p_open]
+        closed_edges = [e for e in edges if e not in open_edges]
+        comp = _components(open_edges)
+
+        sizes = {}
+        for k in range(ROWS * COLS):
+            sizes[comp[k]] = sizes.get(comp[k], 0) + 1
+        big = [c for c, n in sizes.items() if n >= 2]
+        if len(sizes) < 3 or len(big) < 2:
+            continue
+
+        # two marker apartments, each spanning at least two rooms
+        rng.shuffle(big)
+        cg_comp, cr_comp = big[0], big[1]
+        g_cells = [k for k in range(ROWS * COLS) if comp[k] == cg_comp]
+        r_cells = [k for k in range(ROWS * COLS) if comp[k] == cr_comp]
+        g_cell = rng.choice(g_cells)
+        r_cell = rng.choice(r_cells)
+
+        correct = []
+        useless = []
+        third = []
+        for e in closed_edges:
+            ca, cb = _edge_cells(e)
+            a, b = comp[_cell_index(ca)], comp[_cell_index(cb)]
+            pair = {a, b}
+            if pair == {cg_comp, cr_comp}:
+                # the door must not simply sit between the two marked rooms
+                if _cell_index(ca) not in (g_cell, r_cell) and _cell_index(cb) not in (
+                    g_cell,
+                    r_cell,
+                ):
+                    correct.append(e)
+            elif a == b:
+                useless.append(e)
+            elif (a in (cg_comp, cr_comp)) != (b in (cg_comp, cr_comp)):
+                third.append(e)
+        if not correct or not useless or not third:
+            continue
+
+        correct_edge = rng.choice(correct)
+        useless_edge = rng.choice(useless)
+        third_edge = rng.choice(third)
+        if len({tuple(correct_edge), tuple(useless_edge), tuple(third_edge)}) != 3:
+            continue
+
+        doors = [
+            {"edge": correct_edge, "color": perm[0]},
+            {"edge": useless_edge, "color": perm[1]},
+            {"edge": third_edge, "color": perm[2]},
+        ]
+
+        scene = {
+            "seed": int(seed),
+            "canvas": CANVAS,
+            "supersample": SUPERSAMPLE,
+            "rows": ROWS,
+            "cols": COLS,
+            "cell": CELL,
+            "origin": ORIGIN,
+            "wall_thickness": w,
+            "dot_radius": float(DOT_R),
+            "door_length": float(DOOR_LEN),
+            "open_edges": sorted([list(e) for e in open_edges]),
+            "doors": doors,
+            "markers": [],
+        }
+
+        # place the two dots inside their rooms with a sampled wall clearance
+        markers = []
+        ok = True
+        for color, cell_idx in (("green", g_cell), ("red", r_cell)):
+            cx, cy = _cell_center((cell_idx // COLS, cell_idx % COLS))
+            target = rng.uniform(MIN_SAMPLED_MARGIN, 22.0)
+            placed = None
+            for _ in range(400):
+                ang = rng.uniform(0, 2 * math.pi)
+                rad = rng.uniform(0, CELL / 2.0 - w / 2.0 - DOT_R - 1.0)
+                pos = (round(cx + rad * math.cos(ang), 2), round(cy + rad * math.sin(ang), 2))
+                scene["markers"] = markers + [
+                    {"color": color, "cell": [cell_idx // COLS, cell_idx % COLS], "pos": list(pos)}
+                ]
+                c = _clearance(scene, pos)
+                if c >= MIN_SAMPLED_MARGIN and abs(c - target) <= 2.0:
+                    placed = pos
+                    break
+            if placed is None:
+                ok = False
+                break
+            markers.append(
+                {"color": color, "cell": [cell_idx // COLS, cell_idx % COLS], "pos": list(placed)}
+            )
+        if not ok:
+            continue
+        scene["markers"] = markers
+
+        if margin(scene) < MIN_SAMPLED_MARGIN:
+            continue
+        if analytic_gold(scene) != perm[0]:
+            continue
+
+        # counterbalance: the correct door must not always be the one nearest
+        # to the two dots
+        gp = markers[0]["pos"]
+        rp = markers[1]["pos"]
+
+        def door_dist(d):
+            r = _door_span(d["edge"], w)
+            mx, my = (r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0
+            return math.hypot(mx - gp[0], my - gp[1]) + math.hypot(mx - rp[0], my - rp[1])
+
+        nearest = min(doors, key=door_dist)
+        is_nearest = nearest["color"] == perm[0]
+        if best is None:
+            best = scene
+        if is_nearest == want_correct_nearest:
+            return scene
+        if attempt > 12000 and best is not None:
+            return best
+
+    if best is not None:
+        return best
+    raise RuntimeError(f"could not sample a scene for seed {seed}")
+
+
+# ------------------------------------------------------------------ rendering
+
+
+def render(scene: dict) -> Image.Image:
+    s = int(scene["supersample"])
+    n = int(scene["canvas"])
+    img = Image.new("RGB", (n * s, n * s), PAPER)
+    d = ImageDraw.Draw(img)
+    w = float(scene["wall_thickness"])
+
+    def box(rect, fill):
+        d.rectangle([rect[0] * s, rect[1] * s, rect[2] * s - 1, rect[3] * s - 1], fill=fill)
+
+    for rect in _wall_rects(scene):
+        box(rect, WALL)
+
+    by_color = {dd["color"]: dd for dd in scene["doors"]}
+    for name in DOOR_ORDER:
+        if name in by_color:
+            box(_door_span(by_color[name]["edge"], w), DOOR_COLORS[name])
+
+    mk = {m["color"]: m for m in scene["markers"]}
+    r = float(scene["dot_radius"])
+    for name in MARKER_ORDER:
+        if name not in mk:
+            continue
+        x, y = mk[name]["pos"]
+        d.ellipse(
+            [(x - r) * s, (y - r) * s, (x + r) * s - 1, (y + r) * s - 1],
+            fill=MARKER_COLORS[name],
+        )
+
+    return img.resize((n, n), Image.Resampling.BOX)
+
+
+# ---------------------------------------------------------------------- gold
+
+
+def analytic_gold(scene: dict) -> str:
+    comp = _components(scene["open_edges"])
+    mk = {m["color"]: m for m in scene["markers"]}
+    cg = comp[_cell_index(mk["green"]["cell"])]
+    cr = comp[_cell_index(mk["red"]["cell"])]
+    winners = []
+    for door in scene["doors"]:
+        ca, cb = _edge_cells(door["edge"])
+        pair = {comp[_cell_index(ca)], comp[_cell_index(cb)]}
+        if pair == {cg, cr}:
+            winners.append(door["color"])
+    if len(winners) != 1:
+        raise ValueError("scene does not have exactly one joining door")
+    return winners[0]
+
+
+def margin(scene: dict) -> float:
+    w = float(scene["wall_thickness"])
+    terms = [w, float(scene["door_length"]), float(scene["cell"]) - w]
+    for m in scene["markers"]:
+        terms.append(_clearance(scene, m["pos"]))
+    return round(min(terms), 3)
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_PX
+
+
+def latent_symmetries(scene: dict):
+    out = []
+
+    a = json_copy(scene)
+    a["open_edges"] = list(reversed(a["open_edges"]))
+    out.append(("open_edge_order_reversal", a))
+
+    b = json_copy(scene)
+    b["doors"] = list(reversed(b["doors"]))
+    out.append(("door_record_reversal", b))
+
+    c = json_copy(scene)
+    c["markers"] = list(reversed(c["markers"]))
+    out.append(("marker_record_reversal", c))
+
+    return out
+
+
+def json_copy(obj):
+    if isinstance(obj, dict):
+        return {k: json_copy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_copy(v) for v in obj]
+    return obj

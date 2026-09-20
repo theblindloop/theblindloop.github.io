@@ -1,0 +1,207 @@
+"""Independent inverse arm: reconstruct tile occupancies from the final PNG only."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+LABELS = ("A", "B", "C", "D")
+
+
+class OracleAbstention(ValueError):
+    """The raster does not expose one well-separated rotation-only match."""
+
+
+@dataclass(frozen=True)
+class Component:
+    cx: float
+    cy: float
+    width: int
+    height: int
+    area: int
+    fill_ratio: float
+
+
+def _components(mask: np.ndarray) -> list[Component]:
+    height, width = mask.shape
+    ys, xs = np.nonzero(mask)
+    unseen = set((ys * width + xs).tolist())
+    found: list[Component] = []
+    while unseen:
+        start = unseen.pop()
+        stack = [start]
+        pixels = [start]
+        while stack:
+            value = stack.pop()
+            y, x = divmod(value, width)
+            for neighbor in (value - 1, value + 1, value - width, value + width):
+                if neighbor not in unseen:
+                    continue
+                ny, nx = divmod(neighbor, width)
+                if not (0 <= ny < height and 0 <= nx < width):
+                    continue
+                if abs(nx - x) + abs(ny - y) != 1:
+                    continue
+                unseen.remove(neighbor)
+                stack.append(neighbor)
+                pixels.append(neighbor)
+        if len(pixels) < 120:
+            continue
+        py = np.fromiter((item // width for item in pixels), dtype=np.int32)
+        px = np.fromiter((item % width for item in pixels), dtype=np.int32)
+        x0, x1 = int(px.min()), int(px.max())
+        y0, y1 = int(py.min()), int(py.max())
+        box_area = (x1 - x0 + 1) * (y1 - y0 + 1)
+        found.append(
+            Component(
+                cx=float(px.mean()),
+                cy=float(py.mean()),
+                width=x1 - x0 + 1,
+                height=y1 - y0 + 1,
+                area=len(pixels),
+                fill_ratio=len(pixels) / box_area,
+            )
+        )
+    return found
+
+
+def _split_by_gaps(items: list[Component], axis: str, parts: int) -> list[list[Component]]:
+    if len(items) < parts:
+        raise OracleAbstention("too few visible tiles to enumerate regions")
+    ordered = sorted(items, key=lambda item: getattr(item, axis))
+    gaps = [
+        (getattr(ordered[index + 1], axis) - getattr(ordered[index], axis), index + 1)
+        for index in range(len(ordered) - 1)
+    ]
+    cuts = sorted(index for _, index in sorted(gaps, reverse=True)[: parts - 1])
+    groups: list[list[Component]] = []
+    start = 0
+    for cut in cuts + [len(ordered)]:
+        groups.append(ordered[start:cut])
+        start = cut
+    groups.sort(key=lambda group: sum(getattr(item, axis) for item in group) / len(group))
+    return groups
+
+
+def _axis_centers(values: list[float], tile_extent: float) -> list[float]:
+    clusters: list[list[float]] = []
+    for value in sorted(values):
+        if not clusters or value - (sum(clusters[-1]) / len(clusters[-1])) > tile_extent * 0.45:
+            clusters.append([value])
+        else:
+            clusters[-1].append(value)
+    return [sum(cluster) / len(cluster) for cluster in clusters]
+
+
+def _pattern_from_group(group: list[Component], tile_extent: float) -> np.ndarray:
+    if len(group) != 11:
+        raise OracleAbstention(f"each region must contain eleven tiles; measured {len(group)}")
+    x_centers = _axis_centers([item.cx for item in group], tile_extent)
+    y_centers = _axis_centers([item.cy for item in group], tile_extent)
+    if len(x_centers) != 5 or len(y_centers) != 5:
+        raise OracleAbstention("a tile pattern does not span a recoverable five-by-five lattice")
+    pattern = np.zeros((5, 5), dtype=np.uint8)
+    for item in group:
+        column = min(range(5), key=lambda index: abs(item.cx - x_centers[index]))
+        row = min(range(5), key=lambda index: abs(item.cy - y_centers[index]))
+        if pattern[row, column]:
+            raise OracleAbstention("two tile components map to the same lattice cell")
+        pattern[row, column] = 1
+    return pattern
+
+
+def _connected(pattern: np.ndarray) -> bool:
+    cells = set(map(tuple, np.argwhere(pattern > 0)))
+    if not cells:
+        return False
+    seen = {min(cells)}
+    stack = list(seen)
+    while stack:
+        row, column = stack.pop()
+        for neighbor in ((row - 1, column), (row + 1, column),
+                         (row, column - 1), (row, column + 1)):
+            if neighbor in cells and neighbor not in seen:
+                seen.add(neighbor)
+                stack.append(neighbor)
+    return seen == cells
+
+
+def _perimeter(pattern: np.ndarray) -> int:
+    cells = set(map(tuple, np.argwhere(pattern > 0)))
+    return sum(
+        (row + dr, column + dc) not in cells
+        for row, column in cells
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1))
+    )
+
+
+def _score(reference: np.ndarray, candidate: np.ndarray) -> int:
+    return max(int(np.logical_and(reference, np.rot90(candidate, turns)).sum())
+               for turns in range(4))
+
+
+def _rows(pattern: np.ndarray) -> list[str]:
+    return ["".join("#" if value else "." for value in row) for row in pattern]
+
+
+def analyze_image(image: Image.Image) -> dict:
+    """Enumerate all regions, recover masks, and report every rotational score."""
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    spread = arr.max(axis=2) - arr.min(axis=2)
+    mask = (spread >= 48) & (arr.max(axis=2) <= 210) & (arr.min(axis=2) <= 175)
+    components = _components(mask)
+    if len(components) != 55:
+        raise OracleAbstention(f"expected 55 visible tile components, measured {len(components)}")
+
+    extents = [0.5 * (item.width + item.height) for item in components]
+    tile_extent = float(np.median(extents))
+    if not 18.0 <= tile_extent <= 30.0:
+        raise OracleAbstention(f"tile extent {tile_extent:.2f} is outside the readable range")
+    if max(abs(value - tile_extent) for value in extents) > 2.5:
+        raise OracleAbstention("tile sizes are not uniform")
+    if min(item.fill_ratio for item in components) < 0.82:
+        raise OracleAbstention("a recovered tile is not a filled square")
+    areas = [item.area for item in components]
+    if max(areas) / min(areas) > 1.12:
+        raise OracleAbstention("tile ink areas are not uniform")
+
+    horizontal_bands = _split_by_gaps(components, "cy", 3)
+    if [len(group) for group in horizontal_bands] != [11, 22, 22]:
+        raise OracleAbstention("could not separate reference and two candidate rows")
+    upper = _split_by_gaps(horizontal_bands[1], "cx", 2)
+    lower = _split_by_gaps(horizontal_bands[2], "cx", 2)
+    if [len(group) for group in upper + lower] != [11, 11, 11, 11]:
+        raise OracleAbstention("could not enumerate four candidate panels")
+
+    patterns = [_pattern_from_group(horizontal_bands[0], tile_extent)]
+    patterns.extend(_pattern_from_group(group, tile_extent) for group in upper + lower)
+    expected_counts = [1, 1, 2, 3, 4]
+    for pattern in patterns:
+        if int(pattern.sum()) != 11 or not _connected(pattern):
+            raise OracleAbstention("a visible pattern violates the common inventory")
+        if _perimeter(pattern) != 24:
+            raise OracleAbstention("a visible pattern violates the common perimeter")
+        row_counts = sorted(int(value) for value in pattern.sum(axis=1))
+        column_counts = sorted(int(value) for value in pattern.sum(axis=0))
+        if row_counts != expected_counts or column_counts != expected_counts:
+            raise OracleAbstention("a visible pattern violates balanced row/column counts")
+
+    reference = patterns[0]
+    scores = [_score(reference, candidate) for candidate in patterns[1:]]
+    ranking = sorted(range(4), key=lambda index: scores[index], reverse=True)
+    top_gap = scores[ranking[0]] - scores[ranking[1]]
+    if scores[ranking[0]] != 11 or top_gap < 2:
+        raise OracleAbstention("no unique exact match with a two-cell runner-up margin")
+    return {
+        "decision": LABELS[ranking[0]],
+        "scores": scores,
+        "runner_up_margin": float(top_gap),
+        "tile_extent": tile_extent,
+        "patterns": [_rows(pattern) for pattern in patterns],
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

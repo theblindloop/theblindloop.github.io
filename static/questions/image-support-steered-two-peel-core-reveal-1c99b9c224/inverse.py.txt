@@ -1,0 +1,124 @@
+"""Independent pixel-only inverse arm for Two-Peel Core Reveal.
+
+This module deliberately duplicates the public transform and answer-shape
+definitions.  It imports no renderer, generator, prompts, scene, or gold code.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+N = 15
+FRAME = 4
+LABELS = ("cross", "tee", "elbow")
+
+
+class OracleError(ValueError):
+    pass
+
+
+def _grow(mask: np.ndarray) -> np.ndarray:
+    p = np.pad(mask.astype(bool), 1, constant_values=False)
+    return p[1:-1, 1:-1] | p[:-2, 1:-1] | p[2:, 1:-1] | p[1:-1, :-2] | p[1:-1, 2:]
+
+
+def _survive(mask: np.ndarray) -> np.ndarray:
+    p = np.pad(mask.astype(bool), 1, constant_values=False)
+    return p[1:-1, 1:-1] & p[:-2, 1:-1] & p[2:, 1:-1] & p[1:-1, :-2] & p[1:-1, 2:]
+
+
+def _twice(mask: np.ndarray) -> np.ndarray:
+    return _survive(_survive(mask))
+
+
+def _answer_shapes() -> dict[str, np.ndarray]:
+    shapes = {}
+    for label in LABELS:
+        thin = np.zeros((N, N), dtype=bool)
+        if label == "cross":
+            thin[3:12, 7] = True
+            thin[7, 3:12] = True
+        elif label == "tee":
+            thin[3, 3:12] = True
+            thin[3:12, 7] = True
+        else:
+            thin[3:12, 3] = True
+            thin[11, 3:12] = True
+        shapes[label] = _twice(_grow(_grow(thin)))
+    return shapes
+
+
+ANSWER_SHAPES = _answer_shapes()
+
+
+def _all_orientations(mask: np.ndarray) -> tuple[np.ndarray, ...]:
+    result = []
+    for turns in range(4):
+        rotated = np.rot90(mask, turns)
+        result.append(rotated)
+        result.append(np.fliplr(rotated))
+    return tuple(result)
+
+
+def _recover_cells(image: Image.Image) -> np.ndarray:
+    arr = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if arr.shape[:2] != (512, 512):
+        raise OracleError("unexpected canvas size")
+    cyan = (arr[:, :, 0] < 75) & (arr[:, :, 1] > 130) & (arr[:, :, 1] < 215) & (arr[:, :, 2] > 145)
+    points = np.argwhere(cyan)
+    if len(points) < 1000:
+        raise OracleError("cyan mosaic fiducial is missing")
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0)
+    outer_w, outer_h = int(x1 - x0 + 1), int(y1 - y0 + 1)
+    if outer_w != outer_h or (outer_w - 2 * FRAME) % N:
+        raise OracleError("cyan frame does not define a square 15-cell lattice")
+    cell = (outer_w - 2 * FRAME) // N
+    if cell not in (11, 12):
+        raise OracleError("unsupported or damaged cell scale")
+
+    border = np.concatenate(
+        (arr[:3].reshape(-1, 3), arr[-3:].reshape(-1, 3), arr[:, :3].reshape(-1, 3), arr[:, -3:].reshape(-1, 3)),
+        axis=0,
+    )
+    background = np.median(border, axis=0)
+    cells = np.zeros((N, N), dtype=bool)
+    left, top = int(x0) + FRAME, int(y0) + FRAME
+    for y in range(N):
+        for x in range(N):
+            cx = left + x * cell + cell // 2
+            cy = top + y * cell + cell // 2
+            patch = arr[cy - 1 : cy + 2, cx - 1 : cx + 2].mean(axis=(0, 1))
+            if float(np.linalg.norm(patch - background)) < 35.0:
+                raise OracleError("mosaic has a missing or erased cell")
+            luminance = float(0.2126 * patch[0] + 0.7152 * patch[1] + 0.0722 * patch[2])
+            cells[y, x] = luminance < 125.0
+    if int(cells.sum()) < 120 or int(cells.sum()) > 180:
+        raise OracleError("dark-cell count is outside the declared precursor regime")
+    return cells
+
+
+def analyze_image(image: Image.Image) -> dict:
+    cells = _recover_cells(image)
+    peeled = _twice(cells)
+    distances = {
+        label: min(
+            int(np.count_nonzero(peeled ^ variant))
+            for variant in _all_orientations(template)
+        )
+        for label, template in ANSWER_SHAPES.items()
+    }
+    ranked = sorted((distance, label) for label, distance in distances.items())
+    decision = "ambiguous" if ranked[0][0] == ranked[1][0] else ranked[0][1]
+    return {
+        "decision": decision,
+        "margin": float(ranked[1][0] - ranked[0][0]),
+        "distances": distances,
+        "dark_cells": int(cells.sum()),
+        "surviving_cells": int(peeled.sum()),
+    }
+
+
+def decision_from_image(image: Image.Image) -> str:
+    return str(analyze_image(image)["decision"])

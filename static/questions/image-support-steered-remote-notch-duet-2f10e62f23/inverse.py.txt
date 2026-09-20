@@ -1,0 +1,115 @@
+"""Independent image-only inverse for the remote-notch pair."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from PIL import Image
+
+
+def _foreground(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.int16)
+    # The renderer uses a white field and a dark randomized ink palette.
+    return np.max(np.abs(array - 255), axis=2) >  thirty_threshold()
+
+
+def thirty_threshold() -> int:
+    """Keep the threshold in a function so the image path has no renderer state."""
+    return 30
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros(mask.shape, dtype=bool)
+    found: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        iy, ix = int(y), int(x)
+        if seen[iy, ix]:
+            continue
+        stack = [(iy, ix)]
+        seen[iy, ix] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for ny in range(cy - 1, cy + 2):
+                for nx in range(cx - 1, cx + 2):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and not seen[ny, nx]
+                        and mask[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        found.append(np.asarray(points, dtype=np.int32))
+    return sorted(found, key=len, reverse=True)
+
+
+def _box(component: np.ndarray) -> tuple[int, int, int, int]:
+    y0 = int(component[:, 0].min())
+    y1 = int(component[:, 0].max())
+    x0 = int(component[:, 1].min())
+    x1 = int(component[:, 1].max())
+    return x0, y0, x1, y1
+
+
+def _notch_direction(component: np.ndarray, image_shape: tuple[int, int]) -> float:
+    """Find the angular sector with the least foreground occupancy."""
+    x0, y0, x1, y1 = _box(component)
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    if min(width, height) < 120:
+        raise ValueError("medallion is too small")
+    # The outer ellipse remains almost circular even after the edge notch, so
+    # its bounding-box midpoint is a stable raster estimate of its center.
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    radius = 0.5 * min(width, height) - 1.0
+    mask = np.zeros(image_shape, dtype=bool)
+    mask[component[:, 0], component[:, 1]] = True
+
+    angles = np.linspace(-math.pi, math.pi, 144, endpoint=False)
+    radii = np.linspace(0.53 * radius, 0.94 * radius, 12)
+    missing = np.zeros(len(angles), dtype=np.float64)
+    for index, angle in enumerate(angles):
+        xs = np.rint(cx + radii * math.cos(float(angle))).astype(int)
+        ys = np.rint(cy + radii * math.sin(float(angle))).astype(int)
+        valid = (xs >= 0) & (xs < image_shape[1]) & (ys >= 0) & (ys < image_shape[0])
+        occupancy = float(mask[ys[valid], xs[valid]].mean()) if np.any(valid) else 0.0
+        missing[index] = 1.0 - occupancy
+
+    baseline = float(np.median(missing))
+    weights = np.maximum(0.0, missing - baseline - 0.08)
+    if float(weights.sum()) < 2.0:
+        raise ValueError("no measurable notch sector")
+    vector = np.sum(weights * np.exp(1j * angles))
+    if abs(vector) < 0.15 * float(weights.sum()):
+        raise ValueError("notch direction is ambiguous")
+    return float(math.atan2(vector.imag, vector.real))
+
+
+def decision_from_image(image: Image.Image) -> str:
+    """Recover both notch directions from the final PNG only."""
+    mask = _foreground(image)
+    components = _components(mask)
+    substantial = [component for component in components if len(component) >= 8000]
+    if len(substantial) != 2:
+        raise ValueError("expected exactly two intact medallion components")
+
+    measurements = []
+    for component in substantial:
+        x0, y0, x1, y1 = _box(component)
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        fill = len(component) / float(width * height)
+        if min(width, height) < 120 or fill < 0.62:
+            raise ValueError("one medallion is incomplete or materially erased")
+        measurements.append(_notch_direction(component, mask.shape))
+
+    raw = (measurements[1] - measurements[0]) % (2.0 * math.pi)
+    delta = min(raw, 2.0 * math.pi - raw)
+    if abs(delta - math.pi / 2.0) < 0.10:
+        raise ValueError("notch relation is too close to the right-angle boundary")
+    return "yes" if delta > math.pi / 2.0 else "no"

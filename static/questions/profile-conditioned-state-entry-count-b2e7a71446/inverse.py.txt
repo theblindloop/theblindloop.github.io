@@ -1,0 +1,121 @@
+"""Independent pixel-only inverse arm for the state-entry-count world.
+
+Receives only the final PNG. From the raster alone it:
+  1. labels pixels against the fixed palette and recovers the 6 slot columns
+     from the panel-box border edges;
+  2. locates the royal-blue token in each panel to recover its slot in timeline
+     order (top to bottom);
+  3. detects which slots carry the light-grey shaded band fill;
+  4. replays the inside/outside timeline and counts the outside -> inside
+     transitions between consecutive panels.
+
+No latent scene, renderer, prompt, or gold code is accessed.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+
+BG = (255, 255, 255)
+BORDER = (90, 90, 90)
+BAND = (228, 228, 234)
+TOKEN = (30, 60, 220)
+
+PALETTE = [BG, BORDER, BAND, TOKEN]
+_BG, _BRD, _BAND, _TOK = range(4)
+
+N_SLOTS = 6
+PANELS = 5
+SLOT_W = 110
+SLOT_H = 90
+GAP = 30
+TOKEN_R = 22
+
+
+class UnreadableImageError(ValueError):
+    """The raster does not expose the expected panel structure."""
+
+
+def _label(arr: np.ndarray) -> np.ndarray:
+    dists = np.stack(
+        [np.linalg.norm(arr - np.array(c, dtype=np.float32), axis=-1) for c in PALETTE],
+        axis=-1,
+    )
+    return dists.argmin(axis=-1)
+
+
+def _cluster(sorted_vals: list[int], tol: int) -> list[int]:
+    if not sorted_vals:
+        return []
+    out = [[sorted_vals[0]]]
+    for v in sorted_vals[1:]:
+        if v - out[-1][-1] > tol:
+            out.append([v])
+        else:
+            out[-1].append(v)
+    return [r[len(r) // 2] for r in out]
+
+
+def decision_from_image(image: Image.Image) -> str:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    labels = _label(arr)
+    h, w = labels.shape
+
+    border_ys, border_xs = np.nonzero(labels == _BRD)
+    if len(border_xs) == 0:
+        raise UnreadableImageError("no panel borders found")
+
+    top_edge = int(border_ys.min())
+    panel_bottom = top_edge + PANELS * SLOT_H + (PANELS - 1) * GAP
+    in_panel = np.arange(labels.shape[0]) < panel_bottom
+    keep = in_panel[border_ys]
+    border_ys = border_ys[keep]
+    border_xs = border_xs[keep]
+    if len(border_xs) == 0:
+        raise UnreadableImageError("no panel borders found")
+    top_edge = int(border_ys.min())
+
+    counts = np.bincount(border_xs, minlength=w)
+    edge_cols = [int(x) for x in range(w) if counts[x] > 40]
+    edges = _cluster(sorted(set(edge_cols)), 6)
+    if len(edges) < 2 * N_SLOTS:
+        raise UnreadableImageError(f"expected {2 * N_SLOTS} column edges, found {len(edges)}")
+    edge = edges[: 2 * N_SLOTS]
+    col_centers = [(edge[2 * i] + edge[2 * i + 1]) // 2 for i in range(N_SLOTS)]
+
+    token_ys, token_xs = np.nonzero(labels == _TOK)
+    if len(token_xs) == 0:
+        raise UnreadableImageError("no tracked token found")
+
+    positions = []
+    for k in range(PANELS):
+        cy = top_edge + k * (SLOT_H + GAP) + SLOT_H // 2
+        lo, hi = cy - SLOT_H // 2, cy + SLOT_H // 2
+        xs_here = [int(x) for (y, x) in zip(token_ys.tolist(), token_xs.tolist()) if lo <= y < hi]
+        if not xs_here:
+            raise UnreadableImageError(f"token missing from panel {k + 1}")
+        mean_x = sum(xs_here) // len(xs_here)
+        positions.append(min(range(N_SLOTS), key=lambda i: abs(col_centers[i] - mean_x)))
+
+    band_xs = np.nonzero(labels == _BAND)[1]
+    if len(band_xs) == 0:
+        raise UnreadableImageError("no shaded band found")
+    band_slots = set()
+    for i in range(N_SLOTS):
+        x0 = edge[2 * i]
+        x1 = edge[2 * i + 1]
+        inside = sum(1 for x in band_xs.tolist() if x0 < x < x1)
+        if inside > 300:
+            band_slots.add(i)
+    if not band_slots:
+        raise UnreadableImageError("band does not cover any slot")
+
+    def is_inside(slot: int) -> bool:
+        return slot in band_slots
+
+    count = 0
+    for k in range(PANELS - 1):
+        if (not is_inside(positions[k])) and is_inside(positions[k + 1]):
+            count += 1
+    return str(count)

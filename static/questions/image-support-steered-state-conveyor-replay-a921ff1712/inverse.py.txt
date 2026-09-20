@@ -1,0 +1,187 @@
+"""Independent pixel-only inverse for the state conveyor.
+
+This module intentionally duplicates the public color contract instead of
+importing any renderer or analytic code.  It first reconstructs the one
+connected traversable component, orders station components by image distance
+from the ringed start, and then replays their visible operation colors.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_PALETTE = np.asarray(
+    [
+        (250, 248, 243),  # background
+        (38, 55, 70),  # route
+        (211, 65, 62),  # finish
+        (154, 163, 170),  # distractor
+        (51, 102, 204),  # W
+        (226, 168, 32),  # X
+        (44, 160, 105),  # Y
+        (190, 75, 145),  # Z
+        (236, 125, 42),  # clockwise +1
+        (30, 161, 177),  # counterclockwise -1
+        (116, 85, 175),  # fork
+        (105, 105, 105),  # reset bar
+    ],
+    dtype=np.float32,
+)
+_ROUTE = 1
+_FINISH = 2
+_STATE = (4, 5, 6, 7)
+_OPS = (8, 9, 10, 11)
+
+
+def _labels(image: Image.Image) -> np.ndarray:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32)
+    distance = ((array[:, :, None, :] - _PALETTE[None, None, :, :]) ** 2).sum(axis=3)
+    return distance.argmin(axis=2)
+
+
+def _components(mask: np.ndarray, minimum: int = 1) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    result: list[np.ndarray] = []
+    for y, x in np.argwhere(mask):
+        y, x = int(y), int(x)
+        if seen[y, x]:
+            continue
+        stack = [(y, x)]
+        seen[y, x] = True
+        points: list[tuple[int, int]] = []
+        while stack:
+            cy, cx = stack.pop()
+            points.append((cy, cx))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if not (dy or dx):
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(points) >= minimum:
+            result.append(np.asarray(points, dtype=np.int32))
+    return result
+
+
+def _centroid(component: np.ndarray) -> tuple[int, int]:
+    y, x = np.rint(component.mean(axis=0)).astype(int)
+    return int(y), int(x)
+
+
+def _flood(mask: np.ndarray, seeds: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    reached = np.zeros_like(mask, dtype=bool)
+    queue: deque[tuple[int, int]] = deque()
+    for y, x in seeds:
+        y, x = int(y), int(x)
+        if mask[y, x] and not reached[y, x]:
+            reached[y, x] = True
+            queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and not reached[ny, nx]:
+                    reached[ny, nx] = True
+                    queue.append((ny, nx))
+    return reached
+
+
+def _distance_map(mask: np.ndarray, seeds: np.ndarray) -> np.ndarray:
+    height, width = mask.shape
+    distance = np.full(mask.shape, -1, dtype=np.int32)
+    queue: deque[tuple[int, int]] = deque()
+    for y, x in seeds:
+        y, x = int(y), int(x)
+        if mask[y, x] and distance[y, x] < 0:
+            distance[y, x] = 0
+            queue.append((y, x))
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and mask[ny, nx] and distance[ny, nx] < 0:
+                    distance[ny, nx] = distance[y, x] + 1
+                    queue.append((ny, nx))
+    return distance
+
+
+def _large_components(labels: np.ndarray, label: int, *, y_floor: int, minimum: int) -> list[np.ndarray]:
+    result = []
+    for component in _components(labels == label, minimum=minimum):
+        y, _ = _centroid(component)
+        if y >= y_floor:
+            result.append(component)
+    return result
+
+
+def _transition(state: int, operation: int) -> int:
+    if operation == 0:
+        return (state + 1) % 4
+    if operation == 1:
+        return (state - 1) % 4
+    if operation == 2:
+        return state if state in (0, 2) else (state + 1) % 4
+    if operation == 3:
+        return 1
+    raise ValueError("unknown station operation")
+
+
+def decision_from_image(image: Image.Image) -> str:
+    labels = _labels(image)
+    state_parts: list[tuple[int, np.ndarray]] = []
+    for state, label in enumerate(_STATE):
+        parts = _large_components(labels, label, y_floor=65, minimum=300)
+        if len(parts) > 1:
+            raise ValueError("a state color has multiple large route components")
+        if parts:
+            state_parts.append((state, parts[0]))
+    if len(state_parts) != 1:
+        raise ValueError("ringed initial state is missing or ambiguous")
+    initial_state, start_state = state_parts[0]
+
+    finish_parts = _large_components(labels, _FINISH, y_floor=65, minimum=300)
+    if len(finish_parts) != 1:
+        raise ValueError("finish marker is missing or ambiguous")
+    finish = finish_parts[0]
+
+    station_parts: list[tuple[int, np.ndarray]] = []
+    for operation, label in enumerate(_OPS):
+        for part in _large_components(labels, label, y_floor=65, minimum=150):
+            station_parts.append((operation, part))
+    if len(station_parts) != 8:
+        raise ValueError("expected eight visible stations")
+
+    traversable_labels = [_ROUTE, _FINISH, *_STATE, *_OPS]
+    traversable = np.isin(labels, traversable_labels)
+    main = _flood(traversable, start_state)
+    if not np.all(main[finish[:, 0], finish[:, 1]]):
+        raise ValueError("finish is not connected to the ringed start")
+
+    distance = _distance_map(main, start_state)
+    ordered: list[tuple[int, int, np.ndarray]] = []
+    for operation, part in station_parts:
+        values = distance[part[:, 0], part[:, 1]]
+        if np.any(values < 0):
+            raise ValueError("station is not on the connected conveyor")
+        ordered.append((int(values.min()), operation, part))
+    ordered.sort(key=lambda item: item[0])
+    if any(right[0] - left[0] < 5 for left, right in zip(ordered, ordered[1:])):
+        raise ValueError("station order is unresolved")
+
+    state = initial_state
+    for _, operation, _ in ordered:
+        state = _transition(state, operation)
+    return ("W", "X", "Y", "Z")[state]

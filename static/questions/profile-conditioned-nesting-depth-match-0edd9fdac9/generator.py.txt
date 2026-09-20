@@ -1,0 +1,305 @@
+"""Nesting-depth match world renderer.
+
+A set of 2-3 closed black ring loops, all concentric about a shared center, is
+drawn on a white canvas. Three colored dot markers appear in the white regions.
+The "nesting depth" of a dot is the number of closed loops that enclose it (the
+number of rings with radius larger than the dot's distance from the shared
+center). The green dot is the reference; exactly one of the other two dots (red
+or blue) is enclosed by the same number of loops as green.
+
+Decision: which of red/blue shares green's nesting depth.
+
+The scene is a plain dict so the verifier's AST reachability audit is free of
+side effects.
+
+    z = {
+        "width": 400,
+        "height": 400,
+        "background": "white",
+        "rings":   [[cx, cy, r], ...],       # concentric black ring loops
+        "ring_color": "black",
+        "ring_width": 10.0,
+        "dots":    [{"color": "green", "x": .., "y": ..}, ...],
+        "dot_radius": 8.0,
+    }
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections.abc import Iterator
+
+from PIL import Image, ImageDraw
+
+RENDERER_VERSION = "nesting_depth_match-0.4.0"
+
+DOT_COLORS = {
+    "green": (0, 128, 0),
+    "red": (255, 0, 0),
+    "blue": (0, 0, 255),
+}
+
+RING_WIDTH = 10.0          # ring stroke
+RING_HALF = RING_WIDTH / 2.0
+DOT_RADIUS = 8.0
+MIN_R = 34.0               # innermost ring radius
+GAP_MIN = 26.0             # minimum gap between consecutive ring radii
+GAP_MAX = 46.0
+MAX_R_CAP = 116.0
+DOT_CLEAR = 9.0            # dot centroid must clear every ring rim by this many px
+DOT_SEP = 22.0             # min center distance between any two dots
+CANVAS_MARGIN = 16.0
+QUARANTINE_MIN = 6.0       # below this the nesting-depth decision is fragile
+
+
+def _inside_canvas(x: float, y: float, width: int, height: int) -> bool:
+    return (
+        CANVAS_MARGIN < x < width - CANVAS_MARGIN
+        and CANVAS_MARGIN < y < height - CANVAS_MARGIN
+    )
+
+
+def _depth(dist: float, radii: list[float]) -> int:
+    return sum(1 for r in radii if r > dist)
+
+
+def _clearance(dot: dict, rings: list[list[float]]) -> float:
+    """Min over every (dot, ring) of |distance(dot, ring_center) - ring radius|."""
+    best: float = float("inf")
+    for (cx, cy, r) in rings:
+        d = math.hypot(dot["x"] - cx, dot["y"] - cy)
+        best = min(best, abs(d - r))
+    return best
+
+
+def _usable_bands(radii: list[float], max_dist: float) -> list[dict]:
+    """Radial bands available for dots, each with a distinct nesting depth and
+    already clipped so a dot placed inside is >= DOT_CLEAR from every ring rim."""
+    r = sorted(radii)
+    k = len(r)
+    bands: list[dict] = []
+    inner_lo = 0.0
+    inner_hi = r[0] - DOT_CLEAR
+    if inner_hi > inner_lo:
+        bands.append({"lo": inner_lo, "hi": inner_hi, "depth": k})
+    for i in range(k - 1):
+        lo = r[i] + DOT_CLEAR
+        hi = r[i + 1] - DOT_CLEAR
+        if hi > lo:
+            mid = (lo + hi) / 2.0
+            bands.append({"lo": lo, "hi": hi, "depth": _depth(mid, r)})
+    out_lo = r[-1] + DOT_CLEAR
+    out_hi = max_dist
+    if out_hi > out_lo:
+        bands.append({"lo": out_lo, "hi": out_hi, "depth": 0})
+    return bands
+
+
+def _place_in_band(
+    rng: random.Random,
+    cx: float,
+    cy: float,
+    full_band: dict,
+    existing: list[dict],
+    width: int,
+    height: int,
+) -> dict | None:
+    (lo, hi) = (full_band["lo"], full_band["hi"])
+    for _ in range(500):
+        dist = rng.uniform(lo, hi)
+        angle = rng.uniform(0.0, 2.0 * math.pi)
+        x = cx + dist * math.cos(angle)
+        y = cy + dist * math.sin(angle)
+        if not _inside_canvas(x, y, width, height):
+            continue
+        if any(math.hypot(x - o["x"], y - o["y"]) < DOT_SEP for o in existing):
+            continue
+        return {"x": x, "y": y}
+    return None
+
+
+def _place_in_band_at_depth(
+    rng: random.Random,
+    cx: float,
+    cy: float,
+    bands: list[dict],
+    depth: int,
+    existing: list[dict],
+    width: int,
+    height: int,
+) -> dict | None:
+    matching = [band for band in bands if band["depth"] == depth]
+    if not matching:
+        return None
+    band = rng.choice(matching)
+    return _place_in_band(rng, cx, cy, band, existing, width, height)
+
+
+def sample_scene(rng: random.Random, width: int = 400, height: int = 400) -> dict:
+    """Sample a valid scene with exactly one of red/blue matching green's depth."""
+    for _attempt in range(160):
+        cx = rng.uniform(175, 225)
+        cy = rng.uniform(175, 225)
+        max_r = max(72.0, min(cx, cy, width - cx, height - cy) - CANVAS_MARGIN)
+        max_r = min(max_r, MAX_R_CAP)
+
+        k = rng.choice([2, 3])
+        if MIN_R + (k - 1) * GAP_MIN > max_r - 4:
+            k = 2
+        if MIN_R + (k - 1) * GAP_MIN > max_r - 4:
+            continue
+
+        gaps = [rng.uniform(GAP_MIN, GAP_MAX) for _ in range(k - 1)]
+        total = MIN_R + sum(gaps)
+        if total > max_r - 4:
+            scale = (max_r - 4 - MIN_R) / sum(gaps)
+            if scale < 0.75:
+                continue
+            gaps = [g * scale for g in gaps]
+        radii = [MIN_R]
+        for g in gaps:
+            radii.append(radii[-1] + g)
+
+        max_dist = min(max_r - 4, math.hypot(cx, cy) - CANVAS_MARGIN)
+        bands = _usable_bands(radii, max_dist)
+        if len(bands) < 2:
+            continue
+
+        g_band = rng.choice(bands)
+        g_dot = _place_in_band(rng, cx, cy, g_band, [], width, height)
+        if g_dot is None:
+            continue
+        g_dot["color"] = "green"
+        g_depth = _depth(
+            math.hypot(g_dot["x"] - cx, g_dot["y"] - cy), radii
+        )
+
+        matcher_color = rng.choice(["red", "blue"])
+        other_color = "blue" if matcher_color == "red" else "red"
+
+        m_dot = _place_in_band_at_depth(
+            rng, cx, cy, bands, g_depth, [g_dot], width, height
+        )
+        if m_dot is None or _depth(math.hypot(m_dot["x"] - cx, m_dot["y"] - cy), radii) != g_depth:
+            continue
+        m_dot["color"] = matcher_color
+
+        other_depths = [band["depth"] for band in bands if band["depth"] != g_depth]
+        o_dot = None
+        for _o in range(60):
+            if not other_depths:
+                break
+            o_band = rng.choice(bands)
+            if o_band["depth"] == g_depth:
+                continue
+            candidate = _place_in_band(rng, cx, cy, o_band, [g_dot, m_dot], width, height)
+            if candidate is not None:
+                o_dot = candidate
+                break
+        if o_dot is None:
+            continue
+        o_dot["color"] = other_color
+        if _depth(math.hypot(o_dot["x"] - cx, o_dot["y"] - cy), radii) == g_depth:
+            continue
+
+        scene = {
+            "width": width,
+            "height": height,
+            "background": "white",
+            "rings": [[cx, cy, float(r)] for r in radii],
+            "ring_color": "black",
+            "ring_width": RING_WIDTH,
+            "dots": [g_dot, m_dot, o_dot],
+            "dot_radius": DOT_RADIUS,
+        }
+        return scene
+    return _fallback_scene()
+
+
+def _fallback_scene() -> dict:
+    cx = 200.0
+    cy = 200.0
+    radii = [34.0, 34.0 + 30.0, 34.0 + 60.0]
+    dots = [
+        {"color": "green", "x": cx, "y": cy},
+        {"color": "red", "x": cx + 8.0, "y": cy},
+        {"color": "blue", "x": cx, "y": cy + 8.0},
+    ]
+    return {
+        "width": 400,
+        "height": 400,
+        "background": "white",
+        "rings": [[cx, cy, r] for r in radii],
+        "ring_color": "black",
+        "ring_width": RING_WIDTH,
+        "dots": dots,
+        "dot_radius": DOT_RADIUS,
+    }
+
+
+def render(scene: dict, supersample: int = 1) -> Image.Image:
+    width = int(scene["width"])
+    height = int(scene["height"])
+    background = scene["background"]
+    ss = supersample
+    img = Image.new("RGB", (width * ss, height * ss), background)
+    draw = ImageDraw.Draw(img)
+    ring_w = max(1, int(round(float(scene["ring_width"]) * ss)))
+    dot_r = float(scene["dot_radius"]) * ss
+    for (ccx, ccy, r) in scene["rings"]:
+        box = [(ccx - r) * ss, (ccy - r) * ss, (ccx + r) * ss, (ccy + r) * ss]
+        draw.ellipse(box, outline="black", width=ring_w)
+    for dot in scene["dots"]:
+        (dx, dy) = (float(dot["x"]), float(dot["y"]))
+        dbox = [(dx - dot_r) * ss, (dy - dot_r) * ss, (dx + dot_r) * ss, (dy + dot_r) * ss]
+        draw.ellipse(dbox, fill=DOT_COLORS[dot["color"]])
+    if ss > 1:
+        img = img.resize((width, height), Image.LANCZOS)
+    return img
+
+
+def _dot_depth(scene: dict, dot: dict) -> int:
+    cx = float(scene["rings"][0][0])
+    cy = float(scene["rings"][0][1])
+    radii = [float(r) for (_x, _y, r) in scene["rings"]]
+    dist = math.hypot(float(dot["x"]) - cx, float(dot["y"]) - cy)
+    return _depth(dist, radii)
+
+
+def analytic_gold(scene: dict) -> str:
+    """Return which of red/blue matches green's nesting depth (red on tie)."""
+    dots = {dot["color"]: dot for dot in scene["dots"]}
+    target = _dot_depth(scene, dots["green"])
+    red_matches = _dot_depth(scene, dots["red"]) == target
+    blue_matches = _dot_depth(scene, dots["blue"]) == target
+    if blue_matches and not red_matches:
+        return "blue"
+    return "red"
+
+
+def margin(scene: dict) -> float:
+    """Robustness margin: the smallest radial clearance between any dot and any
+    ring rim, plus the narrowest white band between consecutive rings."""
+    rings = scene["rings"]
+    best: float = float("inf")
+    for dot in scene["dots"]:
+        best = min(best, _clearance(dot, rings))
+    radii = sorted(float(r) for (_x, _y, r) in rings)
+    ring_w = float(scene.get("ring_width", RING_WIDTH))
+    for i in range(len(radii) - 1):
+        best = min(best, radii[i + 1] - radii[i] - ring_w)
+    if not scene["dots"] or math.isinf(best):
+        return float("inf")
+    return max(0.0, float(best))
+
+
+def is_quarantined(scene: dict) -> bool:
+    return margin(scene) < QUARANTINE_MIN
+
+
+def latent_symmetries(scene: dict) -> Iterator[dict]:
+    """No nontrivial render-invariant symmetry: every stored ring and dot
+    coordinate changes the picture, and the decision is a deterministic function
+    of the pixels. Declared not_applicable."""
+    return iter(())

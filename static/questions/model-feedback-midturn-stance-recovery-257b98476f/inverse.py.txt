@@ -1,0 +1,139 @@
+"""Pixel-only inverse arm for the midturn-stance-recovery world.
+
+Receives the rendered PNG and nothing else: no scene, no renderer, no gold.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import numpy as np
+from PIL import Image
+
+_GREEN = (36, 150, 74)
+_ORANGE = (232, 124, 26)
+_BLUE = (66, 84, 196)
+_TOLERANCE = 26
+
+
+class OracleAbstention(RuntimeError):
+    """Raised when the raster does not expose a decidable configuration."""
+
+
+def _mask(array: np.ndarray, colour) -> np.ndarray:
+    reference = np.array(colour, dtype=np.int16)
+    return (np.abs(array.astype(np.int16) - reference) <= _TOLERANCE).all(axis=2)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    height, width = mask.shape
+    seen = np.zeros_like(mask)
+    blobs: list[np.ndarray] = []
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        queue = deque([(sx, sy)])
+        seen[sy, sx] = True
+        blob: list[tuple[int, int]] = []
+        while queue:
+            cx, cy = queue.popleft()
+            blob.append((cx, cy))
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < width and 0 <= ny < height and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    queue.append((nx, ny))
+        if len(blob) >= 400:
+            blobs.append(np.array(blob, dtype=np.float64))
+    return blobs
+
+
+def _centroid(blob: np.ndarray) -> tuple[float, float]:
+    return (float(blob[:, 0].mean()), float(blob[:, 1].mean()))
+
+
+def _far_angle(blob: np.ndarray, centre) -> float:
+    dx = blob[:, 0] - centre[0]
+    dy = blob[:, 1] - centre[1]
+    distance = np.hypot(dx, dy)
+    tip = distance >= distance.max() - 6.0
+    if not tip.any():
+        raise OracleAbstention("no orientation tip")
+    return math.degrees(math.atan2(float(dy[tip].mean()), float(dx[tip].mean())))
+
+
+def _wrap(degrees: float) -> float:
+    return (degrees + 180.0) % 360.0 - 180.0
+
+
+def _rotation_centre(source, image, degrees: float) -> tuple[float, float]:
+    radians = math.radians(degrees)
+    cos = math.cos(radians)
+    sin = math.sin(radians)
+    a = 1.0 - cos
+    b = sin
+    rx = image[0] - (source[0] * cos - source[1] * sin)
+    ry = image[1] - (source[0] * sin + source[1] * cos)
+    determinant = a * a + b * b
+    if determinant < 1e-6:
+        raise OracleAbstention("demonstrated turn is degenerate")
+    return ((a * rx - b * ry) / determinant, (b * rx + a * ry) / determinant)
+
+
+def decision_from_image(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"))
+
+    greens = _components(_mask(array, _GREEN))
+    oranges = _components(_mask(array, _ORANGE))
+    blues = _components(_mask(array, _BLUE))
+    if len(greens) != 1 or len(oranges) != 1:
+        raise OracleAbstention("expected exactly one green and one orange figure")
+    if len(blues) != 4:
+        raise OracleAbstention("expected exactly four blue figures")
+
+    areas = [len(greens[0]), len(oranges[0])] + [len(blob) for blob in blues]
+    if max(areas) - min(areas) > 0.10 * max(areas):
+        raise OracleAbstention("figures are not congruent")
+
+    green_centre = _centroid(greens[0])
+    orange_centre = _centroid(oranges[0])
+    blue_centres = [_centroid(blob) for blob in blues]
+    green_angle = _far_angle(greens[0], green_centre)
+    orange_angle = _far_angle(oranges[0], orange_centre)
+    blue_angles = [_far_angle(blob, centre) for blob, centre in zip(blues, blue_centres)]
+    for angle in blue_angles[1:]:
+        if abs(_wrap(angle - blue_angles[0])) > 8.0:
+            raise OracleAbstention("blue figures do not share one orientation")
+
+    theta = _wrap(orange_angle - green_angle)
+    if abs(theta) < 80.0:
+        raise OracleAbstention("demonstrated turn is too small to halve")
+    hinge = _rotation_centre(green_centre, orange_centre, theta)
+
+    best_half = None
+    for half in (theta / 2.0, theta / 2.0 + 180.0):
+        error = abs(_wrap(green_angle + half - blue_angles[0]))
+        if best_half is None or error < best_half[0]:
+            best_half = (error, half)
+    if best_half[0] > 25.0:
+        raise OracleAbstention("no halved turn matches the drawn stance orientation")
+    half = best_half[1]
+
+    radians = math.radians(half)
+    dx = green_centre[0] - hinge[0]
+    dy = green_centre[1] - hinge[1]
+    predicted = (
+        hinge[0] + dx * math.cos(radians) - dy * math.sin(radians),
+        hinge[1] + dx * math.sin(radians) + dy * math.cos(radians),
+    )
+
+    order = sorted(range(4), key=lambda k: blue_centres[k][0])
+    distances = sorted(
+        (math.hypot(blue_centres[k][0] - predicted[0], blue_centres[k][1] - predicted[1]), rank)
+        for rank, k in enumerate(order)
+    )
+    if distances[0][0] > 0.40 * distances[1][0]:
+        raise OracleAbstention("halfway stance is not cleanly resolved")
+    return f"blue-{distances[0][1] + 1}"
