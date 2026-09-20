@@ -27,3 +27,20 @@ publication status, URLs, citations, or research licenses.
 This is an anonymized submission website. Do not include project author names,
 affiliations, author URLs, or identifying publication metadata. Author omission
 is intentional, not a missing task. Only add submission-safe resource links.
+
+## Website narrative and presentation
+
+Use conventional main headings: Introduction, Method, Experiments and Results,
+and Limitations. Follow the paper’s six-experiment order within Results.
+The inverse-program analysis belongs under Collection Growth, not in its own
+numbered homepage section. Its homepage summary contains three recorded guitar
+images, what the inverse program does, the principal findings, and one button
+to the dedicated analysis. Keep the detailed tables and walkthroughs there.
+Use the manuscript abstract without its redundant project-page sentence.
+Use plain academic English and define technical terms before relying on them.
+Keep the 225-world paper analysis distinct from the supplementary 250-world audit.
+Show model accuracy as a table, not progress-style bars. Preserve the
+side-by-side forward/image/inverse comparison on phones.
+Shared navigation is maintained by scripts/sync_navigation.py; reading.css
+loads last and provides common reading styles across all seven pages.
+Run tests/site_consistency.py after cross-page changes.

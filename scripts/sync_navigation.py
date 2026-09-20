@@ -14,5 +14,11 @@ def sync(root=ROOT):
         text=re.sub(r'<nav\b[^>]*class="(?:site-nav|inverse-nav)"[^>]*>.*?</nav>',nav,text,count=1,flags=re.S)
         if 'static/css/navigation.css' not in text:
             text=text.replace('</head>','<link rel="stylesheet" href="static/css/navigation.css"></head>')
+        # Keep primary navigation outside the article on the legacy examples page.
+        if page.name == 'inverse-programs.html':
+            text=text.replace(nav,'',1)
+            text=re.sub(r'(<body[^>]*>)',lambda m:m.group(1)+nav,text,count=1)
+        text=re.sub(r'<link[^>]*href="static/css/reading.css"[^>]*>', '', text)
+        text=text.replace('</head>','<link rel="stylesheet" href="static/css/reading.css"></head>')
         page.write_text(text)
 if __name__=='__main__': sync()

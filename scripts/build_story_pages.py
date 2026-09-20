@@ -13,15 +13,17 @@ def build_story_pages(root, detailed):
         h=re.sub(r'<title>.*?</title>',f'<title>{title} · BlindLoop</title>',head,flags=re.S)
         body=re.sub(r'href="#world=', 'href="questions.html#world=',body)
         body=body.replace('href="#method"','href="index.html#method"')
+        body=re.sub(r'^[ \t]+$', '', body, flags=re.M)
         (root/name).write_text(h+extra+'</head><body class="reading-page"><a class="skip-link" href="#main">Skip to content</a>'+nav+f'<main id="main"><header class="reading-page-intro container site-width"><a href="index.html">← Project overview</a><h1>{title}</h1><p>{lead}</p></header>'+body+'</main><footer class="reading-footer"><a href="index.html">Project overview</a> · <a href="THIRD_PARTY_NOTICES.md">Third-party notices</a></footer></body></html>')
     results=''.join(sections[k] for k in ['results','human-review','training','external'])
-    write('results.html','Detailed experiments and results','This page reports the full experimental results, including sample counts, scoring rules, and additional analyses.',results)
+    results=re.sub(r'<header class="section-intro">.*?</header>', '', results, count=1, flags=re.S)
+    write('results.html','Experiments and Results','This page reports the full experimental results, including sample counts, scoring rules, and additional analyses.',results)
     inverse=(root/'inverse-programs.html').read_text()
     inverse=inverse[inverse.index('<div class="inverse-pipeline"'):inverse.index('<footer class="inverse-foot"')]
     program=sections['programs']+sections['verification']+sections['source-analysis']
     program=program.replace('href="inverse-programs.html"','href="#inverse-walkthroughs"')
-    program+='<section class="section" id="inverse-walkthroughs"><div class="container site-width inverse-wrap"><h2>Five inverse programs, step by step</h2>'+inverse+'</div></section>'
-    write('programs.html','Programs behind the questions','This page shows forward and inverse program examples, an image-replacement test, and five explanations of how inverse programs compute their answers.',program,'<link rel="stylesheet" href="static/css/inverse.css">')
+    program+='<section class="section" id="inverse-walkthroughs"><div class="container site-width inverse-wrap">'+inverse+'</div></section>'
+    write('programs.html','Programs and Verification','This page shows forward and inverse program examples, an image-replacement test, and five explanations of how inverse programs compute their answers.',program,'<link rel="stylesheet" href="static/css/inverse.css">')
 
     from sync_navigation import sync
     sync(root)
